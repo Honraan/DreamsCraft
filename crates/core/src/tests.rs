@@ -947,14 +947,17 @@ fn dump_brush_comparisons() {
 /// `BRUSH_SET=set.brushset PROCRAFT_DUMP=dir cargo test -p procraft-core dump_brush_strokes -- --ignored`
 /// (`BRUSH_SET` can be another app's brush file too: .abr, .sut, .kpp and the rest; or
 /// `bundled:Name,Other Name` for those of the brushes the app comes with; `DUMP_FINGER=1` draws
-/// with a finger.)
+/// with a finger, `DUMP_STRAIGHT=1` straight across, `DUMP_UNCOMBINE=1` each part of a dual brush
+/// alone.)
 #[test]
 #[ignore]
 fn dump_brush_strokes() {
     use procraft_engine::brushfile;
     let Ok(path) = std::env::var("BRUSH_SET") else { return };
     let Ok(root) = std::env::var("PROCRAFT_DUMP") else { return };
-    let Some(s) = session(1024, 1024) else { return };
+    // the canvas's side, `DUMP_CANVAS` (1024 unless given)
+    let side: u32 = std::env::var("DUMP_CANVAS").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
+    let Some(s) = session(side, side) else { return };
     // the app's own brushes by name, a set of ours, or another app's brushes
     let brushes: Vec<(u32, u32, String)> = match path.strip_prefix("bundled:") {
         Some(names) => {
@@ -967,6 +970,16 @@ fn dump_brush_strokes() {
             let bytes = std::fs::read(path).unwrap();
             let imported = s.import_brushes(bytes.clone()).or_else(|| s.import_other_brushes(bytes, "Dump".to_owned()));
             let set = imported.unwrap();
+            // with DUMP_UNCOMBINE, a dual brush's two brushes each draw alone
+            if std::env::var_os("DUMP_UNCOMBINE").is_some() {
+                let mut index = 0;
+                while index < s.brush_library()[set as usize].brushes.len() as u32 {
+                    if s.brush_is_dual(set, index) {
+                        s.uncombine_brush(set, index);
+                    }
+                    index += 1;
+                }
+            }
             let library = s.brush_library();
             library[set as usize].brushes.iter().map(|b| (set, b.index, b.name.clone())).collect()
         }
@@ -1024,10 +1037,16 @@ fn dump_brush_strokes() {
         s.set_brush_opacity(1.0);
         for (row, size) in sizes.into_iter().enumerate() {
             s.set_brush_size(size);
-            let y = 1024.0 * (row as f32 + 0.5) / rows;
+            let y = side as f32 * (row as f32 + 0.5) / rows;
+            let across = side as f32 / 1024.0;
+            // the stroke's length in time, `DUMP_MS` (960 unless given)
+            let step: f64 =
+                std::env::var("DUMP_MS").ok().and_then(|v| v.parse::<f64>().ok()).map_or(8.0, |ms| ms / 120.0);
             let at = |i: usize| {
                 let t = i as f32 / 120.0;
-                let mut p = sample(100.0 + t * 820.0, y + (t * 6.0).sin() * 25.0, i as f64 * 8.0);
+                // straight with DUMP_STRAIGHT
+                let wave = if std::env::var_os("DUMP_STRAIGHT").is_some() { 0.0 } else { 25.0 };
+                let mut p = sample((100.0 + t * 820.0) * across, y + (t * 6.0).sin() * wave * across, i as f64 * step);
                 p.pressure = if size == start {
                     // the preview's swell: light at the ends, full in the middle
                     (least + gain * 1.005 * (-9.0 * (t - 0.5) * (t - 0.5)).exp()).clamp(0.0, 1.0)
@@ -1048,7 +1067,7 @@ fn dump_brush_strokes() {
             s.stroke_end(vec![at(120)]);
         }
         let rgba = s.shared.lock().layer_pixels(procraft_engine::document::LayerId(layer)).unwrap();
-        std::fs::write(format!("{root}/{file_name}.png"), crate::project::rgba_png(1024, 1024, &rgba)).unwrap();
+        std::fs::write(format!("{root}/{file_name}.png"), crate::project::rgba_png(side, side, &rgba)).unwrap();
     }
 }
 
@@ -10034,6 +10053,58 @@ fn a_dual_brush_draws_its_two_strokes_combined_by_its_mode() {
     assert!(both > 0 && both < plain, "multiply {both} of {plain}");
     assert!(either >= plain, "normal {either} of {plain}");
     assert!(wet_both > 0 && wet_both < plain, "a wet second, multiply {wet_both} of {plain}");
+}
+
+#[test]
+fn a_dual_brush_takes_its_first_brushs_opacity_after_its_two_strokes_combine() {
+    use procraft_engine::brush::Brush;
+    let Some(s) = session(120, 120) else { return };
+    s.set_brush_size(0.5);
+    s.set_color(0.0, 0.0, 0.0);
+    // the ink one straight stroke lays with the current brush at the opacity slider's `opacity`
+    let ink = |s: &CanvasSession, opacity: f32| {
+        s.set_brush_opacity(opacity);
+        s.stroke_begin(PointerKind::Finger, vec![sample(10.0, 60.0, 0.0)]);
+        s.stroke_add((1..30).map(|k| sample(10.0 + k as f32 * 3.4, 60.0, k as f64 * 8.0)).collect());
+        s.stroke_end(vec![]);
+        let sum: u64 = {
+            let mut guard = s.shared.lock();
+            let st = &mut *guard;
+            let id = st.doc.current();
+            let (canvas, gpu) = (st.canvas.as_mut().unwrap(), st.gpu.as_ref().unwrap());
+            canvas.render_finished(gpu, &mut st.doc);
+            canvas.read_layer(gpu, id).unwrap().chunks(4).map(|p| u64::from(p[3])).sum()
+        };
+        s.undo();
+        sum as f64
+    };
+    // a glaze (the round pen) with a second of wide dabs far apart, cut by Linear Height: where
+    // the second is thin, faint paint of the first rises to full, so an opacity taken into the
+    // first's paint before the cut would come out stronger than it is
+    let mut second = Brush { name: "Dabs".to_owned(), ..Brush::round_pen() };
+    second.set_setting("spacing", 1.0);
+    {
+        let mut guard = s.shared.lock();
+        let st = &mut *guard;
+        let tool = st.tool;
+        let brush = st.brush_mut(tool).unwrap();
+        brush.secondary = Some(Box::new(second));
+        brush.set_setting("dual_blend", 28.0);
+    }
+    let (full, half) = (ink(&s, 1.0), ink(&s, 0.5));
+    // the first's opacity at the slider, half, over the two strokes as they combined
+    assert!(full > 0.0 && (half / full - 0.5).abs() < 0.03, "{half} of {full}");
+    // and the second's own opacity range has no say over the whole (its stamps lighter, which
+    // this cut doesn't show)
+    {
+        let mut guard = s.shared.lock();
+        let st = &mut *guard;
+        let tool = st.tool;
+        let brush = st.brush_mut(tool).unwrap();
+        brush.secondary.as_mut().unwrap().max_opacity = 0.5;
+    }
+    let still = ink(&s, 0.5);
+    assert!((still / full - 0.5).abs() < 0.03, "{still} of {full}");
 }
 
 #[test]

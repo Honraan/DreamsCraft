@@ -1,7 +1,7 @@
 // Brush stamps into the stroke texture: one instanced quad per stamp, turned and squashed as the
 // stamp says, with the round tip or a shape image, and a moving grain if the brush has one.
-// Written premultiplied; the pipeline blends them "over" (light glaze) or keeps the maximum
-// (uniform glaze).
+// Written premultiplied; the pipeline blends them "over" or keeps the maximum (see stamp_rule.wgsl
+// for strokes that take their rule pixel by pixel).
 
 // how far a stamp's quad reaches past the stamp each way (pixels): its shape fills all of it
 const QUAD_REACH: f32 = 0.70710678;
