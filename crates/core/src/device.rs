@@ -69,7 +69,7 @@ static RECORD_FOLDER: Mutex<Option<(PathBuf, String)>> = Mutex::new(None);
 
 /// The record's file in [`RECORD_FOLDER`]: "<backend> trying|made|drew", and on a second line the
 /// build that wrote it.
-const RECORD: &str = "gpu-start.txt";
+pub(crate) const RECORD: &str = "gpu-start.txt";
 
 /// Whether a canvas has shown in this run (so nothing is at risk any more).
 #[cfg_attr(not(any(target_os = "android", target_os = "ios")), allow(dead_code))]
@@ -125,16 +125,17 @@ pub fn set_gpu_record_folder(dir: String, build: String) {
     *RECORD_FOLDER.lock().unwrap_or_else(PoisonError::into_inner) = Some((PathBuf::from(dir), build));
 }
 
-/// The log, to Android's (tag "procraft"), with a panic's message and place in it (the platform
-/// drops what the standard error says); once.
+/// The log, to Android's (tag "procraft") and to the app's log file once that has begun (see
+/// `app_log`), with a panic's message and place in it (the platform drops what the standard error
+/// says); once.
 pub(crate) fn start_log() {
     #[cfg(target_os = "android")]
     {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
-            android_logger::init_once(
+            crate::app_log::install(android_logger::AndroidLogger::new(
                 android_logger::Config::default().with_max_level(log::LevelFilter::Info).with_tag("procraft"),
-            );
+            ));
             let before = std::panic::take_hook();
             std::panic::set_hook(Box::new(move |info| {
                 log::error!("{info}");
