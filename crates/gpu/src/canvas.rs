@@ -115,9 +115,12 @@ const IN_PLACE_PIXEL_WORK: u64 = 16;
 const IN_PLACE_STAMP_WORK: u64 = 256 << 10;
 
 /// Undo steps kept, and the most memory they may hold (their pixels and the selections they put
-/// back).
+/// back): no more than half the layers' textures' budget, where there is one (a device of little
+/// memory), so the history never leaves the layers worked on too little room to stay on the GPU;
+/// but never less than the least (a budget that small isn't a device's).
 const MAX_UNDO: usize = 100;
 const MAX_UNDO_BYTES: u64 = 768 << 20;
+const LEAST_UNDO_BYTES: u64 = 256 << 20;
 
 /// How a transformed layer is resampled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -444,6 +447,8 @@ pub struct Target<'a> {
 /// A colour table on the GPU for [`Target::lut`].
 pub struct DisplayLut {
     bind: wgpu::BindGroup,
+    /// Its own among the tables made while the app runs.
+    id: u64,
 }
 
 /// Panels of frosted glass over the target: what is behind each region is blurred (Gaussian,
@@ -464,15 +469,36 @@ pub struct Backdrop<'a> {
 pub type SmallScene<'s> = &'s mut dyn FnMut(&mut wgpu::CommandEncoder, &wgpu::TextureView, (u32, u32));
 
 /// The backdrop's blur is this many texels wide (sigma) where it is worked out: the scene is
-/// drawn that much smaller, and drawn back up as it is that's a window's softening.
+/// drawn that much smaller, and drawn back up as it is that's a window's softening. On a weak GPU
+/// half that: a quarter of the texels, each blurred over half the taps (the blur as wide, its
+/// picture coarser under it, which so wide a blur hides).
 const BACKDROP_TEXELS: f32 = 5.0;
+const BACKDROP_TEXELS_WEAK: f32 = 2.5;
 
-/// The scene drawn small for frosted panels, half blurred, and blurred.
+/// The scene drawn small for frosted panels, half blurred, and blurred; and what it was drawn
+/// for, while it still shows that (see [`Canvas::frost_ready`]).
 struct BackdropGpu {
     size: (u32, u32),
     format: wgpu::TextureFormat,
     views: [wgpu::TextureView; 3],
     binds: [wgpu::BindGroup; 3],
+    made: Option<FrostMade>,
+}
+
+/// What the glass's blurred scene was drawn for: the canvas where the target had it, its look and
+/// the blur. While these stay and the composite hasn't changed near the glass, the scene is as it
+/// would be drawn again, and is kept: a frame that only moves a stroke elsewhere on the canvas
+/// draws no glass of its own.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FrostMade {
+    to_screen: Affine,
+    k: f32,
+    sigma: f32,
+    surround: [f32; 3],
+    convert: Option<[[f32; 3]; 3]>,
+    /// The colour table's (see [`DisplayLut::id`]).
+    lut: Option<u64>,
+    grey: bool,
 }
 
 impl BackdropGpu {
@@ -499,8 +525,36 @@ impl BackdropGpu {
         };
         let views = [view(), view(), view()];
         let binds = views.each_ref().map(|v| sampled_bind(device, layout, v, sampler));
-        BackdropGpu { size, format, views, binds }
+        BackdropGpu { size, format, views, binds, made: None }
     }
+}
+
+/// Whether a change to the composite inside `changed` (canvas pixels), seen through `to_screen`,
+/// shows in any of the glass's regions or windows that show: within `reach` target pixels of one
+/// (how far the blur and its sampling spread it).
+fn reaches_glass(changed: IRect, to_screen: Affine, reach: f32, backdrop: Backdrop<'_>) -> bool {
+    if changed.is_empty() {
+        return false;
+    }
+    let corners =
+        [(changed.x0, changed.y0), (changed.x1, changed.y0), (changed.x0, changed.y1), (changed.x1, changed.y1)]
+            .map(|(x, y)| to_screen.apply(procraft_engine::geom::Vec2::new(x as f32, y as f32)));
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for p in corners {
+        x0 = x0.min(p.x);
+        y0 = y0.min(p.y);
+        x1 = x1.max(p.x);
+        y1 = y1.max(p.y);
+    }
+    // a map that can't be followed reaches everywhere
+    if ![x0, y0, x1, y1, reach].iter().all(|v| v.is_finite()) {
+        return true;
+    }
+    let (x0, y0, x1, y1) = (x0 - reach, y0 - reach, x1 + reach, y1 + reach);
+    backdrop.regions.iter().chain(backdrop.windows).any(|&[rx0, ry0, rx1, ry1, _, alpha]| {
+        // one that can't be read is drawn as nothing (see `draw_glass`)
+        alpha > 0.0 && rx0 < x1 && x0 < rx1 && ry0 < y1 && y0 < ry1
+    })
 }
 
 /// The glass [`Canvas::frost_ready`] worked out, `k` times smaller than the target of `size`, drawn
@@ -2206,8 +2260,14 @@ pub struct Canvas {
     transforming: Option<Transforming>,
     /// Other layers transformed along with it (layers picked together).
     transform_more: Vec<Transforming>,
-    /// For frosted panels, made when first needed.
+    /// For frosted panels, made when first needed, and how many texels wide their blur is where
+    /// it is worked out (see [`BACKDROP_TEXELS`]).
     backdrop: Option<BackdropGpu>,
+    backdrop_texels: f32,
+    /// Where the composite changed since the glass's scene was drawn (canvas pixels), and how many
+    /// times it has been drawn.
+    frost_stale: IRect,
+    frosts: u64,
 }
 
 const PREMULTIPLIED_OVER: wgpu::BlendState = wgpu::BlendState {
@@ -2509,6 +2569,9 @@ impl Canvas {
             transforming: None,
             transform_more: Vec::new(),
             backdrop: None,
+            backdrop_texels: if gpu.is_weak() { BACKDROP_TEXELS_WEAK } else { BACKDROP_TEXELS },
+            frost_stale: IRect::from_size(width, height),
+            frosts: 0,
             shapes,
             grains,
             brush_images: images,
@@ -2852,6 +2915,11 @@ impl Canvas {
     /// How many times the composite has been redrawn: it changes whenever the picture does.
     pub fn composites(&self) -> u64 {
         self.composites
+    }
+
+    /// How many times the glass's scene has been drawn and blurred (see [`Canvas::frost_ready`]).
+    pub fn frosts(&self) -> u64 {
+        self.frosts
     }
 
     /// Starts a stroke on `layer` (finishing one still open).
@@ -3298,6 +3366,15 @@ impl Canvas {
     /// What the undo and redo history's pixels take on the GPU, bytes.
     pub fn history_bytes(&self) -> u64 {
         self.undo.iter().chain(&self.redo).map(Step::bytes).sum()
+    }
+
+    /// The most the undo history's pixels may take (see [`MAX_UNDO_BYTES`]).
+    pub fn history_most(&self) -> u64 {
+        if self.resident_budget == 0 {
+            MAX_UNDO_BYTES
+        } else {
+            (self.resident_budget / 2).clamp(LEAST_UNDO_BYTES, MAX_UNDO_BYTES)
+        }
     }
 
     /// Drops the open stroke.
@@ -5414,6 +5491,7 @@ impl Canvas {
             if !dirty.is_empty() {
                 self.composite(device, doc, &mut encoder, &mut uniforms, dirty);
                 self.composites = self.composites.wrapping_add(1);
+                self.frost_stale = self.frost_stale.union(dirty);
             }
             self.dirty = IRect::EMPTY;
         }
@@ -5629,13 +5707,25 @@ impl Canvas {
     /// `cs_synthesize`), and shown.
     fn synthesize(&mut self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, params: &mut UniformData, rect: IRect) {
         let device = &gpu.device;
-        let rect = rect.intersect(IRect::from_size(self.width, self.height));
-        let Some(&(style, dual, dual_threshold)) = self.smudge.as_ref().and_then(|s| s.apart.as_ref()) else { return };
+        let Some(&(style, dual, _)) = self.smudge.as_ref().and_then(|s| s.apart.as_ref()) else { return };
         let brush = self.full_grain_bind(device, &style).unwrap_or_else(|| self.brush_bind.clone());
-        if rect.is_empty() {
+        let pieces = self.synthesis(rect);
+        if pieces.is_empty() {
             return;
         }
         let second = (dual != 0).then(|| self.second_stroke.get(device).1.clone());
+        self.lay_pieces(gpu, encoder, params, &pieces, (&brush, second.as_ref()));
+    }
+
+    /// The pieces of [`Canvas::synthesize`] over `rect`: none without paint laid apart.
+    fn synthesis(&self, rect: IRect) -> Vec<smudge::Piece> {
+        let rect = rect.intersect(IRect::from_size(self.width, self.height));
+        let Some(&(style, dual, dual_threshold)) = self.smudge.as_ref().and_then(|s| s.apart.as_ref()) else {
+            return Vec::new();
+        };
+        if rect.is_empty() {
+            return Vec::new();
+        }
         let uniform = SmudgeUniform {
             mode: 1,
             dual,
@@ -5644,8 +5734,7 @@ impl Canvas {
             laid_apart: 2,
             ..smudge_uniform(&bytemuck::Zeroable::zeroed(), &style, rect, (self.width, self.height))
         };
-        let pieces = self.bands(smudge::Pipe::Synthesize, uniform, rect, (true, false), 0);
-        self.lay_pieces(gpu, encoder, params, &pieces, (&brush, second.as_ref()));
+        self.bands(smudge::Pipe::Synthesize, uniform, rect, (true, false), 0)
     }
 
     /// Lays wet paint, a pass a display frame (see [`wet_pass`]; at most [`WET_PASS_MOST`] stamps):
@@ -5704,10 +5793,12 @@ impl Canvas {
                 };
                 pieces.extend(self.bands(smudge::Pipe::Deposit, uniform, bbox, changes, 0));
             }
-            self.lay_pieces(gpu, encoder, params, &pieces, (&brush, second.as_ref()));
+            // paint laid apart put together right after, in the same window where it fits (the
+            // layer, the paint as laid and the layer as it was are then copied in once a frame)
             if laid_apart == 1 {
-                self.synthesize(gpu, encoder, params, changed);
+                pieces.extend(self.synthesis(changed));
             }
+            self.lay_pieces(gpu, encoder, params, &pieces, (&brush, second.as_ref()));
             return;
         }
         // what a pass of `group` reads and writes
@@ -5821,10 +5912,10 @@ impl Canvas {
                 pieces.extend(self.wet_stamp_pieces(&head.0, piece, changes));
             }
         }
-        self.lay_pieces(gpu, encoder, params, &pieces, (&brush, second.as_ref()));
         if laid_apart == 1 {
-            self.synthesize(gpu, encoder, params, changed);
+            pieces.extend(self.synthesis(changed));
         }
+        self.lay_pieces(gpu, encoder, params, &pieces, (&brush, second.as_ref()));
     }
 
     /// Ends a smudge stroke: one undo step with the pixels it changed, or (`cancel`) puts the
@@ -6717,7 +6808,8 @@ impl Canvas {
         }
         self.undo.push(step);
         let mut bytes: u64 = self.undo.iter().map(Step::bytes).sum();
-        while self.undo.len() > MAX_UNDO || (bytes > MAX_UNDO_BYTES && self.undo.len() > 1) {
+        let most = self.history_most();
+        while self.undo.len() > MAX_UNDO || (bytes > most && self.undo.len() > 1) {
             let dropped = self.undo.remove(0);
             bytes = bytes.saturating_sub(dropped.bytes());
             self.keep_spare_snapshot(dropped);
@@ -8098,12 +8190,37 @@ impl Canvas {
         backdrop: Backdrop<'_>,
         other: Option<SmallScene<'_>>,
     ) -> f32 {
-        let k = (backdrop.sigma / BACKDROP_TEXELS).floor().clamp(1.0, 16.0);
+        let k = (backdrop.sigma / self.backdrop_texels).floor().clamp(1.0, 16.0);
         let size = ((target.size.0 as f32 / k).ceil() as u32, (target.size.1 as f32 / k).ceil() as u32);
         if self.backdrop.as_ref().is_none_or(|b| b.size != size || b.format != target.format) {
             self.backdrop =
                 Some(BackdropGpu::new(device, &self.pipelines.sampled_layout, &self.sampler, size, target.format));
         }
+        // blurred across this many target pixels each way (and a window's tent, a texel more)
+        let sigma = backdrop.sigma / k;
+        let radius = (sigma * 3.0).ceil().min(64.0);
+        let made = FrostMade {
+            to_screen: target.to_screen,
+            k,
+            sigma,
+            surround: target.surround,
+            convert: target.convert,
+            lut: target.lut.map(|l| l.id),
+            grey: target.grey,
+        };
+        // the scene as drawn last still shows where the glass is: kept (another's scene never is)
+        let reach = (radius + 2.0) * k;
+        let near = self.frost_stale.intersect(self.full());
+        let kept = other.is_none()
+            && self.backdrop.as_ref().is_some_and(|b| b.made == Some(made))
+            && !reaches_glass(near, target.to_screen, reach, backdrop);
+        if kept {
+            return k;
+        }
+        let Some(small) = self.backdrop.as_mut() else { return k };
+        small.made = other.is_none().then_some(made);
+        self.frost_stale = IRect::EMPTY;
+        self.frosts += 1;
         let Some(small) = self.backdrop.as_ref() else { return k };
         let srgb = target.format.is_srgb();
         let Pipelines { display_module, display_pipeline_layout, display_lut_layout, backdrop_module, .. } =
@@ -8193,8 +8310,6 @@ impl Canvas {
             pass.draw(0..6, 0..1);
         }
         // blurred across, then down
-        let sigma = backdrop.sigma / k;
-        let radius = (sigma * 3.0).ceil().min(64.0);
         for (from, to, step) in
             [(&small.binds[0], &small.views[1], [1.0 / w, 0.0]), (&small.binds[1], &small.views[2], [0.0, 1.0 / h])]
         {
@@ -8694,7 +8809,9 @@ impl Canvas {
                 [c(0), c(1), c(2), 255]
             })
             .collect();
-        DisplayLut { bind: lut_bind(gpu, &self.pipelines.lut_layout, lut.grid as u32, &rgba) }
+        static MADE: AtomicU64 = AtomicU64::new(0);
+        let id = MADE.fetch_add(1, Ordering::Relaxed);
+        DisplayLut { bind: lut_bind(gpu, &self.pipelines.lut_layout, lut.grid as u32, &rgba), id }
     }
 
     /// The composite's pixels (premultiplied RGBA8, rows top to bottom) as last rendered: after
@@ -11104,6 +11221,26 @@ mod tests {
         // never none
         canvas.set_resident_budget(per);
         assert_eq!(canvas.most_resident(), 1);
+    }
+
+    #[test]
+    fn with_little_memory_the_history_keeps_to_half_the_room_for_layers() {
+        use procraft_engine::document::Document;
+        let Ok(gpu) = Gpu::headless() else { return };
+        let doc = Document::new(64, 64);
+        let mut canvas = Canvas::new(&gpu, &doc).unwrap();
+        // no budget: the history's own bound
+        assert_eq!(canvas.history_most(), MAX_UNDO_BYTES);
+        // a tablet of 4 GB (a quarter of it for the layers' textures): half that; of 3 GB likewise
+        canvas.set_resident_budget(1 << 30);
+        assert_eq!(canvas.history_most(), 512 << 20);
+        canvas.set_resident_budget(750 << 20);
+        assert_eq!(canvas.history_most(), 375 << 20);
+        // a device of plenty keeps the history's own bound, and none goes below the least
+        canvas.set_resident_budget(3 << 30);
+        assert_eq!(canvas.history_most(), MAX_UNDO_BYTES);
+        canvas.set_resident_budget(64 << 20);
+        assert_eq!(canvas.history_most(), LEAST_UNDO_BYTES);
     }
 
     #[test]
