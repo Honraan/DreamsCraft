@@ -982,7 +982,8 @@ impl State {
         }
         self.use_full_shape(&mut style, &second);
         let mode = first.setting("dual_blend").round().max(0.0) as u32;
-        Some((second, SecondStroke { style, mode, threshold: style.alpha_threshold }, diameter))
+        let classic = first.setting("classic_combine") >= 0.5;
+        Some((second, SecondStroke { style, mode, threshold: style.alpha_threshold, classic }, diameter))
     }
 
     /// More input for the pad's last kept stroke, if it keeps them.
@@ -1208,8 +1209,13 @@ fn lay_stroke(
     }
     let drawn = builder.stamp_count();
     let for_good = if canvas.shows_tip() { builder.drawn_for_good() } else { None };
+    // a smudge, or an adjustment painted on, has laid its stamps for good as they came
+    let laid = canvas.stroke_tool() == Some(StrokeTool::Smudge) || canvas.is_pencil();
+    if laid {
+        builder.hold_laid();
+    }
     let all = builder.finish();
-    if canvas.stroke_tool() == Some(StrokeTool::Smudge) || canvas.is_pencil() {
+    if laid {
         canvas.add_stamps(&guide::mirrored(guide, all.get(drawn..).unwrap_or(&[])));
     } else if let Some(rest) = for_good.and_then(|stamps| all.strip_prefix(stamps.as_slice())) {
         // nothing laid changes: a long stroke's end needn't lay it all again
