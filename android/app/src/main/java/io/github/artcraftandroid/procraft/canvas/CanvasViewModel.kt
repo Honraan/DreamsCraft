@@ -653,6 +653,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             pluginPanel = plugins.panel()
             s.takeFailure()?.let { showNotice(it) }
             readPlugins()
+            if (s.takeBrushesChanged()) libraryChanged()
             refresh()
         }
     }
@@ -669,6 +670,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             pluginPanel = plugins.panel()
             s.takeFailure()?.let { showNotice(it) }
             readPlugins()
+            // a plugin's studio changed a brush: read again and kept
+            if (s.takeBrushesChanged()) libraryChanged()
             refresh()
         }
     }
@@ -4842,7 +4845,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             // the shared core tells the kinds apart and makes them brushes off the main
             // thread; they join the library here, once nothing holds a place in it
             val read = withContext(Dispatchers.Default) {
-                io.github.artcraftandroid.procraft.core.readBrushes(bytes, name)
+                // plugins' brush engines make theirs of the file here too, off the main thread
+                io.github.artcraftandroid.procraft.core.readBrushes(bytes, name)?.also { r -> it.makeEngineBrushes(r) }
             }
             if (importCancelled) return
             read?.let {
@@ -4987,7 +4991,10 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 val f = withContext(Dispatchers.IO) { pendingBrushDir.listFiles()?.minByOrNull { it.name } } ?: break
                 val read = withContext(Dispatchers.Default) {
                     // named after the set, for another app's (kept as .abr by earlier versions)
-                    runCatching { io.github.artcraftandroid.procraft.core.readBrushes(f.readBytes(), f.name.substringAfter('-')) }.getOrNull()
+                    runCatching {
+                        io.github.artcraftandroid.procraft.core.readBrushes(f.readBytes(), f.name.substringAfter('-'))
+                            ?.also { r -> session?.makeEngineBrushes(r) }
+                    }.getOrNull()
                 }
                 if (session == null) break
                 if (read != null) {
@@ -5182,6 +5189,11 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     /** Opens the studio on the current tool's brush. */
     fun openStudio() {
         val s = session ?: return
+        // a brush a plugin's brush engine draws opens in that plugin's own studio
+        s.brushStudioAction()?.let {
+            runPluginAction(it)
+            return
+        }
         // the brush library stays open under it, so Cancel and Done go back to it
         if (panel != Panel.BRUSHES) closePanels()
         studioName = s.studioBegin()

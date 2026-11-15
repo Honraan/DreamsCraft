@@ -53,6 +53,7 @@ mod palettes;
 mod pick;
 mod pickers;
 mod plugin_artwork;
+mod plugin_brushes;
 mod plugin_canvas;
 mod plugin_commands;
 mod plugin_file;
@@ -120,6 +121,7 @@ pub use animation::{
     AnimationPlayback, AnimationSettings, FrameRate, PlayStep, animation_next_step, export_fps_at, export_fps_fraction,
     export_fps_label, frame_rate,
 };
+pub use brush_files::BrushEngines;
 pub use brush_files::{BrushesRead, OTHER_BRUSH_EXTENSIONS, ReadBrushes, is_brush_zip, read_any_brushes, read_brushes};
 pub use brush_libraries::BrushLibraryInfo;
 pub use brush_library::prepare_brushes;
@@ -560,6 +562,10 @@ pub(crate) struct State {
     /// Plugins' changes in progress (an action's or a panel touch's): while any is, no stroke
     /// begins and undo and redo wait, or they would join its step.
     pub(crate) plugin_stepping: u32,
+    /// The brush a plugin's brush studio edits (set, index), while it is open; and whether a plugin
+    /// changed a brush since the app last asked.
+    pub(crate) engine_studio: Option<(usize, usize)>,
+    pub(crate) brushes_changed: bool,
     /// The pad shows only its sample scribble: a stroke of one's own takes it away.
     pub(crate) pad_sample: bool,
     /// The pad drawn as a sphere, the flat pad's strokes set aside meanwhile.
@@ -1529,6 +1535,8 @@ impl CanvasSession {
             grain_store: grain_store::GrainStore::default(),
             library_kept: None,
             plugin_stepping: 0,
+            engine_studio: None,
+            brushes_changed: false,
             pad_sample: false,
             sphere: None,
             frame_interval_ms: 0.0,
@@ -1777,6 +1785,19 @@ impl CanvasSession {
         let mut builder = make(st, brush.clone(), diameter, seed);
         let mut second_builder =
             second.as_ref().map(|(b, _, d)| make(st, b.clone(), d * st.brush_scale(), seed ^ 0x5eed_0002));
+        // a brush a plugin's brush engine made is drawn by it while it is on: its stamps, how they
+        // are laid and its second stroke are the engine's
+        let outside = st.outside_stroke(&brush, tool, current, pointer, diameter, seed);
+        let laid = match outside {
+            Some(o) => {
+                builder = builder.with_engine(Box::new(o.first));
+                second_builder = o.second.as_ref().map(|_| {
+                    make(st, brush.clone(), diameter, seed ^ 0x5eed_0002).with_engine(Box::new(o.second_half))
+                });
+                Some((o.style, o.second))
+            }
+            None => None,
+        };
         let canvas_samples = st.to_canvas(&samples);
         st.assist_from = canvas_samples.first().map(|s| s.pos);
         st.assist_angle = None;
@@ -1809,8 +1830,12 @@ impl CanvasSession {
                 line: builder.clone(),
             });
         let Some(canvas) = st.canvas.as_mut() else { return };
+        let (style, second) = match laid {
+            Some(laid) => laid,
+            None => (style, second.map(|(_, s, _)| s)),
+        };
         match second {
-            Some((_, second, _)) => canvas.begin_dual_stroke(current, style, second),
+            Some(second) => canvas.begin_dual_stroke(current, style, second),
             None => canvas.begin_stroke(current, style),
         }
         draw_samples(canvas, &mut builder, second_builder.as_mut(), &canvas_samples, &st.doc.stroke_guide());
