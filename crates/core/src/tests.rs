@@ -5795,6 +5795,54 @@ fn picked_layers_transform_together() {
     assert_eq!(pixel(&s, 40, 40), [0, 0, 0, 255]);
 }
 
+#[test]
+fn a_group_current_transforms_what_is_in_it() {
+    use crate::transform::TransformHandle;
+    let Some(s) = session(100, 100) else { return };
+    let dot = |x: f32, y: f32| {
+        s.stroke_begin(PointerKind::Finger, vec![sample(x, y, 0.0)]);
+        s.stroke_end(vec![]);
+    };
+    dot(20.0, 20.0);
+    let below = s.layers()[0].id;
+    s.add_layer();
+    dot(40.0, 40.0);
+    let above = s.layers().iter().find(|l| l.current).unwrap().id;
+    // a layer outside the group stays where it is
+    s.add_layer();
+    dot(80.0, 80.0);
+    assert!(s.select_layer(above));
+    assert!(s.pick_layer(below));
+    let group = s.group_picked();
+    assert_ne!(group, 0);
+    assert!(s.select_layer(group));
+    assert_eq!(s.chosen_layers(), [group]);
+    // the box holds both dots in it, not the one outside
+    let b = s.transform_begin().expect("the group's layers transform");
+    let [x0, y0, x1, _, _, y1, ..] = b.corners[..] else { panic!() };
+    assert!(x0 < 20.0 && y0 < 20.0 && x1 > 40.0 && y1 > 40.0 && x1 < 70.0 && y1 < 70.0, "{b:?}");
+    s.transform_grab(TransformHandle::Move, 30.0, 30.0);
+    s.transform_drag(60.0, 30.0);
+    s.transform_release();
+    s.transform_end(true);
+    assert_eq!(pixel(&s, 50, 20), [0, 0, 0, 255]);
+    assert_eq!(pixel(&s, 70, 40), [0, 0, 0, 255]);
+    assert_eq!(pixel(&s, 20, 20), [255, 255, 255, 255]);
+    assert_eq!(pixel(&s, 80, 80), [0, 0, 0, 255]);
+    // one step puts both back
+    s.undo();
+    assert_eq!(pixel(&s, 20, 20), [0, 0, 0, 255]);
+    assert_eq!(pixel(&s, 40, 40), [0, 0, 0, 255]);
+    assert_eq!(pixel(&s, 50, 20), [255, 255, 255, 255]);
+    // a group holding nothing painted says so
+    let empty = s.add_layer();
+    assert!(s.select_layer(empty));
+    let lone = s.group_picked();
+    assert!(s.select_layer(lone));
+    assert!(s.transform_begin().is_none());
+    assert_eq!(s.transform_refusal(), "This group is empty");
+}
+
 /// On request (`BRUSH_SHEET=path.png`): every library brush's sample stroke, three to a row on
 /// dark grey, with their names listed beside it (`path.txt`), to look the library over.
 #[test]
@@ -11656,6 +11704,60 @@ fn liquify_turns_away_an_alpha_locked_layer_and_other_adjustments_take_it() {
     assert_eq!(s.why_not_adjusted(Adjustment::Liquify), None);
     assert!(s.adjustment_start(Adjustment::Liquify));
     s.adjustment_end(false);
+}
+
+/// Liquify works on every layer chosen (those in a group current too) and turns them away while
+/// the alpha of one is locked; the other adjustments, a copy and a cut take one layer.
+#[test]
+fn liquify_pushes_every_layer_chosen_and_the_others_take_one() {
+    use crate::adjust_menu::Adjustment;
+    use crate::layers::Blocked;
+    let Some(s) = session(100, 100) else { return };
+    s.set_brush_size(0.2);
+    let line = |s: &CanvasSession, y: f32| {
+        s.stroke_begin(PointerKind::Finger, vec![sample(10.0, y, 0.0)]);
+        s.stroke_add((1..=16).map(|i| sample(10.0 + i as f32 * 5.0, y, i as f64 * 8.0)).collect());
+        s.stroke_end(vec![]);
+    };
+    line(&s, 30.0);
+    let below = s.layers()[0].id;
+    let above = s.add_layer();
+    line(&s, 70.0);
+    let column = |s: &CanvasSession| (0..100).map(|y| pixel(s, 50, y)).collect::<Vec<_>>();
+    let before = column(&s);
+    // several chosen: one layer at a time, but for Liquify
+    assert!(s.pick_layer(below));
+    assert_eq!(s.why_not_adjusted(Adjustment::GaussianBlur), Some(Blocked::Several));
+    assert!(!s.adjustment_start(Adjustment::GaussianBlur));
+    assert_eq!(s.why_not_copied(false), Some(Blocked::Several));
+    assert_eq!(s.why_not_copied(true), Some(Blocked::Several));
+    assert_eq!(s.why_not_adjusted(Adjustment::Liquify), None);
+    // in a group, the group current: the same
+    let group = s.group_picked();
+    assert!(s.select_layer(group));
+    assert_eq!(s.why_not_adjusted(Adjustment::Hsb), Some(Blocked::Group));
+    assert!(!s.adjustment_start(Adjustment::Hsb));
+    assert_eq!(s.why_not_copied(false), Some(Blocked::Group));
+    // the alpha of one in it locked: Liquify turns them away and says which
+    assert!(s.set_layer_alpha_lock(below, true));
+    assert_eq!(s.why_not_adjusted(Adjustment::Liquify), Some(Blocked::AlphaLocked));
+    assert_eq!(s.alpha_locked_chosen(), Some(below));
+    assert!(!s.adjustment_start(Adjustment::Liquify));
+    assert!(s.set_layer_alpha_lock(below, false));
+    // a push down the middle moves both lines
+    assert!(s.adjustment_start(Adjustment::Liquify));
+    s.adjustment_liquify_stroke((0..=30).flat_map(|i| [50.0, 15.0 + i as f32 * 2.5, 1.0, 8.0]).collect(), true, false);
+    assert!(s.adjustment_end(true));
+    let after = column(&s);
+    assert_ne!(before[25..45], after[25..45], "the line in the layer below moved");
+    assert_ne!(before[65..85], after[65..85], "the line in the layer above moved");
+    // one step puts both back
+    s.undo();
+    assert_eq!(column(&s), before);
+    // a layer alone takes them all again
+    assert!(s.select_layer(above));
+    assert_eq!(s.why_not_adjusted(Adjustment::GaussianBlur), None);
+    assert_eq!(s.why_not_copied(true), None);
 }
 
 #[test]
