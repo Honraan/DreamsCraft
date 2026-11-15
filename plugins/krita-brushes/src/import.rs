@@ -278,6 +278,12 @@ mod tests {
         );
         stroke.add(&samples);
         assert!(stroke.out.iter().all(|d| d.flags & 256 == 256), "laid over");
+        // in overlay mode its look says it picks up from every layer
+        let overlay = xml.replace("</Preset>", r#"<param name="MergedPaint"><![CDATA[true]]></param></Preset>"#);
+        let mut data = Record::new();
+        data.field(1, overlay.as_bytes());
+        let look = load(&data.bytes(), false).unwrap().look();
+        assert!(fields(&look).any(|(f, v)| f == 10 && v == [1]));
     }
 
     /// A picture tip the preset names but doesn't hold is Krita's default tip, as Krita stands it
@@ -414,18 +420,102 @@ mod tests {
         assert!(dabs.iter().any(|d| (d.y - 50.0).abs() >= 3.5), "spread");
     }
 
+    /// Krita 3's chalk brush: its speckled round tip at every pixel; its dyna brush: circles a
+    /// weight on a spring lays as the pen pulls it.
+    #[test]
+    fn a_chalk_and_a_dyna_brush_lay_as_krita_3_laid_them() {
+        let chalk = drawn("chalkbrush", r#"<param name="Chalk/radius"><![CDATA[3]]></param>"#, 10.0);
+        // a dab at every pixel of the path (30 samples 3 apart), each 7 across
+        assert!(chalk.len() >= 80, "{}", chalk.len());
+        assert!(chalk.iter().all(|d| (d.diameter - 7.0).abs() < 0.01));
+        let dots = r#"<param name="Dyna/action"><![CDATA[0]]></param><param name="Dyna/diameter"><![CDATA[3]]></param><param name="Dyna/mass"><![CDATA[0]]></param><param name="Dyna/drag"><![CDATA[0.65]]></param><param name="Dyna/width"><![CDATA[0.1]]></param>"#;
+        let dyna = drawn("dynabrush", dots, 10.0);
+        // a circle for each move after the first two (the weight starting where the pen first was)
+        assert!(
+            dyna.len() >= 20 && dyna.iter().all(|d| d.tip == 0 && d.diameter >= 2.0 && d.diameter <= 8.0),
+            "{}",
+            dyna.len()
+        );
+        // following the pen, behind it
+        assert!(dyna.iter().all(|d| (d.y - 50.0).abs() < 1.0 && d.x >= 50.0 && d.x <= 137.0));
+    }
+
+    /// A bristle brush's ink runs out pixel by pixel along its lines, and soaking it up its bristles
+    /// take the colours where the stroke starts.
+    #[test]
+    fn a_bristle_brush_s_ink_runs_out_and_soaks_up_the_colours_under_it() {
+        let ink = r#"<param name="HairyBristle/scale"><![CDATA[1]]></param><param name="HairyBristle/random"><![CDATA[0]]></param><param name="HairyBristle/isConnected"><![CDATA[true]]></param><param name="HairyInk/enabled"><![CDATA[true]]></param><param name="HairyInk/inkAmount"><![CDATA[40]]></param><param name="HairyInk/soak"><![CDATA[true]]></param>"#;
+        let xml = format!(
+            r#"<Preset name="E" paintopid="hairybrush"><param name="brush_definition"><![CDATA[<Brush type="auto_brush" spacing="0.2" BrushVersion="2"><MaskGenerator type="circle" id="default" diameter="4" ratio="1" hfade="1" vfade="1"/></Brush>]]></param>{ink}</Preset>"#
+        );
+        let mut data = Record::new();
+        data.field(1, xml.as_bytes());
+        let brush = load(&data.bytes(), false).unwrap();
+        // it wants the colours where its strokes start
+        let side =
+            fields(&brush.look()).find(|(f, _)| *f == 11).and_then(|(_, v)| v.try_into().ok()).map(u32::from_le_bytes);
+        assert!(side.is_some_and(|s| s >= 4), "{side:?}");
+        let mut stroke = Stroke::new(
+            Rc::new(brush),
+            Begin {
+                colour: [1.0, 0.0, 0.0],
+                secondary: [1.0; 3],
+                diameter: 1.0,
+                start_diameter: 1.0,
+                seed: 5,
+                turn: 0.0,
+            },
+        );
+        // green under where it starts
+        let side = 16_u32;
+        let mut bytes = Vec::new();
+        for v in [42_u32, 42, side] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        bytes.extend((0..side * side).flat_map(|_| [0_u8, 255, 0, 255]));
+        stroke.under = crate::engine::Under::read(&bytes);
+        let samples: Vec<Sample> =
+            (0..30).map(|i| Sample { x: 50.0 + i as f32 * 3.0, y: 50.0, pressure: 1.0, ..Sample::default() }).collect();
+        stroke.add(&samples);
+        let dabs = &stroke.out;
+        assert!(dabs.iter().all(|d| d.colour == [0.0, 1.0, 0.0] && d.flags & 4 != 0), "soaked up green");
+        // running out: the last lines fainter than the first, in steps a 64th apart at most
+        let first = dabs.iter().take(8).map(|d| d.opacity).fold(0.0, f32::max);
+        let last = dabs.iter().rev().take(8).map(|d| d.opacity).fold(0.0, f32::max);
+        assert!(last < first * 0.5, "{first} {last}");
+    }
+
     /// Krita's hatching brush: inside each dab of its tip, the lines of a hatching anchored to the
-    /// canvas, a separation apart, the tip laid as the mask they are multiplied by.
+    /// canvas, a separation apart, each kept inside the dab's tip.
     #[test]
     fn a_hatching_brush_lays_canvas_lines_inside_its_tip() {
         let hatching = r#"<param name="Hatching/angle"><![CDATA[0]]></param><param name="Hatching/separation"><![CDATA[4]]></param><param name="Hatching/thickness"><![CDATA[1]]></param><param name="Hatching/origin_x"><![CDATA[0]]></param><param name="Hatching/origin_y"><![CDATA[0]]></param><param name="Hatching/bool_nocrosshatching"><![CDATA[true]]></param>"#;
         let dabs = drawn("hatchingbrush", hatching, 20.0);
-        let (masks, lines): (Vec<&crate::engine::Dab>, Vec<_>) = dabs.iter().partition(|d| d.flags & 8 != 0);
-        assert!(!masks.is_empty() && !lines.is_empty());
+        assert!(!dabs.is_empty() && dabs.iter().all(|d| d.flags & 8 == 0), "no masking stroke");
         // level lines on the canvas's rows a separation apart
-        assert!(lines.iter().all(|d| d.angle.abs() < 1e-3 && d.tip == 1), "level");
-        assert!(lines.iter().all(|d| (d.y.rem_euclid(4.0)).min(4.0 - d.y.rem_euclid(4.0)) < 0.01), "on the rows");
-        assert!(masks.iter().all(|d| (d.diameter - 20.0).abs() < 0.5), "the tip as the mask");
+        assert!(dabs.iter().all(|d| d.angle.abs() < 1e-3 && d.tip == 1), "level");
+        assert!(dabs.iter().all(|d| (d.y.rem_euclid(4.0)).min(4.0 - d.y.rem_euclid(4.0)) < 0.01), "on the rows");
+        assert!(dabs.iter().any(|d| (d.y - 44.0).abs() < 0.01) && dabs.iter().any(|d| (d.y - 56.0).abs() < 0.01));
+        // one dab's lines: inside its round tip, 20 across, not out in its box's corners
+        let xml = format!(
+            r#"<Preset name="E" paintopid="hatchingbrush"><param name="brush_definition"><![CDATA[<Brush type="auto_brush" spacing="0.2" BrushVersion="2"><MaskGenerator type="circle" id="default" diameter="20" ratio="1" hfade="1" vfade="1"/></Brush>]]></param>{hatching}</Preset>"#
+        );
+        let mut data = Record::new();
+        data.field(1, xml.as_bytes());
+        let mut stroke = Stroke::new(
+            Rc::new(load(&data.bytes(), false).unwrap()),
+            Begin {
+                colour: [1.0, 0.0, 0.0],
+                secondary: [1.0; 3],
+                diameter: 1.0,
+                start_diameter: 1.0,
+                seed: 5,
+                turn: 0.0,
+            },
+        );
+        stroke.add(&[Sample { x: 50.0, y: 50.0, pressure: 1.0, ..Sample::default() }]);
+        assert!(!stroke.out.is_empty());
+        assert!(stroke.out.iter().all(|d| (d.x - 50.0).hypot(d.y - 50.0) <= 11.0), "inside the tip");
     }
 
     /// Krita's curve brush: a line for each move, and once it has passed as many points as it

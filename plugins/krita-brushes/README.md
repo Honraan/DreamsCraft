@@ -37,7 +37,8 @@ with the app, off.
   that paint made one colour first (dulling, from the share of it its smudge radius says, weighed by
   the tip in the newer engine), the colour mixed in at its colour rate (the gradient option moving
   it towards the secondary colour; an eraser's is clear, taking the paint away), laid as far as its
-  smudge rate says (in place of what is there, or over it without smearing alpha), by the older engine's sums or the newer's; the first dab only marks where the
+  smudge rate says (in place of what is there, or over it without smearing alpha), picked up from
+  every layer in overlay mode, by the older engine's sums or the newer's; the first dab only marks where the
   next picks up from.
 - Other engines: the quick brush (hard round dabs of its diameter and spacing), the tangent normal
   brush (a pixel brush painting the pen's lean, or the stroke's way, or the pen's turn, as a normal
@@ -51,7 +52,8 @@ with the app, off.
   long as the tip is opaque there; at each move each bristle a line a pixel wide from where it was,
   or would have been, to where it is, the bristles spread by its scale and size, shaken by its
   randomness, sheared as the pen presses, turned by the rotation option, cut by the pressure's
-  threshold, their ink running out along its curve, taking their opacity and saturation, by its
+  threshold, their ink running out pixel by pixel along its curve (soaked up from the colours
+  under where the stroke starts if it says), taking their opacity and saturation, by its
   weights or not); the hatching brush (at each dab of its tip, the lines of a hatching anchored to
   the canvas at its origin, a separation apart, as thick as it says, at its angle, crosshatched as
   its style and the crosshatching option say, its separation stepped by the separation option, on
@@ -64,6 +66,11 @@ with the app, off.
   takes only its size and spacing options; the sketch, spray and bristle brushes their size,
   opacity and rotation; the hatching brush its size and opacity besides its own; the curve brush its
   opacity besides its own; the particle and grid brushes none.
+- Krita 3's chalk and dyna brushes (Krita dropped them in version 4): the chalk brush's speckled round
+  tip at every pixel of the path, its ink running out with the log of its dabs if it says; the dyna
+  brush's weight on a spring (its mass and drag, in the canvas as 1 each way) pulled towards where
+  the pen was, drawing circles growing with its speed, a ribbon as wide as it is slow (filled or its
+  outline) or lines.
 
 The app draws each brush's preview with the plugin, and QuickShape, layers of a plugin's own laying
 their strokes again and painting on a 3D model go through it too; brush files the app writes keep
@@ -74,7 +81,9 @@ a brush's Krita settings a page at a time, the pages its engine has: a pixel bru
 size, opacity and flow, turn and squash, scatter and mirror, colour and texture; a colour smudge
 brush's smudge length and mode, smudge radius, colour rate and gradient; a tangent normal brush's
 tilt; a sketch brush's lines; a spray brush's area, particles, their dynamics and colours; a quick
-brush's diameter and spacing. Each option comes with the sensor it follows and its curve.
+brush's diameter and spacing; a bristle, hatching, curve, particle, grid, chalk or dyna brush's own.
+Each setting is named and ranged as Krita's own option widgets name and range it, and each option
+comes with the sensor it follows and its curve.
 
 The app keeps how each brush looks (its tips drawn, its texture's mask) with the plugin, so only a
 brush's first stroke ever waits for them; after that the plugin only reads the brush's settings.
@@ -86,12 +95,15 @@ readers (which its tests use) run in it.
 - Krita's other engines come in as the app reads them. Some lay no dabs at all, so a brush engine
   of dabs can't draw them: the shape brush (it fills the outline the stroke makes), the filter brush
   (it filters what is under it), the deform brush (it moves the pixels under it) and the clone brush
-  (it copies pixels from elsewhere). The dyna and chalk brushes could be drawn as dabs and aren't
-  yet.
-- The bristle brush keeps at most 4,096 bristles, takes its ink as it runs out once for each line
-  (Krita at each pixel), draws its lines smooth whatever its antialiasing and compositing say, and
-  doesn't soak up the canvas's colours. The hatching brush keeps its lines inside the stroke's tips
-  as a whole (Krita inside each dab's). The curve brush lays a move's line and curve over each
+  (it copies pixels from elsewhere). The chalk brush picks among a few speckled tips (Krita speckles
+  each dab afresh). The dyna brush's weight is pulled at each sample the app hands it (Krita at each
+  of the tablet's events), so the more samples, the smaller and closer its circles.
+- The bristle brush keeps at most 4,096 bristles, draws its lines smooth whatever its antialiasing
+  and compositing say, and takes its ink as it runs out in pieces within a 64th of it (Krita at
+  each pixel). The hatching brush keeps its lines inside each dab's tip in
+  pieces, each as opaque as the tip where it lies, halved down to a pixel where the tip's edge
+  crosses them (Krita masks each pixel), so a thick line's end at the edge is cut square across it.
+  The curve brush lays a move's line and curve over each
   other; the particle brush lays nothing more while the pen holds still; the grid brush taking the
   colour under its cells lays them in no other colour and without a background.
 - The sketch brush draws each move's lines over each other (Krita draws them into one dab first,
@@ -100,8 +112,9 @@ readers (which its tests use) run in it.
   background fill aren't drawn.
 - The lightness and gradient texturing modes take the texture's grey alone (a pattern's
   see-through parts are taken as opaque).
-- Colour smudge's overlay mode (picking up from every layer: it picks up from the layer drawn on)
-  and its paint thickness (lightness tips' height).
+- Colour smudge's paint thickness (lightness tips' height). Its overlay mode picks up from the
+  image as last shown, so within one batch of the pen's moves it doesn't see what it has just laid
+  (Krita keeps its own copy of the image up to date dab by dab).
 - Pictures a preset takes from Krita's own resources without carrying them (nor its bundle): a
   tip of one is Krita's default tip, as Krita stands it in (round, 40 px across, the studio saying
   so); a masking brush or texture of one is left out.

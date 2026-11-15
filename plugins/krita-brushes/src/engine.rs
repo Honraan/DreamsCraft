@@ -135,6 +135,8 @@ struct BristleState {
     y: f32,
     counter: u32,
     ink: f32,
+    /// The colour it soaked up where the stroke started.
+    colour: Option<[f32; 3]>,
 }
 
 /// One of a particle brush's particles: where it is, its pull towards the pen as it builds, and how
@@ -340,6 +342,35 @@ impl Dab {
     }
 }
 
+/// The colours of the layer under where a stroke starts, as the app hands them: a square's left and
+/// top (canvas pixels), its side and its pixels (RGBA8, straight).
+pub struct Under {
+    x0: i32,
+    y0: i32,
+    side: u32,
+    pixels: Vec<u8>,
+}
+
+impl Under {
+    pub fn read(bytes: &[u8]) -> Option<Under> {
+        let word = |i: usize| bytes.get(i * 4..i * 4 + 4).and_then(|b| b.try_into().ok()).map(u32::from_le_bytes);
+        let (x0, y0, side) = (word(0)? as i32, word(1)? as i32, word(2)?);
+        let pixels = bytes.get(12..)?.to_vec();
+        (pixels.len() as u64 == u64::from(side) * u64::from(side) * 4).then_some(Under { x0, y0, side, pixels })
+    }
+
+    /// The colour at canvas pixel (x, y), if the square holds it.
+    fn at(&self, x: i32, y: i32) -> Option<[f32; 3]> {
+        let (i, j) = (x - self.x0, y - self.y0);
+        if i < 0 || j < 0 || i >= self.side as i32 || j >= self.side as i32 {
+            return None;
+        }
+        let at = ((j as u32 * self.side + i as u32) * 4) as usize;
+        let p = self.pixels.get(at..at + 3)?;
+        Some([p[0], p[1], p[2]].map(|v| f32::from(v) / 255.0))
+    }
+}
+
 pub struct Stroke {
     brush: Rc<Brush>,
     begin: Begin,
@@ -369,6 +400,14 @@ pub struct Stroke {
     pace: f32,
     speed: f32,
     pub out: Vec<Dab>,
+    /// The colours under where it starts, if the app handed them.
+    pub under: Option<Under>,
+    /// The canvas's size (canvas pixels), if the app said.
+    pub canvas: Option<(f32, f32)>,
+    /// A dyna brush's weight, the way it was drawn across last, and its lines' ends.
+    dyna: Option<crate::others::DynaWeight>,
+    dyna_across: (f32, f32),
+    dyna_lines: Vec<(f32, f32)>,
 }
 
 impl Stroke {
@@ -410,13 +449,18 @@ impl Stroke {
             texture_offset,
             moves: Vec::new(),
             points: Vec::new(),
-            bristles: vec![BristleState { x: 0.0, y: 0.0, counter: 0, ink: 1.0 }; bristles],
+            bristles: vec![BristleState { x: 0.0, y: 0.0, counter: 0, ink: 1.0, colour: None }; bristles],
             hairy_moves: 0,
             old_pressure: 1.0,
             particles: Vec::new(),
             pace: 0.0,
             speed: 0.0,
             out: Vec::new(),
+            under: None,
+            canvas: None,
+            dyna: None,
+            dyna_across: (0.0, 0.0),
+            dyna_lines: Vec::new(),
         }
     }
 
@@ -475,6 +519,13 @@ impl Stroke {
                 let from = self.last.unwrap_or(p);
                 self.sketch_move(&from, &p);
                 self.length += ((p.x - from.x).powi(2) + (p.y - from.y).powi(2)).sqrt();
+                self.last = Some(p);
+                continue;
+            }
+            // a dyna brush's weight is pulled towards where the pen was at each move
+            if self.brush.dyna.is_some() {
+                let at = self.last.unwrap_or(p);
+                self.dyna_move(&at);
                 self.last = Some(p);
                 continue;
             }
@@ -827,6 +878,94 @@ impl Stroke {
         (size, turn, opacity.clamp(0.0, 1.0))
     }
 
+    /// A dyna brush's weight pulled towards `p` (where the pen was), drawing as it goes: circles
+    /// growing with its speed, a ribbon (or its outline) as wide as it is slow, or lines.
+    fn dyna_move(&mut self, p: &Point) {
+        let brush = Rc::clone(&self.brush);
+        let Some(d) = &brush.dyna else { return };
+        // where the pen was, in the canvas as 1 each way
+        let (w, h) = self.canvas.filter(|(w, h)| *w > 0.0 && *h > 0.0).unwrap_or((1000.0, 1000.0));
+        let to = (p.x / w, p.y / h);
+        let Some(weight) = self.dyna.as_mut() else {
+            self.dyna = Some(crate::others::DynaWeight { at: to, was: to, ..Default::default() });
+            self.dyna_lines = vec![(p.x, p.y); d.line_count];
+            return;
+        };
+        if !weight.pull(d, to) {
+            return;
+        }
+        let weight = weight.clone();
+        let opacity = brush.dynamics.opacity.strength.clamp(0.0, 1.0);
+        let wide = ((d.width_range - weight.speed) * d.width).max(0.000_01);
+        let across = (weight.across.0 * wide, weight.across.1 * wide);
+        let before = self.dyna_across;
+        let px = |q: (f32, f32)| (q.0 * w, q.1 * h);
+        let (was, now) = (px(weight.was), px(weight.at));
+        let was_right = px((weight.was.0 + before.0, weight.was.1 + before.1));
+        let was_left = px((weight.was.0 - before.0, weight.was.1 - before.1));
+        let now_left = px((weight.at.0 - across.0, weight.at.1 - across.1));
+        let now_right = px((weight.at.0 + across.0, weight.at.1 + across.1));
+        if d.line {
+            self.line(was, now, 1.0, opacity, None);
+        }
+        match d.action {
+            0 => {
+                // a circle as big as the weight is fast (and one where it got to)
+                let speed = (weight.velocity.0 * w).hypot(weight.velocity.1 * h).clamp(0.0, d.diameter.max(0.0));
+                let radius = (d.diameter * 0.5 + speed).trunc().max(0.5);
+                let circles: &[(f32, f32)] = if d.two_circles { &[was, now] } else { &[was] };
+                for &(x, y) in circles {
+                    if self.out.len() < MOST_DABS {
+                        self.out.push(Dab {
+                            x,
+                            y,
+                            diameter: 2.0 * radius,
+                            opacity,
+                            flow: 1.0,
+                            tip: 0,
+                            strength: 1.0,
+                            texture_offset: self.texture_offset,
+                            ..Dab::default()
+                        });
+                    }
+                }
+            }
+            1 => {
+                // the ribbon filled: lines along it, side by side across it
+                let span = (was_right.0 - was_left.0)
+                    .hypot(was_right.1 - was_left.1)
+                    .max((now_right.0 - now_left.0).hypot(now_right.1 - now_left.1));
+                let n = (span.ceil() as usize).clamp(1, 512);
+                for k in 0..=n {
+                    let t = k as f32 / n as f32;
+                    let a = (was_left.0 + (was_right.0 - was_left.0) * t, was_left.1 + (was_right.1 - was_left.1) * t);
+                    let b = (now_left.0 + (now_right.0 - now_left.0) * t, now_left.1 + (now_right.1 - now_left.1) * t);
+                    self.line(a, b, 1.5, opacity, None);
+                }
+            }
+            2 => {
+                for (a, b) in
+                    [(was_right, was_left), (was_left, now_left), (now_left, now_right), (now_right, was_right)]
+                {
+                    self.line(a, b, 1.0, opacity, None);
+                }
+            }
+            3 => {
+                let half = (d.line_count / 2) as f32;
+                for i in 0..self.dyna_lines.len() {
+                    let k = (i as f32 - half) * d.line_spacing * weight.pull;
+                    let to = (now.0 + weight.across.0 * k, now.1 + weight.across.1 * k);
+                    let from = self.dyna_lines[i];
+                    self.line(from, to, 1.0, opacity, None);
+                    self.dyna_lines[i] = to;
+                }
+            }
+            _ => {}
+        }
+        self.dyna_across = across;
+        self.dabs += 1;
+    }
+
     /// A bristle brush's move from `a` to `b`: each bristle a line from where it was to where it is
     /// now (from where it would have been at `a`, unless its path is connected), a pixel wide.
     fn hairy_move(&mut self, a: &Point, b: &Point) {
@@ -851,6 +990,16 @@ impl Stroke {
         let shear = pressure * h.shear;
         let (sin, cos) = (-turn).sin_cos();
         let paint = self.begin.colour;
+        // soaking its ink up: each bristle takes the colour under it where the stroke starts
+        if first
+            && h.ink.as_ref().is_some_and(|i| i.soak)
+            && let Some(under) = &self.under
+        {
+            for (state, bristle) in self.bristles.iter_mut().zip(&h.bristles) {
+                let (x, y) = ((bristle.x + a.x).round() as i32, (bristle.y + a.y).round() as i32);
+                state.colour = Some(under.at(x, y).unwrap_or([0.0; 3]));
+            }
+        }
         for (i, bristle) in h.bristles.iter().enumerate() {
             let rx = (self.random.next() * 2.0 - 1.0) * h.random;
             let ry = (self.random.next() * 2.0 - 1.0) * h.random;
@@ -868,42 +1017,55 @@ impl Stroke {
             let from = (a.x + fx1, a.y + fy1);
             let to = (b.x + fx, b.y + fy);
             let pixels = (((to.0 - from.0).powi(2) + (to.1 - from.1).powi(2)).sqrt().ceil() as u32).max(1);
-            let mut colour = bristle.colour;
-            let alpha = match &h.ink {
-                Some(ink) if !ink.depletion.is_empty() => {
-                    // the ink as it runs out along this line, taken at its middle
-                    let at = (state.counter as usize + pixels as usize / 2).min(ink.depletion.len() - 1);
-                    let depletion = ink.depletion[at];
-                    if ink.saturation {
-                        let s = match ink.weights {
-                            Some([pw, lw, iw, dw]) => {
-                                pressure * pw + bristle.length * lw + state.ink * iw + (1.0 - depletion) * dw
-                            }
-                            None => pressure * bristle.length * state.ink * (1.0 - depletion),
-                        } - 1.0;
-                        let [ch, cs, cv] = hsv(colour.unwrap_or(paint));
-                        let cs = if s < 0.0 { cs * (1.0 + s) } else { cs + (1.0 - cs) * s };
-                        colour = Some(rgb([ch, cs.clamp(0.0, 1.0), cv]));
-                    }
-                    let alpha = if ink.opacity {
-                        match ink.weights {
-                            Some([pw, lw, iw, dw]) => {
-                                pressure * pw + bristle.length * lw + state.ink * iw + (1.0 - depletion) * dw
-                            }
-                            None => bristle.length * state.ink,
-                        }
-                        .clamp(0.0, 1.0)
-                    } else {
-                        bristle.length
-                    };
-                    let end = (state.counter as usize + pixels as usize).min(ink.depletion.len() - 1);
-                    state.ink = 1.0 - ink.depletion[end];
-                    state.counter = state.counter.saturating_add(pixels);
-                    alpha
-                }
-                _ => bristle.length,
+            let base = state.colour.or(bristle.colour);
+            let Some(ink) = h.ink.as_ref().filter(|i| !i.depletion.is_empty()) else {
+                self.line(from, to, 1.0, bristle.length * opacity, base);
+                continue;
             };
-            self.line(from, to, 1.0, alpha * opacity, colour);
+            // the ink as it runs out pixel by pixel along the line: at pixel `k` of it, its
+            // opacity and colour (the ink it has the last pixel's leaving)
+            let last = ink.depletion.len() - 1;
+            let (counter, ink_then) = (state.counter as usize, state.ink);
+            let at = |k: usize| -> (f32, Option<[f32; 3]>) {
+                let depletion = ink.depletion[(counter + k).min(last)];
+                let left = if k == 0 { ink_then } else { 1.0 - ink.depletion[(counter + k - 1).min(last)] };
+                let weighed = |[pw, lw, iw, dw]: [f32; 4]| {
+                    pressure * pw + bristle.length * lw + left * iw + (1.0 - depletion) * dw
+                };
+                let mut colour = base;
+                if ink.saturation {
+                    let s = ink.weights.map_or(pressure * bristle.length * left * (1.0 - depletion), weighed) - 1.0;
+                    let [ch, cs, cv] = hsv(colour.unwrap_or(paint));
+                    let cs = if s < 0.0 { cs * (1.0 + s) } else { cs + (1.0 - cs) * s };
+                    colour = Some(rgb([ch, cs.clamp(0.0, 1.0), cv]));
+                }
+                let alpha = if ink.opacity {
+                    ink.weights.map_or(bristle.length * left, weighed).clamp(0.0, 1.0)
+                } else {
+                    bristle.length
+                };
+                (alpha, colour)
+            };
+            // pieces as long as the ink stays within a 64th
+            let n = pixels as usize;
+            let mut start = 0;
+            let (mut alpha0, _) = at(0);
+            for k in 1..=n {
+                let next = (k < n).then(|| at(k).0);
+                if next.is_some_and(|a| (a - alpha0).abs() <= 1.0 / 64.0) {
+                    continue;
+                }
+                let (alpha, colour) = at((start + k) / 2);
+                let (t0, t1) = (start as f32 / n as f32, k as f32 / n as f32);
+                let p0 = (from.0 + (to.0 - from.0) * t0, from.1 + (to.1 - from.1) * t0);
+                let p1 = (from.0 + (to.0 - from.0) * t1, from.1 + (to.1 - from.1) * t1);
+                self.line(p0, p1, 1.0, alpha * opacity, colour);
+                start = k;
+                alpha0 = next.unwrap_or(alpha0);
+            }
+            let Some(state) = self.bristles.get_mut(i) else { continue };
+            state.ink = 1.0 - ink.depletion[(counter + n - 1).min(last)];
+            state.counter = state.counter.saturating_add(pixels);
         }
     }
 
@@ -997,10 +1159,11 @@ impl Stroke {
     }
 
     /// A hatching brush's dab at `p`: the hatching's lines across the dab's box, each as thick as
-    /// it says, crosshatched as it says (its tip, laid as the masking stroke, keeps them inside it).
+    /// it says, crosshatched as it says, kept inside the dab's tip: in pieces, each as opaque as the
+    /// tip is where it lies.
     fn hatch_at(&mut self, p: &Point, hatching: &crate::others::Hatching) {
         let brush = Rc::clone(&self.brush);
-        let Some(mask) = &brush.masking else { return };
+        let Some(tip) = &brush.hatch_tip else { return };
         let info = self.info(p, self.main.dabs);
         let seed = self.begin.seed;
         let k = self.size_factor();
@@ -1013,9 +1176,9 @@ impl Stroke {
         let cross_value = one(&hatching.crosshatching_option, &mut fuzz);
         let separation_value = one(&hatching.separation_option, &mut fuzz);
         let thickness_value = one(&hatching.thickness_option, &mut fuzz);
-        let (dw, dh) = (mask.tip.width * scale, mask.tip.height * scale);
+        let (dw, dh) = (tip.width * scale, tip.height * scale);
         // the next dab as the tip spaces it
-        let spacing = spacing_of(&mask.tip, dw.max(1e-3), dh.max(1e-3), 1.0, false);
+        let spacing = spacing_of(tip, dw.max(1e-3), dh.max(1e-3), 1.0, false);
         self.main.spacing = spacing;
         self.main.turn = 0.0;
         self.main.dabs += 1;
@@ -1033,17 +1196,19 @@ impl Stroke {
         } else {
             hatching.separation
         };
+        let (cx, cy) = (x0 + w * 0.5, y0 + h * 0.5);
         if hatching.opaque_background {
-            let long = w.max(h);
+            // the secondary colour behind them, in the tip's own shape
+            let long = dw.max(dh);
             self.out.push(Dab {
-                x: x0 + w * 0.5,
-                y: y0 + h * 0.5,
+                x: cx,
+                y: cy,
                 diameter: long,
-                angle: if w >= h { 0.0 } else { FRAC_PI_2 },
-                ratio: (w.min(h) / long).clamp(0.01, 1.0),
+                angle: tip.angle,
+                ratio: (dw.min(dh) / long).clamp(0.01, 1.0),
                 opacity,
                 flow: 1.0,
-                tip: LINE_TIP,
+                tip: LINE_TIP + 1,
                 flags: OWN_COLOUR,
                 colour: self.begin.secondary,
                 strength: 1.0,
@@ -1051,6 +1216,21 @@ impl Stroke {
                 ..Dab::default()
             });
         }
+        // how much of the tip is at a point on the canvas
+        let (turn_sin, turn_cos) = (-tip.angle).sin_cos();
+        let cover = |x: f32, y: f32| -> f32 {
+            let Some(m) = tip.masks.first() else { return 1.0 };
+            let (u, v) = (x - cx, y - cy);
+            let (u, v) = (u * turn_cos - v * turn_sin, u * turn_sin + v * turn_cos);
+            let (fu, fv) = (u / dw + 0.5, v / dh + 0.5);
+            if !(0.0..1.0).contains(&fu) || !(0.0..1.0).contains(&fv) || m.width == 0 || m.height == 0 {
+                return 0.0;
+            }
+            let (i, j) = ((fu * m.width as f32) as usize, (fv * m.height as f32) as usize);
+            m.pixels.get(j * m.width as usize + i).map_or(1.0, |&a| f32::from(a) / 255.0)
+        };
+        // pieces short enough to follow the tip's edge
+        let step = (dw.min(dh) / 24.0).max(1.5);
         // the passes: a crosshatching's by its style and value, then the hatching's own
         let mut angles = Vec::new();
         let cross = hatching.crosshatching_option.checked;
@@ -1086,7 +1266,33 @@ impl Stroke {
             let (sin, cos) = angle.to_radians().sin_cos();
             let across = thickness * sin.abs().max(cos.abs());
             for (a, b) in hatch_lines(hatching, angle, separation, (x0, y0, w, h)) {
-                self.line(a, b, across, opacity, None);
+                let length = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+                let pieces = ((length / step).ceil() as usize).clamp(1, 4096);
+                let point = |t: f32| (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+                // each piece halved where the tip's edge crosses it, down to a pixel
+                let mut left: Vec<(f32, f32, f32, f32)> = (0..pieces)
+                    .rev()
+                    .map(|i| {
+                        let (t0, t1) = (i as f32 / pieces as f32, (i + 1) as f32 / pieces as f32);
+                        let (p0, p1) = (point(t0), point(t1));
+                        (t0, t1, cover(p0.0, p0.1), cover(p1.0, p1.1))
+                    })
+                    .collect();
+                while let Some((t0, t1, c0, c1)) = left.pop() {
+                    if (c0 - c1).abs() > 0.04 && (t1 - t0) * length > 1.0 {
+                        let t = (t0 + t1) * 0.5;
+                        let m = point(t);
+                        let cm = cover(m.0, m.1);
+                        left.push((t, t1, cm, c1));
+                        left.push((t0, t, c0, cm));
+                        continue;
+                    }
+                    let (p0, p1) = (point(t0), point(t1));
+                    let c = cover((p0.0 + p1.0) * 0.5, (p0.1 + p1.1) * 0.5).max((c0 + c1) * 0.5);
+                    if c > 0.002 {
+                        self.line(p0, p1, across, opacity * c, None);
+                    }
+                }
             }
         }
     }
@@ -1412,6 +1618,21 @@ impl Stroke {
             if let Some(t) = &brush.tangent {
                 dab.colour = t.colour(&info, self.begin.turn);
                 dab.flags |= OWN_COLOUR;
+            }
+            // a chalk brush's ink running out with the log of its dabs
+            if let Some(c) = brush.chalk.as_ref().filter(|c| c.depletion) {
+                let less = -(((self.main.dabs + 1) as f32).ln() * 10.0) / 100.0;
+                if c.opacity {
+                    dab.opacity *= (1.0 + less).clamp(0.0, 1.0);
+                }
+                if c.saturation {
+                    let from = if dab.flags & OWN_COLOUR != 0 { dab.colour } else { self.begin.colour };
+                    let [ch, cs, cv] = hsv(from);
+                    let s = 1.0 + less;
+                    let cs = if s < 0.0 { cs * (1.0 + s) } else { cs + (1.0 - cs) * s };
+                    dab.colour = rgb([ch, cs.clamp(0.0, 1.0), cv]);
+                    dab.flags |= OWN_COLOUR;
+                }
             }
         }
         if scale > 0.0 && dab.diameter.is_finite() {

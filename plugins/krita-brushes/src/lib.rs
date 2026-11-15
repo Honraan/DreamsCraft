@@ -132,6 +132,8 @@ pub extern "C" fn procraft_brush_begin(len: i32) -> i32 {
     with(|s| {
         let input = s.input.get(..usize::try_from(len).unwrap_or(0)).unwrap_or_default();
         let mut id = None;
+        let mut under = None;
+        let mut canvas = None;
         let mut begin =
             Begin { colour: [0.0; 3], secondary: [1.0; 3], diameter: 1.0, start_diameter: 1.0, seed: 1, turn: 0.0 };
         for (field, value) in fields(input) {
@@ -147,6 +149,11 @@ pub extern "C" fn procraft_brush_begin(len: i32) -> i32 {
                 8 => begin.seed = u32_of(value).unwrap_or(1),
                 9 => begin.turn = f32_of(value).filter(|t| t.is_finite()).unwrap_or(0.0),
                 10 => begin.start_diameter = f32_of(value).unwrap_or(1.0),
+                11 => under = engine::Under::read(value),
+                12 => {
+                    let f = f32s(value);
+                    canvas = (f.len() >= 2).then(|| (f[0], f[1]));
+                }
                 _ => {}
             }
         }
@@ -159,7 +166,10 @@ pub extern "C" fn procraft_brush_begin(len: i32) -> i32 {
         if s.strokes.len() >= MOST_STROKES {
             s.strokes.remove(0);
         }
-        s.strokes.push((number, Stroke::new(brush, begin)));
+        let mut stroke = Stroke::new(brush, begin);
+        stroke.under = under;
+        stroke.canvas = canvas;
+        s.strokes.push((number, stroke));
         number
     })
 }
