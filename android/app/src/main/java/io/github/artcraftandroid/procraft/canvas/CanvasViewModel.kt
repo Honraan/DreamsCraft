@@ -511,6 +511,13 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     var tweensOn by mutableStateOf(false)
         private set
 
+    /**
+     * Whether a plugin makes the strokes' sound, as last asked: only then does a hovering pen tell
+     * the canvas where it is (each hover event would otherwise wait on the canvas for nothing).
+     */
+    var strokeSoundOn = false
+        private set
+
     // the interface's accent as the plugins give it
     init { followPluginLooks() }
 
@@ -542,7 +549,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         // set up before the session is, the first time
         @Suppress("SENSELESS_COMPARISON")
         if (strokeSound == null) return
-        strokeSound.follow(session?.takeIf { inFront && screen == Screen.CANVAS }, plugins.makesStrokeSound())
+        strokeSoundOn = plugins.makesStrokeSound()
+        strokeSound.follow(session?.takeIf { inFront && screen == Screen.CANVAS }, strokeSoundOn)
     }
 
     /** The app came to the front ([front]) or went behind: the strokes' sound follows. */
@@ -2996,13 +3004,18 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             showNotice(said)
             return
         }
-        val ids = session?.layersAt(at.x, at.y).orEmpty()
-        if (ids.isEmpty()) {
-            message = "Nothing is drawn there."
-            return
+        val s = session ?: return
+        // read back from the GPU off the main thread, as a finger set to pick layers asks on every touch
+        viewModelScope.launch {
+            val ids = withContext(Dispatchers.Default) { s.layersAt(at.x, at.y) }
+            if (session !== s) return@launch
+            if (ids.isEmpty()) {
+                message = "Nothing is drawn there."
+                return@launch
+            }
+            selectLayer(ids.first())
+            layerChoice = if (ids.size > 1) at to ids else null
         }
-        selectLayer(ids.first())
-        layerChoice = if (ids.size > 1) at to ids else null
     }
 
     /** The QuickMenu, open around this window point. */
@@ -3730,11 +3743,9 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         frameJob = viewModelScope.launch {
             do {
                 frameStale = false
-                withContext(Dispatchers.Default) {
-                    // frames as large as the video they make, private layers left out
-                    val shot = s.timeLapseFrame(t.settings.side.toUInt()) ?: return@withContext
-                    t.record(shot.rgba, shot.width.toInt(), shot.height.toInt())
-                }
+                // read back at the size frames are kept, private layers left out, and kept by the
+                // core without the picture coming here: a frame after each stroke
+                withContext(Dispatchers.Default) { t.recordFrom(s) }
                 // one that couldn't be kept (the storage full) is told once
                 t.takeProblem()?.let { message = it }
             } while (frameStale)

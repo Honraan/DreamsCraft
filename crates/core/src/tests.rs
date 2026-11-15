@@ -630,6 +630,30 @@ fn a_save_leaves_liquify_working_and_the_next_keeps_how_it_ended() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A call that waits on the canvas past the long wait still gets it once it is let go, and the
+/// lock says who took it last (what the log names when a wait is long).
+#[test]
+fn a_long_wait_on_the_canvas_ends_and_names_who_held_it() {
+    let s = CanvasSession::new(8, 8);
+    let held = {
+        let s = std::sync::Arc::clone(&s);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            let guard = s.shared.lock();
+            tx.send(()).unwrap();
+            std::thread::sleep(crate::held::LONG_WAIT + std::time::Duration::from_millis(200));
+            drop(guard);
+        });
+        rx.recv().unwrap();
+        t
+    };
+    assert!(s.shared.holder.said().starts_with("taken at tests.rs:"), "{}", s.shared.holder.said());
+    let started = std::time::Instant::now();
+    drop(s.shared.lock());
+    assert!(started.elapsed() > crate::held::LONG_WAIT);
+    held.join().unwrap();
+}
+
 #[test]
 fn a_pen_stroke_paints_and_undoes() {
     let Some(s) = session(100, 200) else { return };
@@ -3098,6 +3122,35 @@ fn a_private_picture_shows_on_the_canvas_but_not_in_the_thumbnail() {
     assert!(s.layers().iter().any(|l| l.id == pasted && l.private));
     s.undo();
     assert!(s.layers().iter().all(|l| l.id != pasted));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A time-lapse frame is read back at the size frames are kept, whatever the video's, and kept by
+/// the core itself: after each stroke it moves a few MB, not dozens (a frame the video's size
+/// went to the app and back, and had the page faults of a tablet's drawing at 60 000 a second).
+#[test]
+fn a_time_lapse_frame_is_read_at_the_size_it_is_kept() {
+    let Some(s) = session(2048, 512) else { return };
+    let dir = std::env::temp_dir().join(format!("procraft-lapse-size-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let lapse = crate::TimeLapse::new(dir.to_string_lossy().into_owned());
+    // the largest video: frames would have been read at its 3840
+    lapse.set_settings(crate::TimeLapseSettings { resolution: 2, quality: 1, hevc: false });
+    s.stroke_begin(PointerKind::Finger, vec![sample(100.0, 100.0, 0.0)]);
+    s.stroke_add(vec![sample(400.0, 300.0, 40.0)]);
+    s.stroke_end(vec![]);
+    assert!(s.record_time_lapse(std::sync::Arc::clone(&lapse)));
+    let frame = lapse.frame(0).unwrap();
+    assert_eq!((frame.width, frame.height), (crate::timelapse::FRAME_SIDE, crate::timelapse::FRAME_SIDE));
+    // nothing new: no frame
+    assert!(!s.record_time_lapse(std::sync::Arc::clone(&lapse)));
+    assert_eq!(lapse.count(), 1);
+    // not recording: none
+    lapse.set_recording(false);
+    s.stroke_begin(PointerKind::Finger, vec![sample(100.0, 400.0, 0.0)]);
+    s.stroke_end(vec![]);
+    assert!(!s.record_time_lapse(std::sync::Arc::clone(&lapse)));
+    assert_eq!(lapse.count(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -13545,4 +13598,204 @@ fn zoomed_in_and_out_a_vector_layer_is_drawn_sharp_on_one_canvas_kept_for_each_p
     drop(st);
     assert_eq!(gpu.errors(), 0);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A long session as a tablet runs it, on a canvas the size of a 2944 x 1840 tablet's: a render
+/// thread drawing frames, a time-lapse frame after each stroke, the autosave every 3 s, the app's
+/// poll for failures, and pen strokes and layer picks on the app's thread. The app's thread's calls
+/// stay as quick at the end as at the start, and none waits long on the canvas (a frozen interface:
+/// "isn't responding"). How long they take is printed every `LONG_EVERY` strokes (250) of
+/// `LONG_STROKES` (1500). Run with `--ignored --nocapture`.
+#[test]
+#[ignore]
+fn a_long_session_keeps_the_app_s_thread_quick() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    let gpu = match Gpu::headless() {
+        Ok(g) => g,
+        Err(e) => return eprintln!("skipped: {e}"),
+    };
+    let (w, h) = (2944u32, 1840u32);
+    let s = CanvasSession::new(w, h);
+    {
+        let mut st = s.shared.lock();
+        st.window_size = (1080, 2340);
+        st.view = Some(View::fit((w, h), (1080, 2340)));
+        st.gpu = Some(gpu);
+        st.ensure_canvas();
+    }
+    let began_render = Instant::now();
+    let dir = std::env::temp_dir().join(format!("procraft-long-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let lapse = crate::timelapse::TimeLapse::new(dir.to_string_lossy().into_owned());
+    let stop = Arc::new(AtomicBool::new(false));
+    // the autosave as the tablet runs it: every 3 s, when something changed
+    let saver = {
+        let (s, stop, dir) = (Arc::clone(&s), Arc::clone(&stop), dir.to_string_lossy().into_owned());
+        std::thread::spawn(move || {
+            let mut kept = s.edits();
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(3000));
+                let now = s.edits();
+                if now != kept && s.save_if_idle(dir.clone()).unwrap_or(false) {
+                    kept = now;
+                }
+            }
+        })
+    };
+    // the render thread's holds since last asked: how many, their total and most (microseconds)
+    let holds = Arc::new(parking_lot::Mutex::new((0u64, 0u128, 0u128)));
+    let render = {
+        let (s, stop, holds) = (Arc::clone(&s), Arc::clone(&stop), Arc::clone(&holds));
+        std::thread::spawn(move || {
+            let mut worst = Duration::ZERO;
+            // an offscreen target the window's size, drawn into as the window is
+            let target = s.shared.lock().gpu.as_ref().map(|g| {
+                g.device.create_texture(&procraft_gpu::wgpu::TextureDescriptor {
+                    label: Some("probe target"),
+                    size: procraft_gpu::wgpu::Extent3d { width: 1080, height: 2340, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: procraft_gpu::wgpu::TextureDimension::D2,
+                    format: procraft_gpu::wgpu::TextureFormat::Rgba8Unorm,
+                    usage: procraft_gpu::wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                })
+            });
+            let view = target.map(|t| t.create_view(&Default::default()));
+            while !stop.load(Ordering::Relaxed) {
+                {
+                    let mut guard = s.shared.lock();
+                    let st = &mut *guard;
+                    let t = Instant::now();
+                    if let Some(v) = view.as_ref() {
+                        st.draw_frame(
+                            v,
+                            procraft_gpu::wgpu::TextureFormat::Rgba8Unorm,
+                            (1080, 2340),
+                            procraft_engine::profile::Profile::Srgb,
+                            began_render,
+                        );
+                    }
+                    let took = t.elapsed();
+                    worst = worst.max(took);
+                    let mut h = holds.lock();
+                    h.0 += 1;
+                    h.1 += took.as_micros();
+                    h.2 = h.2.max(took.as_micros());
+                    drop(h);
+                    parking_lot::MutexGuard::unlock_fair(guard);
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            worst
+        })
+    };
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let lapse_thread = {
+        let s = Arc::clone(&s);
+        std::thread::spawn(move || {
+            while rx.recv().is_ok() {
+                while rx.try_recv().is_ok() {}
+                if let Some(f) = s.time_lapse_frame(1920) {
+                    lapse.record(f.rgba, f.width, f.height);
+                }
+            }
+        })
+    };
+    let strokes: u64 = std::env::var("LONG_STROKES").ok().and_then(|v| v.parse().ok()).unwrap_or(1500);
+    let every: u64 = std::env::var("LONG_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(250);
+    let mut seed = 12345u64;
+    let mut rnd = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % 10_000) as f32 / 10_000.0
+    };
+    let began = Instant::now();
+    let mut times: Vec<f64> = Vec::new();
+    let mut worst_call = 0.0f64;
+    let mut clock = 0.0f64;
+    // each block's 99th percentile of the app's thread's calls, and the most any took
+    let mut blocks: Vec<f64> = Vec::new();
+    let mut most = 0.0f64;
+    for k in 0..strokes {
+        // in the window, where the canvas shows (as the tablet's loop draws)
+        let (x0, y0) = (10.0 + rnd() * 1060.0, 845.0 + rnd() * 650.0);
+        let (x1, y1) = (10.0 + rnd() * 1060.0, 845.0 + rnd() * 650.0);
+        let n = 20 + (rnd() * 80.0) as usize;
+        let at = |i: usize| (x0 + (x1 - x0) * i as f32 / n as f32, y0 + (y1 - y0) * i as f32 / n as f32);
+        let mut timed = |f: &mut dyn FnMut()| {
+            let t = Instant::now();
+            f();
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            times.push(ms);
+            worst_call = worst_call.max(ms);
+        };
+        let p = at(0);
+        clock += 4.0;
+        let c0 = clock;
+        timed(&mut || {
+            s.touch_down(1, PointerKind::Stylus, vec![sample(p.0, p.1, c0)]);
+        });
+        for i in 1..=n {
+            let p = at(i);
+            clock += 4.0;
+            let c = clock;
+            timed(&mut || {
+                s.touch_moves(vec![crate::touch::TouchMove { id: 1, samples: vec![sample(p.0, p.1, c)] }]);
+            });
+        }
+        clock += 4.0;
+        timed(&mut || {
+            s.touch_up(1, vec![]);
+            let _ = s.info();
+        });
+        // now and then a finger picks a layer (Layer Select set to a touch), and the app asks
+        // after failures
+        if k % 10 == 0 {
+            timed(&mut || {
+                let _ = s.layers_at(x1, y1);
+            });
+            timed(&mut || {
+                let _ = s.take_failure();
+            });
+        }
+        clock += 300.0;
+        let _ = tx.send(());
+        if (k + 1) % every == 0 {
+            times.sort_by(f64::total_cmp);
+            let q = |f: f64| times.get(((times.len().max(1) - 1) as f64 * f) as usize).copied().unwrap_or(0.0);
+            let undo = s.shared.lock().canvas.as_ref().map_or(0, |c| c.history_bytes());
+            let h = std::mem::take(&mut *holds.lock());
+            println!(
+                "{} strokes, {:.0} s: calls 50% {:.3} ms, 99% {:.3} ms, 99.9% {:.3} ms, most {:.1} ms; undo bytes {}; frames {} held {} us on average, {} us most",
+                k + 1,
+                began.elapsed().as_secs_f64(),
+                q(0.5),
+                q(0.99),
+                q(0.999),
+                worst_call,
+                undo,
+                h.0,
+                h.1 / u128::from(h.0.max(1)),
+                h.2,
+            );
+            blocks.push(q(0.99));
+            most = most.max(worst_call);
+            times.clear();
+            worst_call = 0.0;
+        }
+    }
+    drop(tx);
+    let _ = lapse_thread.join();
+    stop.store(true, Ordering::Relaxed);
+    let worst = render.join().unwrap();
+    saver.join().unwrap();
+    println!("render's worst hold {:.1} ms", worst.as_secs_f64() * 1000.0);
+    let _ = std::fs::remove_dir_all(&dir);
+    let (first, last) = (blocks.first().copied().unwrap_or(0.0), blocks.last().copied().unwrap_or(0.0));
+    assert!(last <= first * 4.0 + 2.0, "the app's thread's calls grew slower: 99% {first:.3} ms, then {last:.3} ms");
+    assert!(most < crate::held::LONG_WAIT.as_secs_f64() * 1000.0, "a call on the app's thread took {most:.0} ms");
 }

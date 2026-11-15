@@ -326,11 +326,17 @@ impl CanvasSession {
 
     /// The visible paint layers with something drawn under window point (`x`, `y`), top first.
     pub fn layers_at(&self, x: f32, y: f32) -> Vec<u64> {
-        let mut guard = self.shared.lock();
-        let st = &mut *guard;
-        let Some((px, py)) = st.window_texel(x, y) else { return Vec::new() };
-        let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else { return Vec::new() };
-        let Ok(alphas) = canvas.alphas_at(gpu, &mut st.doc, px, py) else { return Vec::new() };
+        // the copy started under the lock, waited for once it is let go: touches and frames go
+        // on while the GPU finishes what it was given before
+        let pending = {
+            let mut guard = self.shared.lock();
+            let st = &mut *guard;
+            let Some((px, py)) = st.window_texel(x, y) else { return Vec::new() };
+            let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else { return Vec::new() };
+            canvas.start_alphas_at(gpu, &mut st.doc, px, py)
+        };
+        let Ok(alphas) = pending.alphas() else { return Vec::new() };
+        let st = self.shared.lock();
         let doc = &st.doc;
         alphas
             .into_iter()
@@ -943,6 +949,18 @@ impl CanvasSession {
         };
         let t = pending.pixels().ok()?;
         Some(ThumbnailImage { width: t.width, height: t.height, rgba: t.rgba })
+    }
+
+    /// Records the canvas as `lapse`'s next frame, read back at the size frames are kept (not the
+    /// video's): the picture stays in the core, never crossing to the app and back, so a frame
+    /// after each stroke moves a few MB, not dozens. Whether one was kept (none before the canvas
+    /// exists, while it doesn't record, or when nothing changed since the last).
+    pub fn record_time_lapse(&self, lapse: std::sync::Arc<crate::timelapse::TimeLapse>) -> bool {
+        if !lapse.recording() {
+            return false;
+        }
+        let Some(t) = self.time_lapse_frame(crate::timelapse::FRAME_SIDE) else { return false };
+        lapse.record(t.rgba, t.width, t.height)
     }
 
     /// Each paint layer's and mask's pixels' version, the queued work done first: a thumbnail
