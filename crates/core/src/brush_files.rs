@@ -1874,6 +1874,11 @@ fn brush_from(file: &BrushFile) -> Brush {
     };
     // its own preview, if it can be shown
     b.thumbnail = file.thumbnail.as_deref().filter(|t| thumbnail_pixels(t).is_some()).map(Into::into);
+    // drawn by a plugin's brush engine, if one was
+    b.engine = file.engine.as_ref().map(|(engine, data)| procraft_engine::brush::OutsideBrush {
+        engine: engine.clone(),
+        data: data.as_slice().into(),
+    });
     // who made it, if the file says
     let png = |bytes: &Option<Vec<u8>>| bytes.as_deref().filter(|p| decode_png(p).is_some()).map(Into::into);
     let (picture, signature) = (png(&file.author_picture), png(&file.signature));
@@ -1905,7 +1910,7 @@ pub(crate) fn thumbnail_pixels(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
 
 /// An image's pixels at 8 bits a sample: width, height, samples a pixel and the samples. A brush
 /// file's images are PNG or JPEG, whatever they are named.
-fn decode_picture(bytes: &[u8]) -> Option<(usize, usize, usize, Vec<u8>)> {
+pub(crate) fn decode_picture(bytes: &[u8]) -> Option<(usize, usize, usize, Vec<u8>)> {
     decode_png(bytes).or_else(|| decode_jpeg(bytes))
 }
 

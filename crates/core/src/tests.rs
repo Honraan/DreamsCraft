@@ -973,7 +973,7 @@ fn dump_brush_comparisons() {
 /// `bundled:Name,Other Name` for those of the brushes the app comes with; `DUMP_FINGER=1` draws
 /// with a finger, `DUMP_STRAIGHT=1` straight across, `DUMP_UNCOMBINE=1` each part of a dual brush
 /// alone; `DUMP_PLUGIN=x.procraft-plugin` with that plugin on, as its brush engine reads and draws
-/// the file.)
+/// the file; `DUMP_UNDER=1` over bands of colour, for a brush that moves paint to move.)
 #[test]
 #[ignore]
 fn dump_brush_strokes() {
@@ -1043,6 +1043,12 @@ fn dump_brush_strokes() {
             }
         }
         let layer = s.add_layer();
+        if std::env::var_os("DUMP_UNDER").is_some() {
+            let bands: [[u8; 4]; 4] = [[220, 40, 40, 255], [40, 160, 60, 255], [40, 80, 220, 255], [230, 200, 40, 255]];
+            let rgba: Vec<u8> = (0..side * side).flat_map(|i| bands[((i % side) * 8 / side) as usize % 4]).collect();
+            let whole = procraft_engine::geom::IRect::from_size(side, side);
+            s.shared.lock().rewrite_layer(procraft_engine::document::LayerId(layer), whole, rgba);
+        }
         assert!(s.select_brush(set, index));
         // settings changed first, to see what each does (`BRUSH_SETTINGS=burnt_edges=0,wet_edges=0`)
         if let Ok(changes) = std::env::var("BRUSH_SETTINGS") {
@@ -6965,11 +6971,30 @@ fn a_photoshop_brush_files_tips_become_a_set() {
 /// Real brush files, when a folder of them is given (`BRUSH_CORPUS=folder`, never committed):
 /// every brush file in it and below (ours, and Photoshop's, GIMP's, Krita's and Clip Studio's)
 /// imports, each brush draws in its
-/// preview, and a brush written out, read back and written out again comes out the same.
+/// preview, and a brush written out, read back and written out again comes out the same. With
+/// `BRUSH_CORPUS_PLUGINS` set, the brush-engine plugin the app comes with is on as it imports.
 #[test]
 fn a_corpus_of_real_brush_files_imports_draws_and_round_trips() {
     use procraft_engine::brushfile::{self, BrushFile};
     let Ok(root) = std::env::var("BRUSH_CORPUS") else { return };
+    let store = std::env::temp_dir().join(format!("procraft-corpus-plugins-{}", std::process::id()));
+    let plugins = std::env::var_os("BRUSH_CORPUS_PLUGINS").map(|_| {
+        let _ = std::fs::remove_dir_all(&store);
+        let plugins = crate::Plugins::with_store(store.to_string_lossy().into_owned());
+        let packed = crate::bundled::BUNDLED.iter().find(|(name, _)| *name == "krita-brushes").unwrap().1;
+        assert_eq!(plugins.install(packed.to_vec()), None);
+        let id = plugins.plugins().into_iter().find(|p| p.name == "Krita brushes").unwrap().id;
+        assert!(plugins.set_on(id, true));
+        plugins
+    });
+    let session = |canvas: u32, window: u32| {
+        let s = session(canvas, window)?;
+        if let Some(plugins) = &plugins {
+            s.use_plugins(std::sync::Arc::clone(plugins));
+        }
+        Some(s)
+    };
+    let mut engines = 0;
     let extension =
         |p: &std::path::Path| p.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
     let mut files = Vec::new();
@@ -7045,6 +7070,14 @@ fn a_corpus_of_real_brush_files_imports_draws_and_round_trips() {
                 );
             grained += usize::from(grain);
             tipped += usize::from(tip);
+            engines += usize::from(
+                s.shared
+                    .lock()
+                    .library
+                    .get(set as usize)
+                    .and_then(|l| l.brushes.get(i as usize))
+                    .is_some_and(|b| b.engine.is_some()),
+            );
             if let Some(mode) = dual {
                 *duals.entry(mode).or_default() += 1;
             }
@@ -7082,6 +7115,8 @@ fn a_corpus_of_real_brush_files_imports_draws_and_round_trips() {
     }
     eprintln!("{} files, {brushes} brushes, {tipped} with a tip and {grained} with a grain of their own", files.len());
     eprintln!("{} dual brushes, by mode: {duals:?}", duals.values().sum::<usize>());
+    eprintln!("{engines} drawn by plugins' brush engines");
+    let _ = std::fs::remove_dir_all(&store);
     assert!(failures.is_empty(), "{} failed:\n{}", failures.len(), failures.join("\n"));
 }
 
@@ -7112,7 +7147,7 @@ fn changes(a: &procraft_engine::brushfile::BrushFile, b: &procraft_engine::brush
             out.push(format!("{k} added"));
         }
     }
-    let fields: [(&str, bool); 15] = [
+    let fields: [(&str, bool); 16] = [
         ("name", a.name == b.name),
         ("author", a.author == b.author),
         ("max_size", a.max_size == b.max_size),
@@ -7128,6 +7163,7 @@ fn changes(a: &procraft_engine::brushfile::BrushFile, b: &procraft_engine::brush
         ("sliders", sliders_kept(&a.sliders, &b.sliders)),
         ("notches", a.notches == b.notches),
         ("author pictures", a.author_picture == b.author_picture && a.signature == b.signature),
+        ("engine", a.engine == b.engine),
     ];
     out.extend(fields.iter().filter(|f| !f.1).map(|f| f.0.to_owned()));
     let order = |f: &procraft_engine::brushfile::BrushFile| f.settings.iter().map(|s| s.0.clone()).collect::<Vec<_>>();

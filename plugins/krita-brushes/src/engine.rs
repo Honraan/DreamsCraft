@@ -1,8 +1,11 @@
-//! A stroke of a Krita pixel brush, dab by dab: its input walked along, a dab laid each time the
-//! path has gone as far as the spacing of the last dab reaches (an ellipse turned with the dab,
-//! or a circle when the spacing is the same every way), each dab's size, turn, squash, scatter,
-//! mirroring, opacity, flow, colour, tip and texture strength from the brush's options and the pen
-//! where it lies. A masking brush walks the same path with its own spacing.
+//! A stroke of a Krita pixel brush (or colour smudge brush), dab by dab: its input walked along, a
+//! dab laid each time the path has gone as far as the spacing of the last dab reaches (an ellipse
+//! turned with the dab, or a circle when the spacing is the same every way), each dab's size, turn,
+//! squash, scatter, mirroring, opacity, flow, colour, tip and texture strength from the brush's
+//! options and the pen where it lies. A colour smudge brush's dabs move the paint under the last
+//! dab to where they lie, mixing in the colour as its rates say. A masking brush walks the same
+//! path with its own spacing. The sketch brush lays lines at each move instead, and the spray brush
+//! its particles at each dab (see `others.rs`).
 
 use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU};
 use std::rc::Rc;
@@ -20,6 +23,8 @@ pub struct Begin {
     pub diameter: f32,
     pub start_diameter: f32,
     pub seed: u32,
+    /// How far the canvas is turned on screen (radians).
+    pub turn: f32,
 }
 
 /// A sample of the pen: canvas pixels, pressure, lean from upright and its way (radians,
@@ -112,12 +117,22 @@ struct Walker {
     spacing: (f32, f32),
     turn: f32,
     dabs: u32,
+    /// When its last dab was laid (ms), for an airbrush.
+    last_ms: f32,
 }
 
 /// Spacing below this (canvas pixels) is taken as this, as Krita does.
 const LEAST_SPACING: f32 = 0.5;
-/// The most dabs one call lays.
+/// The most dabs one call lays, and the most points a sketch brush keeps.
 const MOST_DABS: usize = 20_000;
+const MOST_SKETCH_POINTS: usize = 4096;
+
+/// A number of the standard normal distribution (Box and Muller's way).
+fn gaussian(random: &mut Random) -> f32 {
+    let u = random.next().max(1e-7);
+    let v = random.next();
+    (-2.0 * u.ln()).sqrt() * (TAU * v).cos()
+}
 
 impl Walker {
     /// How far along `from`..`to` (0..1) its next dab goes, if it goes there at all.
@@ -157,7 +172,7 @@ struct PipeState {
     steps: Vec<u32>,
 }
 
-/// A dab, as the app takes it (see the app's guide): 16 numbers.
+/// A dab, as the app takes it (see the app's guide): 24 numbers.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Dab {
     pub x: f32,
@@ -172,16 +187,29 @@ pub struct Dab {
     pub colour: [f32; 3],
     pub strength: f32,
     pub texture_offset: (f32, f32),
+    /// How strongly a lightness tip's grey shows; its sharpness threshold (0: none) and the share
+    /// below it kept as it is.
+    pub lightness: f32,
+    pub threshold: f32,
+    pub softness: f32,
+    /// A dab that moves paint: the share of what it lays that is its colour, and the share of where
+    /// the last lay it picks one colour from (dulling).
+    pub paint_share: f32,
+    pub radius: f32,
 }
 
 const FLIP_ACROSS: u32 = 1;
 const FLIP_DOWN: u32 = 2;
 const OWN_COLOUR: u32 = 4;
 const FOR_SECOND: u32 = 8;
+const MOVES_PAINT: u32 = 16;
+const DULLS: u32 = 32;
+const WEIGHED: u32 = 64;
+const CLEAR_PAINT: u32 = 128;
 
 impl Dab {
     pub fn write(&self, out: &mut Vec<u8>) {
-        let words: [u32; 16] = [
+        let words: [u32; 24] = [
             self.x.to_bits(),
             self.y.to_bits(),
             self.diameter.to_bits(),
@@ -197,6 +225,14 @@ impl Dab {
             self.strength.to_bits(),
             self.texture_offset.0.to_bits(),
             self.texture_offset.1.to_bits(),
+            self.lightness.to_bits(),
+            self.threshold.to_bits(),
+            self.softness.to_bits(),
+            self.paint_share.to_bits(),
+            self.radius.to_bits(),
+            0,
+            0,
+            0,
             0,
         ];
         for w in words {
@@ -223,6 +259,8 @@ pub struct Stroke {
     texture_offset: (f32, f32),
     /// For the speed: the last samples' moves and the time between samples, averaged.
     moves: Vec<f32>,
+    /// A sketch brush's points passed, the latest last.
+    points: Vec<(f32, f32)>,
     pace: f32,
     speed: f32,
     pub out: Vec<Dab>,
@@ -265,6 +303,7 @@ impl Stroke {
             average: 0.0,
             texture_offset,
             moves: Vec::new(),
+            points: Vec::new(),
             pace: 0.0,
             speed: 0.0,
             out: Vec::new(),
@@ -321,6 +360,14 @@ impl Stroke {
                 continue;
             }
             let p = self.point(s);
+            // a sketch brush draws its lines at each move
+            if self.brush.sketch.is_some() {
+                let from = self.last.unwrap_or(p);
+                self.sketch_move(&from, &p);
+                self.length += ((p.x - from.x).powi(2) + (p.y - from.y).powi(2)).sqrt();
+                self.last = Some(p);
+                continue;
+            }
             let Some(last) = self.last else {
                 // the first point gets a dab of each brush
                 self.dab_at(&p, false);
@@ -341,9 +388,20 @@ impl Stroke {
                 let mut at = last;
                 let start_length = self.length;
                 while self.out.len() < MOST_DABS {
+                    // an airbrush lays a dab when its time comes, wherever its spacing has got to
+                    let timed = if second { None } else { self.airbrushed(&at, &p) };
+                    let until = timed.map_or(p, |k| Point::between(&at, &p, k));
+                    let ignore = !second && self.brush.airbrush.as_ref().is_some_and(|a| a.ignore_spacing);
                     let walker = if second { &mut self.second } else { &mut self.main };
-                    let Some(t) = walker.next((at.x, at.y), (p.x, p.y)) else { break };
-                    let here = Point::between(&at, &p, t);
+                    let spaced = if ignore { None } else { walker.next((at.x, at.y), (until.x, until.y)) };
+                    let (t, here) = match (spaced, timed) {
+                        (Some(t), _) => (t, Point::between(&at, &until, t)),
+                        (None, Some(_)) => {
+                            walker.gone = (0.0, 0.0);
+                            (1.0, until)
+                        }
+                        (None, None) => break,
+                    };
                     // the distance sensor's: as far along as this dab
                     let done = ((here.x - last.x).powi(2) + (here.y - last.y).powi(2)).sqrt();
                     self.length = start_length + done;
@@ -360,6 +418,236 @@ impl Stroke {
             self.length += (dx * dx + dy * dy).sqrt();
             self.last = Some(p);
         }
+    }
+
+    /// How far from `at` to `to` (0..1) the airbrush's next dab comes, if it comes before `to`:
+    /// once its interval (scaled by its rate option where `at` is) has passed since the last.
+    fn airbrushed(&mut self, at: &Point, to: &Point) -> Option<f32> {
+        let airbrush = self.brush.airbrush.clone()?;
+        let info = self.info(at, self.main.dabs);
+        let seed = self.begin.seed;
+        let mut fuzz = Fuzz { random: &mut self.random, seed };
+        let scale = if airbrush.rate.checked { airbrush.rate.size_like(&info, &mut fuzz, true) } else { 1.0 };
+        if scale <= 0.0 {
+            return None;
+        }
+        let need = airbrush.interval / scale - (at.time - self.main.last_ms);
+        let span = to.time - at.time;
+        if need <= 0.0 {
+            Some(0.0)
+        } else if span > 0.0 && need <= span {
+            Some(need / span)
+        } else {
+            None
+        }
+    }
+
+    /// A dab of a line from `a` to `b`, `width` across, with tip `tip` (a square), `opacity`, its
+    /// colour its own if given.
+    fn line(&mut self, a: (f32, f32), b: (f32, f32), width: f32, opacity: f32, colour: Option<[f32; 3]>) {
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let length = (dx * dx + dy * dy).sqrt();
+        if length < 1e-3 || opacity <= 0.0 || self.out.len() >= MOST_DABS {
+            return;
+        }
+        let long = length.max(width);
+        self.out.push(Dab {
+            x: (a.0 + b.0) * 0.5,
+            y: (a.1 + b.1) * 0.5,
+            diameter: long,
+            angle: dy.atan2(dx),
+            ratio: (width / long).clamp(0.01, 1.0),
+            opacity,
+            flow: 1.0,
+            tip: 0,
+            flags: if colour.is_some() { OWN_COLOUR } else { 0 },
+            colour: colour.unwrap_or([0.0; 3]),
+            strength: 1.0,
+            texture_offset: self.texture_offset,
+            ..Dab::default()
+        });
+    }
+
+    /// A sketch brush's move from `last` to `p`: a line between them if it says, and a line from
+    /// `p` towards each point it passed within its reach, as likely as its density says.
+    fn sketch_move(&mut self, last: &Point, p: &Point) {
+        let brush = Rc::clone(&self.brush);
+        let Some(sketch) = &brush.sketch else { return };
+        self.points.push((p.x, p.y));
+        let over = self.points.len().saturating_sub(MOST_SKETCH_POINTS);
+        self.points.drain(..over);
+        let info = self.info(p, self.dabs);
+        let seed = self.begin.seed;
+        let k = self.size_factor();
+        let mut fuzz = Fuzz { random: &mut self.random, seed };
+        let one = |o: &CurveOption, fuzz: &mut Fuzz<'_>| if o.checked { o.size_like(&info, fuzz, true) } else { 1.0 };
+        let scale = one(&brush.dynamics.size, &mut fuzz) * k;
+        if scale * brush.tip.width <= 0.01 {
+            return;
+        }
+        let width = (one(&sketch.line_width_option, &mut fuzz) * sketch.line_width).max(0.9);
+        let offset = one(&sketch.offset_option, &mut fuzz) * sketch.offset * 0.01;
+        let density = one(&sketch.density_option, &mut fuzz) * sketch.probability;
+        let opacity = if brush.dynamics.opacity.checked {
+            brush.dynamics.opacity.size_like(&info, &mut fuzz, true)
+        } else {
+            brush.dynamics.opacity.strength
+        };
+        // its reach: half the tip across, at its size
+        let reach = brush.sketch_radius * scale;
+        let threshold = reach * reach;
+        let points = self.points.clone();
+        if sketch.connect {
+            self.line((last.x, last.y), (p.x, p.y), width, opacity, None);
+        }
+        let mut chance = 1.0 - density;
+        for (qx, qy) in points {
+            let (dx, dy) = (qx - p.x, qy - p.y);
+            let distance = dx * dx + dy * dy;
+            if distance >= threshold {
+                continue;
+            }
+            if sketch.distance_density {
+                chance = distance / (threshold * density).max(1e-6);
+            }
+            if self.random.next() < chance {
+                continue;
+            }
+            let colour = sketch.random_rgb.then(|| {
+                let c = self.begin.colour;
+                [self.random.next() * c[0], self.random.next() * c[1], self.random.next() * c[2]]
+            });
+            let mut alpha = opacity;
+            if sketch.distance_opacity {
+                alpha *= (1.0 - distance / threshold).round();
+            }
+            if sketch.random_opacity {
+                alpha *= self.random.next();
+            }
+            let (ox, oy) = (dx * offset, dy * offset);
+            let to = if sketch.magnetify { (qx - ox, qy - oy) } else { (p.x - ox, p.y - oy) };
+            self.line((p.x + ox, p.y + oy), to, width, alpha, colour);
+        }
+        self.dabs += 1;
+    }
+
+    /// A spray brush's dab at `p`: its particles.
+    fn spray_at(&mut self, p: &Point, spray: &crate::others::Spray) {
+        let brush = Rc::clone(&self.brush);
+        let info = self.info(p, self.main.dabs);
+        let seed = self.begin.seed;
+        let k = self.size_factor();
+        let mut fuzz = Fuzz { random: &mut self.random, seed };
+        let one = |o: &CurveOption, fuzz: &mut Fuzz<'_>| if o.checked { o.size_like(&info, fuzz, true) } else { 1.0 };
+        let scale = one(&brush.dynamics.size, &mut fuzz) * k;
+        let rotation = if brush.dynamics.rotation.checked {
+            (1.0 - brush.dynamics.rotation.rotation_like(&info, &mut fuzz, 0.0, -1.0)) * PI
+        } else {
+            0.0
+        };
+        let opacity = if brush.dynamics.opacity.checked {
+            brush.dynamics.opacity.size_like(&info, &mut fuzz, true)
+        } else {
+            brush.dynamics.opacity.strength
+        };
+        let radius = spray.diameter * 0.5 * scale;
+        let (mut x, mut y) = (p.x, p.y);
+        if let Some(amount) = spray.jitter {
+            x += (2.0 * radius * self.random.next() - radius) * amount;
+            y += (2.0 * radius * self.random.next() - radius) * amount;
+        }
+        let count = match spray.coverage {
+            Some(c) => c * PI * radius * radius,
+            None => spray.count,
+        };
+        let count = (count.max(0.0) as usize).min(MOST_DABS.saturating_sub(self.out.len()));
+        let (turn_sin, turn_cos) = (spray.rotation.to_radians() - rotation).sin_cos();
+        let (pw, ph) = spray.particle(spray.diameter);
+        // particles of the brush's own tip: at its size, turned as it is, a pipe's cell picked
+        // as its dabs pick them
+        let own = spray.own_tip.then(|| {
+            let tip = &brush.tip;
+            let index = match &tip.tips {
+                Tips::Auto { levels, .. } => levels.saturating_sub(1),
+                Tips::Images { count, pipe: Some(pick) } => {
+                    pipe_cell(pick, &mut self.pipe, &info, *count, self.main.dabs, &mut self.random)
+                }
+                Tips::Images { .. } => 0,
+            };
+            (tip.width, tip.height, tip.angle, index)
+        });
+        let mut colour = None;
+        for _ in 0..count {
+            let angle = self.random.next() * TAU;
+            let length = if spray.gaussian {
+                let n = gaussian(&mut self.random) * spray.deviation;
+                if spray.centre_biased { n.abs().min(1.0) } else { n.abs().min(1.0).sqrt() }
+            } else if spray.centre_biased {
+                self.random.next()
+            } else {
+                self.random.next().sqrt()
+            };
+            let mut turn = spray.turn.to_radians();
+            if let Some(w) = spray.random_turn {
+                turn += self.random.next() * TAU * w;
+            }
+            if let Some(w) = spray.follow_cursor {
+                turn += (angle - turn) * w;
+            }
+            if let Some(w) = spray.follow_angle {
+                turn += (info.drawing_angle - turn) * w;
+            }
+            let size = if spray.random_size { self.random.next() } else { 1.0 };
+            let (nx, ny) = (radius * angle.cos() * length, radius * angle.sin() * length * spray.aspect);
+            let (nx, ny) =
+                ((nx * turn_cos - ny * turn_sin) * spray.scale, (nx * turn_sin + ny * turn_cos) * spray.scale);
+            // its colour: the colour moved at random, once or for each particle
+            if colour.is_none() || spray.per_particle {
+                let mut c = self.begin.colour;
+                if spray.mix_background {
+                    let w = p.pressure;
+                    c = [0, 1, 2].map(|j| c[j] * w + self.begin.secondary[j] * (1.0 - w));
+                }
+                if let Some((h, s, v)) = spray.random_hsv {
+                    let [mut ch, mut cs, mut cv] = hsv(c);
+                    ch = (ch + h / 360.0 * self.random.next()).rem_euclid(1.0);
+                    cs = (cs + s / 100.0 * self.random.next()).clamp(0.0, 1.0);
+                    cv = (cv + v / 100.0 * self.random.next()).clamp(0.0, 1.0);
+                    c = rgb([ch, cs, cv]);
+                }
+                colour = Some(c);
+            }
+            let alpha = if spray.random_opacity { opacity * self.random.next() } else { opacity };
+            let (w, h) = match (own, spray.shape) {
+                (Some((tw, th, ..)), _) => ((tw * size).max(1.0), (th * size).max(1.0)),
+                (None, 2 | 3) => (1.0, 1.0),
+                (None, _) => ((pw * size).max(1.0), (ph * size).max(1.0)),
+            };
+            let long = w.max(h);
+            self.out.push(Dab {
+                x: x + nx,
+                y: y + ny,
+                diameter: long,
+                angle: -turn - own.map_or(0.0, |o| o.2),
+                ratio: (w.min(h) / long).clamp(0.01, 1.0),
+                opacity: alpha,
+                flow: 1.0,
+                // an ellipse the round tip, the rest the square, or the brush's own
+                tip: own.map_or(u32::from(spray.shape != 0), |o| o.3),
+                flags: OWN_COLOUR,
+                colour: colour.unwrap_or(self.begin.colour),
+                strength: 1.0,
+                texture_offset: self.texture_offset,
+                ..Dab::default()
+            });
+        }
+        // the next dab a share of its diameter on
+        let step = if spray.diameter * 0.5 > 1.0 { spray.diameter * 0.5 * spray.spacing } else { 1.0 };
+        self.main.spacing = (step.max(LEAST_SPACING), step.max(LEAST_SPACING));
+        self.main.turn = 0.0;
+        self.main.dabs += 1;
+        self.main.last_ms = p.time;
+        self.dabs += 1;
     }
 
     /// The pen where it lies, for the options.
@@ -381,6 +669,11 @@ impl Stroke {
     fn dab_at(&mut self, p: &Point, second: bool) {
         let brush = Rc::clone(&self.brush);
         let k = self.size_factor();
+        // a spray brush lays its particles there instead
+        if let (Some(spray), false) = (&brush.spray, second) {
+            self.spray_at(p, spray);
+            return;
+        }
         let (tip, dynamics, coeff) = match (second, &brush.masking) {
             (true, Some(m)) => (&m.tip, &m.dynamics, Some(m.size)),
             _ => (&brush.tip, &brush.dynamics, None),
@@ -464,6 +757,11 @@ impl Stroke {
             colour: [0.0; 3],
             strength: 1.0,
             texture_offset: self.texture_offset,
+            lightness: 1.0,
+            threshold: 0.0,
+            softness: 0.0,
+            paint_share: 0.0,
+            radius: 0.0,
         };
         // its tip: a pipe's cell, or an auto tip's drawing (noise afresh, softness as it says)
         dab.tip = match &tip.tips {
@@ -492,8 +790,63 @@ impl Stroke {
             if let Some(t) = &brush.texture {
                 dab.strength = t.strength.apply(&info, &mut fuzz).clamp(0.0, 1.0);
             }
+            if brush.lightness.checked {
+                dab.lightness = brush.lightness.size_like(&info, &mut fuzz, true).clamp(0.0, 1.0);
+            }
+            if let Some(smudge) = &brush.smudge {
+                let one = |o: &CurveOption, otherwise: f32, fuzz: &mut Fuzz<'_>| {
+                    if o.checked { o.size_like(&info, fuzz, true) } else { otherwise }
+                };
+                let rate = one(&smudge.rate, 1.0, &mut fuzz);
+                let colour_rate = one(&smudge.colour_rate, 0.0, &mut fuzz);
+                let (laid, share) = smudge.laid(rate, colour_rate, dab.opacity);
+                // the first dab only marks where the next picks up from
+                dab.opacity = if self.dabs == 0 { 0.0 } else { laid };
+                dab.flow = 1.0;
+                dab.paint_share = share;
+                dab.radius = one(&smudge.radius, 0.0, &mut fuzz).max(0.0);
+                dab.flags |= MOVES_PAINT;
+                if smudge.dulls {
+                    dab.flags |= DULLS;
+                }
+                if smudge.newer {
+                    dab.flags |= WEIGHED;
+                }
+                // Krita mixes the colour in by the brush's composite op: an eraser's takes paint away
+                if brush.erases {
+                    dab.flags |= CLEAR_PAINT;
+                }
+                if smudge.gradient.checked {
+                    let g = smudge.gradient.size_like(&info, &mut fuzz, true).clamp(0.0, 1.0);
+                    let from = if dab.flags & OWN_COLOUR != 0 { dab.colour } else { self.begin.colour };
+                    dab.colour = [0, 1, 2].map(|i| from[i] + (self.begin.secondary[i] - from[i]) * g);
+                    dab.flags |= OWN_COLOUR;
+                }
+            }
+            let sharp = &brush.sharpness;
+            if sharp.option.checked {
+                let value = sharp.option.size_like(&info, &mut fuzz, true).clamp(0.0, 1.0);
+                // (a threshold of nothing would leave nothing: the app takes 0 as none)
+                dab.threshold = value.max(1e-6);
+                dab.softness = sharp.softness;
+                if sharp.align && sharp.option.strength > 0.0 {
+                    // its corner moved towards a whole pixel as far as the value goes
+                    let snap = |c: f32, side: f32| {
+                        let corner = c - side * 0.5;
+                        value * corner.round() + (1.0 - value) * corner + side * 0.5
+                    };
+                    let side = dab.diameter.round().max(1.0);
+                    dab.x = snap(dab.x, side);
+                    dab.y = snap(dab.y, side);
+                }
+            }
             if let Some(colour) = colour_of(&brush, &self.begin, &info, &mut fuzz) {
                 dab.colour = colour;
+                dab.flags |= OWN_COLOUR;
+            }
+            // a tangent normal brush's colour: the pen's lean as a normal
+            if let Some(t) = &brush.tangent {
+                dab.colour = t.colour(&info, self.begin.turn);
                 dab.flags |= OWN_COLOUR;
             }
         }
@@ -507,6 +860,7 @@ impl Stroke {
         walker.spacing = spacing;
         walker.turn = if dynamics.isotropic { 0.0 } else { turn };
         walker.dabs += 1;
+        walker.last_ms = p.time;
         if !second {
             self.dabs += 1;
         }

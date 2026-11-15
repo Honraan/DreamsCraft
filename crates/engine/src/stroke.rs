@@ -78,6 +78,14 @@ pub struct Stamp {
     /// Which of its stroke's shape images it is, counted from the stroke's own (0): a brush
     /// engine outside the app picks one for each stamp from the set its brush has.
     pub tip: u32,
+    /// How strongly a lightness tip moves the colour's lightness (0..1; see the GPU's tip kinds).
+    pub lightness: f32,
+    /// A smudge stamp that picks up what lies under where its stroke's last stamp lay (not under
+    /// itself), as a colour smudge brush's dabs do.
+    pub pick_up: Option<PickUp>,
+    /// Its shape made sharp: what is over the first (0..1; 0: as it is) paints fully, what is
+    /// under that share of it (the second, 0..1) of it not at all, what lies between as it is.
+    pub threshold: [f32; 2],
 }
 
 impl Stamp {
@@ -107,6 +115,9 @@ impl Stamp {
             distance: 0.0,
             overlap: 0.0,
             tip: 0,
+            lightness: 1.0,
+            pick_up: None,
+            threshold: [0.0; 2],
         }
     }
 
@@ -770,6 +781,18 @@ impl Random {
         self.0 = x;
         (x >> 8) as f32 / (1u32 << 24) as f32
     }
+}
+
+/// What a smudge stamp that picks up behind it does with what it picks up: lays it with a share of
+/// its colour mixed in (the stroke's, or its own), or first makes it one colour, the average of
+/// what lies within a share of its reach of the middle (weighed by its shape, or not). A clear
+/// colour (an erasing brush's) takes that share of the paint away instead.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PickUp {
+    pub paint_share: f32,
+    pub paint: Option<[f32; 3]>,
+    pub dull: Option<(f32, bool)>,
+    pub clear: bool,
 }
 
 /// A brush engine outside the app's own (a plugin's): it lays a stroke's stamps from its input
@@ -2528,6 +2551,9 @@ impl StrokeBuilder {
             distance: p.distance,
             overlap: p.overlap,
             tip: 0,
+            lightness: 1.0,
+            pick_up: None,
+            threshold: [0.0; 2],
         }
     }
 }

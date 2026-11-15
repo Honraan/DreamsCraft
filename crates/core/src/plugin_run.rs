@@ -260,7 +260,7 @@ const MOST_BRUSH_LOAD_TIME: Duration = Duration::from_secs(10);
 const DAB_FUEL: u64 = 40_000_000;
 const MOST_DAB_TIME: Duration = Duration::from_millis(250);
 /// The bytes of one dab, and the most dabs one call may answer.
-pub(crate) const DAB_BYTES: usize = 64;
+pub(crate) const DAB_BYTES: usize = 96;
 const MOST_DABS: usize = 1 << 16;
 /// The most a brush's look or the brushes made of a file may be, in bytes.
 const MOST_LOOK: usize = 128 << 20;
@@ -2264,6 +2264,38 @@ pub(crate) mod tests {
         assert!(!wants(r#"(import "wasi_snapshot_preview1" "fd_write" (func (param i32 i32 i32 i32) (result i32)))"#));
         assert!(!wants(r#"(import "env" "memory" (memory 1))"#));
         assert!(!wants(r#"(import "env" "g" (global i32))"#));
+    }
+
+    /// Unpacks two bytes (zlib) at each sample and moves it to them: the utilities need no
+    /// permission, and work at a hook.
+    const UNPACKS: &str = r#"(module
+        (import "procraft" "inflate" (func $inflate (param i32 i32 i32) (result i32)))
+        (import "procraft" "read_answer" (func $read (param i32) (result i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 0) "\78\9c\63\e7\04\00\00\19\00\11")
+        (func $byte (param i32) (result i64)
+            (i64.extend_i32_u (i32.reinterpret_f32 (f32.convert_i32_u (i32.load8_u (local.get 0))))))
+        (func (export "procraft_position") (param f32 f32) (result i64)
+            (if (i32.ne (call $inflate (i32.const 0) (i32.const 10) (i32.const 1)) (i32.const 2))
+                (then (return (i64.const 0))))
+            (if (i32.ne (call $read (i32.const 100)) (i32.const 1)) (then (return (i64.const 0))))
+            (i64.or (call $byte (i32.const 100)) (i64.shl (call $byte (i32.const 101)) (i64.const 32)))))"#;
+
+    #[test]
+    fn the_utilities_need_no_permission_and_answer_at_a_hook() {
+        let bytes = wat::parse_str(UNPACKS).unwrap();
+        assert!(can_run(&bytes, &[Hook::Position], false));
+        let mut running = Running::start(&bytes, &[]).unwrap();
+        assert_eq!(running.position(10.0, 20.0), Ok((7.0, 9.0)));
+        // with other types it is refused
+        let wrong = UNPACKS.replace("(param i32 i32 i32) (result i32)", "(param i32 i32) (result i32)");
+        assert!(!can_run(&wat::parse_str(wrong).unwrap(), &[Hook::Position], false));
+        // what doesn't unpack, or isn't a picture, is none
+        assert_eq!(crate::plugin_commands::inflated(b"not packed", 1), None);
+        assert_eq!(crate::plugin_commands::inflated(&[3, 0], 0), Some(Vec::new()));
+        assert_eq!(crate::plugin_commands::decoded_image(b"\x89PNG not one"), None);
+        let png = crate::project::rgba_png(2, 1, &[255, 0, 0, 255, 0, 0, 0, 0]);
+        assert_eq!(crate::plugin_commands::decoded_image(&png), Some((2, 1, vec![255, 0, 0, 255, 0, 0, 0, 0])));
     }
 
     #[test]

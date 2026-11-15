@@ -1,12 +1,14 @@
 //! Krita brushes, a plugin for ProCraft: a brush engine (the app's `brush_engines`) that reads
 //! Krita's presets (`.kpp`) and bundles (`.bundle`) and draws their brushes as Krita's pixel
-//! brush does. The app hands it each stroke's input and lays the dabs it answers on the GPU.
+//! brush and colour smudge brush do, and its quick, tangent normal, sketch and spray brushes as far
+//! as dabs draw them. The app hands it each stroke's input and lays the dabs it answers on the GPU.
 //!
-//! - Importing: each pixel-brush preset of the file becomes a brush whose data is the preset's
+//! - Importing: each preset of an engine it draws becomes a brush whose data is the preset's
 //!   settings and the pictures it names (its tip, its masking brush's, its texture's), found in it
 //!   or its bundle. See `import.rs`.
 //! - Loading: the data read again into a brush ready to draw, and how it looks to the app (its tips
-//!   drawn as grey pictures, its texture's mask, whether it washes, its blend). See `brush.rs`.
+//!   drawn as grey pictures, its texture's mask, whether it washes, its blend), unless the app holds
+//!   that already (it keeps it on the disk). See `brush.rs`.
 //! - Drawing: dab by dab, as Krita spaces and shapes them. See `engine.rs`.
 //!
 //! What it knows of Krita's brushes comes from Krita's manual and from reading how Krita works; the
@@ -19,10 +21,12 @@ mod files;
 mod gimp;
 mod import;
 mod options;
+mod others;
 mod preset;
 mod rec;
 mod studio;
 mod tips;
+mod utilities;
 mod xml;
 
 use std::cell::RefCell;
@@ -91,22 +95,24 @@ pub extern "C" fn procraft_brush_import(_engine: i32, len: i32) -> i32 {
     })
 }
 
-/// A brush (a record of the app's id for it and its data): read, kept, and how it looks; its
-/// length, or -1 if it isn't one this engine draws.
+/// A brush (a record of the app's id for it, its data, and whether the app holds its look): read,
+/// kept, and how it looks (nothing if the app holds that); its length, or -1 if it isn't one this
+/// engine draws.
 #[unsafe(no_mangle)]
 pub extern "C" fn procraft_brush_load(_engine: i32, len: i32) -> i32 {
     with(|s| {
         let input = s.input.get(..usize::try_from(len).unwrap_or(0)).unwrap_or_default();
-        let (mut id, mut data) = (None, &[][..]);
+        let (mut id, mut data, mut look_held) = (None, &[][..], false);
         for (field, value) in fields(input) {
             match field {
                 1 => id = u64_of(value),
                 2 => data = value,
+                3 => look_held = value.first() == Some(&1),
                 _ => {}
             }
         }
-        let Some(brush) = import::load(data) else { return -1 };
-        let look = brush.look();
+        let Some(brush) = import::load(data, look_held) else { return -1 };
+        let look = if look_held { Vec::new() } else { brush.look() };
         if let Some(id) = id {
             s.brushes.retain(|(i, _)| *i != id);
             s.brushes.push((id, Rc::new(brush)));
@@ -125,7 +131,8 @@ pub extern "C" fn procraft_brush_begin(len: i32) -> i32 {
     with(|s| {
         let input = s.input.get(..usize::try_from(len).unwrap_or(0)).unwrap_or_default();
         let mut id = None;
-        let mut begin = Begin { colour: [0.0; 3], secondary: [1.0; 3], diameter: 1.0, start_diameter: 1.0, seed: 1 };
+        let mut begin =
+            Begin { colour: [0.0; 3], secondary: [1.0; 3], diameter: 1.0, start_diameter: 1.0, seed: 1, turn: 0.0 };
         for (field, value) in fields(input) {
             let three = |v: &[u8]| {
                 let f = f32s(v);
@@ -137,6 +144,7 @@ pub extern "C" fn procraft_brush_begin(len: i32) -> i32 {
                 3 => begin.secondary = three(value).unwrap_or(begin.secondary),
                 4 => begin.diameter = f32_of(value).unwrap_or(1.0),
                 8 => begin.seed = u32_of(value).unwrap_or(1),
+                9 => begin.turn = f32_of(value).filter(|t| t.is_finite()).unwrap_or(0.0),
                 10 => begin.start_diameter = f32_of(value).unwrap_or(1.0),
                 _ => {}
             }
@@ -161,7 +169,9 @@ pub extern "C" fn procraft_brush_add(stroke: i32, len: i32) -> i32 {
     with(|s| {
         let input = s.input.get(..usize::try_from(len).unwrap_or(0)).unwrap_or_default();
         let samples: Vec<Sample> = input
-            .chunks_exact(32)
+            .as_chunks::<32>()
+            .0
+            .iter()
             .map(|b| {
                 let f = f32s(&b[..24]);
                 let ms = f64::from_le_bytes(b[24..32].try_into().unwrap_or([0; 8]));
