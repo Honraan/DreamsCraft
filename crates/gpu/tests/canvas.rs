@@ -2747,6 +2747,83 @@ fn a_dual_brush_s_second_adds_nothing_where_the_first_is_not() {
 }
 
 #[test]
+fn a_dual_brush_s_first_fades_into_its_second_s_colour() {
+    let Some(gpu) = gpu() else { return };
+    let _check = NoErrors(&gpu);
+    // a soft red first inside a wide blue second, by Normal: where the first fades out its colour
+    // gives way to the second's as far as the second shows past it, not all at once at its edge
+    let laid = |dual: bool| {
+        let mut doc = Document::new(64, 32);
+        let mut canvas = Canvas::new(&gpu, &doc).unwrap();
+        let first = StrokeStyle { hardness: 0.1, ..StrokeStyle::new(StrokeTool::Paint, [1.0, 0.0, 0.0], 1.0) };
+        if dual {
+            let second = procraft_gpu::SecondStroke {
+                style: StrokeStyle::new(StrokeTool::Paint, [0.0, 0.0, 1.0], 1.0),
+                mode: 0,
+                threshold: -1.0,
+            };
+            canvas.begin_dual_stroke(doc.current(), first, second);
+            canvas.add_second_stamps(&[Stamp::round(Vec2::new(32.0, 16.0), 30.0, 1.0)]);
+        } else {
+            canvas.begin_stroke(doc.current(), first);
+        }
+        canvas.add_stamps(&[Stamp::round(Vec2::new(32.0, 16.0), 12.0, 1.0)]);
+        canvas.end_stroke();
+        canvas.render(&gpu, &mut doc, None);
+        canvas.read_layer(&gpu, doc.current()).unwrap()
+    };
+    let (alone, both) = (laid(false), laid(true));
+    // where the first alone is about half there
+    let x = (32..64).find(|&x| pixel(&alone, 64, x, 16)[3] < 140).unwrap();
+    let [r, _, b, a] = pixel(&both, 64, x, 16);
+    assert!(a > 250, "{a}");
+    assert!(r > 60 && b > 60, "red {r} blue {b} at {x}");
+    // the first's own colour in its middle, the second's past it
+    assert_eq!(pixel(&both, 64, 32, 16), [255, 0, 0, 255]);
+    assert_eq!(pixel(&both, 64, 60, 16), [0, 0, 255, 255]);
+}
+
+#[test]
+fn a_glaze_shows_its_wet_paint_only_as_far_as_its_own_build_up() {
+    let Some(gpu) = gpu() else { return };
+    let _check = NoErrors(&gpu);
+    // twenty half-strong wet stamps over one spot, a frame apart, each laying fresh black paint:
+    // built up, the spot goes all but solid; the Light Glaze shows no more than its strongest
+    // stamp, the Uniform Glaze no more than its transfer
+    let spot = |rendering: Rendering, alpha: f32, transfer: f32| {
+        let mut doc = Document::new(64, 32);
+        let mut canvas = Canvas::new(&gpu, &doc).unwrap();
+        let wet = StrokeStyle {
+            wet_pull: Some(0.0),
+            load: 1.0,
+            grade: 1.0,
+            rendering,
+            ..StrokeStyle::new(StrokeTool::Paint, [0.0, 0.0, 0.0], 1.0)
+        };
+        canvas.begin_stroke(doc.current(), wet);
+        canvas.add_stamps(
+            &(0..20)
+                .map(|i| Stamp {
+                    time_ms: f64::from(i) * 20.0,
+                    transfer,
+                    ..Stamp::round(Vec2::new(32.0, 16.0), 10.0, alpha)
+                })
+                .collect::<Vec<_>>(),
+        );
+        canvas.end_stroke();
+        canvas.render(&gpu, &mut doc, None);
+        let layer = canvas.read_layer(&gpu, doc.current()).unwrap();
+        pixel(&layer, 64, 32, 16)[3]
+    };
+    let built = spot(Rendering::BuildUp, 0.5, 1.0);
+    assert!(built > 245, "{built}");
+    let strongest = spot(Rendering::Strongest, 0.5, 1.0);
+    assert!((120..=136).contains(&strongest), "{strongest}");
+    let capped = spot(Rendering::Capped, 1.0, 0.4);
+    assert!((94..=110).contains(&capped), "{capped}");
+}
+
+#[test]
 fn modulated_wet_paint_lays_a_pixel_once() {
     let Some(gpu) = gpu() else { return };
     let _check = NoErrors(&gpu);
@@ -3352,6 +3429,37 @@ fn stamps_mix_in_the_secondary_colour() {
     let layer = canvas.read_layer(&gpu, doc.current()).unwrap();
     assert_eq!(pixel(&layer, 64, 16, 32), [255, 0, 0, 255]);
     assert_eq!(pixel(&layer, 64, 48, 32), [0, 0, 255, 255]);
+}
+
+#[test]
+fn a_grain_combined_by_a_colour_only_mode_leaves_the_coverage_alone() {
+    let Some(gpu) = gpu() else { return };
+    let _check = NoErrors(&gpu);
+    // a half-strong dot over the paper grain: hue, saturation, colour, luminosity, darker and
+    // lighter colour have nothing to say about how much paint there is, so it is as without grain
+    let cover = |grain_blend: u32, grain_depth: f32| {
+        let mut doc = Document::new(64, 64);
+        let mut canvas = Canvas::new(&gpu, &doc).unwrap();
+        let style = StrokeStyle {
+            grain: Some(0),
+            grain_depth,
+            grain_scale: 64.0,
+            grain_blend,
+            ..StrokeStyle::new(StrokeTool::Paint, [1.0, 1.0, 1.0], 1.0)
+        };
+        canvas.begin_stroke(doc.current(), style);
+        canvas.add_stamps(&[Stamp::round(Vec2::new(32.0, 32.0), 20.0, 0.5)]);
+        canvas.end_stroke();
+        canvas.render(&gpu, &mut doc, None);
+        let layer = canvas.read_layer(&gpu, doc.current()).unwrap();
+        (24..40).map(|x| pixel(&layer, 64, x, 32)[3]).collect::<Vec<_>>()
+    };
+    let bare = cover(1, 0.0);
+    for mode in [5, 10, 22, 23, 24, 25] {
+        assert_eq!(cover(mode, 1.0), bare, "mode {mode}");
+    }
+    // a mode that does combine amounts changes it
+    assert_ne!(cover(1, 1.0), bare);
 }
 
 #[test]
