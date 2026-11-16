@@ -330,6 +330,190 @@ mod tests {
         stroke.out
     }
 
+    /// A brush along a path turning a right angle (right, then down), the canvas turned `turn`.
+    fn cornered(params: &str, turn: f32) -> Vec<crate::engine::Dab> {
+        let xml = format!(
+            r#"<Preset name="E" paintopid="paintbrush"><param name="brush_definition"><![CDATA[<Brush type="auto_brush" spacing="0.5" BrushVersion="2"><MaskGenerator type="rect" id="default" diameter="10" ratio="0.3" hfade="1" vfade="1"/></Brush>]]></param>{params}</Preset>"#
+        );
+        let mut data = Record::new();
+        data.field(1, xml.as_bytes());
+        let brush = load(&data.bytes(), false).unwrap();
+        let begin = Begin { colour: [1.0; 3], secondary: [1.0; 3], diameter: 1.0, start_diameter: 1.0, seed: 5, turn };
+        let mut stroke = Stroke::new(Rc::new(brush), begin);
+        let at = |i: i32| if i < 10 { (50.0 + i as f32 * 5.0, 50.0) } else { (95.0, 50.0 + (i - 9) as f32 * 5.0) };
+        let samples: Vec<Sample> = (0..20)
+            .map(|i| {
+                let (x, y) = at(i);
+                Sample { x, y, pressure: 1.0, ms: f64::from(i) * 8.0, ..Sample::default() }
+            })
+            .collect();
+        stroke.add(&samples);
+        stroke.out
+    }
+
+    /// A dab turned by the way the stroke goes takes that way from where the last dab lay; with fan
+    /// corners, dabs at each of their steps fill a corner (Krita's drawing angle and its fans).
+    #[test]
+    fn a_drawing_angle_fans_round_a_corner_when_it_says() {
+        let rotation = |fan: &str| {
+            format!(
+                r#"<param name="PressureRotation"><![CDATA[true]]></param><param name="RotationSensor"><![CDATA[<params id="drawingangle" fanCornersEnabled="{fan}" fanCornersStep="30" angleOffset="0" lockedAngleMode="0"/>]]></param>"#
+            )
+        };
+        // the dabs turned neither along nor across
+        let between = |dabs: &[crate::engine::Dab]| {
+            let ways = dabs.iter().map(|d| d.angle.to_degrees().rem_euclid(180.0));
+            ways.filter(|a| *a > 10.0 && *a < 80.0).count()
+        };
+        let plain = cornered(&rotation("0"), 0.0);
+        let fanned = cornered(&rotation("1"), 0.0);
+        // 0 to 90 degrees in steps of 30: two dabs between
+        assert_eq!(between(&plain), 0);
+        assert_eq!(between(&fanned), 2);
+        assert_eq!(fanned.len(), plain.len() + 2);
+    }
+
+    /// A dab its rotation option leaves alone turns with the canvas, so it looks the same on screen.
+    #[test]
+    fn an_unturned_dab_turns_with_the_canvas() {
+        let dabs = cornered("", 0.5);
+        assert!(dabs.iter().all(|d| (d.angle + 0.5).abs() < 1e-5), "{}", dabs[0].angle);
+    }
+
+    /// At precision 1 a dab near enough the last drawn afresh is that one laid again, at the
+    /// whole pixel its box starts on: along a steady stroke, every dab at the same place within a
+    /// pixel; at 5, each where it falls.
+    #[test]
+    fn a_low_precision_lays_the_kept_dab_again() {
+        let within = |level: &str| {
+            let params = format!(r#"<param name="KisPrecisionOption/precisionLevel"><![CDATA[{level}]]></param>"#);
+            let dabs = drawn("paintbrush", &params, 21.0);
+            let mut places: Vec<i32> =
+                dabs.iter().map(|d| ((d.x - 10.5).rem_euclid(1.0) * 1000.0).round() as i32).collect();
+            places.sort_unstable();
+            places.dedup();
+            (dabs.len(), places.len())
+        };
+        let (kept, one) = within("1");
+        let (fresh, many) = within("5");
+        assert_eq!(kept, fresh);
+        assert_eq!(one, 1);
+        assert!(many > 1, "{many}");
+    }
+
+    /// Spacing measures the tip as Krita does: its box turned by its own angle, not squashed by the
+    /// ratio option.
+    #[test]
+    fn spacing_measures_the_tip_turned_and_unsquashed() {
+        let down = |tip: &str, params: &str| {
+            let xml = format!(
+                r#"<Preset name="E" paintopid="paintbrush"><param name="brush_definition"><![CDATA[<Brush type="auto_brush" spacing="0.5" BrushVersion="2" {tip}><MaskGenerator type="rect" id="default" diameter="20" ratio="0.25" hfade="1" vfade="1"/></Brush>]]></param>{params}</Preset>"#
+            );
+            let mut data = Record::new();
+            data.field(1, xml.as_bytes());
+            let brush = load(&data.bytes(), false).unwrap();
+            let begin =
+                Begin { colour: [1.0; 3], secondary: [1.0; 3], diameter: 1.0, start_diameter: 1.0, seed: 5, turn: 0.0 };
+            let mut stroke = Stroke::new(Rc::new(brush), begin);
+            let samples: Vec<Sample> = (0..=20)
+                .map(|i| Sample {
+                    x: 50.0,
+                    y: 50.0 + i as f32 * 5.0,
+                    pressure: 1.0,
+                    ms: f64::from(i) * 8.0,
+                    ..Sample::default()
+                })
+                .collect();
+            stroke.add(&samples);
+            stroke.out.len()
+        };
+        // 100 down: a dab every 2.5 (half of 20 x 0.25), or every 10 with the tip turned upright
+        let flat = down("", "");
+        let upright = down(r#"angle="1.5707964""#, "");
+        assert!((38..=42).contains(&flat), "{flat}");
+        assert!((10..=12).contains(&upright), "{upright}");
+        // the ratio option squashes the dab, not its spacing
+        let squashed = down(
+            r#"angle="1.5707964""#,
+            r#"<param name="PressureRatio"><![CDATA[true]]></param><param name="RatioUseCurve"><![CDATA[false]]></param><param name="RatioValue"><![CDATA[0.25]]></param>"#,
+        );
+        assert_eq!(squashed, upright);
+    }
+
+    /// Krita's deform and filter brushes lay the layer's own pixels: moved about under each dab, or
+    /// blurred; the clone brush from where a tap set its source, as far from where it lies as its
+    /// stroke started from the source.
+    #[test]
+    fn deform_filter_and_clone_dabs_pick_up_the_layer() {
+        let swirl = r#"<param name="Deform/deformAction"><![CDATA[3]]></param><param name="Deform/deformAmount"><![CDATA[0.5]]></param><param name="Brush/diameter"><![CDATA[30]]></param>"#;
+        let dabs = drawn("deformbrush", swirl, 20.0);
+        assert!(!dabs.is_empty());
+        assert!(dabs.iter().all(|d| d.flags & (16 | 512 | 2048) == 16 | 512 | 2048 && d.kind == 2 + 16));
+        assert!((dabs[0].extra[2] - std::f32::consts::FRAC_PI_2).abs() < 1e-4);
+        assert!((dabs[0].diameter - 30.0).abs() < 0.5, "{}", dabs[0].diameter);
+        let blur = r#"<param name="Filter/id"><![CDATA[gaussian blur]]></param><filterconfig version="1"><param name="horizRadius"><![CDATA[5]]></param><param name="vertRadius"><![CDATA[5]]></param></filterconfig>"#;
+        let dabs = drawn("filter", blur, 20.0);
+        assert!(!dabs.is_empty() && dabs.iter().all(|d| d.flags & (16 | 512 | 4096 | 8192) == 16 | 512 | 4096 | 8192));
+        assert!(dabs[0].extra[2] > 0.1 && dabs[0].extra[2] < 0.5, "{}", dabs[0].extra[2]);
+        // a tap at (10, 50) sets the source; a stroke from (50, 50) picks up 40 to its left
+        let clone = |samples: &[(f32, f32)]| {
+            let xml = r#"<Preset name="C" paintopid="duplicate"><param name="brush_definition"><![CDATA[<Brush type="auto_brush" spacing="0.2" BrushVersion="2"><MaskGenerator type="circle" id="default" diameter="10" ratio="1" hfade="1" vfade="1"/></Brush>]]></param></Preset>"#;
+            let mut data = Record::new();
+            data.field(1, xml.as_bytes());
+            let begin =
+                Begin { colour: [1.0; 3], secondary: [1.0; 3], diameter: 1.0, start_diameter: 1.0, seed: 5, turn: 0.0 };
+            let mut stroke = Stroke::new(Rc::new(load(&data.bytes(), false).unwrap()), begin);
+            let samples: Vec<Sample> = samples
+                .iter()
+                .enumerate()
+                .map(|(i, &(x, y))| Sample { x, y, pressure: 1.0, ms: i as f64 * 8.0, ..Sample::default() })
+                .collect();
+            stroke.add(&samples);
+            stroke.finish();
+            stroke.out
+        };
+        assert!(clone(&[(10.0, 50.0)]).is_empty());
+        let dabs = clone(&(0..10).map(|i| (50.0 + i as f32 * 3.0, 50.0)).collect::<Vec<_>>());
+        assert!(!dabs.is_empty());
+        assert!(
+            dabs.iter().all(|d| d.flags & (1024 | 8192 | 256) == 1024 | 8192 | 256 && (d.extra[0] + 40.0).abs() < 1e-3)
+        );
+    }
+
+    /// Krita's shape brush fills the outline its stroke makes as the stroke ends: a square loop's
+    /// inside, row by row.
+    #[test]
+    fn a_shape_brush_fills_its_outline() {
+        let xml = r#"<Preset name="S" paintopid="experimentbrush"><param name="Experiment/windingFill"><![CDATA[true]]></param></Preset>"#;
+        let mut data = Record::new();
+        data.field(1, xml.as_bytes());
+        let begin =
+            Begin { colour: [1.0; 3], secondary: [1.0; 3], diameter: 1.0, start_diameter: 1.0, seed: 5, turn: 0.0 };
+        let mut stroke = Stroke::new(Rc::new(load(&data.bytes(), false).unwrap()), begin);
+        let corners = [(10.0, 10.0), (50.0, 10.0), (50.0, 50.0), (10.0, 50.0), (10.0, 12.0)];
+        let samples: Vec<Sample> = corners
+            .iter()
+            .enumerate()
+            .map(|(i, &(x, y))| Sample { x, y, pressure: 1.0, ms: i as f64 * 8.0, ..Sample::default() })
+            .collect();
+        stroke.add(&samples);
+        assert!(stroke.out.is_empty(), "nothing until it ends");
+        stroke.finish();
+        let rows: std::collections::BTreeSet<i32> = stroke.out.iter().map(|d| d.y.floor() as i32).collect();
+        assert_eq!(rows.len(), 40, "{rows:?}");
+        let covered: f32 = stroke.out.iter().map(|d| d.diameter).sum();
+        assert!((covered - 40.0 * 40.0).abs() < 60.0, "{covered}");
+    }
+
+    /// Krita's composite ops go to the app's blend modes by the app's own numbers (Colour Burn 3 on,
+    /// with no Shade among them).
+    #[test]
+    fn composite_ops_are_the_app_s_blend_numbers() {
+        let n = crate::brush::blend_number;
+        assert_eq!([n("darken"), n("burn"), n("add"), n("overlay"), n("subtract")], [2, 3, 9, 11, 20].map(Some));
+        assert_eq!([n("color"), n("luminize"), n("behind"), n("erase")], [Some(24), Some(25), Some(29), None]);
+    }
+
     /// Krita's quick brush lays hard round dabs of its own diameter, close together, each over the
     /// last.
     #[test]
@@ -637,7 +821,8 @@ mod tests {
     }
 
     /// A Krita file's brushes made, read again and each drawn along a wave, with how long it took:
-    /// `KRITA_FILE=x.bundle cargo test --release real_file -- --ignored --nocapture`.
+    /// `KRITA_FILE=x.bundle cargo test --release real_file -- --ignored --nocapture` (`KRITA_SHOW=name`
+    /// lists the first dabs of the brushes whose names hold it).
     #[test]
     #[ignore]
     fn a_real_file_s_brushes_draw() {
@@ -685,6 +870,14 @@ mod tests {
             let t2 = std::time::Instant::now();
             stroke.add(&samples);
             println!("  {name}: look {look} B in {loaded:?}, {} dabs in {:?}", stroke.out.len(), t2.elapsed());
+            if std::env::var("KRITA_SHOW").is_ok_and(|w| name.contains(&w)) {
+                for d in stroke.out.iter().take(12) {
+                    println!(
+                        "    {:.1} {:.1} d={:.2} o={:.3} f={:.3} tip={} flags={}",
+                        d.x, d.y, d.diameter, d.opacity, d.flow, d.tip, d.flags
+                    );
+                }
+            }
         }
     }
 }

@@ -3,7 +3,8 @@
 A ProCraft plugin that is a brush engine (see the guide's "Brush engines of its own"): it reads
 Krita's brush presets (`.kpp`) and bundles (`.bundle`) as they are imported, and draws their
 brushes as Krita's pixel brush and colour smudge brush draw them, and its quick, tangent normal,
-sketch, spray, bristle, hatching, curve, particle and grid brushes as far as dabs draw them. It comes
+sketch, spray, bristle, hatching, curve, particle, grid, clone, deform, filter and shape brushes as
+far as dabs draw them. It comes
 with the app, off.
 
 ## What it draws
@@ -20,14 +21,19 @@ with the app, off.
   way), scaled by the spacing option.
 - Options and their sensors: size, opacity, flow, rotation, ratio, spacing, scatter (both ways,
   along or across), mirror, softness, darken, mix, hue, saturation and value, the texture's strength;
-  sensors pressure, X and Y tilt, tilt direction and elevation, speed, drawing angle, rotation,
-  distance, time, fade, fuzzy per dab and per stroke (perspective counts as 1); each through its
-  curve, several combined by multiply, add, max, min or difference.
+  sensors pressure, the most pressure so far, X and Y tilt, tilt direction and elevation, speed,
+  drawing angle (the way from the last dab, offset, locked at the start, or fanning dabs round a
+  corner), rotation, distance, time, fade, fuzzy per dab and per stroke (perspective counts as 1);
+  each through its curve (one they share, or each its own; an older preset's kept in its sensor or
+  apart, as Krita reads them), several combined by multiply, add, max, min or difference. Dabs turn
+  with the canvas on screen, as Krita's do. Each engine takes only the options Krita's takes.
 - Painting: wash (dabs build towards their opacity, the stroke keeping near the opacity it has
   averaged) or build-up; the preset's blend mode; eraser presets erase. Sharpness: each dab's mask
   made hard at its threshold (what lies within its softness kept), dabs moved onto whole pixels as
   far as it says. Airbrush: dabs by time as well as by spacing (or by time alone), the app handing
-  the pen again while it holds still.
+  the pen again while it holds still. Precision: below its highest, the last dab drawn afresh is
+  laid again while the next is near enough to it (its size, turn, place within a pixel and the rest,
+  as near as the level says), as Krita keeps and lays its dabs.
 - Texture: the pattern made into Krita's mask (brightness, contrast, invert, neutral point,
   cutoff), scaled, offset (or at random per stroke), combined with each dab by its texturing mode at
   the strength its sensors give, softly where it says.
@@ -66,6 +72,16 @@ with the app, off.
   takes only its size and spacing options; the sketch, spray and bristle brushes their size,
   opacity and rotation; the hatching brush its size and opacity besides its own; the curve brush its
   opacity besides its own; the particle and grid brushes none.
+- The clone brush (each dab lays the layer's pixels from elsewhere, from the layer as it was before
+  the stroke or from every layer, over what is there: from as far away as the stroke started from
+  its source, the source moving with the brush, or from the source itself; a tap sets the source),
+  the deform brush (each dab, an ellipse of its own diameter, squash, scale, turn and density, takes
+  the pixels under it from elsewhere under it: grown or shrunk, swirled, moved with the pen, through
+  a lens or scattered, by its amount or its counter, mixed from the pixels around or not) and the
+  filter brush (each dab lays the layer as it was before the stroke blurred, by a Gaussian blur or a
+  blur, or sharpened by an unsharp mask, under its tip); the shape brush (the outline the stroke
+  makes, its corners smoothed or its places drawn on by its speed as it says, filled as the stroke
+  ends by the even-odd or the winding rule).
 - Krita 3's chalk and dyna brushes (Krita dropped them in version 4): the chalk brush's speckled round
   tip at every pixel of the path, its ink running out with the log of its dabs if it says; the dyna
   brush's weight on a spring (its mass and drag, in the canvas as 1 each way) pulled towards where
@@ -92,14 +108,16 @@ readers (which its tests use) run in it.
 
 ## Not yet
 
-- Krita's other engines come in as the app reads them. Some lay no dabs at all, so a brush engine
-  of dabs can't draw them: the shape brush (it fills the outline the stroke makes), the filter brush
-  (it filters what is under it), the deform brush (it moves the pixels under it) and the clone brush
-  (it copies pixels from elsewhere). The chalk brush picks among a few speckled tips (Krita speckles
+- Krita's MyPaint brushes come in as the app reads them. The clone brush's source is set by a tap
+  (Krita's with a key held), and it doesn't heal; the filter brush draws blurs and the unsharp mask
+  only (others lay nothing), with the app's blur matched to theirs; the deform brush's lens is as
+  wide as each dab (Krita's as the brush's own diameter) and its spacing scales with its size; the
+  shape brush fills its outline as the stroke ends (Krita as it goes) without its displacement, its
+  edges whole pixels. The chalk brush picks among a few speckled tips (Krita speckles
   each dab afresh). The dyna brush's weight is pulled at each sample the app hands it (Krita at each
   of the tablet's events), so the more samples, the smaller and closer its circles.
-- The bristle brush keeps at most 4,096 bristles, draws its lines smooth whatever its antialiasing
-  and compositing say, and takes its ink as it runs out in pieces within a 64th of it (Krita at
+- The bristle brush keeps at most 4,096 bristles, lays its lines over what is there whatever its
+  compositing says, and takes its ink as it runs out in pieces within a 64th of it (Krita at
   each pixel). The hatching brush keeps its lines inside each dab's tip in
   pieces, each as opaque as the tip where it lies, halved down to a pixel where the tip's edge
   crosses them (Krita masks each pixel), so a thick line's end at the edge is cut square across it.
@@ -108,7 +126,9 @@ readers (which its tests use) run in it.
   colour under its cells lays them in no other colour and without a background.
 - The sketch brush draws each move's lines over each other (Krita draws them into one dab first,
   then lays that at the opacity option's), keeps the last 4,096 points it passed, and takes its tip
-  as round for its reach; the spray brush's particle pictures, its sampled colours and its
+  as round for its reach (Krita's mode that isn't simple takes the tip's own shape); hard lines (its
+  antialiasing off, as it is unless it says, and the bristle brush's) are the pixels a line covers
+  nearly half of or more; the spray brush's particle pictures, its sampled colours and its
   background fill aren't drawn.
 - The lightness and gradient texturing modes take the texture's grey alone (a pattern's
   see-through parts are taken as opaque).
@@ -119,6 +139,10 @@ readers (which its tests use) run in it.
   tip of one is Krita's default tip, as Krita stands it in (round, 40 px across, the studio saying
   so); a masking brush or texture of one is left out.
 - The 1-pixel brush's sharp lines, drawn as dabs.
+- Tips drawn from SVG pictures or text, and the pixel brush's colour sources other than the plain
+  colour (gradient, random, pattern). The hatching brush's mirror and texture.
+- A drawing angle locked at the start takes the way the stroke first goes (Krita takes the way the
+  pen moved just before it touched, which the app doesn't hand).
 - Perspective counts as 1 (the app has no perspective assistant), as in Krita without one; a
   gradient map takes the gradient from the colour to the secondary colour (the app has no current
   gradient).

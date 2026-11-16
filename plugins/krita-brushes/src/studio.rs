@@ -103,6 +103,10 @@ enum Shows {
     GridColour,
     Chalk,
     Dyna,
+    Deform,
+    Clone,
+    Filter,
+    ShapeFill,
 }
 
 /// A pixel brush's pages, as the page row offers them.
@@ -177,6 +181,15 @@ fn pages(paintop: &str) -> &'static [(Shows, &'static str)] {
         "gridbrush" => &[(Shows::Grid, "Grid"), (Shows::GridColour, "Colour")],
         "chalkbrush" => &[(Shows::Chalk, "Chalk")],
         "dynabrush" => &[(Shows::Dyna, "Dyna")],
+        "deformbrush" => &[(Shows::Deform, "Deform"), (Shows::SizeOpacity, "Size and opacity"), (Shows::Turn, "Turn")],
+        "duplicate" => &[
+            (Shows::Tip, "Tip"),
+            (Shows::Clone, "Clone"),
+            (Shows::SizeOpacity, "Size and opacity"),
+            (Shows::Turn, "Turn"),
+        ],
+        "filter" => &[(Shows::Tip, "Tip"), (Shows::Filter, "Filter"), (Shows::SizeOpacity, "Size and opacity")],
+        "experimentbrush" => &[(Shows::ShapeFill, "Shape")],
         _ => &PIXEL_PAGES,
     }
 }
@@ -419,6 +432,10 @@ impl Studio {
                 option_rows(p, &mut page, "Opacity", "Opacity", false);
             }
             Shows::Dyna => dyna_page(p, &mut page),
+            Shows::Deform => deform_page(p, &mut page),
+            Shows::Clone => clone_page(p, &mut page),
+            Shows::Filter => filter_page(p, &mut page),
+            Shows::ShapeFill => shape_page(p, &mut page),
             Shows::ScatterMirror => {
                 option_rows(p, &mut page, "Scatter", "Scatter", true);
                 let (x, y) = (p.flag("Scattering/AxisX", true), p.flag("Scattering/AxisY", true));
@@ -977,6 +994,73 @@ fn grid_colour_page(p: &Preset, page: &mut Page) {
     page.flag(p, "ColorOption/colorPerParticle", "Color per particle", false);
 }
 
+/// A deform brush's action and its own brush (Krita's deform options and brush size).
+fn deform_page(p: &Preset, page: &mut Page) {
+    page.chosen(
+        p,
+        "Deform/deformAction",
+        "Action",
+        &["Grow", "Shrink", "Swirl CW", "Swirl CCW", "Move", "Lens zoom in", "Lens zoom out", "Color deformation"],
+        &["1", "2", "3", "4", "5", "6", "7", "8"],
+        0,
+    );
+    page.setting(p, "Deform/deformAmount", "Deform amount", (0.0, 100.0), 0.01, 0.2, "%");
+    page.flag(p, "Deform/bilinear", "Bilinear interpolation", false);
+    page.flag(p, "Deform/useCounter", "Use counter", false);
+    page.flag(p, "Deform/useOldData", "Use undeformed image", false);
+    page.setting(p, "Brush/diameter", "Diameter", (1.0, 1000.0), 1.0, 20.0, " px");
+    page.setting(p, "Brush/aspect", "Aspect ratio", (1.0, 200.0), 0.01, 1.0, "%");
+    page.setting(p, "Brush/scale", "Scale", (0.0, 1000.0), 0.01, 1.0, "%");
+    page.setting(p, "Brush/rotation", "Rotation", (0.0, 360.0), 1.0, 0.0, "°");
+    page.setting(p, "Brush/spacing", "Spacing", (1.0, 1000.0), 0.01, 0.3, "%");
+    page.setting(p, "Brush/density", "Density", (0.0, 100.0), 0.01, 1.0, "%");
+    page.flag(p, "Brush/jitterMovementEnabled", "Jitter movement", false);
+    page.setting(p, "Brush/jitterMovement", "Jitter amount", (0.0, 500.0), 0.01, 0.0, "%");
+}
+
+/// A clone brush's options; its source is set by a tap.
+fn clone_page(p: &Preset, page: &mut Page) {
+    page.text("A tap sets where it clones from.");
+    page.flag(p, "Duplicateop/MoveSourcePoint", "Source point move", true);
+    page.flag(p, "Duplicateop/CloneFromProjection", "Clone from all visible layers", false);
+    page.flag(p, "Duplicateop/Healing", "Healing (not drawn)", false);
+}
+
+/// A filter brush's filter and its own settings, as far as they are drawn.
+fn filter_page(p: &Preset, page: &mut Page) {
+    let id = p.get("Filter/id").map(str::trim).unwrap_or("");
+    match id {
+        "gaussian blur" => {
+            page.text("Filter: Gaussian blur.");
+            page.setting(p, "Filter/config/horizRadius", "Horizontal radius", (0.0, 100.0), 1.0, 5.0, " px");
+            page.setting(p, "Filter/config/vertRadius", "Vertical radius", (0.0, 100.0), 1.0, 5.0, " px");
+        }
+        "blur" => {
+            page.text("Filter: Blur.");
+            page.setting(p, "Filter/config/halfWidth", "Half width", (0.0, 100.0), 1.0, 5.0, " px");
+            page.setting(p, "Filter/config/halfHeight", "Half height", (0.0, 100.0), 1.0, 5.0, " px");
+            page.setting(p, "Filter/config/strength", "Strength", (0.0, 100.0), 1.0, 100.0, "%");
+        }
+        "unsharp" => {
+            page.text("Filter: Unsharp mask.");
+            page.setting(p, "Filter/config/halfSize", "Half-size", (1.0, 100.0), 1.0, 1.0, " px");
+            page.setting(p, "Filter/config/amount", "Amount", (0.0, 1000.0), 0.01, 0.5, "%");
+        }
+        other => page.text(&format!("Filter \"{other}\": not drawn here.")),
+    }
+}
+
+/// A shape brush's options.
+fn shape_page(p: &Preset, page: &mut Page) {
+    page.text("Filled as the stroke ends.");
+    page.flag(p, "Experiment/speedEnabled", "Speed", false);
+    page.setting(p, "Experiment/speed", "Speed amount", (0.0, 100.0), 1.0, 42.0, "%");
+    page.flag(p, "Experiment/smoothing", "Smooth", false);
+    page.setting(p, "Experiment/smoothingValue", "Smoothing threshold", (0.0, 100.0), 1.0, 20.0, " px");
+    page.flag(p, "Experiment/windingFill", "Winding fill", false);
+    page.flag(p, "Experiment/hardEdge", "Hard edge", false);
+}
+
 /// An option's rows: whether it follows the pen (where it can be switched off), its strength, the
 /// sensor it follows and its curve.
 fn option_rows(p: &Preset, page: &mut Page, id: &str, label: &str, checkable: bool) {
@@ -994,7 +1078,7 @@ fn option_rows(p: &Preset, page: &mut Page, id: &str, label: &str, checkable: bo
     };
     let otherwise = match id {
         "Spacing" | "Scatter" => 5.0,
-        "SmudgeRadius" => 0.0,
+        "SmudgeRadius" => 3.0,
         _ => 1.0,
     };
     let strength = p.number(&format!("{id}Value"), otherwise);
@@ -1006,7 +1090,8 @@ fn option_rows(p: &Preset, page: &mut Page, id: &str, label: &str, checkable: bo
     if sensors.len() > 1 {
         page.text(&format!("{label} follows {} together.", sensors.join(", ")));
     }
-    let curve = p.get(&format!("{id}commonCurve")).unwrap_or("0,0;1,1;").trim().to_owned();
+    // the curve its sensors share, as the engine reads it
+    let curve = crate::options::common_curve(p, "", id);
     let mut names: Vec<&str> = CURVES.iter().map(|(n, _)| *n).collect();
     let at = CURVES.iter().position(|(_, c)| same_curve(c, &curve));
     let chosen = at.unwrap_or_else(|| {
@@ -1077,6 +1162,9 @@ fn change(p: &mut Preset, does: &Does, value: f32) {
         }
         Does::Sensor(id) => {
             let Some((sensor, _)) = SENSORS.get(value.max(0.0) as usize) else { return };
+            // the curve shown stays: kept as the one they share, as the sensor it was kept in goes
+            let common = crate::options::common_curve(p, "", id);
+            set(p, &format!("{id}commonCurve"), common);
             set(p, &format!("{id}Sensor"), format!(r#"<!DOCTYPE params> <params id="{sensor}"/> "#));
             set(p, &format!("{id}UseSameCurve"), "true".to_owned());
             set(p, &format!("{id}UseCurve"), "true".to_owned());
