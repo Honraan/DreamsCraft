@@ -2833,6 +2833,122 @@ fn an_automatic_selection_reads_the_reference_layer_as_colordrop_does() {
     assert!(selected(50, 50) && selected(5, 5));
 }
 
+/// A ring on the bottom layer, made the reference (returned), and an empty layer above it, current.
+fn ring_under_an_empty_layer(s: &CanvasSession) -> u64 {
+    s.set_brush_size(0.05);
+    s.set_color(0.0, 0.0, 0.0);
+    let ring: Vec<PenSample> = (0..=64)
+        .map(|i| {
+            let t = i as f32 / 64.0 * std::f32::consts::TAU;
+            sample(50.0 + 30.0 * t.cos(), 50.0 + 30.0 * t.sin(), f64::from(i) * 8.0)
+        })
+        .collect();
+    s.stroke_begin(PointerKind::Finger, ring[..1].to_vec());
+    s.stroke_add(ring[1..].to_vec());
+    s.stroke_end(vec![]);
+    let bottom = s.layers().iter().find(|l| l.current).map(|l| l.id).unwrap();
+    assert!(s.set_layer_reference(bottom, true));
+    s.add_layer();
+    bottom
+}
+
+/// Whether the selection takes canvas pixel (`x`, `y`).
+fn selected(s: &CanvasSession, x: usize, y: usize) -> bool {
+    s.shared.lock().selection.as_ref().is_some_and(|m| m.data.get(y * m.width as usize + x).is_some_and(|&v| v > 127))
+}
+
+#[test]
+fn a_hidden_reference_layer_is_still_read_and_one_switched_off_is_not() {
+    use crate::selection::SelectionJoin;
+    let Some(s) = session(100, 100) else { return };
+    let bottom = ring_under_an_empty_layer(&s);
+    let top = s.layers().iter().find(|l| l.current).map(|l| l.id).unwrap();
+    let inside_only = |s: &CanvasSession| selected(s, 50, 50) && !selected(s, 5, 5);
+    // hidden, the reference layer is still what Automatic selection and ColorDrop go by
+    assert!(s.set_layer_visible(bottom, false));
+    s.select_by_colour(50.0, 50.0, 0.2, SelectionJoin::Add, false);
+    assert!(inside_only(&s), "a hidden reference layer still bounds the selection");
+    s.select_none();
+    assert!(s.pour_begin(50.0, 50.0, 1.0, 0.0, 0.0, 0.2));
+    s.pour_end(true, None);
+    let red = |[r, g, b, _]: [u8; 4]| r > 200 && g < 60 && b < 60;
+    assert!(red(pixel(&s, 50, 50)) && !red(pixel(&s, 5, 5)), "and the colour dropped stays inside it");
+    s.undo();
+    assert!(s.set_layer_visible(bottom, true));
+    // switched off from its own options (it current then), then back on the empty layer: that
+    // layer's own pixels, all of it
+    s.select_layer(bottom);
+    assert!(s.set_layer_reference(bottom, false));
+    s.select_layer(top);
+    assert!(s.layers().iter().all(|l| !l.reference));
+    s.select_by_colour(50.0, 50.0, 0.2, SelectionJoin::Add, false);
+    assert!(selected(&s, 50, 50) && selected(&s, 5, 5), "no reference: the current layer's own pixels");
+    s.select_none();
+    // on again and off: undo puts the switch back on, redo off again, and undone the ring bounds
+    // the selection again
+    assert!(s.set_layer_reference(bottom, true));
+    assert!(s.set_layer_reference(bottom, false));
+    s.undo();
+    assert!(s.layers().iter().any(|l| l.id == bottom && l.reference));
+    s.redo();
+    assert!(s.layers().iter().all(|l| !l.reference));
+    s.undo();
+    assert!(s.layers().iter().any(|l| l.current && l.id == top));
+    s.select_by_colour(50.0, 50.0, 0.2, SelectionJoin::Add, false);
+    assert!(inside_only(&s), "undone, the reference layer bounds it again");
+}
+
+#[test]
+fn a_colour_selection_drag_taken_back_leaves_nothing_for_the_next() {
+    use crate::SelectionJoin;
+    use crate::{SelectKind, SelectTouch, TouchCommand};
+    let Some(s) = session(100, 100) else { return };
+    let bottom = ring_under_an_empty_layer(&s);
+    // a threshold drag inside the ring, shown as it goes, that the platform then takes back (a
+    // palm, say)
+    s.set_touch_selecting(Some(SelectTouch { kind: SelectKind::Automatic, join: SelectionJoin::Add, threshold: 0.2 }));
+    s.touch_down(1, PointerKind::Finger, vec![sample(50.0, 50.0, 0.0)]);
+    let out = s.touch_move(1, vec![sample(85.0, 50.0, 200.0)]);
+    assert!(out.iter().any(|c| matches!(c, TouchCommand::SelectionThreshold { done: false, .. })), "{out:?}");
+    s.show_colour_selection(50.0, 50.0, 0.2);
+    assert!(selected(&s, 50, 50) && !selected(&s, 5, 5));
+    let out = s.touch_cancel();
+    // it is taken back, and the platform told the drag is over
+    assert!(!s.has_selection());
+    assert!(
+        out.iter()
+            .any(|c| matches!(c, TouchCommand::SelectionThreshold { done: true, threshold, .. } if *threshold == 0.2)),
+        "{out:?}"
+    );
+    assert!(out.contains(&TouchCommand::SelectionChanged), "{out:?}");
+    // a frame's showing left after it does nothing
+    s.show_colour_selection(50.0, 50.0, 0.2);
+    assert!(!s.has_selection());
+    // the reference switched off, the next selection reads the current layer afresh: all of it
+    assert!(s.set_layer_reference(bottom, false));
+    s.select_by_colour(50.0, 50.0, 0.2, SelectionJoin::Add, false);
+    assert!(selected(&s, 50, 50) && selected(&s, 5, 5), "the layer read for the drag taken back is not read again");
+    s.set_touch_selecting(None);
+}
+
+#[test]
+fn a_colour_selection_left_live_reads_afresh_once_its_layer_changes() {
+    use crate::selection::SelectionJoin;
+    let Some(s) = session(100, 100) else { return };
+    let bottom = ring_under_an_empty_layer(&s);
+    // a host's live showing with no last call after it (a touch it lost): the reference layer read
+    s.select_by_colour(50.0, 50.0, 0.2, SelectionJoin::Add, true);
+    assert!(selected(&s, 50, 50) && !selected(&s, 5, 5));
+    // switched off, the next selection goes by the current layer, from the selection before the
+    // drag left over
+    assert!(s.set_layer_reference(bottom, false));
+    s.select_by_colour(50.0, 50.0, 0.2, SelectionJoin::Add, false);
+    assert!(selected(&s, 50, 50) && selected(&s, 5, 5), "the reference layer read for the live showing is let go");
+    // one step, from no selection
+    s.undo();
+    assert!(!s.has_selection());
+}
+
 #[test]
 fn a_transform_with_a_selection_moves_only_what_it_takes() {
     use crate::selection::SelectionJoin;
