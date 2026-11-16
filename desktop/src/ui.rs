@@ -388,7 +388,8 @@ impl Interface {
     }
 
     /// The artwork is put away (to the gallery, for another, or with the window): brushes coming
-    /// in from files are waited for, Recolor ends keeping what it filled, and Layer Opacity ends.
+    /// in from files are waited for, Recolor ends keeping what it filled, Layer Opacity ends, and
+    /// the selection tool closes (Color Fill filling what is selected).
     pub fn closing(&mut self, session: &CanvasSession) {
         // a plugin's panel goes with the artwork it was open over
         self.prefs.plugins.close_panel();
@@ -398,6 +399,7 @@ impl Interface {
         self.library.finish_importing(session);
         self.end_recolor(session);
         session.set_touch_layer_opacity(None);
+        self.selection.close(session);
     }
 
     /// A new artwork just started: without time-lapse if that is turned off.
@@ -575,7 +577,8 @@ impl Interface {
         let lit = Lit {
             actions: self.open == Some(Popover::Actions),
             transform: self.transform.on,
-            selection: self.selection.on,
+            // while the selection tool is open, or while something is selected
+            selection: self.selection.on || session.has_selection(),
             adjustments: self.open == Some(Popover::Adjustments)
                 || session.adjustment_shown().adjustment.is_some()
                 || session.recolor_on()
@@ -2275,7 +2278,7 @@ impl Interface {
     fn switch_modes(&mut self, session: &CanvasSession, button: ModeButton) -> bool {
         let open = self.open_modes(session);
         let ModeSwitch { end, goes_on } = mode_switch(button, open);
-        if mode_switch_deselects(button, open) {
+        if mode_switch_deselects(button, open, self.selection.color_fill()) {
             self.selection.clear(session);
         }
         if end.quickshape {
@@ -2293,7 +2296,9 @@ impl Interface {
             session.set_touch_layer_opacity(None);
         }
         if end.transform {
+            // kept, it ends the selection too
             self.transform.end(session, true);
+            self.selection.changed(session);
         }
         if end.selection {
             self.selection.close(session);
