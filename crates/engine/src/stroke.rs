@@ -886,7 +886,7 @@ pub struct StrokeBuilder {
     brush: Brush,
     diameter: f32,
     pointer: Pointer,
-    /// The pressure (smoothed) and where the input was at the last point streamline settled.
+    /// The pressure (smoothed) and where the path was at the last point all smoothing settled.
     pressure: Option<f32>,
     pressed_from: Option<Vec2>,
     smoothed: Option<PathPoint>,
@@ -929,7 +929,8 @@ pub struct StrokeBuilder {
     speed: f32,
     /// Whether the speed has been measured (the first move is taken as it is).
     speed_known: bool,
-    /// The pressure as each use follows it, at the last sample; and how many samples so far.
+    /// The pressure as each use follows it, at the last point all smoothing settled; and how many
+    /// such points so far.
     soft: Option<[f32; 5]>,
     segments: u32,
     /// A sample stroke drawn for show: no speed, and the pressure taken as it comes.
@@ -1018,6 +1019,9 @@ pub struct InputSettings {
     /// Motion filtering keeps the stroke's end on the pen; off, the end falls short of it as much
     /// as the filter smooths.
     pub tip_attached: bool,
+    /// The pen says how it leans. One that doesn't draws as a finger does: no lean at all (not
+    /// even upright's least), and its brush's tilt switches out of the way.
+    pub tilt_known: bool,
 }
 
 impl Default for InputSettings {
@@ -1030,6 +1034,7 @@ impl Default for InputSettings {
             pressure_curve: Curve::linear(),
             speed_distance: 1.0,
             tip_attached: true,
+            tilt_known: true,
         }
     }
 }
@@ -1572,9 +1577,6 @@ impl StrokeBuilder {
         let since = self.last_sample.map_or(0.0, |last| (s.time_ms - last.time_ms).abs());
         let batched = self.last_sample.is_some() && since < BATCHED_MS;
         let steps = if batched || since <= 0.0 { 1.0 } else { (since / interval).min(MOST_STEPS) as f32 };
-        // frames of a 60 Hz display since the last sample (a sample's worth at the tuned rate, if
-        // it came with it)
-        let frames = if batched || since <= 0.0 { sample_frames(pen) } else { (since * 0.06) as f32 };
         let raw = if pen { self.input.pressure_curve.eval(s.pressure.clamp(0.0, 1.0)).clamp(0.0, 1.0) } else { 1.0 };
         // the pressure is smoothed with the path by streamline; a stroke drawn for show or an
         // exact path, which no streamline holds back, smooths it as it comes
@@ -1591,23 +1593,14 @@ impl StrokeBuilder {
         if self.roll_turns && self.roll_from.is_none() {
             self.roll_from = Some(roll);
         }
-        if let Some(last) = self.last_sample {
-            let moved = s.pos.distance(last.pos) * self.points_per_pixel / frames;
-            let scale = self.input.speed_distance.clamp(0.25, 1.0);
-            let over = (moved - SLOW * scale) / (SPAN * scale);
-            let now = if over > 0.0 && !self.steady { over.sqrt().min(1.0) } else { 0.0 };
-            // the first move as it is; later ones smoothed over a few frames
-            let held = if self.speed_known { SPEED_FRAMES / frames } else { 0.0 };
-            self.speed = ((now + held * self.speed) / (held + 1.0)).clamp(0.0, 1.0);
-            self.speed_known = true;
-        }
         if self.weights.is_none() {
             let weights = self.made_weights();
             self.averaged.mirrored = !self.input.tip_attached && !weights.is_empty();
             self.weights = Some(weights.into());
         }
-        // (each use's pressure follows once streamline has settled it, see `pressed_on`)
-        let target = PathPoint { pos: s.pos, pressure, soft: [1.0; 5], tilt, azimuth, roll, speed: self.speed };
+        // (each use's pressure, and the speed, follow once all smoothing has settled it, see
+        // `pressed_on`)
+        let target = PathPoint { pos: s.pos, pressure, soft: [1.0; 5], tilt, azimuth, roll, speed: 0.0 };
         // (none for the first sample; nothing of its own for one in a batch with the last)
         let dt = self.last_sample.map(|last| if batched { 0.0 } else { (s.time_ms - last.time_ms).clamp(0.5, 50.0) });
         self.keep_time(s);
@@ -1646,8 +1639,7 @@ impl StrokeBuilder {
         let streams = self.brush.streamline > 0.0 || self.pressure_streams();
         let Some(dt) = dt.filter(|_| !self.exact && !self.steady && streams) else {
             self.smoothed = Some(target);
-            let pressed = self.pressed_on(target, target.pos, dt);
-            self.stabilise_to(pressed, samples, out);
+            self.stabilise_to(target, dt, samples, out);
             return;
         };
         self.streaming.push_back((target, dt));
@@ -1712,8 +1704,7 @@ impl StrokeBuilder {
             None => to,
         };
         self.smoothed = Some(smoothed);
-        let pressed = self.pressed_on(smoothed, to.pos, Some(dt));
-        self.stabilise_to(pressed, (dt / self.tuned_interval()).min(MOST_STEPS), out);
+        self.stabilise_to(smoothed, Some(dt), (dt / self.tuned_interval()).min(MOST_STEPS), out);
     }
 
     /// Takes the path and pressure on through streamline's window to the input, as if no more
@@ -1748,25 +1739,41 @@ impl StrokeBuilder {
         self.pointer.has_pressure() && self.pressure_smoothing() > 0.0
     }
 
-    /// `p`, a point streamline has settled (its input was `at`, `dt` milliseconds after the last's;
-    /// none: the first), with each use's pressure as the brush's curves take its pressure (a
-    /// finger's full, whatever they say): followed as they lag and even out (see
-    /// [`StrokeBuilder::soften`]), unless the stroke is drawn for show or is an exact path.
-    fn pressed_on(&mut self, p: PathPoint, at: Vec2, dt: Option<f64>) -> PathPoint {
+    /// `p`, a point motion filtering, streamline and stabilisation have all settled (`dt`
+    /// milliseconds after the last; none: the first), with each use's pressure as the brush's
+    /// curves take its pressure (a finger's full, whatever they say): followed as they lag and
+    /// even out over the way the path went from the last (see [`StrokeBuilder::soften`]), unless
+    /// the stroke is drawn for show or is an exact path; and the speed the path went there at.
+    fn pressed_on(&mut self, p: PathPoint, dt: Option<f64>) -> PathPoint {
         let pen = self.pointer.has_pressure();
         let curved = if pen { self.brush.pressures(p.pressure) } else { [1.0; 5] };
-        let soft = match (self.pressed_from, self.soft, dt) {
-            (Some(from), Some(before), Some(dt)) if !self.steady && !self.exact => {
-                let frames = if dt > 0.0 { (dt * 0.06) as f32 } else { sample_frames(pen) };
-                self.soften(curved, before, frames, at.distance(from))
+        // frames of a 60 Hz display since the last point (a sample's worth at the input's rate,
+        // if it came with it)
+        let gone = self.pressed_from.zip(dt).map(|(from, dt)| {
+            let frames = if dt > 0.0 { (dt * 0.06) as f32 } else { sample_frames(pen) };
+            (p.pos.distance(from), frames)
+        });
+        if let Some((moved, frames)) = gone {
+            let moved = moved * self.points_per_pixel / frames;
+            let scale = self.input.speed_distance.clamp(0.25, 1.0);
+            let over = (moved - SLOW * scale) / (SPAN * scale);
+            let now = if over > 0.0 && !self.steady { over.sqrt().min(1.0) } else { 0.0 };
+            // the first move as it is; later ones smoothed over a few frames
+            let held = if self.speed_known { SPEED_FRAMES / frames } else { 0.0 };
+            self.speed = ((now + held * self.speed) / (held + 1.0)).clamp(0.0, 1.0);
+            self.speed_known = true;
+        }
+        let soft = match (gone, self.soft) {
+            (Some((moved, frames)), Some(before)) if !self.steady && !self.exact => {
+                self.soften(curved, before, frames, moved)
             }
             _ => curved,
         };
         self.soft = Some(soft);
         self.pressure = Some(p.pressure);
-        self.pressed_from = Some(at);
+        self.pressed_from = Some(p.pos);
         self.segments = self.segments.saturating_add(1);
-        PathPoint { soft, ..p }
+        PathPoint { soft, speed: self.speed, ..p }
     }
 
     /// Takes the input on along motion filtering's points up to the `to`th, each filtered with
@@ -1793,13 +1800,14 @@ impl StrokeBuilder {
         self.averaged.settled = i;
     }
 
-    /// Takes the path on to `to`, a point streamline settled `samples` samples (at the tuned rate)
-    /// after the last, through stabilisation: each point waits until those after it within reach
-    /// of its average are known.
-    fn stabilise_to(&mut self, to: PathPoint, samples: f64, out: &mut Vec<Stamp>) {
+    /// Takes the path on to `to`, a point streamline settled `dt` milliseconds (`samples` samples
+    /// at the tuned rate) after the last, through stabilisation: each point waits until those
+    /// after it within reach of its average are known.
+    fn stabilise_to(&mut self, to: PathPoint, dt: Option<f64>, samples: f64, out: &mut Vec<Stamp>) {
         let half = self.stabilised();
         if half == 0 {
-            self.path_to(to, out);
+            let pressed = self.pressed_on(to, dt);
+            self.path_to(pressed, out);
             return;
         }
         self.stable.add(to, samples);
@@ -1820,8 +1828,11 @@ impl StrokeBuilder {
             self.stable.slide(&mut sum, i, half);
             i += 1;
             if let Some(next) = next {
+                // (its points a sample apart at the tuned rate)
                 let next = self.still_where_it_was(&self.stable, next);
-                self.path_to(next, out);
+                let dt = self.pressed_from.map(|_| self.tuned_interval());
+                let pressed = self.pressed_on(next, dt);
+                self.path_to(pressed, out);
             }
         }
         self.stable.settled = i;
@@ -2191,9 +2202,14 @@ impl StrokeBuilder {
     }
 
     /// How far the pen leans past where a tilt control at `theta` starts (see [`Tilt::reach`]);
-    /// nothing for a finger.
+    /// nothing for a finger, or a pen that doesn't say how it leans.
     fn leaning(&self, p: PathPoint, theta: f32) -> f32 {
-        if self.pointer.has_pressure() { Tilt::reach(p.tilt, theta) } else { 0.0 }
+        if self.lean_known() { Tilt::reach(p.tilt, theta) } else { 0.0 }
+    }
+
+    /// Whether the input says how it leans: a pen that does.
+    fn lean_known(&self) -> bool {
+        self.pointer.has_pressure() && self.input.tilt_known
     }
 
     /// What leaning adds to the stamp's diameter (canvas pixels): the tilt size, as far as the
@@ -2412,10 +2428,10 @@ impl StrokeBuilder {
         self.pressed_roundness(self.drawn_share(p), p.soft[3], size_left) * tilted
     }
 
-    /// The tilt switches act: on a pen's lean, and on the pad only if the brush previews tilt.
-    /// Otherwise they aren't there, so what they would hold back isn't.
+    /// The tilt switches act: on the lean of a pen that says it, and on the pad only if the brush
+    /// previews tilt. Otherwise they aren't there, so what they would hold back isn't.
     fn switches_act(&self) -> bool {
-        self.pointer.has_pressure() && self.pad != Some(false)
+        self.lean_known() && self.pad != Some(false)
     }
 
     /// How far a tilt switch at `theta` lets its control act: all of it when the switch is off or
@@ -2555,11 +2571,11 @@ impl StrokeBuilder {
                 *first = tilt;
             }
         }
-        // the wet attack follows the pressure, and the lean when its switch is on (a finger as a
-        // pen lying flat)
+        // the wet attack follows the pressure, and the lean when its switch is on (a finger, or a
+        // pen that doesn't say how it leans, as a pen lying flat)
         let attack_tilt = match sw.attack {
             None => 1.0,
-            Some(theta) if self.pointer.has_pressure() => Tilt::reach(p.tilt, theta),
+            Some(theta) if self.lean_known() => Tilt::reach(p.tilt, theta),
             Some(theta) => Tilt::reach(std::f32::consts::FRAC_PI_2, theta),
         };
         let pressed = if self.pointer.has_pressure() { p.soft[1] } else { self.brush.touch_opacity };
@@ -3019,6 +3035,27 @@ mod tests {
         assert!(held > plain_settled, "{held} {plain_settled}");
         // as it ends, near what the pen pressed (left behind, it would be half as wide again)
         assert!(end < plain_end * 1.2, "{end} {plain_end}");
+    }
+
+    #[test]
+    fn the_brushs_pressure_curves_take_the_pressure_stabilisation_has_averaged() {
+        // a pen pressing fully and lightly by turns, stabilised: its pressure averages to a half
+        // before the size curve takes it (a tenth there), rather than the curve's ends averaging
+        // to a half
+        let samples: Vec<Sample> = (0..200)
+            .map(|i| {
+                let pressure = if i % 2 == 0 { 1.0 } else { 0.0 };
+                Sample::at(Vec2::new(i as f32 * 2.0, 50.0), pressure, f64::from(i) * 1000.0 / 240.0)
+            })
+            .collect();
+        let mut b = Brush { pressure_size: 1.0, ..plain() };
+        b.size_curve = Curve::new(&[Vec2::new(0.0, 0.0), Vec2::new(0.5, 0.1), Vec2::new(1.0, 1.0)]);
+        b.set_setting("stabilization", 0.5);
+        let mut s = StrokeBuilder::new(b, 20.0, Pointer::Stylus);
+        s.add(&samples);
+        let stamps = s.finish();
+        let middle = stamps.get(stamps.len() / 2).map_or(0.0, |st| st.radius);
+        assert!(middle < 10.0 * 0.2, "{middle}");
     }
 
     #[test]
@@ -4417,6 +4454,25 @@ mod tests {
     }
 
     #[test]
+    fn a_pen_that_doesnt_say_how_it_leans_has_no_lean_at_all() {
+        // fading fully as it leans: upright, a pen still fades by the root of the lean's floor
+        // (1/32, eased as the opacity is); one that doesn't say how it leans, not at all
+        let alpha = |known: bool| {
+            let mut b = Brush { pressure_size: 0.0, pressure_opacity: 0.0, ..plain() };
+            b.tilt.opacity = 1.0;
+            let input = InputSettings { tilt_known: known, ..InputSettings::default() };
+            let s = Sample::at(Vec2::new(50.0, 50.0), 1.0, 0.0);
+            StrokeBuilder::new(b, 10.0, Pointer::Stylus)
+                .with_input(input)
+                .preview(&[s])
+                .first()
+                .map_or(0.0, |s| s.alpha)
+        };
+        let (upright, unknown) = (alpha(true), alpha(false));
+        assert!((upright / unknown - (1.0f32 - 1.0 / 32.0).powf(FLOW_POWER)).abs() < 1e-3, "{upright} {unknown}");
+    }
+
+    #[test]
     fn tilt_switches_hold_their_controls_back_until_the_pen_leans() {
         let make = |tilt: f32, switches: bool| {
             let mut b = Brush { pressure_size: 0.0, ..plain() };
@@ -4444,8 +4500,8 @@ mod tests {
         assert!((upright[0].center.y - 50.0).abs() < 0.05);
         assert!(upright[0].grain_depth > 0.99, "{}", upright[0].grain_depth);
         // a finger has no lean to wait for, so the switches aren't there: all of it, and the pad
-        // without the brush's tilt preview likewise
-        let touched = |on_pad: bool| {
+        // without the brush's tilt preview likewise, and a pen that doesn't say how it leans
+        let touched = |how: usize| {
             let mut b = Brush { pressure_size: 0.0, ..plain() };
             b.shape.count = 8;
             b.set_setting("jitter_lateral", 1.0);
@@ -4454,13 +4510,14 @@ mod tests {
             b.set_setting("stamp_hue", 1.0);
             b.set_setting("stamp_hue_tilt", 1.0);
             let s = Sample::at(Vec2::new(50.0, 50.0), 1.0, 0.0);
-            if on_pad {
-                StrokeBuilder::new(b, 10.0, Pointer::Stylus).on_pad(false).preview(&[s])
-            } else {
-                StrokeBuilder::new(b, 10.0, Pointer::Finger).preview(&[s])
+            let unknown = InputSettings { tilt_known: false, ..InputSettings::default() };
+            match how {
+                0 => StrokeBuilder::new(b, 10.0, Pointer::Finger).preview(&[s]),
+                1 => StrokeBuilder::new(b, 10.0, Pointer::Stylus).on_pad(false).preview(&[s]),
+                _ => StrokeBuilder::new(b, 10.0, Pointer::Stylus).with_input(unknown).preview(&[s]),
             }
         };
-        for stamps in [touched(false), touched(true)] {
+        for stamps in [touched(0), touched(1), touched(2)] {
             assert_eq!(stamps.len(), 8);
             assert!(stamps.iter().any(|s| (s.center.y - 50.0).abs() > 0.5));
             assert!(stamps.iter().any(|s| s.tint.hue.abs() > 0.05));
