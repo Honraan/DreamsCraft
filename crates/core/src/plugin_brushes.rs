@@ -135,6 +135,16 @@ const WARPS: u32 = 2048;
 const FILTERS: u32 = 4096;
 /// It picks up from the layer as it was before the stroke.
 const PICKS_BEFORE: u32 = 8192;
+/// It lays nothing: its engine is told the colours of the layer under it, as the stroke has laid
+/// it by then, before the engine's next samples (word 7 says how they are weighed).
+const TELLS_UNDER: u32 = 16384;
+/// Its own colour (flags 4 and 16) is as opaque as word 22 says: laid in place, it thins what is
+/// there towards that.
+const SEE_THROUGH: u32 = 32768;
+
+/// The most dabs a stroke may ask about at once, and the most pixels read for them at once.
+const MOST_ASKED: usize = 4096;
+const MOST_READ: i64 = 1 << 20;
 
 /// The most tips, and the largest side of one, and of a texture.
 const MOST_TIP_SIDE: u32 = 4096;
@@ -754,9 +764,106 @@ pub(crate) fn begin_stroke(
         fed: 0,
         ended: false,
         laid: [VecDeque::new(), VecDeque::new()],
+        layer: starting.under_at.map(|(layer, ..)| layer),
+        asked: Vec::new(),
+        told: Vec::new(),
     }));
     let half = |second| EngineHalf { core: Arc::clone(&core), second, seen: 0 };
     Some((half(false), half(true)))
+}
+
+/// The open stroke an engine draws, as the app tells it the colours under the dabs it asks about
+/// (see [`crate::State::tell_under`]).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Asking(std::sync::Weak<Mutex<StrokeCore>>);
+
+impl EngineHalf {
+    /// Its stroke, to be told the colours under its dabs.
+    pub(crate) fn asking(&self) -> Asking {
+        Asking(Arc::downgrade(&self.core))
+    }
+}
+
+/// The colours of `pixels` (premultiplied RGBA8, the canvas's `rect` of them) under `a`, weighed as
+/// it asks, as four f32: premultiplied red, green and blue, and alpha (what lies off them clear).
+fn colours_under(a: &Asked, pixels: &[u8], rect: procraft_engine::geom::IRect) -> [f32; 4] {
+    let r = a.radius.max(0.5);
+    let (x0, y0, side) = match a.weighing {
+        // the square from its corner, as wide as the disc (whole pixels)
+        1 => ((a.x - r) as i32, (a.y - r) as i32, ((2.0 * r) as i32).max(1)),
+        _ => ((a.x - r).floor() as i32, (a.y - r).floor() as i32, (2.0 * r).ceil() as i32 + 1),
+    };
+    let (mut sum, mut total) = ([0.0_f64; 4], 0.0_f64);
+    for py in y0..y0 + side {
+        for px in x0..x0 + side {
+            let (dx, dy) = (px as f32 + 0.5 - a.x, py as f32 + 0.5 - a.y);
+            let rr = (dx * dx + dy * dy) / (r * r);
+            let w = match a.weighing {
+                1 => {
+                    let (cx, cy) = (px as f32 - a.x, py as f32 - a.y);
+                    if cx * cx + cy * cy <= (r + 1.0) * (r + 1.0) { ((1.0 - rr) * 255.0).round() / 255.0 } else { 1.0 }
+                }
+                _ if rr <= 1.0 => 1.0 - rr,
+                _ => continue,
+            };
+            let w = f64::from(w);
+            total += w;
+            let inside = px >= rect.x0 && px < rect.x1 && py >= rect.y0 && py < rect.y1;
+            if !inside {
+                continue;
+            }
+            let at = (((py - rect.y0) * rect.width() as i32 + (px - rect.x0)) * 4) as usize;
+            if let Some(p) = pixels.get(at..at + 4) {
+                for (s, v) in sum.iter_mut().zip(p) {
+                    *s += w * f64::from(*v) / 255.0;
+                }
+            }
+        }
+    }
+    if total <= 0.0 {
+        return [0.0; 4];
+    }
+    sum.map(|s| ((s / total) as f32).clamp(0.0, 1.0))
+}
+
+impl crate::State {
+    /// The open stroke's engine told the colours under the dabs it has asked about, as the stroke
+    /// has laid its layer by now: before its next samples, so that it sees them as near as the GPU
+    /// allows (what it laid in the batch of samples with them, the dabs after them included).
+    pub(crate) fn tell_under(&mut self) {
+        let Some(core) = self.engine_asking.0.upgrade() else { return };
+        let (asked, layer) = {
+            let mut c = core.lock().unwrap_or_else(|e| e.into_inner());
+            (std::mem::take(&mut c.asked), c.layer)
+        };
+        let (Some(layer), false) = (layer, asked.is_empty()) else { return };
+        let (Some(canvas), Some(gpu)) = (self.canvas.as_mut(), self.gpu.as_ref()) else { return };
+        // what is still to be laid laid first
+        canvas.render(gpu, &mut self.doc, None);
+        let (width, height) = canvas.size();
+        let full = procraft_engine::geom::IRect::from_size(width, height);
+        let reach = |a: &Asked| {
+            let r = a.radius.ceil() as i32 + 2;
+            let (x, y) = (a.x.floor() as i32, a.y.floor() as i32);
+            procraft_engine::geom::IRect::new(x - r, y - r, x + r + 1, y + r + 1)
+        };
+        // the pixels under all of them at once, unless that is too many (then each its own)
+        let all = asked.iter().map(reach).reduce(|a, b| a.union(b)).unwrap_or(full).intersect(full);
+        let mut told = Vec::with_capacity(asked.len() * 16);
+        let together = i64::from(all.width()) * i64::from(all.height()) <= MOST_READ;
+        let read_all = if together { canvas.read_layer_part(gpu, layer, all).ok() } else { None };
+        for a in &asked {
+            let colours = match &read_all {
+                Some(pixels) => colours_under(a, pixels, all),
+                None => {
+                    let rect = reach(a).intersect(full);
+                    canvas.read_layer_part(gpu, layer, rect).map_or([0.0; 4], |p| colours_under(a, &p, rect))
+                }
+            };
+            told.extend(colours.iter().flat_map(|c| c.to_le_bytes()));
+        }
+        core.lock().unwrap_or_else(|e| e.into_inner()).told.extend(told);
+    }
 }
 
 /// A stroke an engine draws: what both its halves share.
@@ -775,6 +882,23 @@ struct StrokeCore {
     ended: bool,
     /// The stamps each half has yet to take: the first stroke's, the second's.
     laid: [VecDeque<Stamp>; 2],
+    /// The layer it is laid on, if the colours under its dabs can be read there; the dabs it has
+    /// asked about since it was last told, and what it is to be told before its next samples.
+    layer: Option<procraft_engine::document::LayerId>,
+    asked: Vec<Asked>,
+    told: Vec<u8>,
+}
+
+/// A dab a stroke asked about: where (canvas pixels), its radius and how the colours are weighed
+/// (0: the disc, each pixel by 1 - (d / r)^2 at its middle; 1: the square from the corner, the
+/// pixels whose corners lie within a pixel past the rim so, less than nothing past it, the rest
+/// fully).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Asked {
+    x: f32,
+    y: f32,
+    radius: f32,
+    weighing: u32,
 }
 
 impl StrokeCore {
@@ -782,6 +906,17 @@ impl StrokeCore {
     fn feed(&mut self, samples: &[Sample]) {
         // a few at a time, so that an engine laying many dabs for each (a line for each of a
         // bristle brush's bristles) stays within what a call may answer
+        // what it asked about first
+        if !self.told.is_empty()
+            && let Some(number) = self.number
+        {
+            let told = std::mem::take(&mut self.told);
+            if let Err(stop) = at_work(&self.running).brush_under(number, &told) {
+                self.number = None;
+                self.hooks.stopped(&self.plugin, stop);
+                return;
+            }
+        }
         for some in samples.chunks(SAMPLES_A_CALL) {
             self.feed_some(some);
         }
@@ -825,6 +960,20 @@ impl StrokeCore {
         let first_ms = self.first_ms.unwrap_or(0.0);
         for dab in dabs.as_chunks::<DAB_BYTES>().0 {
             let flags = u32_of(dab.get(32..).unwrap_or_default()).unwrap_or(0);
+            if flags & TELLS_UNDER != 0 {
+                let word = |i: usize| u32_of(dab.get(i * 4..).unwrap_or_default()).unwrap_or(0);
+                let [x, y, diameter] = [0, 1, 2].map(|i| f32::from_bits(word(i)));
+                if self.layer.is_some()
+                    && self.asked.len() < MOST_ASKED
+                    && x.is_finite()
+                    && y.is_finite()
+                    && diameter.is_finite()
+                {
+                    let radius = (diameter * 0.5).clamp(0.5, 1024.0);
+                    self.asked.push(Asked { x, y, radius, weighing: word(7).min(1) });
+                }
+                continue;
+            }
             let second = flags & FOR_SECOND != 0;
             let look = &*self.look;
             let (tips, build) = match (second, &look.second) {
@@ -891,6 +1040,11 @@ fn stamp_of(dab: &[u8; DAB_BYTES], colour: [f32; 3], tips: usize, build: Build, 
             dull: (flags & DULLS != 0)
                 .then(|| (if radius.is_finite() { radius.clamp(0.0, 3.0) } else { 0.0 }, flags & WEIGHED != 0)),
             clear: flags & CLEAR_PAINT != 0,
+            thin: if own && flags & SEE_THROUGH != 0 && flags & (WARPS | FILTERS) == 0 {
+                1.0 - unit(w22, 1.0)
+            } else {
+                0.0
+            },
             over: flags & LAID_OVER != 0,
             here: flags & PICKS_HERE != 0,
             from: (flags & PICKS_FROM != 0 && w20.is_finite() && w21.is_finite()).then_some([w20, w21]),
@@ -1181,7 +1335,12 @@ impl crate::State {
         if first.is_some() && look_of(&hooks, brush).is_some_and(|(l, _)| l.under_start > 0) {
             canvas.render(gpu, &mut self.doc, None);
         }
-        engine_stroke(&hooks, brush, tool.stroke_tool(), starting, look, canvas, gpu)
+        let stroke = engine_stroke(&hooks, brush, tool.stroke_tool(), starting, look, canvas, gpu);
+        // a stroke of the pen's on the canvas is told the colours under the dabs it asks about
+        if first.is_some() {
+            self.engine_asking = stroke.as_ref().map(|o| o.first.asking()).unwrap_or_default();
+        }
+        stroke
     }
 }
 
@@ -1319,6 +1478,34 @@ mod tests {
         plain[8..12].copy_from_slice(&8.0_f32.to_bits().to_le_bytes());
         plain[32..36].copy_from_slice(&(PICKS_FROM | WARPS).to_le_bytes());
         assert!(stamp_of(&plain, [0.0; 3], 1, Build::Over, 0.0).unwrap().pick_up.is_none());
+        // its own colour see-through as word 22 says (not with a warp's or a blur's words)
+        let own = MOVES_PAINT | OWN_COLOUR | PICKS_HERE;
+        assert_eq!(dab(own | SEE_THROUGH, [0, 0, f(0.25), 0]).thin, 0.75);
+        assert_eq!(dab(own, [0, 0, f(0.25), 0]).thin, 0.0);
+        assert_eq!(dab(own | SEE_THROUGH | FILTERS, [0, 0, f(0.25), 0]).thin, 0.0);
+    }
+
+    #[test]
+    fn the_colours_under_a_dab_asked_about_are_weighed_as_it_asks() {
+        use procraft_engine::geom::IRect;
+        // a 20 x 20 layer, its left half opaque red, its right half clear
+        let rect = IRect::new(0, 0, 20, 20);
+        let pixels: Vec<u8> =
+            (0..400).flat_map(|i| if i % 20 < 10 { [255, 0, 0, 255] } else { [0, 0, 0, 0] }).collect();
+        let disc = |x: f32, weighing: u32| colours_under(&Asked { x, y: 10.0, radius: 4.0, weighing }, &pixels, rect);
+        assert_eq!(disc(5.0, 0), [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(disc(15.0, 0), [0.0; 4]);
+        // across the edge: half and half, premultiplied
+        let [r, g, _, a] = disc(10.0, 0);
+        assert!((r - 0.5).abs() < 0.02 && g == 0.0 && (a - r).abs() < 1e-6, "{r} {a}");
+        // the square from its corner, its corners counted fully: the same across the edge
+        let [r, _, _, a] = disc(10.0, 1);
+        assert!((r - 0.5).abs() < 0.05 && (a - r).abs() < 1e-6, "{r} {a}");
+        // off the layer it is clear
+        let off = colours_under(&Asked { x: -10.0, y: 10.0, radius: 4.0, weighing: 0 }, &pixels, rect);
+        assert_eq!(off, [0.0; 4]);
+        let half_off = colours_under(&Asked { x: 0.0, y: 10.0, radius: 4.0, weighing: 0 }, &pixels, rect);
+        assert!((half_off[3] - 0.5).abs() < 0.05, "{half_off:?}");
     }
 
     #[test]
@@ -1495,6 +1682,139 @@ mod tests {
         let at_x = |x: usize| &px[(60 * 200 + x) * 4..(60 * 200 + x) * 4 + 4];
         assert!(at_x(130)[0] > 128 && at_x(130)[3] > 128 && at_x(130)[2] < 64, "red dragged out: {:?}", at_x(130));
         assert_eq!(at_x(190)[3], 0, "past the stroke, still clear");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A session on `gpu` with the Krita plugin on (the one at `KRITA_PLUGIN`, else the bundled one)
+    /// and a bundle's MyPaint brushes brought in: one that smudges fully, its dabs hard and close,
+    /// and one that only paints. The session, the plugins, the plugin's id, the set and its folder.
+    fn mypaint_session(
+        gpu: procraft_gpu::Gpu,
+        tag: &str,
+    ) -> (Arc<crate::CanvasSession>, Arc<crate::Plugins>, String, u32, std::path::PathBuf) {
+        let packed = match std::env::var("KRITA_PLUGIN") {
+            Ok(path) => std::fs::read(path).unwrap(),
+            Err(_) => crate::bundled::BUNDLED.iter().find(|(name, _)| *name == "krita-brushes").unwrap().1.to_vec(),
+        };
+        let s = crate::CanvasSession::new(200, 120);
+        {
+            let mut st = s.shared.lock();
+            st.window_size = (200, 120);
+            st.view = Some(procraft_engine::view::View::fit((200, 120), (200, 120)));
+            st.gpu = Some(gpu);
+            st.ensure_canvas();
+        }
+        let dir = std::env::temp_dir().join(format!("procraft-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let plugins = crate::Plugins::with_store(dir.to_string_lossy().into_owned());
+        assert_eq!(plugins.install(packed), None);
+        let id = plugins.plugins().into_iter().find(|p| p.name == "Krita brushes").unwrap().id;
+        assert!(plugins.set_on(id.clone(), true));
+        s.use_plugins(Arc::clone(&plugins));
+        let brush = |smudge: f32| {
+            format!(
+                r#"{{"version": 3, "settings": {{
+                "radius_logarithmic": {{"base_value": 1.6, "inputs": {{}}}},
+                "hardness": {{"base_value": 0.9, "inputs": {{}}}},
+                "opaque_multiply": {{"base_value": 1.0, "inputs": {{}}}},
+                "dabs_per_actual_radius": {{"base_value": 4.0, "inputs": {{}}}},
+                "smudge": {{"base_value": {smudge}, "inputs": {{}}}},
+                "smudge_length": {{"base_value": 0.5, "inputs": {{}}}}
+            }}}}"#
+            )
+        };
+        let mut zip = procraft_engine::zip::ZipWriter::new();
+        zip.add("mimetype", b"application/x-krita-resourcebundle");
+        zip.add("paintoppresets/Wet_Drag.myb", brush(1.0).as_bytes());
+        zip.add("paintoppresets/Plain_Ink.myb", brush(0.0).as_bytes());
+        let read = crate::read_brushes(zip.finish(), Some("Drag.bundle".to_owned())).unwrap();
+        s.make_engine_brushes(Arc::clone(&read));
+        let set = s.add_brushes_read(read, 0).expect("the engine's brushes come in");
+        (s, plugins, id, set, dir)
+    }
+
+    /// The pen dragged across the middle of a 200 x 120 canvas, from x = 60 to 150, in batches of
+    /// three samples as its moves come.
+    fn drag_across(s: &crate::CanvasSession) {
+        let at = |x: f32| crate::PenSample {
+            x,
+            y: 60.0,
+            pressure: 1.0,
+            tilt: 0.0,
+            orientation: 0.0,
+            time_ms: f64::from(x),
+            roll: 0.0,
+        };
+        s.stroke_begin(crate::PointerKind::Stylus, vec![at(60.0)]);
+        for from in (61..=150).step_by(3) {
+            s.stroke_add((from..from + 3).map(|x| at(x as f32)).collect());
+        }
+        s.stroke_end(vec![]);
+    }
+
+    /// The brush of `set` called `name`, chosen.
+    fn choose(s: &crate::CanvasSession, set: u32, name: &str) {
+        let index = s.shared.lock().library[set as usize].brushes.iter().position(|b| b.name == name).unwrap();
+        assert!(s.shared.lock().library[set as usize].brushes[index].engine.is_some());
+        assert!(s.select_brush(set, index as u32));
+    }
+
+    /// A brush engine that asks what lies under its dabs is told, a batch of samples later: a Krita
+    /// MyPaint brush that smudges, dragged from red into the clear, carries the red there in place of
+    /// its blue (picking up the red it laid itself as it goes on).
+    #[test]
+    fn an_engine_is_told_the_colours_under_the_dabs_it_asks_about() {
+        let Ok(gpu) = procraft_gpu::Gpu::headless() else { return };
+        let (s, plugins, id, set, dir) = mypaint_session(gpu, "told-under");
+        choose(&s, set, "Wet Drag");
+        // red on the left half
+        let layer = s.add_layer();
+        {
+            let mut st = s.shared.lock();
+            let rect = procraft_engine::geom::IRect::new(0, 0, 100, 120);
+            st.rewrite_layer(procraft_engine::document::LayerId(layer), rect, [255, 0, 0, 255].repeat(100 * 120));
+        }
+        s.set_color(0.0, 0.0, 1.0);
+        drag_across(&s);
+        assert!(plugins.plugins().iter().any(|p| p.id == id && p.on && p.problem.is_none()), "the engine still on");
+        let px = s.shared.lock().layer_pixels(procraft_engine::document::LayerId(layer)).unwrap();
+        let at_x = |x: usize| &px[(60 * 200 + x) * 4..(60 * 200 + x) * 4 + 4];
+        // just past the red, the red it carries (none of its blue: it smudges fully)
+        let [r, _, b, a] = at_x(110).try_into().unwrap();
+        assert!(r > 128 && b < 64 && a > 64, "red carried out: {:?}", at_x(110));
+        // further on, still red: what it laid itself is what it picks up
+        let [r, _, b, _] = at_x(145).try_into().unwrap();
+        assert!(r > 128 && b < 64, "red carried on: {:?}", at_x(145));
+        assert_eq!(at_x(190)[3], 0, "past the stroke, still clear");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On an old GPU (no compute passes: see `Gpu::headless_old`) an engine whose dabs ask what lies
+    /// under them and move paint goes on without trouble: its smudge lays nothing and says so once,
+    /// as the smudge tool does there, the engine still on; one that only paints paints.
+    #[test]
+    fn an_engine_asking_on_an_old_gpu_smudges_nothing_and_says_so() {
+        let gpu = match procraft_gpu::Gpu::headless_old() {
+            Ok(g) => g,
+            Err(e) => return eprintln!("skipped: {e}"),
+        };
+        let (s, plugins, id, set, dir) = mypaint_session(gpu, "told-under-old");
+        let layer = s.add_layer();
+        s.set_color(0.0, 0.0, 1.0);
+        choose(&s, set, "Plain Ink");
+        drag_across(&s);
+        let painted = s.shared.lock().layer_pixels(procraft_engine::document::LayerId(layer)).unwrap();
+        let blue = |px: &[u8], x: usize| px[(60 * 200 + x) * 4 + 2];
+        assert!(blue(&painted, 100) > 200, "it paints");
+        choose(&s, set, "Wet Drag");
+        for told in [true, false] {
+            let before = s.shared.lock().layer_pixels(procraft_engine::document::LayerId(layer)).unwrap();
+            drag_across(&s);
+            let after = s.shared.lock().layer_pixels(procraft_engine::document::LayerId(layer)).unwrap();
+            assert_eq!(before, after, "its smudge lays nothing");
+            assert_eq!(s.take_failure().as_deref(), told.then_some("This device's graphics can't smudge."));
+        }
+        assert!(plugins.plugins().iter().any(|p| p.id == id && p.on && p.problem.is_none()), "the engine still on");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

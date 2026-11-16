@@ -311,7 +311,13 @@ pub struct Brush {
     /// How near a dab may be to the last one drawn afresh to be that one laid again (its engine
     /// keeping its dabs that way and its tip allowing it).
     pub precision: Option<Precision>,
+    /// A MyPaint brush's settings, if it is one (drawn by MyPaint's engine, see `mypaint.rs`).
+    pub mypaint: Option<crate::mypaint::MyPaint>,
 }
+
+/// How big a square of the layer under where it starts a MyPaint brush that smudges wants, for
+/// its first dabs (before it is told what lies under them).
+const MYPAINT_UNDER: u32 = 256;
 
 /// Krita's engines this one draws: its pixel brush, colour smudge, quick brush, tangent normal,
 /// sketch, spray, bristle, hatching, curve, particle and grid brushes, and Krita 3's chalk and dyna
@@ -482,6 +488,16 @@ struct Pictures {
 }
 
 fn pictures(bytes: &[u8], light: bool) -> Option<Pictures> {
+    // an SVG tip, drawn as Krita draws it (grey over white, 1000 pixels across)
+    if crate::svg::is_svg(bytes) {
+        let picture = if light {
+            let (width, height) = crate::svg::size(bytes)?;
+            Rgba { width, height, pixels: Vec::new() }
+        } else {
+            crate::svg::render(bytes)?
+        };
+        return Some(Pictures { cells: vec![picture], image: false, colourful: false, pipe: None });
+    }
     if bytes.starts_with(b"\x89PNG") {
         if light {
             let (width, height) = png_size(bytes)?;
@@ -707,6 +723,35 @@ fn bristles_of(
 }
 
 /// A hard round tip `diameter` across.
+/// The half length of a thin line's pieces the thin line tips are drawn for (canvas pixels).
+pub const THIN_PIECE: f32 = 5.5;
+
+/// The tip a line a pixel thin is laid with, a piece at a time: across it, as much as a line a pixel
+/// wide covers of each pixel by how far its middle is from the line (one less that distance, the
+/// tip being as wide as two pixels once the app's dab reaches past it); along it, ramps where it
+/// meets the next piece, so that the two add up to one (none for a `hard` line, made hard by a
+/// threshold that keeps the pixels nearest).
+fn thin_line(hard: bool, light: bool) -> Mask {
+    const SIDE: u32 = 64;
+    // the app lays a picture over its dab and as far again as this past it each way
+    const PAST: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    let pixels = if light {
+        Vec::new()
+    } else {
+        (0..SIDE * SIDE)
+            .map(|i| {
+                let u = ((i % SIDE) as f32 + 0.5) / (SIDE / 2) as f32 - 1.0;
+                let v = ((i / SIDE) as f32 + 0.5) / (SIDE / 2) as f32 - 1.0;
+                let across = 1.0 - v.abs();
+                let along =
+                    if hard { 1.0 } else { ((1.0 - u.abs()) * (THIN_PIECE + PAST) / (2.0 * PAST)).clamp(0.0, 1.0) };
+                (across * along * 255.0).round() as u8
+            })
+            .collect()
+    };
+    Mask { width: SIDE, height: SIDE, pixels }
+}
+
 fn round_tip(diameter: f32) -> Tip {
     tip_of(
         &format!(
@@ -947,9 +992,10 @@ impl Brush {
             // particles are its own tip)
             let round = round_tip(64.0).masks.into_iter().next();
             let square = Mask { width: 1, height: 1, pixels: if light { Vec::new() } else { vec![255] } };
-            // (and a hatching's own, for the background behind its lines)
-            let own = hatch_tip.as_ref().and_then(|t| t.masks.first().cloned());
-            let masks: Vec<Mask> = round.into_iter().chain([square]).chain(own).collect();
+            // (and a hatching's own, for the background behind its lines; then the thin lines')
+            let own = hatch_tip.as_ref().and_then(|t| t.masks.first().cloned()).unwrap_or_else(|| square.clone());
+            let thin = [thin_line(false, light), thin_line(true, light)];
+            let masks: Vec<Mask> = round.into_iter().chain([square, own]).chain(thin).collect();
             let count = masks.len() as u32;
             tip = Tip { tips: Tips::Images { count, pipe: None }, kind: Kind::Mask, masks, ..tip };
         }
@@ -1008,7 +1054,26 @@ impl Brush {
             texture,
             precision,
             masking,
+            mypaint: None,
         })
+    }
+
+    /// A MyPaint brush (`settings`): MyPaint's round dab at each of its hardnesses for its tips;
+    /// `light`: only to draw strokes with (its tips not drawn).
+    pub fn mypaint(settings: crate::mypaint::MyPaint, light: bool) -> Option<Brush> {
+        let stand_in = format!(
+            r#"<Preset name="MyPaint" paintopid="paintbrush"><param name="brush_definition" type="string"><![CDATA[{STAND_IN}]]></param><param name="PaintOpAction" type="string"><![CDATA[1]]></param></Preset>"#
+        );
+        let preset = Preset::read(&stand_in)?;
+        let mut brush = Brush::read(&preset, &|_| None, true)?;
+        let masks = crate::mypaint::tips(light);
+        let count = masks.len() as u32;
+        brush.tip = Tip { tips: Tips::Images { count, pipe: None }, kind: Kind::Mask, masks, ..brush.tip };
+        brush.wash = false;
+        brush.erases = settings.erases();
+        brush.precision = None;
+        brush.mypaint = Some(settings);
+        Some(brush)
     }
 
     fn read_texture(p: &Preset, find: &dyn Fn(&str) -> Option<Vec<u8>>, light: bool) -> Option<Texture> {
@@ -1050,7 +1115,11 @@ impl Brush {
 
     /// Whether its dabs move the layer's paint (a colour smudge's, a clone's, a deform's, a filter's).
     pub fn moves_paint(&self) -> bool {
-        self.smudge.is_some() || self.clone.is_some() || self.deform.is_some() || self.filter.is_some()
+        self.smudge.is_some()
+            || self.clone.is_some()
+            || self.deform.is_some()
+            || self.filter.is_some()
+            || self.mypaint.as_ref().is_some_and(|m| m.smudges() && !m.erases())
     }
 
     /// How it looks to the app (see the app's guide to brush engines).
@@ -1077,6 +1146,10 @@ impl Brush {
         // a bristle brush soaking up its ink wants the colours where its strokes start
         if let Some(side) = self.hairy.as_ref().map(crate::others::Hairy::soaks).filter(|&s| s > 0) {
             look.word(11, side);
+        }
+        // a MyPaint brush that smudges, for its first dabs
+        if self.mypaint.is_some() && self.moves_paint() {
+            look.word(11, MYPAINT_UNDER);
         }
         // (a smudge's dabs are laid each as far as it says)
         look.byte(2, u8::from(self.wash && !self.moves_paint() && self.grid.is_none()));

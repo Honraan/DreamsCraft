@@ -6,6 +6,10 @@
 //! its settings (field 1) and the pictures it names (field 2 each: its file name, field 1, and
 //! bytes, field 2): those the preset carries taken out of its settings and unpacked once, so that a
 //! brush read again needn't pass over them (one kept with them in its settings reads as well).
+//!
+//! A MyPaint brush (a `.myb`, MyPaint's JSON, alone or in a bundle's `paintoppresets/` beside its
+//! preview `<name>_prev.png`; or a preset of Krita's MyPaint engine keeping one) keeps that JSON
+//! (field 4) instead (field 3 is the brush studio's: the settings as they came).
 
 use crate::brush::Brush;
 use crate::files::{Zip, png_picture_only, png_texts};
@@ -20,7 +24,6 @@ fn preset_text(kpp: &[u8]) -> Option<String> {
 /// The brushes made of a file called `name` (`bytes`): a bundle's or a preset's, as the record the
 /// app takes; empty for none.
 pub fn import(name: &str, bytes: &[u8]) -> Vec<u8> {
-    let _ = name;
     let mut made = Record::new();
     if let Some(zip) = Zip::read(bytes) {
         let names: Vec<String> = zip.names().map(str::to_owned).collect();
@@ -38,10 +41,50 @@ pub fn import(name: &str, bytes: &[u8]) -> Vec<u8> {
                 add(&mut made, &kpp, &find);
             }
         }
+        // MyPaint's brushes, each beside its preview
+        for n in names.iter().filter(|n| n.starts_with("paintoppresets/") && n.to_ascii_lowercase().ends_with(".myb")) {
+            let stem = &n[..n.len() - 4];
+            let preview = zip.file(&format!("{stem}_prev.png"));
+            if let Some(json) = zip.file(n) {
+                add_mypaint(&mut made, stem.rsplit('/').next().unwrap_or(stem), &json, preview);
+            }
+        }
     } else if bytes.starts_with(b"\x89PNG") {
         add(&mut made, bytes, &|_| None);
+    } else if bytes.trim_ascii_start().starts_with(b"{") {
+        let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
+        let stem = file.split('.').next().unwrap_or(file);
+        add_mypaint(&mut made, if stem.is_empty() { "MyPaint" } else { stem }, bytes, None);
     }
     made.bytes()
+}
+
+/// A brush made of a MyPaint brush file (`json`) called `name` (as Krita names it: the file's name
+/// up to its first dot, its underscores spaces), with its preview if it has one, if it is one.
+fn add_mypaint(made: &mut Record, name: &str, json: &[u8], preview: Option<Vec<u8>>) {
+    let name = name.replace('_', " ");
+    let name = name.as_str();
+    let Ok(text) = std::str::from_utf8(json) else { return };
+    if crate::mypaint::MyPaint::read(text).is_none() {
+        return;
+    }
+    let mut data = Record::new();
+    data.field(4, text.as_bytes());
+    let mut brush = Record::new();
+    brush.field(1, name.as_bytes()).field(2, &data.bytes());
+    if let Some(png) = preview.filter(|p| p.starts_with(b"\x89PNG")) {
+        brush.field(3, &png);
+    }
+    made.field(1, &brush.bytes());
+}
+
+/// The MyPaint JSON a preset of Krita's MyPaint engine keeps (as text, or in base64).
+fn mypaint_json(preset: &Preset) -> Option<String> {
+    let kept = preset.get("MyPaint/json")?.trim();
+    if kept.starts_with('{') {
+        return Some(kept.to_owned());
+    }
+    String::from_utf8(crate::files::base64(kept)?).ok()
 }
 
 /// A brush made of preset `kpp`, its pictures found in it or by `find`, if it is one this engine
@@ -49,6 +92,13 @@ pub fn import(name: &str, bytes: &[u8]) -> Vec<u8> {
 fn add(made: &mut Record, kpp: &[u8], find: &dyn Fn(&str) -> Option<Vec<u8>>) {
     let Some(text) = preset_text(kpp) else { return };
     let Some(preset) = Preset::read(&text) else { return };
+    // Krita's MyPaint engine's: the MyPaint brush it keeps
+    if preset.paintop == "mypaintbrush" {
+        if let Some(json) = mypaint_json(&preset) {
+            add_mypaint(made, &preset.name, json.as_bytes(), png_picture_only(kpp));
+        }
+        return;
+    }
     if !crate::brush::ENGINES.contains(&preset.paintop.as_str()) {
         return;
     }
@@ -132,6 +182,10 @@ pub fn load(data: &[u8], light: bool) -> Option<Brush> {
     let mut files: Vec<(String, &[u8])> = Vec::new();
     for (id, value) in fields(data) {
         match id {
+            4 => {
+                let settings = crate::mypaint::MyPaint::read(&String::from_utf8_lossy(value))?;
+                return Brush::mypaint(settings, light);
+            }
             1 => text = Some(String::from_utf8_lossy(value).into_owned()),
             2 => {
                 let (mut name, mut bytes) = (String::new(), &[][..]);
@@ -190,6 +244,44 @@ mod tests {
             }
         }
         out
+    }
+
+    /// An SVG tip is drawn as Krita draws one: 1000 pixels across, black where it paints, at the
+    /// preset's scale; and a MyPaint brush file in a bundle comes in by Krita's name for it.
+    #[test]
+    fn an_svg_tip_and_a_mypaint_brush_come_in() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 50"><rect x="0" y="0" width="50" height="50"/></svg>"#;
+        let xml = r#"<Preset name="S" paintopid="paintbrush"><param name="brush_definition"><![CDATA[<Brush type="svg_brush" scale="0.5" spacing="0.2" BrushVersion="2" filename="half.svg"/>]]></param></Preset>"#;
+        let mut file = Record::new();
+        file.field(1, b"half.svg").field(2, svg);
+        let mut data = Record::new();
+        data.field(1, xml.as_bytes()).field(2, &file.bytes());
+        let data = data.bytes();
+        let brush = load(&data, false).unwrap();
+        assert_eq!((brush.tip.width, brush.tip.height), (500.0, 250.0));
+        let m = &brush.tip.masks[0];
+        assert_eq!((m.width, m.height), (1000, 500));
+        // painting on its left half, nothing on its right
+        assert!(m.pixels[(250 * 1000 + 250) as usize] > 250 && m.pixels[(250 * 1000 + 750) as usize] < 5);
+        // light: its size only
+        assert_eq!(load(&data, true).unwrap().tip.width, 500.0);
+        // a bundle's MyPaint brush file, by its name with spaces, drawn by MyPaint's engine
+        let myb = br#"{"version": 3, "settings": {"radius_logarithmic": {"base_value": 1.0, "inputs": {}}}}"#;
+        let made = import("x.myb", myb);
+        let (_, made) = fields(&made).next().unwrap();
+        let mut name = String::new();
+        let mut kept = Vec::new();
+        for (f, v) in fields(made) {
+            match f {
+                1 => name = String::from_utf8_lossy(v).into_owned(),
+                2 => kept = v.to_vec(),
+                _ => {}
+            }
+        }
+        assert_eq!(name, "x");
+        let brush = load(&kept, true).unwrap();
+        assert_eq!(brush.mypaint.as_ref().unwrap().base(crate::mypaint::RADIUS_LOGARITHMIC), 1.0);
+        assert_eq!(brush.tip.masks.len(), crate::mypaint::HARDNESSES as usize);
     }
 
     /// A colour picture tip paints as its preset says Krita applies it, and at twice its scale in a
@@ -450,7 +542,8 @@ mod tests {
         assert!(!dabs.is_empty());
         assert!(dabs.iter().all(|d| d.flags & (16 | 512 | 2048) == 16 | 512 | 2048 && d.kind == 2 + 16));
         assert!((dabs[0].extra[2] - std::f32::consts::FRAC_PI_2).abs() < 1e-4);
-        assert!((dabs[0].diameter - 30.0).abs() < 0.5, "{}", dabs[0].diameter);
+        // (each dab as much smaller as the app lays its tip's picture past it)
+        assert!((dabs[0].diameter + std::f32::consts::SQRT_2 - 30.0).abs() < 0.5, "{}", dabs[0].diameter);
         let blur = r#"<param name="Filter/id"><![CDATA[gaussian blur]]></param><filterconfig version="1"><param name="horizRadius"><![CDATA[5]]></param><param name="vertRadius"><![CDATA[5]]></param></filterconfig>"#;
         let dabs = drawn("filter", blur, 20.0);
         assert!(!dabs.is_empty() && dabs.iter().all(|d| d.flags & (16 | 512 | 4096 | 8192) == 16 | 512 | 4096 | 8192));
@@ -524,7 +617,7 @@ mod tests {
             40.0,
         );
         assert!(dabs.len() > 30);
-        assert!(dabs.iter().all(|d| (d.diameter - 12.0).abs() < 0.5 && d.opacity == 1.0));
+        assert!(dabs.iter().all(|d| (d.diameter + std::f32::consts::SQRT_2 - 12.0).abs() < 0.5 && d.opacity == 1.0));
         // the preset's opacity whatever the pressure: the quick brush has no opacity option
         let xml = r#"<Preset name="Q" paintopid="roundmarker"><param name="diameter"><![CDATA[12]]></param><param name="OpacityValue"><![CDATA[1]]></param></Preset>"#;
         let mut data = Record::new();
@@ -570,7 +663,8 @@ mod tests {
         let dabs = drawn("sketchbrush", lines, 40.0);
         // a line for each move at the least, and more back to the points it passed
         assert!(dabs.len() > 40, "{}", dabs.len());
-        assert!(dabs.iter().all(|d| d.tip == 1 && d.ratio <= 1.0));
+        // (lines a pixel thin with the thin line tips)
+        assert!(dabs.iter().all(|d| matches!(d.tip, 1 | 3 | 4) && d.ratio <= 1.0));
         assert!(dabs.iter().any(|d| d.diameter > 6.0), "lines longer than a move");
     }
 
@@ -598,10 +692,11 @@ mod tests {
         assert!(!dabs.is_empty() && dabs.len().is_multiple_of(29), "{}", dabs.len());
         let per_move = dabs.len() / 29;
         assert!((20..=40).contains(&per_move), "{per_move}");
-        assert!(dabs.iter().all(|d| d.tip == 1 && d.ratio <= 1.0 && d.opacity <= 1.0));
-        // spread by the scale: twice the tip's reach from the path
-        assert!(dabs.iter().all(|d| (d.y - 50.0).abs() <= 7.0), "within reach");
-        assert!(dabs.iter().any(|d| (d.y - 50.0).abs() >= 3.5), "spread");
+        assert!(dabs.iter().all(|d| matches!(d.tip, 3 | 4) && d.ratio <= 1.0 && d.opacity <= 1.0));
+        // spread by the scale: twice the tip's reach from the path (each half a pixel on, as Krita
+        // lays a bristle's points)
+        assert!(dabs.iter().all(|d| (d.y - 50.5).abs() <= 7.0), "within reach");
+        assert!(dabs.iter().any(|d| (d.y - 50.5).abs() >= 3.5), "spread");
     }
 
     /// Krita 3's chalk brush: its speckled round tip at every pixel; its dyna brush: circles a
@@ -611,7 +706,7 @@ mod tests {
         let chalk = drawn("chalkbrush", r#"<param name="Chalk/radius"><![CDATA[3]]></param>"#, 10.0);
         // a dab at every pixel of the path (30 samples 3 apart), each 7 across
         assert!(chalk.len() >= 80, "{}", chalk.len());
-        assert!(chalk.iter().all(|d| (d.diameter - 7.0).abs() < 0.01));
+        assert!(chalk.iter().all(|d| (d.diameter + std::f32::consts::SQRT_2 - 7.0).abs() < 0.01));
         let dots = r#"<param name="Dyna/action"><![CDATA[0]]></param><param name="Dyna/diameter"><![CDATA[3]]></param><param name="Dyna/mass"><![CDATA[0]]></param><param name="Dyna/drag"><![CDATA[0.65]]></param><param name="Dyna/width"><![CDATA[0.1]]></param>"#;
         let dyna = drawn("dynabrush", dots, 10.0);
         // a circle for each move after the first two (the weight starting where the pen first was)
@@ -677,7 +772,7 @@ mod tests {
         let dabs = drawn("hatchingbrush", hatching, 20.0);
         assert!(!dabs.is_empty() && dabs.iter().all(|d| d.flags & 8 == 0), "no masking stroke");
         // level lines on the canvas's rows a separation apart
-        assert!(dabs.iter().all(|d| d.angle.abs() < 1e-3 && d.tip == 1), "level");
+        assert!(dabs.iter().all(|d| d.angle.abs() < 1e-3 && d.tip == 3), "level");
         assert!(dabs.iter().all(|d| (d.y.rem_euclid(4.0)).min(4.0 - d.y.rem_euclid(4.0)) < 0.01), "on the rows");
         assert!(dabs.iter().any(|d| (d.y - 44.0).abs() < 0.01) && dabs.iter().any(|d| (d.y - 56.0).abs() < 0.01));
         // one dab's lines: inside its round tip, 20 across, not out in its box's corners
