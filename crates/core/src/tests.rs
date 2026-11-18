@@ -2575,6 +2575,442 @@ fn what_runs_ahead_of_a_predicted_stroke_shows_as_worked_out_at_each_sample() {
     assert!(tipped > 0, "a pen showing its tip among them");
 }
 
+/// A stroke's end made after the stamps it has laid is what making it whole gives after them, and
+/// those are as they were laid: every brush the app comes with, by a pen drawing with its tip and
+/// without, and a finger.
+#[test]
+fn a_strokes_end_made_after_what_it_laid_is_its_end_made_whole() {
+    use procraft_engine::input::{Pointer, Sample};
+    use procraft_engine::stroke::StrokeBuilder;
+    let at = |k: usize| Sample {
+        pos: procraft_engine::geom::Vec2::new(20.0 + k as f32 * 1.5, 200.0 + (k as f32 * 0.04).sin() * 90.0),
+        pressure: 0.3 + 0.6 * (k as f32 * 0.07).sin().abs(),
+        tilt: 0.5,
+        azimuth: 0.3,
+        roll: 0.0,
+        time_ms: k as f64 * 4.17,
+    };
+    let (mut tried, mut cut) = (0, 0);
+    for set in crate::stock_library::shipped().iter() {
+        for brush in &set.brushes {
+            for (pointer, tipped) in [(Pointer::Stylus, true), (Pointer::Stylus, false), (Pointer::Finger, false)] {
+                let mut b = StrokeBuilder::with_seed(brush.clone(), 26.0, pointer, 11);
+                if tipped && !b.shows_tip() {
+                    continue;
+                }
+                // laid as the canvas lays it: what is drawn for good (with its tip), or each stamp
+                // as it comes, the first few again once they turn the way the stroke goes
+                let mut laid = Vec::new();
+                for e in 0..90 {
+                    let samples = [at(2 * e), at(2 * e + 1)];
+                    if tipped {
+                        laid.extend(b.add_kept(&samples));
+                        b.preview_tip(&[at(2 * e + 2)]);
+                    } else {
+                        let stamps = b.add(&samples);
+                        if b.take_turned() {
+                            laid = b.placed_stamps();
+                        } else {
+                            laid.extend(stamps);
+                        }
+                    }
+                }
+                let lifted = b.add(&[at(180)]);
+                if !tipped {
+                    laid.extend(lifted);
+                }
+                let all = b.clone().finish();
+                tried += 1;
+                if let Some(rest) = b.finish_after(laid.len()) {
+                    cut += 1;
+                    assert!(all.get(..laid.len()) == Some(laid.as_slice()), "{}: what was laid changed", brush.name);
+                    assert!(all.get(laid.len()..) == Some(rest.as_slice()), "{}: its end made differently", brush.name);
+                }
+            }
+        }
+    }
+    assert!(cut * 4 > tried * 3, "{cut} of {tried} strokes' ends made after what they laid");
+}
+
+/// A dual brush's stroke ends laying only what follows the stamps it and its second have laid (a
+/// long stroke of wet paint laid whole again held the next stroke up), and comes out as laid whole:
+/// wet and dry paint laid in place, with a second inside the stroke or reaching past it, and paint
+/// built up in the stroke by its rule.
+#[test]
+fn a_dual_brushs_stroke_ends_laying_only_the_rest_as_laid_whole() {
+    let side = 256;
+    let names = ["Lestrade", "Aberdeen", "Whitsand Bay", "Petrel", "Trevose", "Quagga", "Garnet Rose", "Merlin"];
+    for name in names {
+        let ended = |whole: bool| -> Option<(Vec<u8>, u64, bool, usize)> {
+            let s = session(side, side)?;
+            let (set, index) = library_brush(&s, |b| b.name == name)?;
+            assert!(s.select_brush(set, index));
+            s.set_brush_size(0.3);
+            s.set_color(0.7, 0.2, 0.1);
+            {
+                let mut st = s.shared.lock();
+                let canvas = st.canvas.as_mut()?;
+                canvas.lay_ends_whole(whole);
+                // each stamp its own piece of work, to count what the end lays
+                canvas.set_work_at_once(1);
+            }
+            let point = |k: usize| PenSample {
+                pressure: 0.4 + 0.5 * (k as f32 * 0.06).sin().abs(),
+                ..sample(20.0 + k as f32 * 1.6, 128.0 + (k as f32 * 0.05).sin() * 60.0, k as f64 * 4.17)
+            };
+            s.stroke_begin(PointerKind::Stylus, vec![point(0)]);
+            for e in 1..=65 {
+                s.stroke_add(vec![point(2 * e - 1), point(2 * e)]);
+                if e % 2 == 0 {
+                    picture(&s);
+                }
+            }
+            picture(&s);
+            let (dual, laid) = {
+                let st = s.shared.lock();
+                (st.second.is_some(), st.stroke.as_ref()?.stamp_count())
+            };
+            let before = s.shared.lock().canvas.as_ref()?.pieces_sent();
+            s.stroke_end(vec![point(131)]);
+            picture(&s);
+            let sent = s.shared.lock().canvas.as_ref()?.pieces_sent() - before;
+            let current = s.layers().iter().find(|l| l.current).map_or(0, |l| l.id);
+            Some((layer_rgba(&s, current), sent, dual, laid))
+        };
+        let (Some((whole, sent_whole, dual, laid)), Some((rest, sent_rest, ..))) = (ended(true), ended(false)) else {
+            continue;
+        };
+        assert!(dual || name == "Merlin", "{name} is a dual brush");
+        assert_eq!(differ(&whole, &rest), (0, 0), "{name}: ended unlike laid whole");
+        // wet paint laid in place with its second inside it: what it laid isn't laid again at the
+        // end (a second laid by a rule is, which costs little; one reaching past the paint has it
+        // all laid again, a share a frame)
+        if name == "Lestrade" {
+            let saved = sent_whole.saturating_sub(sent_rest);
+            assert!(saved * 2 > laid as u64, "{name}: {sent_rest} pieces at the end against {sent_whole}, {laid} laid");
+        }
+    }
+}
+
+/// A stroke laid again whole as it ends (its end taper reaching back over wet paint) is laid a share
+/// at each frame shown, the picture held as it was until it is all laid, and comes out as laid in
+/// one; meanwhile the next stroke begins and goes on without waiting for it.
+#[test]
+fn a_stroke_laid_again_as_it_ends_goes_on_over_frames_as_the_next_begins() {
+    use procraft_gpu::wgpu;
+    let side = 256;
+    let point = |k: usize, y: f32| PenSample {
+        pressure: 0.4 + 0.5 * (k as f32 * 0.06).sin().abs(),
+        ..sample(20.0 + k as f32 * 1.6, y + (k as f32 * 0.05).sin() * 30.0, k as f64 * 4.17)
+    };
+    let drawn = |sliced: bool| -> Option<(Vec<u8>, Vec<u8>)> {
+        let s = session(side, side)?;
+        let gpu = s.shared.lock().gpu.clone()?;
+        let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("window"),
+            size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let (set, index) = library_brush(&s, |b| b.name == "Lundy")?;
+        assert!(s.select_brush(set, index));
+        s.set_brush_size(0.3);
+        let most = if sliced { std::time::Duration::ZERO } else { std::time::Duration::from_secs(60) };
+        s.shared.lock().canvas.as_mut()?.set_relay_at_once(most);
+        s.stroke_begin(PointerKind::Stylus, vec![point(0, 90.0)]);
+        for e in 1..=65 {
+            s.stroke_add(vec![point(2 * e - 1, 90.0), point(2 * e, 90.0)]);
+            if e % 2 == 0 {
+                framed(&s, &texture, &gpu, side);
+            }
+        }
+        let shown = framed(&s, &texture, &gpu, side);
+        s.stroke_end(vec![point(131, 90.0)]);
+        let lifted = framed(&s, &texture, &gpu, side);
+        let relaying = s.shared.lock().canvas.as_ref()?.relaying();
+        assert_eq!(relaying, sliced, "laid again over frames only when asked to");
+        if sliced {
+            // what shows stays as it was meanwhile
+            assert_eq!(differ(&shown, &lifted), (0, 0), "the picture held while the stroke is laid again");
+        }
+        // the next stroke begins and goes on (while the last is still being laid, laid a share a
+        // frame)
+        s.stroke_begin(PointerKind::Stylus, vec![point(0, 170.0)]);
+        s.stroke_add((1..40).map(|k| point(k, 170.0)).collect());
+        assert_eq!(s.shared.lock().canvas.as_ref()?.relaying(), sliced, "begun before the last was laid again");
+        let settle = || -> usize {
+            let mut frames = 0;
+            while s.shared.lock().canvas.as_ref().is_some_and(procraft_gpu::Canvas::relaying) {
+                framed(&s, &texture, &gpu, side);
+                frames += 1;
+                assert!(frames < 10_000, "laid again in time");
+            }
+            frames
+        };
+        let frames = settle();
+        assert!(!sliced || frames > 1, "laid over {frames} frames");
+        s.stroke_end(vec![point(40, 170.0)]);
+        framed(&s, &texture, &gpu, side);
+        settle();
+        let current = s.layers().iter().find(|l| l.current).map_or(0, |l| l.id);
+        Some((layer_rgba(&s, current), framed(&s, &texture, &gpu, side)))
+    };
+    let (Some((whole, whole_shown)), Some((sliced, sliced_shown))) = (drawn(false), drawn(true)) else { return };
+    assert_eq!(differ(&whole, &sliced), (0, 0), "laid over frames as in one");
+    assert_eq!(differ(&whole_shown, &sliced_shown), (0, 0), "shown as laid in one");
+}
+
+/// With the canvas drawn on its own thread as the apps draw it, a stroke begun right after one whose
+/// end lays it whole again (wet paint whose end taper reaches back) doesn't wait for that: its first
+/// samples are taken while the last is still being laid.
+#[test]
+fn a_stroke_begun_right_after_another_doesnt_wait_for_its_end() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let Some(s) = session(1024, 1024) else { return };
+    let Some((set, index)) = library_brush(&s, |b| b.name == "Lundy") else { return };
+    assert!(s.select_brush(set, index));
+    s.set_brush_size(0.5);
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    // a frame every 8 ms, as a 120 Hz screen asks for them
+    let frames = {
+        let (s, stop) = (s.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let gpu = s.shared.lock().gpu.clone().unwrap();
+            let texture = gpu.device.create_texture(&procraft_gpu::wgpu::TextureDescriptor {
+                label: Some("window"),
+                size: procraft_gpu::wgpu::Extent3d { width: 1024, height: 1024, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: procraft_gpu::wgpu::TextureDimension::D2,
+                format: procraft_gpu::wgpu::TextureFormat::Rgba8Unorm,
+                usage: procraft_gpu::wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&Default::default());
+            while !stop.load(Ordering::Relaxed) {
+                let format = procraft_gpu::wgpu::TextureFormat::Rgba8Unorm;
+                s.draw(&view, format, (1024, 1024), procraft_engine::profile::Profile::Srgb, std::time::Instant::now());
+                gpu.flush();
+                std::thread::sleep(std::time::Duration::from_millis(8));
+            }
+        })
+    };
+    let point = |k: usize, y: f32| PenSample {
+        pressure: 0.4 + 0.5 * (k as f32 * 0.03).sin().abs(),
+        ..sample(40.0 + k as f32 * 2.0, y + (k as f32 * 0.02).sin() * 100.0, k as f64 * 4.17)
+    };
+    let mut waits = Vec::new();
+    for round in 0..3 {
+        let y = 200.0 + 250.0 * round as f32;
+        s.stroke_begin(PointerKind::Stylus, vec![point(0, y)]);
+        for k in 1..=470 {
+            s.stroke_add(vec![point(k, y)]);
+            if k % 2 == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(4));
+            }
+        }
+        let lifted = std::time::Instant::now();
+        s.stroke_end(vec![]);
+        let ended = lifted.elapsed();
+        let begun = std::time::Instant::now();
+        s.stroke_begin(PointerKind::Stylus, vec![point(0, y + 100.0)]);
+        s.stroke_add(vec![point(1, y + 100.0), point(2, y + 100.0)]);
+        let began = begun.elapsed();
+        // how long laying the last again went on after the next began
+        while s.shared.lock().canvas.as_ref().is_some_and(procraft_gpu::Canvas::relaying) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let laid = lifted.elapsed();
+        s.stroke_end(vec![]);
+        waits.push((ended, began, laid));
+    }
+    stop.store(true, Ordering::Relaxed);
+    frames.join().unwrap();
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    for (ended, began, laid) in &waits {
+        eprintln!(
+            "lift {:.1} ms, next begun in {:.1} ms, laid again {:.1} ms after the lift",
+            ms(*ended),
+            ms(*began),
+            ms(*laid)
+        );
+    }
+    // a frame's share of the work, not all of it (as a share: other work on the machine slows each
+    // share as much as the whole; `stroke_end_cost` bounds what they take)
+    for &(ended, began, laid) in &waits {
+        let waited = ended.max(began);
+        if laid > std::time::Duration::from_millis(60) {
+            assert!(
+                waited * 3 < laid,
+                "waited {:.1} ms of the {:.1} ms the last was laid again in",
+                ms(waited),
+                ms(laid)
+            );
+        }
+    }
+}
+
+/// Paint laid in place whose end taper reaches back over what it has laid (wet, wet with a second,
+/// dry built up gradually) ends laid again where the taper reaches: ended with only the stamps after
+/// those laid, as a smudge is, its end would keep the stamps it had before it tapered. Without an
+/// end taper, ending either way leaves the same.
+#[test]
+fn paint_laid_in_place_whose_end_taper_reaches_back_lays_it_again() {
+    let side = 256;
+    for (name, tapers) in [("Lundy", true), ("Kingsley", true), ("Petrel", true), ("Whitsand Bay", false)] {
+        let ended = |only_the_rest: bool| -> Option<Vec<u8>> {
+            let s = session(side, side)?;
+            let (set, index) = library_brush(&s, |b| b.name == name)?;
+            assert!(s.select_brush(set, index));
+            s.set_brush_size(0.3);
+            s.set_color(0.1, 0.3, 0.7);
+            let point = |k: usize| PenSample {
+                pressure: 0.4 + 0.5 * (k as f32 * 0.06).sin().abs(),
+                ..sample(20.0 + k as f32 * 1.6, 128.0 + (k as f32 * 0.05).sin() * 60.0, k as f64 * 4.17)
+            };
+            s.stroke_begin(PointerKind::Stylus, vec![point(0)]);
+            for e in 1..=65 {
+                s.stroke_add(vec![point(2 * e - 1), point(2 * e)]);
+                if e % 2 == 0 {
+                    picture(&s);
+                }
+            }
+            picture(&s);
+            if only_the_rest {
+                let mut guard = s.shared.lock();
+                let st = &mut *guard;
+                let (mut builder, canvas) = (st.stroke.take()?, st.canvas.as_mut()?);
+                assert!(canvas.stroke_tool().is_some());
+                if let Some(mut second) = st.second.take() {
+                    canvas.replace_second_stamps(&second.finish());
+                }
+                let drawn = builder.stamp_count();
+                builder.hold_laid();
+                canvas.add_stamps(builder.finish().get(drawn..).unwrap_or_default());
+                canvas.end_stroke();
+            } else {
+                s.stroke_end(vec![]);
+            }
+            picture(&s);
+            let current = s.layers().iter().find(|l| l.current).map_or(0, |l| l.id);
+            Some(layer_rgba(&s, current))
+        };
+        let (Some(laid_again), Some(rest)) = (ended(false), ended(true)) else { continue };
+        let (most, _) = differ(&laid_again, &rest);
+        assert_eq!(most > 8, tapers, "{name}: its end differs by {most} ended with only the rest");
+    }
+}
+
+/// What a stroke's end costs the pen and the next stroke, with the canvas drawn on its own thread a
+/// frame every 8 ms as the apps draw it: a pen event's work (its samples and their prediction),
+/// the lift, the next stroke's start (begun and its first samples taken) and how long after the
+/// lift the end's work is all done, for an oil (wet, with a second), a pencil (dry paint laid in
+/// place, with a second), two inking pens shown with their tips and a plain round brush.
+/// `END_COST_BRUSHES` lists others (`,` between). Each fails past a bound that stays good on a
+/// tablet: an event within half a 240 Hz pen's interval, the lift and the next start within a
+/// 60 Hz frame. Run alone with `--ignored --nocapture` (other work on the machine slows all of it).
+#[test]
+#[ignore]
+fn stroke_end_cost() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    let names =
+        std::env::var("END_COST_BRUSHES").unwrap_or_else(|_| "Lestrade,Aberdeen,Merlin,Tundra,Austen".to_owned());
+    let (event_most, wait_most) = (Duration::from_micros(2100), Duration::from_micros(16_700));
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    let mut failed = Vec::new();
+    println!("brush\tevent_ms\tlift_ms\tnext_start_ms\tend_done_ms");
+    for name in names.split(',') {
+        let Some(s) = session(2048, 1600) else { return };
+        let Some((set, index)) = library_brush(&s, |b| b.name == name) else { continue };
+        assert!(s.select_brush(set, index));
+        s.set_brush_size(0.4);
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let frames = {
+            let (s, stop) = (s.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let gpu = s.shared.lock().gpu.clone().unwrap();
+                let texture = gpu.device.create_texture(&procraft_gpu::wgpu::TextureDescriptor {
+                    label: Some("window"),
+                    size: procraft_gpu::wgpu::Extent3d { width: 2048, height: 1600, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: procraft_gpu::wgpu::TextureDimension::D2,
+                    format: procraft_gpu::wgpu::TextureFormat::Rgba8Unorm,
+                    usage: procraft_gpu::wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                });
+                let view = texture.create_view(&Default::default());
+                while !stop.load(Ordering::Relaxed) {
+                    let started = Instant::now();
+                    let format = procraft_gpu::wgpu::TextureFormat::Rgba8Unorm;
+                    s.draw(&view, format, (2048, 1600), procraft_engine::profile::Profile::Srgb, started);
+                    gpu.flush();
+                    std::thread::sleep(Duration::from_millis(8).saturating_sub(started.elapsed()));
+                }
+            })
+        };
+        // a quick wavy stroke of 150 pen events (two samples each, 240 a second), pressed unevenly
+        let point = |k: usize, y0: f32| PenSample {
+            pressure: 0.3 + 0.6 * (k as f32 / 15.0).sin().abs(),
+            ..sample(100.0 + k as f32 * 4.67, y0 + (k as f32 / 25.0).sin() * 300.0, k as f64 * 4.17)
+        };
+        let (mut events, mut lifts, mut starts, mut done) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for round in 0..4 {
+            let y0 = 400.0 + 250.0 * round as f32;
+            s.stroke_begin(PointerKind::Stylus, vec![point(0, y0)]);
+            for e in 1..=150 {
+                let t = Instant::now();
+                s.stroke_add(vec![point(2 * e - 1, y0), point(2 * e, y0)]);
+                s.stroke_predict(vec![point(2 * e + 1, y0), point(2 * e + 2, y0)]);
+                if round > 0 {
+                    events.push(t.elapsed());
+                }
+                std::thread::sleep(Duration::from_micros(4170));
+            }
+            let lift = Instant::now();
+            s.stroke_end(vec![]);
+            let lifted = lift.elapsed();
+            let t = Instant::now();
+            s.stroke_begin(PointerKind::Stylus, vec![point(0, y0 + 120.0)]);
+            s.stroke_add(vec![point(1, y0 + 120.0), point(2, y0 + 120.0)]);
+            let started = t.elapsed();
+            while s.shared.lock().canvas.as_ref().is_some_and(procraft_gpu::Canvas::relaying) {
+                std::thread::sleep(Duration::from_micros(500));
+            }
+            let ended = lift.elapsed();
+            s.stroke_end(vec![]);
+            std::thread::sleep(Duration::from_millis(200));
+            // (the first round warms the brush's pictures and the GPU up)
+            if round > 0 {
+                lifts.push(lifted);
+                starts.push(started);
+                done.push(ended);
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        frames.join().unwrap();
+        events.sort();
+        let event = events.get(events.len() / 2).copied().unwrap_or_default();
+        let most = |v: &[Duration]| v.iter().copied().max().unwrap_or_default();
+        let (lift, start, end) = (most(&lifts), most(&starts), most(&done));
+        println!("{name}\t{:.3}\t{:.2}\t{:.2}\t{:.1}", ms(event), ms(lift), ms(start), ms(end));
+        if event > event_most || lift > wait_most || start > wait_most {
+            failed.push(name.to_owned());
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "past the bounds (event {:.1} ms, lift and next start {:.1} ms): {failed:?}",
+        ms(event_most),
+        ms(wait_most)
+    );
+}
+
 #[test]
 fn a_finger_strokes_head_is_drawn_in_its_layer_under_those_above() {
     let Some(s) = session(100, 100) else { return };
