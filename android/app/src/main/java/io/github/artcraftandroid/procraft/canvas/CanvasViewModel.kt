@@ -1637,6 +1637,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             val s = withContext(Dispatchers.IO) {
                 CanvasSession.newCustom(p.width.toUInt(), p.height.toUInt(), p.dpi, rgb, !p.backgroundHidden, "Untitled Artwork").also {
                     it.setNewProfile(p.profile)
+                    it.enableAnimationForNewArtwork()
                     loadBrushes(it)
                 }
             }
@@ -1669,7 +1670,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                     loadBrushes(it)
                 }
                 if (kind == null) {
-                    made
+                    made.also { it.enableAnimationForNewArtwork() }
                 } else {
                     val canvas = plugins.openCanvas(kind, width.coerceAtLeast(1).toUInt(), height.coerceAtLeast(1).toUInt(), null)
                     made.takeIf { canvas != null && it.attachPluginCanvas(kind, canvas) }

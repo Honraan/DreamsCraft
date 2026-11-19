@@ -83,6 +83,8 @@ use winit::window::{Window, WindowId};
 use crate::screen::Screen;
 use crate::ui::{Action, Interface};
 
+const APP_NAME: &str = "DreamsCraft";
+
 /// A new artwork's size when the screen's isn't known.
 const FALLBACK_CANVAS: (u32, u32) = (1920, 1080);
 
@@ -414,7 +416,7 @@ impl ApplicationHandler for App {
             return;
         }
         let attributes = Window::default_attributes()
-            .with_title("ProCraft")
+            .with_title(APP_NAME)
             .with_window_icon(window_icon())
             .with_inner_size(LogicalSize::new(1440.0, 900.0))
             .with_min_inner_size(LogicalSize::new(640.0, 480.0))
@@ -841,7 +843,7 @@ impl App {
         let edits = session.edits();
         let saved = edits == self.ui.saved_edits || session.edits_saved() == Some(edits);
         let unsaved = if saved { "" } else { " •" };
-        let title = format!("{}{unsaved} — ProCraft", session.name());
+        let title = format!("{}{unsaved} — {APP_NAME}", session.name());
         if title != self.title {
             screen.window.set_title(&title);
             self.title = title;
@@ -937,9 +939,9 @@ impl App {
         if let Some(soon) = soon {
             self.again = Some(self.again.map_or(soon, |due| due.min(soon)));
         }
-        if self.title != "ProCraft" {
-            screen.window.set_title("ProCraft");
-            self.title = "ProCraft".into();
+        if self.title != APP_NAME {
+            screen.window.set_title(APP_NAME);
+            self.title = APP_NAME.into();
         }
         self.zoom_on();
         // Project canvas is black while the gallery shows
@@ -959,6 +961,7 @@ impl App {
             Some(gallery::Asked::New(preset, folder)) => {
                 if !busy {
                     let session = files::new_from_preset(&preset);
+                    session.enable_animation_for_new_artwork();
                     let dir = self.gallery.store.new_folder(folder);
                     // its time-lapse made as the preset says
                     files::keep_preset_time_lapse(&preset, &dir);
@@ -971,6 +974,7 @@ impl App {
                     let (w, h) = self.gallery.screen_px;
                     let session = CanvasSession::new(w, h);
                     session.set_new_profile(procraft_core::P3.into());
+                    session.enable_animation_for_new_artwork();
                     let dir = self.gallery.store.new_folder(folder);
                     self.open_artwork(session, dir);
                     self.ui.started_new();

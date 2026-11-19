@@ -6522,6 +6522,19 @@ fn layers_export_as_animations() {
 }
 
 #[test]
+fn new_animation_artwork_starts_on_its_first_frame_without_an_undo_step() {
+    let s = CanvasSession::new(40, 40);
+    assert!(s.animation_settings().is_none());
+
+    s.enable_animation_for_new_artwork();
+
+    assert_eq!(s.animation_frames().len(), 1);
+    assert_eq!(s.current_frame(), Some(0));
+    assert!(s.undo().is_none());
+    assert!(s.animation_settings().is_some());
+}
+
+#[test]
 fn animation_assist_shows_onion_skins_and_plays() {
     let Some(s) = session(40, 40) else { return };
     s.set_brush_size(0.6);

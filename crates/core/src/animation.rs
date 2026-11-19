@@ -344,6 +344,13 @@ impl From<&Animation> for AnimationSettings {
 
 #[uniffi::export]
 impl CanvasSession {
+    /// Enables the timeline on a newly created canvas before it is opened, without an undo step.
+    pub fn enable_animation_for_new_artwork(&self) {
+        let mut st = self.shared.lock();
+        st.doc.animation.get_or_insert_with(Animation::default);
+        self.shared.frame(&mut st);
+    }
+
     /// Turns Animation Assist on (its settings as they start) or off, as an undo step.
     pub fn set_animation_assist(&self, on: bool) -> bool {
         self.set_assist(on, false)
