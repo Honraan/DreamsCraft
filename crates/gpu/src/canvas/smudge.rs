@@ -23,11 +23,11 @@ pub(super) const TILE: u32 = 256;
 
 /// Where a copy from a texture may put its rows in a window's buffer: at a multiple of this many
 /// bytes. Direct3D 12 without unrestricted copy pitches (on Windows 10, and with older drivers, as
-/// many integrated GPUs have) places them only so: wgpu copies to any other offset through a
-/// buffer of its own and copies that back whole, the rest of each row with it, so a tile copied
-/// into a window wider than it wrote over its neighbours in the window with whatever that buffer
-/// held (blocks of the layer gone, stale or doubled as the stroke went on).
-const PLACEMENT: u32 = 512;
+/// many integrated GPUs have) places them only so (see `crate::placed`): a tile copied into a
+/// window wider than it anywhere else wrote over its neighbours in the window with whatever
+/// wgpu's buffer for the copy held (blocks of the layer gone, stale or doubled as the stroke went
+/// on).
+const PLACEMENT: u32 = crate::placed::PLACEMENT as u32;
 const _: () = assert!(TILE.is_multiple_of(PLACEMENT / 4), "tiles start on a column copies can start at");
 
 /// The most bytes a window takes for work laid together in it: past it, the work goes in windows of
@@ -240,30 +240,28 @@ pub(super) fn tile_rect((x, y): (u32, u32)) -> IRect {
     IRect::new(at(x), at(y), at(x + 1), at(y + 1))
 }
 
-/// Copies `size` of a texture from `from` into a window's buffer at `into`; where `placed` says to
-/// (for tests), as Direct3D 12 without unrestricted copy pitches does (see [`PLACEMENT`]): a copy
-/// to an offset it can't place goes through a buffer of its own, holding anything (here every byte
-/// 255), and all of that is copied back.
+/// Copies `size` of a texture from `from` into a window's buffer at `into`: at once where that
+/// starts at a multiple of [`PLACEMENT`], else a row at a time (a window too big to be laid out
+/// so, see [`window_reach`]), as a copy of one row writes nothing past it wherever it starts.
 fn copy_to_window(
-    device: &wgpu::Device,
+    gpu: &Gpu,
     encoder: &mut wgpu::CommandEncoder,
     from: wgpu::TexelCopyTextureInfo<'_>,
     into: wgpu::TexelCopyBufferInfo<'_>,
     size: wgpu::Extent3d,
-    placed: bool,
 ) {
     let layout = into.layout;
-    if !placed || layout.offset.is_multiple_of(u64::from(PLACEMENT)) {
-        encoder.copy_texture_to_buffer(from, into, size);
+    if layout.offset.is_multiple_of(u64::from(PLACEMENT)) || size.height <= 1 {
+        gpu.copy_texture_to_buffer(encoder, from, into, size);
         return;
     }
     let row = layout.bytes_per_row.unwrap_or(0);
-    let bytes = u64::from(row) * u64::from(size.height.saturating_sub(1)) + 4 * u64::from(size.width);
-    let filler = vec![255; usize::try_from(bytes).unwrap_or(0)];
-    let usage = wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
-    let staged = super::buffer_init(device, "placed copy", &filler, usage);
-    encoder.copy_texture_to_buffer(from, in_buffer(&staged, 0, row, size.height), size);
-    encoder.copy_buffer_to_buffer(&staged, 0, into.buffer, layout.offset, bytes);
+    for y in 0..size.height {
+        let from =
+            wgpu::TexelCopyTextureInfo { origin: wgpu::Origin3d { y: from.origin.y + y, ..from.origin }, ..from };
+        let at = layout.offset + u64::from(row) * u64::from(y);
+        gpu.copy_texture_to_buffer(encoder, from, in_buffer(into.buffer, at, row, 1), extent(size.width, 1));
+    }
 }
 
 /// A buffer for a window.
@@ -292,10 +290,13 @@ impl Canvas {
     }
 
     /// Whether a window over `reach` fits a binding, as it would for the open smudge stroke (its
-    /// amount buffer can take two halves), within `most` bytes.
+    /// amount buffer can take two halves), within `most` bytes; and laid in buffers, rows
+    /// [`row_bytes`] apart, within what a binding holds. (Its rows take up to twice its pixels', 256
+    /// bytes apart: work cut close to what a binding holds by those alone wasn't laid.)
     fn window_fits(&self, reach: IRect, most: u64) -> bool {
         let halves = self.smudge.as_ref().map_or(1, |s| s.keeps.halves());
         window_bytes(reach).saturating_mul(halves) <= most
+            && laid_bytes(reach).saturating_mul(halves) <= self.smudge_room
     }
 
     /// Whether a piece reaching `reach` can be laid in a window of its own.
@@ -472,8 +473,9 @@ impl Canvas {
         }
         let reach = if reach.is_empty() { IRect::new(0, 0, 1, 1) } else { reach }.intersect(self.full());
         // laid out so that copies into it start where any API places them, where a binding holds
-        // that (else as it is: only a window close to the most a binding holds is that big)
-        let room = Self::smudge_room_for(&gpu.device);
+        // that (else as it is, its tiles' parts copied in a row at a time: only a window close to
+        // the most a binding holds is that big)
+        let room = self.smudge_room;
         let halves = self.smudge.as_ref().map_or(1, |s| s.keeps.halves());
         let fits = |r: IRect| laid_bytes(r).saturating_mul(halves) <= room;
         let reach = Some(window_reach(reach)).filter(|r| fits(*r)).unwrap_or(reach);
@@ -581,7 +583,7 @@ impl Canvas {
             }
         }
         drop(pass);
-        self.window_out(encoder, reach, writes, (work, kept));
+        self.window_out(gpu, encoder, reach, writes, (work, kept));
         true
     }
 
@@ -615,7 +617,7 @@ impl Canvas {
         let device = &gpu.device;
         let full = self.full();
         let also = self.smudge_also();
-        let placed = self.placed_copies;
+        let room = self.smudge_room;
         let Some(smudge) = self.smudge.as_mut() else { return false };
         let Some(layer) = self.layers.get(&smudge.into) else { return false };
         let also: Vec<&wgpu::Texture> = also.iter().filter_map(|id| self.layers.get(id)).map(|l| &l.texture).collect();
@@ -639,7 +641,7 @@ impl Canvas {
             let invalid = device.push_error_scope(wgpu::ErrorFilter::Validation);
             let window = small.then(|| {
                 // grown in steps, so a stroke that reaches further doesn't make them every frame
-                let most = Self::smudge_room_for(device) / keeps.halves();
+                let most = room / keeps.halves();
                 let bytes = bytes.next_multiple_of(1 << 20).min(most).max(bytes);
                 let side = |n: u32, of: u32| n.next_multiple_of(256).min(of).max(n);
                 let before =
@@ -708,12 +710,12 @@ impl Canvas {
         let size = extent(width, height);
         // the layer as the stroke has left it, and as it was where the stroke hasn't been
         let from_layer = copy_at(&layer.texture, reach.x0, reach.y0);
-        encoder.copy_texture_to_buffer(from_layer, in_buffer(&window.work, 0, row, height), size);
+        gpu.copy_texture_to_buffer(encoder, from_layer, in_buffer(&window.work, 0, row, height), size);
         if before {
             encoder.copy_texture_to_texture(from_layer, copy_at(&window.before, 0, 0), size);
         }
         if let Some(grained) = &window.grained {
-            encoder.copy_texture_to_buffer(from_layer, in_buffer(grained, 0, row, height), size);
+            gpu.copy_texture_to_buffer(encoder, from_layer, in_buffer(grained, 0, row, height), size);
         }
         if let Some(amount) = &window.amount {
             encoder.clear_buffer(amount, 0, Some(bytes * keeps.halves()));
@@ -743,7 +745,7 @@ impl Canvas {
             for (kept, buffer, start) in halves {
                 if let (Some(kept), Some(buffer)) = (kept, buffer) {
                     let into = in_buffer(buffer, start + offset, row, r.height());
-                    copy_to_window(device, encoder, copy_at(kept, x, y), into, size, placed);
+                    copy_to_window(gpu, encoder, copy_at(kept, x, y), into, size);
                 }
             }
         }
@@ -755,6 +757,7 @@ impl Canvas {
     /// keeps (`kept`).
     fn window_out(
         &mut self,
+        gpu: &Gpu,
         encoder: &mut wgpu::CommandEncoder,
         reach: IRect,
         changed: IRect,
@@ -769,7 +772,8 @@ impl Canvas {
         let bytes = u64::from(row) * u64::from(reach.height());
         let offset = |r: IRect| in_window(reach, r);
         if work {
-            encoder.copy_buffer_to_texture(
+            gpu.copy_buffer_to_texture(
+                encoder,
                 in_buffer(&window.work, offset(changed), row, changed.height()),
                 copy_at(&layer.texture, changed.x0, changed.y0),
                 extent(changed.width(), changed.height()),
@@ -794,7 +798,8 @@ impl Canvas {
             ];
             for (kept, buffer, start) in halves {
                 if let (Some(kept), Some(buffer)) = (kept, buffer) {
-                    encoder.copy_buffer_to_texture(
+                    gpu.copy_buffer_to_texture(
+                        encoder,
                         in_buffer(buffer, start + offset(r), row, r.height()),
                         copy_at(kept, x, y),
                         size,
@@ -999,6 +1004,58 @@ mod tests {
         assert_eq!(tiles, [(0, 0), (1, 0), (0, 1), (1, 1), (0, 2), (1, 2)]);
         assert_eq!(tiles_of(IRect::EMPTY).count(), 0);
         assert_eq!(part(0, 0, 255, 255), WHOLE);
+    }
+
+    /// A tile's part copied into a window where a copy can't be placed (one too big for a binding
+    /// once laid out from a column copies can start at) writes its rows and nothing between them,
+    /// where Direct3D 12 without unrestricted copy pitches copies to such an offset (see
+    /// `crate::placed`): copied at once, it wrote over its neighbours' rows there.
+    #[test]
+    fn a_tile_s_part_copied_into_a_window_where_copies_aren_t_placed_leaves_the_rest_be() {
+        let Ok(gpu) = Gpu::headless() else { return };
+        let device = &gpu.device;
+        let tile = texture(device, "tile", TILE, TILE, LAYER_FORMAT);
+        let pixels: Vec<u8> = (0..TILE * TILE * 4).map(|i| (i % 251) as u8).collect();
+        gpu.queue.write_texture(
+            copy_at(&tile, 0, 0),
+            &pixels,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(TILE * 4), rows_per_image: None },
+            extent(TILE, TILE),
+        );
+        // a window from a column copies can't start at, over the second tile's first rows
+        let reach = IRect::new(100, 0, 400, 20);
+        let row = row_bytes(reach.width());
+        let bytes = u64::from(row) * u64::from(reach.height());
+        let window = window_buffer(device, "window", bytes);
+        let r = tile_rect((1, 0)).intersect(reach);
+        let offset = in_window(reach, r);
+        assert_ne!(offset % u64::from(PLACEMENT), 0);
+        let read = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        gpu.emulate_placed_copies(true);
+        gpu.queue.write_buffer(&window, 0, &vec![0xAB; bytes as usize]);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let into = in_buffer(&window, offset, row, r.height());
+        copy_to_window(&gpu, &mut encoder, copy_at(&tile, 0, 0), into, extent(r.width(), r.height()));
+        encoder.copy_buffer_to_buffer(&window, 0, &read, 0, bytes);
+        gpu.queue.submit([encoder.finish()]);
+        read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let got = read.slice(..).get_mapped_range().unwrap().to_vec();
+        // each row the tile's own where it copied to, and as it was all round
+        let (row, offset, wide) = (row as usize, offset as usize, r.width() as usize * 4);
+        let mut want = vec![0xAB; bytes as usize];
+        for y in 0..r.height() as usize {
+            let from = y * (TILE as usize * 4);
+            want[offset + y * row..offset + y * row + wide].copy_from_slice(&pixels[from..from + wide]);
+        }
+        assert!(got == want, "bytes otherwise: {}", got.iter().zip(&want).filter(|(a, b)| a != b).count());
+        assert!(gpu.placed_copies_staged() > 0);
+        assert_eq!(gpu.errors(), 0);
     }
 
     #[test]
