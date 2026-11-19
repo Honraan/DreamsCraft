@@ -97,6 +97,7 @@ mod text;
 mod text_draw;
 mod text_runs;
 mod timelapse;
+mod timeline;
 mod touch;
 mod transform;
 mod tween;
@@ -240,6 +241,11 @@ pub use text_runs::TextStyleChange;
 pub use timelapse::{
     SegmentPlan, TIME_LAPSE_FPS, TimeLapse, TimeLapseSettings, time_lapse_bits_per_pixel, time_lapse_picks,
     time_lapse_setting_names, time_lapse_side,
+};
+pub use timeline::{
+    PerformSampleInfo, TimelineCelInfo, TimelineClipInfo, TimelineClipKind, TimelineEasingInfo, TimelineEasingKind,
+    TimelineKeyframeInfo, TimelineOnionInfo, TimelineState, TimelineTrackInfo, TimelineTransformInfo,
+    TimelineWorkAreaInfo,
 };
 pub use touch::{
     COMPANION_ZOOM_DISTANCE, CompanionMode, Fill, GestureAction, HoverCursor, LOUPE_LIFT, PenHover, PenPreferred,

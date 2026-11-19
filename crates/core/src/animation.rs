@@ -51,9 +51,59 @@ fn timeline(doc: &Document) -> Vec<LayerId> {
     held(doc, frames(doc))
 }
 
-/// The frames as they play: each frame that plays, as often as it is held.
-fn sequence(doc: &Document) -> Vec<LayerId> {
-    held(doc, played(doc))
+/// What one exported or previewed animation frame renders: either a multi-track timeline frame index
+/// or a legacy top-level layer/group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum FrameTarget {
+    TimelineFrame(u32),
+    Layer(LayerId),
+}
+
+fn timeline_export_frames(tl: &procraft_engine::timeline::Timeline) -> Vec<u32> {
+    if let Some(w) = tl.work_area {
+        return (w.start..=w.end).collect();
+    }
+    let content_end = tl
+        .tracks
+        .iter()
+        .filter(|t| t.visible)
+        .flat_map(|t| {
+            let t_kf = t
+                .keyframes
+                .transform
+                .iter()
+                .map(|k| k.frame.saturating_add(1))
+                .chain(t.keyframes.opacity.iter().map(|k| k.frame.saturating_add(1)))
+                .max()
+                .unwrap_or(1);
+            t.clips
+                .iter()
+                .map(|c| {
+                    let c_kf = c
+                        .keyframes
+                        .transform
+                        .iter()
+                        .map(|k| k.frame.saturating_add(1))
+                        .chain(c.keyframes.opacity.iter().map(|k| k.frame.saturating_add(1)))
+                        .max()
+                        .unwrap_or(1);
+                    c.end_frame().max(c_kf)
+                })
+                .chain(std::iter::once(t_kf))
+        })
+        .max()
+        .unwrap_or(1)
+        .clamp(1, tl.duration_frames);
+    (0..content_end).collect()
+}
+
+/// The frames as they play: each timeline frame (when a multi-track timeline is active) or each
+/// frame layer that plays, as often as it is held.
+fn sequence_targets(doc: &Document) -> Vec<FrameTarget> {
+    if let Some(tl) = doc.timeline.as_ref() {
+        return timeline_export_frames(tl).into_iter().map(FrameTarget::TimelineFrame).collect();
+    }
+    held(doc, played(doc)).into_iter().map(FrameTarget::Layer).collect()
 }
 
 #[uniffi::export]
@@ -87,8 +137,12 @@ impl CanvasSession {
     /// held.
     pub fn animation_play_order(&self) -> Vec<u32> {
         let doc = &self.shared.lock().doc;
+        if let Some(tl) = doc.timeline.as_ref() {
+            let count = u32::try_from(timeline_export_frames(tl).len()).unwrap_or(0);
+            return (0..count).collect();
+        }
         let plays = played(doc);
-        sequence(doc)
+        held(doc, plays.clone())
             .iter()
             .filter_map(|id| plays.iter().position(|f| f == id))
             .filter_map(|i| u32::try_from(i).ok())
@@ -109,15 +163,27 @@ impl CanvasSession {
 
     /// How many frames the animation plays (a background or foreground frame is not one of them).
     pub fn animation_frame_count(&self) -> u32 {
-        u32::try_from(played(&self.shared.lock().doc).len()).unwrap_or(u32::MAX)
+        let doc = &self.shared.lock().doc;
+        if let Some(tl) = doc.timeline.as_ref() {
+            return u32::try_from(timeline_export_frames(tl).len()).unwrap_or(u32::MAX);
+        }
+        u32::try_from(played(doc).len()).unwrap_or(u32::MAX)
     }
 
     /// Played frame `index` (bottom first) with a background frame under it and a foreground
     /// frame over it, straight alpha, scaled to fit `max_side` (0: full size), over the background
     /// unless `transparent`; none if there is no such frame.
     pub fn animation_frame(&self, index: u32, transparent: bool, max_side: u32) -> Option<ThumbnailImage> {
-        let unit = played(&self.shared.lock().doc).get(usize::try_from(index).ok()?).copied()?;
-        match self.render_frame(unit, transparent, max_side) {
+        let target = {
+            let doc = &self.shared.lock().doc;
+            let idx = usize::try_from(index).ok()?;
+            if let Some(tl) = doc.timeline.as_ref() {
+                FrameTarget::TimelineFrame(*timeline_export_frames(tl).get(idx)?)
+            } else {
+                FrameTarget::Layer(*played(doc).get(idx)?)
+            }
+        };
+        match self.render_target(target, transparent, max_side) {
             Ok((width, height, rgba)) => Some(ThumbnailImage { width, height, rgba }),
             Err(e) => {
                 log::warn!("animation frame: {e}");
@@ -140,7 +206,7 @@ impl CanvasSession {
         per_frame_palette: bool,
         transparent: bool,
     ) -> Result<(), MobileError> {
-        let units = sequence(&self.shared.lock().doc);
+        let units = sequence_targets(&self.shared.lock().doc);
         let delay = (100.0 / fps.clamp(0.1, 100.0)).round() as u16;
         // the frames made take it to 0.95 (sharing a palette, its look at them to 0.45 first), the
         // file written to 1
@@ -159,7 +225,7 @@ impl CanvasSession {
                 .iter()
                 .skip(next)
                 .take(few)
-                .map(|&unit| self.render_frame(unit, transparent, max_side))
+                .map(|&unit| self.render_target(unit, transparent, max_side))
                 .collect::<Result<Vec<_>, _>>()?;
             next += frames.len();
             let Some(&(w, h, _)) = frames.first() else { break };
@@ -187,7 +253,7 @@ impl CanvasSession {
     /// The animation as a looping animated PNG at `path`, `fps` frames a second, scaled to fit
     /// `max_side` (0: full size), `transparent` leaving the background out.
     pub fn export_apng(&self, path: String, max_side: u32, fps: f32, transparent: bool) -> Result<(), MobileError> {
-        let units = sequence(&self.shared.lock().doc);
+        let units = sequence_targets(&self.shared.lock().doc);
         let count = u32::try_from(units.len()).unwrap_or(u32::MAX);
         let Some((&first, rest)) = units.split_first() else {
             return Err(file_error("saving", "there are no frames"));
@@ -195,7 +261,7 @@ impl CanvasSession {
         // as the GIF's: the frames to 0.95, the file to 1
         self.exported(0.0);
         let made = |k: usize| self.exported(0.95 * k as f32 / count.max(1) as f32);
-        let (w, h, rgba) = self.render_frame(first, transparent, max_side)?;
+        let (w, h, rgba) = self.render_target(first, transparent, max_side)?;
         // a frame lasts 1/fps seconds, in thousandths
         let delay = (1000.0 / fps.clamp(0.1, 1000.0)).round().clamp(1.0, 65535.0) as u16;
         write_atomically(Path::new(&path), |f| {
@@ -210,7 +276,7 @@ impl CanvasSession {
             writer.write_image_data(&rgba).map_err(|e| file_error("saving", e))?;
             made(1);
             for (k, &unit) in rest.iter().enumerate() {
-                let (fw, fh, frame) = self.render_frame(unit, transparent, max_side)?;
+                let (fw, fh, frame) = self.render_target(unit, transparent, max_side)?;
                 if (fw, fh) != (w, h) {
                     return Err(file_error("saving", "the frames differ in size"));
                 }
@@ -229,19 +295,19 @@ impl CanvasSession {
     /// (each drawn once for it); none when there are no frames.
     fn shared_palette_gif(
         &self,
-        units: &[LayerId],
+        units: &[FrameTarget],
         transparent: bool,
         max_side: u32,
     ) -> Result<Option<GifWriter>, MobileError> {
         // a held frame is drawn once, however many places it holds
         let mut seen = std::collections::HashSet::new();
-        let units: Vec<LayerId> = units.iter().copied().filter(|u| seen.insert(*u)).collect();
+        let units: Vec<FrameTarget> = units.iter().copied().filter(|u| seen.insert(*u)).collect();
         // about as many sampled pixels in all as a single frame's palette looks at
         let per_frame = (GIF_PALETTE_SAMPLES / units.len().max(1)).max(256);
         let mut samples: Vec<[u8; 4]> = Vec::new();
         let mut size = None;
         for (k, &unit) in units.iter().enumerate() {
-            let (w, h, rgba) = self.render_frame(unit, transparent, max_side)?;
+            let (w, h, rgba) = self.render_target(unit, transparent, max_side)?;
             size.get_or_insert((w, h));
             let pixels = rgba.as_chunks::<4>().0;
             let step = (pixels.len() / per_frame).max(1);
@@ -249,6 +315,54 @@ impl CanvasSession {
             self.exported(0.45 * (k + 1) as f32 / units.len() as f32);
         }
         Ok(size.map(|(w, h)| GifWriter::shared(w, h, &samples)))
+    }
+
+    fn render_target(
+        &self,
+        target: FrameTarget,
+        transparent: bool,
+        max_side: u32,
+    ) -> Result<(u32, u32, Vec<u8>), MobileError> {
+        match target {
+            FrameTarget::TimelineFrame(frame) => self.render_timeline_frame(frame, transparent, max_side),
+            FrameTarget::Layer(unit) => self.render_frame(unit, transparent, max_side),
+        }
+    }
+
+    /// Renders multi-track timeline `frame` (including all visible tracks, clips, cels, and
+    /// non-destructive keyframe transforms/opacities, without onion skins).
+    fn render_timeline_frame(
+        &self,
+        frame: u32,
+        transparent: bool,
+        max_side: u32,
+    ) -> Result<(u32, u32, Vec<u8>), MobileError> {
+        let (w, h, rgba) = {
+            let mut guard = self.shared.lock();
+            let st = &mut *guard;
+            st.finish_stroke();
+            st.settle();
+            let mut doc = st.doc.clone();
+            if transparent {
+                doc.background_visible = false;
+            }
+            let (w, h) = (doc.width(), doc.height());
+            let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else {
+                return Err(file_error("reading the picture", "the canvas is not shown yet"));
+            };
+            let playing = canvas.play_frame();
+            canvas.set_play_frame(usize::try_from(frame).ok());
+            canvas.invalidate();
+            canvas.render_finished(gpu, &mut doc);
+            let rgba = canvas.read_composite(gpu);
+            canvas.set_play_frame(playing);
+            canvas.invalidate();
+            canvas.render(gpu, &mut st.doc, None);
+            self.shared.frame(st);
+            (w, h, rgba.map_err(|e| file_error("reading the picture", e))?)
+        };
+        let side = if max_side == 0 { w.max(h) } else { max_side.min(w.max(h)) };
+        Ok(thumbnail(&rgba, w, h, side))
     }
 
     /// `unit` with a background and a foreground frame and no other (the background too unless
@@ -348,6 +462,7 @@ impl CanvasSession {
     pub fn enable_animation_for_new_artwork(&self) {
         let mut st = self.shared.lock();
         st.doc.animation.get_or_insert_with(Animation::default);
+        st.doc.ensure_timeline();
         self.shared.frame(&mut st);
     }
 
@@ -375,7 +490,12 @@ impl CanvasSession {
                 },
                 |d| {
                     let now = d.animation.as_ref().is_some_and(|a| a.pages == pages);
-                    (now != on).then(|| d.animation = on.then(|| Animation { pages, ..Animation::default() }))
+                    (now != on).then(|| {
+                        d.animation = on.then(|| Animation { pages, ..Animation::default() });
+                        if !on || pages {
+                            d.timeline = None;
+                        }
+                    })
                 },
             )
             .is_some();
@@ -387,6 +507,26 @@ impl CanvasSession {
         }
         self.shared.frame(st);
         changed
+    }
+}
+
+fn sync_timeline_cel_hold(doc: &mut Document, layer: LayerId, hold: u32) {
+    if let Some(tl) = doc.timeline.as_mut() {
+        let mut max_end = tl.duration_frames;
+        for track in &mut tl.tracks {
+            for clip in &mut track.clips {
+                if let procraft_engine::timeline::ClipKind::Cel { cels } = &mut clip.kind {
+                    for cel in cels {
+                        if cel.layer == layer {
+                            cel.hold = hold;
+                        }
+                    }
+                    clip.sync_duration();
+                    max_end = max_end.max(clip.end_frame());
+                }
+            }
+        }
+        tl.duration_frames = max_end;
     }
 }
 
@@ -406,15 +546,16 @@ impl CanvasSession {
             [r, g, b] => [*r, *g, *b],
             _ => or,
         };
+        let playback = match s.playback {
+            AnimationPlayback::Loop => Playback::Loop,
+            AnimationPlayback::PingPong => Playback::PingPong,
+            AnimationPlayback::OneShot => Playback::OneShot,
+        };
         *a = Animation {
             fps: s.fps,
             onion_frames: s.onion_frames,
             onion_opacity: s.onion_opacity,
-            playback: match s.playback {
-                AnimationPlayback::Loop => Playback::Loop,
-                AnimationPlayback::PingPong => Playback::PingPong,
-                AnimationPlayback::OneShot => Playback::OneShot,
-            },
+            playback,
             blend_primary: s.blend_primary,
             before: color(&s.before, a.before),
             after: color(&s.after, a.after),
@@ -424,6 +565,18 @@ impl CanvasSession {
             pages: a.pages,
         }
         .repaired();
+        let repaired = a.clone();
+        if let Some(tl) = st.doc.timeline.as_mut() {
+            tl.fps = repaired.fps;
+            tl.playback = repaired.playback;
+            tl.onion.enabled = repaired.onion_frames > 0 && !repaired.pages;
+            tl.onion.before_frames = repaired.onion_frames;
+            tl.onion.after_frames = repaired.onion_frames;
+            tl.onion.opacity = repaired.onion_opacity;
+            tl.onion.before_color = repaired.before;
+            tl.onion.after_color = repaired.after;
+            tl.onion.blend_primary = repaired.blend_primary;
+        }
         if let Some(c) = st.canvas.as_mut() {
             c.invalidate();
         }
@@ -488,10 +641,14 @@ impl CanvasSession {
     /// (one undo step for the whole drag).
     pub fn change_frame_hold(&self, id: u64, frames: u32, done: bool) -> bool {
         self.change_live("hold frame length", done, |d| {
-            d.animation.as_mut().is_some_and(|a| {
+            let ok = d.animation.as_mut().is_some_and(|a| {
                 a.set_hold(LayerId(id), frames);
                 true
-            })
+            });
+            if ok {
+                sync_timeline_cel_hold(d, LayerId(id), frames);
+            }
+            ok
         })
     }
 
@@ -501,6 +658,7 @@ impl CanvasSession {
             let a = d.animation.as_mut()?;
             let hold = a.hold(LayerId(id)).checked_sub(1)?;
             a.set_hold(LayerId(id), hold);
+            sync_timeline_cel_hold(d, LayerId(id), hold);
             Some(())
         })
         .is_some()
@@ -519,13 +677,27 @@ impl CanvasSession {
                 a.set_hold(LayerId(id), at - 1);
                 a.set_hold(copy, hold - at);
             }
+            sync_timeline_cel_hold(doc, LayerId(id), at - 1);
+            if let Some(tl) = doc.timeline.as_mut()
+                && let Some(cid) = tl.active_clip
+            {
+                let after = tl.clip(cid).and_then(|c| match &c.kind {
+                    procraft_engine::timeline::ClipKind::Cel { cels } => {
+                        cels.iter().position(|cel| cel.layer == LayerId(id))
+                    }
+                    _ => None,
+                });
+                tl.insert_cel(cid, after, copy, hold - at);
+            }
         })
     }
 
     pub fn set_frame_hold(&self, id: u64, frames: u32) {
-        if let Some(a) = self.shared.lock().doc.animation.as_mut() {
+        let mut st = self.shared.lock();
+        if let Some(a) = st.doc.animation.as_mut() {
             a.set_hold(LayerId(id), frames);
         }
+        sync_timeline_cel_hold(&mut st.doc, LayerId(id), frames);
     }
 }
 

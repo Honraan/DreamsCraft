@@ -52,7 +52,7 @@ const VERSION: u32 = 1;
 pub fn artwork_plays(dir: String) -> bool {
     let text = fs::read_to_string(Path::new(&dir).join("artwork.json"));
     let file = text.ok().and_then(|t| serde_json::from_str::<ArtworkFile>(&t).ok());
-    file.is_some_and(|f| f.document.animation.is_some() || f.model.is_some())
+    file.is_some_and(|f| f.document.animation.is_some() || f.document.timeline.is_some() || f.model.is_some())
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]

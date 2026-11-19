@@ -1433,3 +1433,46 @@ fn the_gpu_memory_set_aside_stays_near_what_is_used() {
     assert!(between >= before);
     assert_eq!(gpu.errors(), 0);
 }
+
+#[test]
+fn timeline_composites_non_destructive_keyframe_transforms_and_onion_skins() {
+    let Some(gpu) = Gpu::headless().ok() else { return eprintln!("skipped: no GPU") };
+    let mut doc = Document::new(32, 32);
+    let layer = doc.current();
+    let mut canvas = Canvas::new(&gpu, &doc).unwrap();
+    // Paint a solid red dot at (8, 8)
+    paint(&mut canvas, &doc, layer, [255, 0, 0], Vec2::new(8.0, 8.0), 3.0, StrokeTool::Paint);
+    canvas.render(&gpu, &mut doc, None);
+    let original_layer_pixels = canvas.read_layer(&gpu, layer).unwrap();
+
+    // Enable timeline and add a translation keyframe from (0, 0) at frame 0 to (+16, +16) at frame 10
+    let tl = doc.ensure_timeline();
+    let clip_id = tl.active_clip.unwrap();
+    tl.resize_clip(clip_id, 11);
+    tl.clip_mut(clip_id).unwrap().keyframes.set_transform(
+        0,
+        procraft_engine::timeline::Transform2D::default(),
+        Some(procraft_engine::timeline::Easing::Linear),
+    );
+    tl.clip_mut(clip_id).unwrap().keyframes.set_transform(
+        10,
+        procraft_engine::timeline::Transform2D { position: [16.0, 16.0], ..Default::default() },
+        Some(procraft_engine::timeline::Easing::Linear),
+    );
+
+    // At frame 10, the red dot should composite at (24, 24) while (8, 8) is white background
+    doc.timeline.as_mut().unwrap().playhead = 10;
+    canvas.invalidate();
+    canvas.render(&gpu, &mut doc, None);
+    let comp = canvas.read_composite(&gpu).unwrap();
+    let px_at = |x: usize, y: usize| {
+        let i = (y * 32 + x) * 4;
+        [comp[i], comp[i + 1], comp[i + 2], comp[i + 3]]
+    };
+    assert_eq!(px_at(8, 8), [255, 255, 255, 255], "old position shows background");
+    let moved = px_at(24, 24);
+    assert!(moved[0] > 200 && moved[1] < 30 && moved[2] < 30, "moved dot at (24, 24): {moved:?}");
+
+    // And the underlying layer texture pixels must remain 100% untouched (non-destructive)!
+    assert_eq!(canvas.read_layer(&gpu, layer).unwrap(), original_layer_pixels);
+}

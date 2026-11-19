@@ -56,6 +56,10 @@ struct LayerUniform {
     // paper), how many canvas pixels a pixel of its tile covers, and how deep it shows in the
     // background (0: a flat colour)
     paper: vec4<f32>,
+    // non-destructive keyframe transform (inverse 2D affine map from canvas pixel to layer pixel):
+    // xform0 = (a, b, c, d), xform1 = (e, f, active: 1.0 when transformed, 0.0 for identity)
+    xform0: vec4<f32>,
+    xform1: vec4<f32>,
 }
 
 // in stroke_blend: the stroke mixed in by its coverage in squared colour (nearer to light)
@@ -238,16 +242,53 @@ fn with_stroke(c0: vec4<f32>, p: vec2<i32>) -> vec4<f32> {
     return c;
 }
 
+fn load_texel(tex: texture_2d<f32>, dims: vec2<i32>, i: vec2<i32>) -> vec4<f32> {
+    if (i.x < 0 || i.y < 0 || i.x >= dims.x || i.y >= dims.y) {
+        return vec4<f32>(0.0);
+    }
+    return textureLoad(tex, i, 0);
+}
+
+fn load_layer_at(tex: texture_2d<f32>, p: vec2<i32>) -> vec4<f32> {
+    if (lu.xform1.z <= 0.5) {
+        return textureLoad(tex, p, 0);
+    }
+    let dims = vec2<i32>(textureDimensions(tex));
+    let pt = vec2<f32>(p) + 0.5;
+    let s = vec2<f32>(
+        lu.xform0.x * pt.x + lu.xform0.z * pt.y + lu.xform1.x,
+        lu.xform0.y * pt.x + lu.xform0.w * pt.y + lu.xform1.y,
+    ) - 0.5;
+    let base = vec2<i32>(floor(s));
+    let f = s - floor(s);
+    let top = mix(load_texel(tex, dims, base), load_texel(tex, dims, base + vec2<i32>(1, 0)), f.x);
+    let bottom = mix(load_texel(tex, dims, base + vec2<i32>(0, 1)), load_texel(tex, dims, base + vec2<i32>(1, 1)), f.x);
+    return mix(top, bottom, f.y);
+}
+
 // a layer as it composites: stroke, mask, clipping, opacity
 fn layer_color(p: vec2<i32>) -> vec4<f32> {
-    var c = textureLoad(layer_tex, p, 0);
+    var c = load_layer_at(layer_tex, p);
     var m = vec4<f32>(1.0);
     if (lu.masked > 0.5) {
-        m = textureLoad(mask_tex, p, 0);
+        m = load_layer_at(mask_tex, p);
     }
     // the stroke goes into the layer, or into its mask: one place for it (its blend written once)
     let into_mask = lu.stroke_on_mask > 0.5;
-    let stroked = with_stroke(select(c, m, into_mask), p);
+    var stroke_p = p;
+    if (lu.xform1.z > 0.5) {
+        let pt = vec2<f32>(p) + 0.5;
+        let s = vec2<f32>(
+            lu.xform0.x * pt.x + lu.xform0.z * pt.y + lu.xform1.x,
+            lu.xform0.y * pt.x + lu.xform0.w * pt.y + lu.xform1.y,
+        );
+        stroke_p = vec2<i32>(floor(s));
+    }
+    let dims = vec2<i32>(textureDimensions(layer_tex));
+    var stroked = select(c, m, into_mask);
+    if (stroke_p.x >= 0 && stroke_p.y >= 0 && stroke_p.x < dims.x && stroke_p.y < dims.y) {
+        stroked = with_stroke(stroked, stroke_p);
+    }
     if (into_mask) {
         m = stroked;
     } else {
@@ -258,10 +299,10 @@ fn layer_color(p: vec2<i32>) -> vec4<f32> {
         c = c * clamp(dot(m.rgb, vec3<f32>(0.299, 0.587, 0.114)), 0.0, 1.0);
     }
     if (lu.clipped == CLIP_BY_BASE) {
-        var base = textureLoad(clip_tex, p, 0).a;
+        var base = load_layer_at(clip_tex, p).a;
         if (lu.clip_masked > 0.5) {
             // the base as its mask shows it
-            base = base * clamp(dot(textureLoad(clip_mask_tex, p, 0).rgb, vec3<f32>(0.299, 0.587, 0.114)), 0.0, 1.0);
+            base = base * clamp(dot(load_layer_at(clip_mask_tex, p).rgb, vec3<f32>(0.299, 0.587, 0.114)), 0.0, 1.0);
         }
         c = c * base;
     }

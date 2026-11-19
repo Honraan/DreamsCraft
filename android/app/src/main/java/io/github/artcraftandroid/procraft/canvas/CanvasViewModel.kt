@@ -160,6 +160,9 @@ enum class SelectionKind(val label: String) { AUTOMATIC("Automatic"), FREEHAND("
 /** A popover over the selection toolbar. */
 enum class SelectionPopup { NONE, FEATHER, SAVED }
 
+/** The active workspace mode shown in the center action bar. */
+enum class DreamsWorkMode { TIMELINE, DRAW_PAINT, PERFORM, TIMELINE_EDIT }
+
 /**
  * A brush ([single]) or a brush set called [name] as a file it is shared in: its letters and
  * digits, in any script, its spaces, `_` and `-` (anything else a file name may not hold made `_`).
@@ -6674,8 +6677,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     /** One animation export at a time: they write the same file. */
     private val animationExports = Mutex()
 
-    /** The artwork's own frame rate, which an animated export starts at: Animation Assist's, else 15. */
-    fun artworkFps(): Float = (session?.animationSettings()?.fps?.toInt() ?: ANIMATION_FPS).toFloat()
+    /** The artwork's own frame rate, which an animated export starts at: the Timeline's or Animation Assist's, else 15. */
+    fun artworkFps(): Float = (session?.timelineState()?.fps?.toInt() ?: session?.animationSettings()?.fps?.toInt() ?: ANIMATION_FPS).toFloat()
 
     /**
      * The animation written as [format] into the cache, to share, [fps] frames a second: Web Ready
@@ -8273,9 +8276,55 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     var animationSettingsOpen by mutableStateOf(false)
     var frameOptionsOpen by mutableStateOf(false)
 
+    // ---- DreamsCraft Multi-Track Timeline, Keyframes & Perform ----
+
+    /** Full multi-track timeline snapshot read in a single UniFFI call. */
+    var timeline by mutableStateOf<io.github.artcraftandroid.procraft.core.TimelineState?>(null)
+        private set
+
+    var dreamsMode by mutableStateOf(DreamsWorkMode.DRAW_PAINT)
+    var stageGizmoActive by mutableStateOf(false)
+    var performRecording by mutableStateOf(false)
+        private set
+    var performSamplesCount by mutableStateOf(0)
+        private set
+    private val recordedPerformSamples = mutableListOf<io.github.artcraftandroid.procraft.core.PerformSampleInfo>()
+    private var performPlayJob: Job? = null
+
+    var selectedTrackIds by mutableStateOf<Set<ULong>>(emptySet())
+        private set
+    var selectedClipIds by mutableStateOf<Set<ULong>>(emptySet())
+        private set
+
+    /** Fraction of window height occupied by the multi-track timeline dock (0.22..0.68). */
+    var timelineSplitRatio by mutableFloatStateOf(0.36f)
+    var timelineZoomPxPerFrame by mutableFloatStateOf(24f)
+    var timelineTrackHeightDp by mutableFloatStateOf(54f)
+
+    var movieSettingsOpen by mutableStateOf(false)
+    var playheadActionMenuOpen by mutableStateOf(false)
+    var addTrackMenuOpen by mutableStateOf(false)
+    var editingKeyframe by mutableStateOf<Pair<ULong, UInt>?>(null)
+
+    private var lastStageBottomInsetPx = -1f
+
+    /**
+     * Adjusts the bottom fit inset of the Stage so the canvas centers in the visible upper Stage
+     * area above the multi-track timeline (or expands to full screen in Flipbook mode).
+     */
+    fun updateStageBottomInset(bottomPx: Float) {
+        val s = session ?: return
+        val clamped = bottomPx.coerceAtLeast(0f)
+        if (abs(clamped - lastStageBottomInsetPx) < 1f) return
+        lastStageBottomInsetPx = clamped
+        val topPx = io.github.artcraftandroid.procraft.ui.Pc.barShown.value * density
+        s.setFitInsets(0f, topPx, 0f, clamped)
+    }
+
     fun changeAnimationAssist(on: Boolean) {
         stopPlaying()
         session?.setAnimationAssist(on)
+        session?.setTimelineEnabled(on)
         refresh()
     }
 
@@ -8285,18 +8334,23 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         refresh()
     }
 
-    /** Re-reads Animation Assist from the session (after any change to the layers). */
+    /** Re-reads Animation Assist and Multi-Track Timeline from the session. */
     private fun refreshAnimation() {
         val s = session ?: return
         val settings = s.animationSettings()
         animation = settings
-        if (settings == null) {
+        timeline = s.timelineState()
+        if (settings == null && timeline == null) {
             animationFrames = emptyList()
             frameSlots = emptyList()
             playedSlots = emptyList()
             currentFrame = null
             animationSettingsOpen = false
             frameOptionsOpen = false
+            movieSettingsOpen = false
+            playheadActionMenuOpen = false
+            addTrackMenuOpen = false
+            editingKeyframe = null
             return
         }
         animationFrames = s.animationFrames()
@@ -8310,7 +8364,15 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun refreshFrameThumbnails() {
         val s = session ?: return
-        val ids = animationFrames
+        val ids = buildSet {
+            addAll(animationFrames)
+            timeline?.tracks?.forEach { t ->
+                t.clips.forEach { c ->
+                    if (c.primaryLayerId != 0uL) add(c.primaryLayerId)
+                    c.cels.forEach { cel -> add(cel.layerId) }
+                }
+            }
+        }.toList()
         frameThumbJob?.cancel()
         frameThumbJob = viewModelScope.launch {
             for (id in ids) {
@@ -8325,11 +8387,310 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // ---- Multi-Track Timeline Actions ----
+
+    fun setTimelinePlayhead(frame: Int) {
+        val s = session ?: return
+        s.timelineSetPlayhead(frame.coerceAtLeast(0).toUInt())
+        timeline = s.timelineState()
+        currentFrame = s.currentFrame()?.toInt()
+    }
+
+    fun stepTimelineFrame(delta: Int) {
+        stopPlaying()
+        val s = session ?: return
+        s.timelineStepFrame(delta)
+        timeline = s.timelineState()
+        currentFrame = s.currentFrame()?.toInt()
+    }
+
+    fun setTimelineFps(fps: Int) {
+        val s = session ?: return
+        s.timelineSetFps(fps.coerceIn(1, 60).toUInt())
+        timeline = s.timelineState()
+        animation = s.animationSettings()
+    }
+
+    fun setTimelineDuration(frames: Int) {
+        val s = session ?: return
+        s.timelineSetDuration(frames.coerceAtLeast(1).toUInt())
+        refresh()
+    }
+
+    fun setTimelinePlayback(playback: io.github.artcraftandroid.procraft.core.AnimationPlayback) {
+        val s = session ?: return
+        s.timelineSetPlayback(playback)
+        timeline = s.timelineState()
+        animation = s.animationSettings()
+    }
+
+    fun setTimelineWorkArea(start: Int?, end: Int?) {
+        val s = session ?: return
+        val wa = if (start != null && end != null) {
+            io.github.artcraftandroid.procraft.core.TimelineWorkAreaInfo(
+                start = start.coerceAtLeast(0).toUInt(),
+                end = end.coerceAtLeast(start.coerceAtLeast(0)).toUInt(),
+            )
+        } else {
+            null
+        }
+        s.timelineSetWorkArea(wa)
+        timeline = s.timelineState()
+    }
+
+    fun updateTimelineOnion(transform: (io.github.artcraftandroid.procraft.core.TimelineOnionInfo) -> io.github.artcraftandroid.procraft.core.TimelineOnionInfo) {
+        val s = session ?: return
+        val current = timeline?.onion ?: return
+        s.timelineSetOnionSkin(transform(current))
+        timeline = s.timelineState()
+        animation = s.animationSettings()
+    }
+
+    fun setFlipbookMode(open: Boolean) {
+        stopPlaying()
+        val s = session ?: return
+        s.timelineSetFlipbook(open)
+        timeline = s.timelineState()
+    }
+
+    fun setBackstageShown(show: Boolean) {
+        val s = session ?: return
+        s.timelineSetBackstage(show)
+        timeline = s.timelineState()
+    }
+
+    fun addTimelineTrack(name: String? = null, withDrawingClip: Boolean = true) {
+        stopPlaying()
+        layerChange {
+            if (it.timelineAddTrack(name, withDrawingClip) == 0uL && withDrawingClip) {
+                message = noRoom()
+            }
+        }
+    }
+
+    fun toggleTrackMultiSelection(trackId: ULong) {
+        selectedTrackIds = if (selectedTrackIds.contains(trackId)) {
+            selectedTrackIds - trackId
+        } else {
+            selectedTrackIds + trackId
+        }
+    }
+
+    fun toggleClipMultiSelection(clipId: ULong) {
+        selectedClipIds = if (selectedClipIds.contains(clipId)) {
+            selectedClipIds - clipId
+        } else {
+            selectedClipIds + clipId
+        }
+    }
+
+    fun groupSelectedTracks(name: String? = null) {
+        if (selectedTrackIds.isEmpty()) return
+        val ids = selectedTrackIds.toList()
+        selectedTrackIds = emptySet()
+        layerChange { it.timelineAddGroupTrack(ids, name) }
+    }
+
+    fun selectTimelineTrack(trackId: ULong) {
+        val s = session ?: return
+        s.timelineSelectTrack(trackId)
+        refresh()
+    }
+
+    fun renameTimelineTrack(trackId: ULong, name: String) {
+        layerChange(thumbs = false) { it.timelineRenameTrack(trackId, name) }
+    }
+
+    fun toggleTrackVisible(trackId: ULong, visible: Boolean) {
+        layerChange(thumbs = false) { it.timelineSetTrackVisible(trackId, visible) }
+    }
+
+    fun toggleTrackLocked(trackId: ULong, locked: Boolean) {
+        layerChange(thumbs = false) { it.timelineSetTrackLocked(trackId, locked) }
+    }
+
+    fun toggleTrackSolo(trackId: ULong, solo: Boolean) {
+        layerChange(thumbs = false) { it.timelineSetTrackSolo(trackId, solo) }
+    }
+
+    fun toggleTrackExpanded(trackId: ULong, expanded: Boolean) {
+        val s = session ?: return
+        s.timelineSetTrackExpanded(trackId, expanded)
+        timeline = s.timelineState()
+    }
+
+    fun selectTimelineClip(clipId: ULong) {
+        val s = session ?: return
+        s.timelineSelectClip(clipId)
+        refresh()
+    }
+
+    fun addCelClipToActiveTrack() {
+        val tl = timeline ?: return
+        val tid = tl.activeTrackId ?: tl.tracks.lastOrNull()?.id ?: return
+        layerChange {
+            if (it.timelineAddCelClip(tid, tl.playhead) == 0uL) message = noRoom()
+        }
+    }
+
+    fun addLayerClipToActiveTrack() {
+        val tl = timeline ?: return
+        val tid = tl.activeTrackId ?: tl.tracks.lastOrNull()?.id ?: return
+        val dur = tl.fps.coerceAtLeast(12u)
+        layerChange {
+            if (it.timelineAddLayerClip(tid, tl.playhead, dur) == 0uL) message = noRoom()
+        }
+    }
+
+    fun moveTimelineClip(clipId: ULong, newStartFrame: Int, targetTrackId: ULong? = null, done: Boolean) {
+        val s = session ?: return
+        s.timelineMoveClip(clipId, newStartFrame.coerceAtLeast(0).toUInt(), targetTrackId, done)
+        timeline = s.timelineState()
+        if (done) refresh()
+    }
+
+    fun resizeTimelineClip(clipId: ULong, newDurationFrames: Int, done: Boolean) {
+        val s = session ?: return
+        s.timelineResizeClip(clipId, newDurationFrames.coerceAtLeast(1).toUInt(), done)
+        timeline = s.timelineState()
+        if (done) refresh()
+    }
+
+    fun splitActiveClipAtPlayhead(clipId: ULong? = null) {
+        val target = clipId ?: timeline?.activeClipId ?: return
+        layerChange(thumbs = false) { it.timelineSplitClipAtPlayhead(target) }
+    }
+
+    fun duplicateTimelineClip(clipId: ULong) {
+        layerChange {
+            if (it.timelineDuplicateClip(clipId) == null) message = noRoom()
+        }
+    }
+
+    fun deleteTimelineClip(clipId: ULong) {
+        layerChange(thumbs = false) { it.timelineDeleteClip(clipId) }
+    }
+
+    fun addTimelineCel(clipId: ULong = 0uL) {
+        stopPlaying()
+        layerChange {
+            if (it.timelineAddCel(clipId) == null) message = noRoom()
+        }
+    }
+
+    fun setClipTransformKeyframe(
+        clipId: ULong,
+        frame: Int,
+        transform: io.github.artcraftandroid.procraft.core.TimelineTransformInfo,
+        done: Boolean,
+    ) {
+        val s = session ?: return
+        s.timelineSetTransformKeyframe(clipId, frame.coerceAtLeast(0).toUInt(), transform, done)
+        timeline = s.timelineState()
+        if (done) refresh()
+    }
+
+    fun setClipOpacityKeyframe(clipId: ULong, frame: Int, opacity: Float, done: Boolean) {
+        val s = session ?: return
+        s.timelineSetOpacityKeyframe(clipId, frame.coerceAtLeast(0).toUInt(), opacity.coerceIn(0f, 1f), done)
+        timeline = s.timelineState()
+        if (done) refresh()
+    }
+
+    fun deleteClipTransformKeyframe(clipId: ULong, frame: Int) {
+        layerChange(thumbs = false) { it.timelineDeleteTransformKeyframe(clipId, frame.coerceAtLeast(0).toUInt()) }
+    }
+
+    fun deleteClipOpacityKeyframe(clipId: ULong, frame: Int) {
+        layerChange(thumbs = false) { it.timelineDeleteOpacityKeyframe(clipId, frame.coerceAtLeast(0).toUInt()) }
+    }
+
+    fun setClipTransformEasing(clipId: ULong, frame: Int, kind: io.github.artcraftandroid.procraft.core.TimelineEasingKind) {
+        val info = io.github.artcraftandroid.procraft.core.TimelineEasingInfo(kind, 0.42f, 0f, 0.58f, 1f)
+        layerChange(thumbs = false) { it.timelineSetTransformEasing(clipId, frame.coerceAtLeast(0).toUInt(), info) }
+    }
+
+    fun setClipOpacityEasing(clipId: ULong, frame: Int, kind: io.github.artcraftandroid.procraft.core.TimelineEasingKind) {
+        val info = io.github.artcraftandroid.procraft.core.TimelineEasingInfo(kind, 0.42f, 0f, 0.58f, 1f)
+        layerChange(thumbs = false) { it.timelineSetOpacityEasing(clipId, frame.coerceAtLeast(0).toUInt(), info) }
+    }
+
+    // ---- Live Perform Motion Recording ----
+
+    fun beginPerformRecording() {
+        val s = session ?: return
+        val tl = timeline ?: return
+        stopPlaying()
+        recordedPerformSamples.clear()
+        performSamplesCount = 0
+        performRecording = true
+        val startTransform = tl.activeEvaluatedTransform
+        recordedPerformSamples.add(
+            io.github.artcraftandroid.procraft.core.PerformSampleInfo(tl.playhead, startTransform),
+        )
+        performSamplesCount = 1
+
+        val fps = tl.fps.toInt().coerceIn(1, 60)
+        val duration = tl.durationFrames.toInt().coerceAtLeast(1)
+        performPlayJob?.cancel()
+        performPlayJob = viewModelScope.launch {
+            while (performRecording) {
+                kotlinx.coroutines.delay(1000L / fps)
+                val curr = timeline?.playhead?.toInt() ?: 0
+                val next = (curr + 1) % duration
+                s.timelineSetPlayhead(next.toUInt())
+                timeline = s.timelineState()
+            }
+        }
+    }
+
+    fun recordPerformTransform(transform: io.github.artcraftandroid.procraft.core.TimelineTransformInfo) {
+        val s = session ?: return
+        val tl = timeline ?: return
+        val cid = tl.activeClipId ?: return
+        val frame = tl.playhead
+        recordedPerformSamples.add(
+            io.github.artcraftandroid.procraft.core.PerformSampleInfo(frame, transform),
+        )
+        performSamplesCount = recordedPerformSamples.size
+        s.timelineSetTransformKeyframe(cid, frame, transform, false)
+        timeline = s.timelineState()
+    }
+
+    fun finishPerformRecording() {
+        performPlayJob?.cancel()
+        performPlayJob = null
+        if (!performRecording) return
+        performRecording = false
+        val s = session ?: return
+        val tl = timeline ?: return
+        val cid = tl.activeClipId ?: return
+        val samples = recordedPerformSamples.toList()
+        if (samples.isNotEmpty()) {
+            val filtering = tl.motionFiltering
+            val written = s.timelineCommitPerform(cid, samples, filtering)
+            message = "Perform recorded $written keyframes"
+        }
+        refresh()
+    }
+
+    fun updatePerformMotionFiltering(filtering: Float) {
+        val s = session ?: return
+        val clamped = filtering.coerceIn(0f, 1f)
+        s.timelineSetMotionFiltering(clamped)
+        val cid = timeline?.activeClipId
+        if (cid != null && recordedPerformSamples.isNotEmpty()) {
+            s.timelineCommitPerform(cid, recordedPerformSamples.toList(), clamped)
+        }
+        refresh()
+    }
+
     fun changeAnimation(f: (io.github.artcraftandroid.procraft.core.AnimationSettings) -> io.github.artcraftandroid.procraft.core.AnimationSettings) {
         val s = session ?: return
         val a = animation ?: return
         s.setAnimationSettings(f(a))
         animation = s.animationSettings()
+        timeline = s.timelineState()
     }
 
     /** Place [slot] comes to the middle, its frame the one drawn on (a tap on the current one opens its options). */
@@ -8422,6 +8783,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         session?.changeFrameHold(id, frames.coerceIn(0, MAX_HOLD).toUInt(), false)
         frameSlots = session?.animationSequence()?.map { it.toInt() }.orEmpty()
         playedSlots = session?.animationPlayedPlaces()?.map { it.toInt() }.orEmpty()
+        timeline = session?.timelineState()
         holdVersion++
     }
 
@@ -8436,6 +8798,36 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun play() {
         val s = session ?: return
+        val tl = timeline
+        if (tl != null && !tl.flipbookOpen) {
+            val total = s.animationFrameCount().toInt()
+            if (total <= 0) return
+            movieSettingsOpen = false
+            playheadActionMenuOpen = false
+            addTrackMenuOpen = false
+            val startIdx = (tl.playhead.toInt()).coerceIn(0, total - 1)
+            playJob?.cancel()
+            playJob = viewModelScope.launch {
+                var at = startIdx
+                var step = 1
+                while (true) {
+                    val wa = timeline?.workArea
+                    val realFrame = if (wa != null) (wa.start.toInt() + at).coerceAtMost(wa.end.toInt()) else at
+                    playingFrame = realFrame
+                    playingSlot = at
+                    s.setPlayFrame(realFrame.toUInt())
+                    s.timelineSetPlayhead(realFrame.toUInt())
+                    timeline = s.timelineState()
+                    val fps = (timeline?.fps ?: tl.fps).toInt().coerceAtLeast(1)
+                    kotlinx.coroutines.delay(1000L / fps)
+                    val mode = timeline?.playback ?: tl.playback
+                    val next = io.github.artcraftandroid.procraft.core.animationNextStep(mode, total.toUInt(), at.toUInt(), step) ?: break
+                    at = next.at.toInt()
+                    step = next.step
+                }
+            }
+            return
+        }
         val a = animation ?: return
         // the timeline's places that play, in order, each frame as often as it is held (the shared
         // core's): a background or foreground frame shows with each, never on its own

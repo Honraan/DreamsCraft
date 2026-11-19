@@ -6525,6 +6525,7 @@ fn layers_export_as_animations() {
 fn new_animation_artwork_starts_on_its_first_frame_without_an_undo_step() {
     let s = CanvasSession::new(40, 40);
     assert!(s.animation_settings().is_none());
+    assert!(s.timeline_state().is_none());
 
     s.enable_animation_for_new_artwork();
 
@@ -6532,6 +6533,67 @@ fn new_animation_artwork_starts_on_its_first_frame_without_an_undo_step() {
     assert_eq!(s.current_frame(), Some(0));
     assert!(s.undo().is_none());
     assert!(s.animation_settings().is_some());
+    let tl = s.timeline_state().unwrap();
+    assert_eq!(tl.fps, 15);
+    assert_eq!(tl.tracks.len(), 1);
+    assert_eq!(tl.tracks[0].clips.len(), 1);
+}
+
+#[test]
+fn multitrack_timeline_tracks_clips_keyframes_perform_and_png_sequence_export() {
+    let Some(s) = session(32, 32) else { return };
+    s.enable_animation_for_new_artwork();
+    let tl0 = s.timeline_state().unwrap();
+    let clip0 = tl0.active_clip_id.unwrap();
+
+    // Add a second cel and set hold
+    let cel2_layer = s.timeline_add_cel(clip0).unwrap();
+    assert!(cel2_layer > 0);
+    assert!(s.timeline_set_cel_hold(clip0, 0, 2, true));
+
+    // Add a second track with a drawing clip
+    let track2 = s.timeline_add_track(Some("Foreground FX".to_owned()), true);
+    assert!(track2 > 0);
+    let tl1 = s.timeline_state().unwrap();
+    assert_eq!(tl1.tracks.len(), 2);
+
+    // Record live Perform samples on clip0 and verify motion filtering + single-step undo
+    let samples: Vec<crate::PerformSampleInfo> = (0..=10)
+        .map(|f| crate::PerformSampleInfo {
+            frame: f,
+            transform: crate::TimelineTransformInfo {
+                x: f as f32 * 5.0,
+                y: 0.0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                rotation: 0.0,
+                anchor_x: 0.5,
+                anchor_y: 0.5,
+            },
+        })
+        .collect();
+    let kfs = s.timeline_commit_perform(clip0, samples, 0.5);
+    assert_eq!(kfs, 2, "linear trajectory simplifies to start and end keyframes");
+    s.timeline_set_playhead(5);
+    s.timeline_select_clip(clip0);
+    let mid_state = s.timeline_state().unwrap();
+    assert!((mid_state.active_evaluated_transform.x - 25.0).abs() < 1.0);
+
+    // Undo removes the Perform recording in one atomic step
+    assert!(s.undo().is_some());
+    assert!(s.timeline_state().unwrap().tracks[0].clips[0].transform_keyframes.is_empty());
+    assert!(s.redo().is_some());
+    assert_eq!(s.timeline_state().unwrap().tracks[0].clips[0].transform_keyframes.len(), 2);
+
+    // Export a PNG sequence over a Work Area
+    s.timeline_set_work_area(Some(crate::TimelineWorkAreaInfo { start: 0, end: 2 }));
+    let dir = std::env::temp_dir().join(format!("dreamscraft-png-seq-{}", std::process::id()));
+    let written = s.export_png_sequence(dir.to_string_lossy().into_owned(), 32, false, true).unwrap();
+    assert_eq!(written, 3);
+    assert!(dir.join("frame_0001.png").is_file());
+    assert!(dir.join("frame_0002.png").is_file());
+    assert!(dir.join("frame_0003.png").is_file());
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]

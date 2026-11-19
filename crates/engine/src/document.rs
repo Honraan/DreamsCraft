@@ -600,6 +600,9 @@ pub struct Document {
     /// Animation Assist's settings while it is on.
     #[serde(default, deserialize_with = "or_default")]
     pub animation: Option<crate::animation::Animation>,
+    /// Multi-track timeline, clips, cels and keyframe animation (DreamsCraft).
+    #[serde(default, deserialize_with = "or_default", skip_serializing_if = "Option::is_none")]
+    pub timeline: Option<crate::timeline::Timeline>,
     /// The colour profile its pixels and colours are in.
     #[serde(default, deserialize_with = "or_default")]
     pub profile: crate::profile::Profile,
@@ -693,6 +696,7 @@ impl Document {
             guide: crate::guide::Guide::new(width.clamp(1, MAX_CANVAS_EDGE), height.clamp(1, MAX_CANVAS_EDGE)),
             dpi: default_dpi(),
             animation: None,
+            timeline: None,
             profile: crate::profile::Profile::Srgb,
             icc: None,
             solo: None,
@@ -2068,7 +2072,33 @@ impl Document {
         }
         let (current, ids): (LayerId, Vec<LayerId>) = (self.current, self.layers.iter().map(|l| l.id).collect());
         self.picked.retain(|p| *p != current && ids.contains(p));
+        let valid_set: std::collections::HashSet<LayerId> = ids.into_iter().collect();
+        self.timeline = self.timeline.map(|t| t.repaired(&valid_set));
         self
+    }
+
+    /// Ensures the document has an active [`crate::timeline::Timeline`], migrating from legacy
+    /// [`crate::animation::Animation`] if present or initializing with the current layer.
+    pub fn ensure_timeline(&mut self) -> &mut crate::timeline::Timeline {
+        if self.timeline.is_none() {
+            let tl = if let Some(anim) = self.animation.as_ref() {
+                crate::timeline::Timeline::from_legacy_animation(self, anim)
+            } else {
+                crate::timeline::Timeline::new_with_layer(self.current)
+            };
+            self.timeline = Some(tl);
+        }
+        self.repair_timeline();
+        let current = self.current;
+        self.timeline.get_or_insert_with(|| crate::timeline::Timeline::new_with_layer(current))
+    }
+
+    /// Cleans up any stale layer references in `self.timeline`.
+    pub fn repair_timeline(&mut self) {
+        if let Some(tl) = self.timeline.take() {
+            let valid: std::collections::HashSet<LayerId> = self.layers.iter().map(|l| l.id).collect();
+            self.timeline = Some(tl.repaired(&valid));
+        }
     }
 
     /// Orders the stack so each group's contents sit just below it and each mask just above its

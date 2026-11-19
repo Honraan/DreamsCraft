@@ -576,6 +576,15 @@ impl CanvasSession {
             let id = d.add_layer();
             let n = procraft_engine::animation::frames(d).len();
             d.rename(id, &format!("{} {n}", if pages { "Page" } else { "Frame" }));
+            if let Some(tl) = d.timeline.as_mut()
+                && let Some(cid) = tl.active_clip
+            {
+                let after = tl.clip(cid).and_then(|c| match &c.kind {
+                    procraft_engine::timeline::ClipKind::Cel { cels } => cels.iter().position(|cel| cel.layer == frame),
+                    _ => None,
+                });
+                tl.insert_cel(cid, after, id, 0);
+            }
             Some(id.0)
         })
         .unwrap_or(0)
@@ -594,14 +603,35 @@ impl CanvasSession {
         let ok = self
             .change("select layer", |d| {
                 d.clear_picks();
-                d.set_current(id).then_some(())
+                let changed = d.set_current(id);
+                if changed && let Some(tl) = d.timeline.as_mut() {
+                    // Move playhead to the cel matching `id` if it belongs to a CelClip
+                    let found = tl.tracks.iter().find_map(|t| {
+                        t.clips.iter().find_map(|c| match &c.kind {
+                            procraft_engine::timeline::ClipKind::Cel { cels } => cels
+                                .iter()
+                                .position(|cel| cel.layer == id)
+                                .and_then(|idx| c.cel_start_frame(idx).map(|f| (t.id, c.id, f))),
+                            procraft_engine::timeline::ClipKind::Layer { layer } if *layer == id => {
+                                Some((t.id, c.id, c.start_frame))
+                            }
+                            _ => None,
+                        })
+                    });
+                    if let Some((tid, cid, frame)) = found {
+                        tl.active_track = Some(tid);
+                        tl.active_clip = Some(cid);
+                        tl.playhead = frame;
+                    }
+                }
+                changed.then_some(())
             })
             .is_some();
         // the onion skins follow the current frame
         let mut guard = self.shared.lock();
         let st = &mut *guard;
         if ok
-            && st.doc.animation.is_some()
+            && (st.doc.animation.is_some() || st.doc.timeline.is_some())
             && let Some(c) = st.canvas.as_mut()
         {
             c.invalidate();
@@ -662,7 +692,14 @@ impl CanvasSession {
 
     /// Removes the current and picked layers (the last layer stays); nothing while one is locked.
     pub fn delete_picked(&self) -> bool {
-        self.change("delete layers", |d| d.delete_chosen().then_some(())).is_some()
+        self.change("delete layers", |d| {
+            let ok = d.delete_chosen();
+            if ok {
+                d.repair_timeline();
+            }
+            ok.then_some(())
+        })
+        .is_some()
     }
 
     /// Merges the picked layers above the bottom one of what is chosen into it.
@@ -680,7 +717,11 @@ impl CanvasSession {
     pub fn delete_layer(&self, id: u64) -> bool {
         self.change("delete layer", |d| {
             let unlocked = d.layer(LayerId(id)).is_some() && !d.is_locked(LayerId(id));
-            (unlocked && d.delete_layer(LayerId(id))).then_some(())
+            let ok = unlocked && d.delete_layer(LayerId(id));
+            if ok {
+                d.repair_timeline();
+            }
+            ok.then_some(())
         })
         .is_some()
     }
@@ -688,7 +729,22 @@ impl CanvasSession {
     /// A copy just above `id` (a layer with its mask, a group with everything in it), made
     /// current; returns its id.
     pub fn duplicate_layer(&self, id: u64) -> Option<u64> {
-        self.duplicated(id, "duplicate layer", |_, _| {})
+        self.duplicated(id, "duplicate layer", |doc, copy| {
+            if let Some(tl) = doc.timeline.as_mut()
+                && let Some(cid) = tl.active_clip
+            {
+                let found = tl.clip(cid).and_then(|c| match &c.kind {
+                    procraft_engine::timeline::ClipKind::Cel { cels } => cels
+                        .iter()
+                        .position(|cel| cel.layer == LayerId(id))
+                        .map(|idx| (idx, cels.get(idx).map_or(0, |cel| cel.hold))),
+                    _ => None,
+                });
+                if let Some((idx, hold)) = found {
+                    tl.insert_cel(cid, Some(idx), copy, hold);
+                }
+            }
+        })
     }
 
     /// Gives paint layer `id` a mask (white: showing all of it), made current; returns its id.

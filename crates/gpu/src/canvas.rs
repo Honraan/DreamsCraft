@@ -49,7 +49,7 @@ const MULTIPLY_MODE: u32 = 1;
 const STROKE_LUMINANCE: u32 = 0x100;
 
 /// The largest uniform block a shader reads.
-const UNIFORM_SIZE: u64 = 160;
+const UNIFORM_SIZE: u64 = 192;
 const _: () = assert!(
     size_of::<LayerUniform>() as u64 <= UNIFORM_SIZE
         && size_of::<StampUniform>() as u64 <= UNIFORM_SIZE
@@ -1124,6 +1124,10 @@ struct LayerUniform {
     /// the stroke takes no paper), how many canvas pixels a pixel of its tile covers, and how deep
     /// it shows in the background (0: a flat colour).
     paper: [f32; 4],
+    /// Non-destructive keyframe transform (inverse 2D affine map from canvas pixel to layer pixel):
+    /// `xform0 = [a, b, c, d]`, `xform1 = [e, f, active, 0]`.
+    xform0: [f32; 4],
+    xform1: [f32; 4],
 }
 
 impl Default for LayerUniform {
@@ -1157,22 +1161,51 @@ impl Default for LayerUniform {
             grain_side: TEXTURE_SIZE as f32,
             scaled: [1.0, 0.0, 0.0, 0.0],
             paper: [0.0, 1.0, 0.0, 0.0],
+            xform0: [1.0, 0.0, 0.0, 1.0],
+            xform1: [0.0; 4],
         }
     }
 }
 
-/// How a layer shows besides its own settings: Animation Assist's onion skins.
+/// How a layer shows besides its own settings: Animation Assist's onion skins and Timeline
+/// keyframe transforms.
 #[derive(Clone, Copy)]
 struct Look {
     tint: [f32; 4],
     opacity: f32,
+    transform: Affine,
+    blend_override: Option<BlendMode>,
 }
 
 impl Look {
-    const PLAIN: Look = Look { tint: [0.0; 4], opacity: 1.0 };
+    const PLAIN: Look = Look { tint: [0.0; 4], opacity: 1.0, transform: Affine::IDENTITY, blend_override: None };
+
+    fn has_transform(&self) -> bool {
+        (self.transform.a - 1.0).abs() >= 1e-4
+            || self.transform.b.abs() >= 1e-4
+            || self.transform.c.abs() >= 1e-4
+            || (self.transform.d - 1.0).abs() >= 1e-4
+            || self.transform.e.abs() >= 1e-4
+            || self.transform.f.abs() >= 1e-4
+    }
 }
 
 impl LayerUniform {
+    /// Applies a non-destructive 2D affine transform (stores its inverse for shader lookup).
+    fn with_transform(mut self, transform: Affine) -> LayerUniform {
+        let is_id = (transform.a - 1.0).abs() < 1e-4
+            && transform.b.abs() < 1e-4
+            && transform.c.abs() < 1e-4
+            && (transform.d - 1.0).abs() < 1e-4
+            && transform.e.abs() < 1e-4
+            && transform.f.abs() < 1e-4;
+        if !is_id && let Some(inv) = transform.inverse() {
+            self.xform0 = [inv.a, inv.b, inv.c, inv.d];
+            self.xform1 = [inv.e, inv.f, 1.0, 0.0];
+        }
+        self
+    }
+
     /// With the stroke's second, if it has one (a dual brush's).
     fn with_dual(self, stroke: Option<&ActiveStroke>) -> LayerUniform {
         match stroke.and_then(|s| s.second) {
@@ -6772,7 +6805,11 @@ impl Canvas {
         self.make_groups(device, group_levels(doc));
         self.ensure_caches(gpu, doc, &mut encoder, &mut uniforms);
         // after the caches: caches just made want the whole picture composited again
-        let dirty = self.dirty.intersect(self.full());
+        let dirty = if !self.dirty.is_empty() && doc.timeline.is_some() {
+            self.full()
+        } else {
+            self.dirty.intersect(self.full())
+        };
         let device = &gpu.device;
         // while caches are remade, or a stroke laid again over several renders, the composite stays
         // as it was, what changed kept for after
@@ -8558,7 +8595,7 @@ impl Canvas {
     /// is below the run), with every layer in them; none while something else is under way
     /// (Animation Assist's frames, an adjustment, liquify, a transform, a stroke elsewhere).
     fn live_items(&self, doc: &Document) -> Option<(Vec<LayerId>, std::ops::Range<usize>)> {
-        if doc.animation.is_some() {
+        if doc.animation.is_some() || doc.timeline.is_some() {
             return None;
         }
         let tops = doc.members(None);
@@ -8773,15 +8810,29 @@ impl Canvas {
         self.caches = Some(caches);
     }
 
-    /// With Animation Assist on (and nothing else under way), the layers of the frames shown: the
-    /// current (or played) one, its onion skins, and a background or foreground frame.
+    /// With Animation Assist or Timeline on (and nothing else under way), the layers of the frames
+    /// shown: the current (or played) one, its onion skins, and any active background/foreground
+    /// tracks.
     fn shown_frames(&self, doc: &Document) -> Option<HashSet<LayerId>> {
-        let a = doc.animation.as_ref()?;
         let busy =
             self.transforming.is_some() || self.liquify.is_some() || self.pencil.is_some() || self.held.is_some();
         if busy || self.smudge.is_some() {
             return None;
         }
+        if let Some(tl) = doc.timeline.as_ref() {
+            let playing = self.play_frame.is_some();
+            let frame = self.play_frame.map_or(tl.playhead as f32, |f| f as f32);
+            let scene = tl.evaluate(doc, frame, playing);
+            let mut shown: HashSet<LayerId> =
+                scene.items.iter().flat_map(|item| item_layers(doc, item.layer)).collect();
+            for top in doc.members(None) {
+                if !scene.managed_layers.contains(&top) && doc.layer(top).is_some_and(|l| l.visible) {
+                    shown.extend(item_layers(doc, top));
+                }
+            }
+            return Some(shown);
+        }
+        let a = doc.animation.as_ref()?;
         let frames = animation::frames(doc);
         let focus = self.play_frame.or_else(|| animation::current_frame(doc))?;
         let shown: HashSet<LayerId> = frames
@@ -9326,6 +9377,10 @@ impl Canvas {
         stack: &Stack<'_>,
         current: &mut usize,
     ) {
+        if top && let Some(tl) = doc.timeline.as_ref() {
+            self.composite_timeline(device, doc, tl, encoder, uniforms, rect, items, stack, current);
+            return;
+        }
         // Animation Assist: the top level's frames show around the current (or played) one; none
         // for a frame not shown
         let animation = if top { doc.animation.as_ref() } else { None };
@@ -9335,7 +9390,7 @@ impl Canvas {
             (Some(a), Some(c), Some(i)) => match animation::look(a, i, frames.len(), c, self.play_frame.is_some()) {
                 FrameLook::Shown => Some(Look::PLAIN),
                 FrameLook::Onion { color, opacity } => {
-                    Some(Look { tint: [color[0], color[1], color[2], 1.0], opacity })
+                    Some(Look { tint: [color[0], color[1], color[2], 1.0], opacity, ..Look::PLAIN })
                 }
                 FrameLook::Hidden => None,
             },
@@ -9350,54 +9405,121 @@ impl Canvas {
                 continue;
             }
             let Some(look) = look_of(id) else { continue };
-            match layer.kind {
-                LayerKind::Mask => {}
-                LayerKind::Paint => {
-                    // with the layers clipped to it just above, a clipping group (a layer clipped
-                    // to one not shown goes through that one's alpha on its own)
-                    let clipped = clipped_run(doc, items.get(at..).unwrap_or_default(), id);
-                    if clipped.is_empty() {
-                        self.composite_layer(
-                            device, doc, encoder, uniforms, rect, layer, look, CLIP_NONE, stack, current,
-                        );
-                    } else {
-                        at += clipped.len();
-                        let group = ClipGroup { base: layer, look, clipped, looks: &look_of };
-                        self.composite_clip_group(device, doc, encoder, uniforms, rect, group, stack, current);
-                    }
+            self.composite_one_item(
+                device, doc, encoder, uniforms, rect, items, &mut at, layer, look, &look_of, stack, current,
+            );
+        }
+    }
+
+    /// Composites a multi-track [`procraft_engine::timeline::Timeline`] scene at the current
+    /// playhead (or `self.play_frame` while playing/exporting).
+    #[allow(clippy::too_many_arguments)]
+    fn composite_timeline(
+        &self,
+        device: &wgpu::Device,
+        doc: &Document,
+        tl: &procraft_engine::timeline::Timeline,
+        encoder: &mut wgpu::CommandEncoder,
+        uniforms: &mut UniformData,
+        rect: IRect,
+        items: &[LayerId],
+        stack: &Stack<'_>,
+        current: &mut usize,
+    ) {
+        let playing = self.play_frame.is_some();
+        let frame = self.play_frame.map_or(tl.playhead as f32, |f| f as f32);
+        let scene = tl.evaluate(doc, frame, playing);
+        for eval in &scene.items {
+            let Some(layer) = doc.layer(eval.layer) else { continue };
+            if doc.soloed_out(eval.layer) {
+                continue;
+            }
+            let look = Look {
+                tint: eval.tint,
+                opacity: eval.opacity,
+                transform: eval.transform,
+                blend_override: (eval.blend != BlendMode::Normal).then_some(eval.blend),
+            };
+            let pos = items.iter().position(|&x| x == eval.layer).map_or(items.len(), |p| p + 1);
+            let mut at = pos;
+            let look_of = |_: LayerId| Some(Look { transform: look.transform, ..Look::PLAIN });
+            self.composite_one_item(
+                device, doc, encoder, uniforms, rect, items, &mut at, layer, look, &look_of, stack, current,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn composite_one_item(
+        &self,
+        device: &wgpu::Device,
+        doc: &Document,
+        encoder: &mut wgpu::CommandEncoder,
+        uniforms: &mut UniformData,
+        rect: IRect,
+        items: &[LayerId],
+        at: &mut usize,
+        layer: &Layer,
+        look: Look,
+        look_of: &dyn Fn(LayerId) -> Option<Look>,
+        stack: &Stack<'_>,
+        current: &mut usize,
+    ) {
+        let id = layer.id;
+        match layer.kind {
+            LayerKind::Mask => {}
+            LayerKind::Paint => {
+                // with the layers clipped to it just above, a clipping group (a layer clipped
+                // to one not shown goes through that one's alpha on its own)
+                let clipped = clipped_run(doc, items.get(*at..).unwrap_or_default(), id);
+                if clipped.is_empty() {
+                    self.composite_layer(device, doc, encoder, uniforms, rect, layer, look, CLIP_NONE, stack, current);
+                } else {
+                    *at += clipped.len();
+                    let group = ClipGroup { base: layer, look, clipped, looks: look_of };
+                    self.composite_clip_group(device, doc, encoder, uniforms, rect, group, stack, current);
                 }
-                LayerKind::Group => {
-                    if !layer.visible || layer.opacity <= 0.0 {
-                        continue;
-                    }
-                    // its members straight onto what is below (an onion skin's frame on its own,
-                    // to be tinted whole)
-                    if layer.passes_through() && look.tint[3] == 0.0 {
-                        let members = doc.members(Some(id));
-                        self.composite_items(device, doc, encoder, uniforms, rect, &members, false, stack, current);
-                        continue;
-                    }
-                    let Some(view) = self.composite_group(device, doc, encoder, uniforms, rect, id) else { continue };
-                    let uniform = LayerUniform {
-                        opacity: layer.opacity.clamp(0.0, 1.0) * look.opacity,
-                        blend: layer.blend.id(),
-                        tint: look.tint,
-                        ..Default::default()
-                    };
-                    self.draw_onto(
-                        device,
-                        encoder,
-                        uniforms,
-                        rect,
-                        view,
-                        None,
-                        &self.stroke_view,
-                        uniform,
-                        layer.blend,
-                        stack,
-                        current,
-                    );
+            }
+            LayerKind::Group => {
+                if !layer.visible || layer.opacity <= 0.0 {
+                    return;
                 }
+                // its members straight onto what is below (an onion skin's or transformed frame
+                // on its own, to be tinted/transformed whole)
+                if layer.passes_through()
+                    && look.tint[3] == 0.0
+                    && !look.has_transform()
+                    && look.blend_override.is_none()
+                {
+                    let members = doc.members(Some(id));
+                    self.composite_items(device, doc, encoder, uniforms, rect, &members, false, stack, current);
+                    return;
+                }
+                let group_rect = if look.has_transform() { self.full() } else { rect };
+                let Some(view) = self.composite_group(device, doc, encoder, uniforms, group_rect, id) else {
+                    return;
+                };
+                let blend = look.blend_override.unwrap_or(layer.blend);
+                let uniform = LayerUniform {
+                    opacity: layer.opacity.clamp(0.0, 1.0) * look.opacity,
+                    blend: blend.id(),
+                    tint: look.tint,
+                    ..Default::default()
+                }
+                .with_transform(look.transform);
+                self.draw_onto(
+                    device,
+                    encoder,
+                    uniforms,
+                    rect,
+                    view,
+                    None,
+                    &self.stroke_view,
+                    uniform,
+                    blend,
+                    stack,
+                    current,
+                );
             }
         }
     }
@@ -9446,32 +9568,35 @@ impl Canvas {
         let (texture, view) = self.clip_group.get(device);
         let inner = Stack { first: (texture, view), second: Second::OnDemand(&self.clip_group_second, device) };
         let mut at = 0;
+        let inner_rect = if look.has_transform() { self.full() } else { rect };
         // the base at full, with the stroke being drawn on it (or its mask), written over what was
         // there
-        self.composite_layer(device, doc, encoder, uniforms, rect, base, Look::PLAIN, CLIP_BASE, &inner, &mut at);
+        self.composite_layer(device, doc, encoder, uniforms, inner_rect, base, Look::PLAIN, CLIP_BASE, &inner, &mut at);
         for &id in clipped {
             let Some(layer) = doc.layer(id) else { continue };
             if doc.soloed_out(id) {
                 continue;
             }
-            let Some(look) = looks(id) else { continue };
-            self.composite_layer(device, doc, encoder, uniforms, rect, layer, look, CLIP_ATOP, &inner, &mut at);
+            let Some(mut member_look) = looks(id) else { continue };
+            member_look.transform = Affine::IDENTITY;
+            self.composite_layer(
+                device,
+                doc,
+                encoder,
+                uniforms,
+                inner_rect,
+                layer,
+                member_look,
+                CLIP_ATOP,
+                &inner,
+                &mut at,
+            );
         }
         let view = if at == 0 { view } else { inner.second().1 };
-        let uniform = LayerUniform { opacity, blend: base.blend.id(), tint: look.tint, ..Default::default() };
-        self.draw_onto(
-            device,
-            encoder,
-            uniforms,
-            rect,
-            view,
-            None,
-            &self.stroke_view,
-            uniform,
-            base.blend,
-            stack,
-            current,
-        );
+        let blend = look.blend_override.unwrap_or(base.blend);
+        let uniform = LayerUniform { opacity, blend: blend.id(), tint: look.tint, ..Default::default() }
+            .with_transform(look.transform);
+        self.draw_onto(device, encoder, uniforms, rect, view, None, &self.stroke_view, uniform, blend, stack, current);
     }
 
     /// One paint layer (through its mask, with the stroke being drawn on it or its mask) onto a
@@ -9495,8 +9620,9 @@ impl Canvas {
     ) {
         let clip = doc.clip_base(layer.id).filter(|_| role == CLIP_NONE);
         let clip_visible = clip.is_none_or(|id| doc.layer(id).is_some_and(|l| l.visible));
+        let effective_blend = look.blend_override.unwrap_or(layer.blend);
         let (opacity, blend) =
-            if role == CLIP_BASE { (1.0, BlendMode::Normal) } else { (layer.opacity.clamp(0.0, 1.0), layer.blend) };
+            if role == CLIP_BASE { (1.0, BlendMode::Normal) } else { (layer.opacity.clamp(0.0, 1.0), effective_blend) };
         if !layer.visible || !clip_visible || opacity <= 0.0 {
             return;
         }
@@ -9510,8 +9636,9 @@ impl Canvas {
             .map(|m| &m.view);
         let mask = doc.mask_of(layer.id).filter(|m| doc.layer(*m).is_some_and(|l| l.visible));
         let mask_view = mask.and_then(|m| self.layers.get(&m)).map(|m| &m.view);
-        // the stroke being drawn shows on its layer, or through the mask it is painting
-        let stroke = self.active.filter(|s| (s.layer == layer.id || Some(s.layer) == mask) && !s.pencil);
+        // the stroke being drawn shows on its layer, or through the mask it is painting (never on an onion ghost)
+        let stroke =
+            self.active.filter(|s| (s.layer == layer.id || Some(s.layer) == mask) && !s.pencil && look.tint[3] == 0.0);
         let uniform = LayerUniform {
             opacity: opacity * look.opacity,
             tint: look.tint,
@@ -9536,7 +9663,8 @@ impl Canvas {
         }
         .with_grain(stroke.as_ref().map(|s| &s.style))
         .with_paper(stroke.is_some(), self.paper_look())
-        .with_dual(stroke.as_ref());
+        .with_dual(stroke.as_ref())
+        .with_transform(look.transform);
         let mask_view = mask_view.unwrap_or(&self.stroke_view);
         self.draw_onto(
             device,
@@ -12295,7 +12423,7 @@ struct Remake {
 /// How many levels of group textures compositing `doc` takes: down to the deepest group
 /// composited on its own (with Animation Assist any group, its frame's onion skin tinted whole).
 fn group_levels(doc: &Document) -> usize {
-    if doc.animation.is_some() {
+    if doc.animation.is_some() || doc.timeline.is_some() {
         return doc.max_depth();
     }
     let alone = doc.layers().iter().filter(|l| l.kind == LayerKind::Group && !l.passes_through());

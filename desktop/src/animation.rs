@@ -650,7 +650,7 @@ impl AnimationBar {
                     y += 55.0 + 11.5;
                 }
                 y += 9.0 - 11.5;
-                let group = Rect::from_min_max(pos2(left, y), pos2(right, y + 44.5 * 2.0 + 2.0));
+                let group = Rect::from_min_max(pos2(left, y), pos2(right, y + 44.5 * 3.0 + 4.0));
                 ui.painter().rect_filled(group, 18, argb(GROUP));
                 let blend = Rect::from_min_max(pos2(left, y), pos2(right, y + 44.5));
                 if toggle_row(ui, blend, "Blend primary frame", a.blend_primary) {
@@ -672,6 +672,32 @@ impl AnimationBar {
                 );
                 if ui.interact(row, ui.scope_id().with("onion colours"), Sense::click()).clicked() {
                     self.colours = Some((false, CompactColours::new(to_rgb(&a.before), 0.0)));
+                }
+                y += 44.5;
+                ui.painter().rect_filled(Rect::from_min_max(pos2(left, y), pos2(right, y + 2.0)), 0, argb(ROW_LINE));
+                y += 2.0;
+                let tracks_row = Rect::from_min_max(pos2(left, y), pos2(right, y + 44.5));
+                let track_count = session.timeline_state().map_or(1, |s| s.tracks.len());
+                text(
+                    ui.painter(),
+                    pos2(tracks_row.left() + 16.0, tracks_row.center().y),
+                    Align2::LEFT_CENTER,
+                    &format!("Timeline tracks ({track_count})"),
+                    17.0,
+                    Weight::Regular,
+                    argb(PANEL_TITLE),
+                );
+                text(
+                    ui.painter(),
+                    pos2(tracks_row.right() - 16.0, tracks_row.center().y),
+                    Align2::RIGHT_CENTER,
+                    "+ Track",
+                    17.0,
+                    Weight::Bold,
+                    argb(pc::ACCENT),
+                );
+                if ui.interact(tracks_row, ui.scope_id().with("add track"), Sense::click()).clicked() {
+                    let _ = session.timeline_add_track(None, true);
                 }
             },
         );
