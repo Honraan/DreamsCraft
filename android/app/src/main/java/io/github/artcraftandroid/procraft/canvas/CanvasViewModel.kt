@@ -2415,12 +2415,33 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             importPsd(uri, name)
         } else if (head != null && String(head, Charsets.ISO_8859_1) == "%PDF") {
             importPdf(uri, name)
+        } else if (zipFile != null && name?.endsWith(".kra", ignoreCase = true) == true) {
+            val outcome = withContext(Dispatchers.IO) {
+                val dir = importFolder()
+                io.github.artcraftandroid.procraft.core.importKra(
+                    zipFile.path,
+                    dir.path,
+                    name.substringBeforeLast('.').trim(),
+                ).also { if (it != io.github.artcraftandroid.procraft.core.PsdOutcome.Imported) dir.deleteRecursively() }
+            }
+            when (outcome) {
+                io.github.artcraftandroid.procraft.core.PsdOutcome.Imported -> refreshGallery()
+                is io.github.artcraftandroid.procraft.core.PsdOutcome.TooManyLayers ->
+                    message = "This Krita file has too many layers (${outcome.most})."
+                else -> message = "This Krita (.kra) file can't be opened."
+            }
         } else if (zipFile != null) {
-            // an artwork file of ours, or a layered package
+            // an artwork file of ours, a layered package, or a Krita .kra document
             val ok = withContext(Dispatchers.IO) {
                 val dir = importFolder()
                 val ours = runCatching { zipFile.inputStream().use { io.github.artcraftandroid.procraft.gallery.ArtworkFile.read(it, dir) } }.getOrNull() == true
-                (ours || importPackage(zipFile, dir)).also { if (!it) dir.deleteRecursively() }
+                val imported = ours || importPackage(zipFile, dir) ||
+                    io.github.artcraftandroid.procraft.core.importKra(
+                        zipFile.path,
+                        dir.path,
+                        name?.substringBeforeLast('.')?.trim().orEmpty(),
+                    ) == io.github.artcraftandroid.procraft.core.PsdOutcome.Imported
+                imported.also { if (!it) dir.deleteRecursively() }
             }
             if (ok) refreshGallery() else message = "This file can't be opened."
         } else {
@@ -6668,9 +6689,15 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     fun animationFrameCount(): Int = session?.animationFrameCount()?.toInt() ?: 0
 
-    /** Frame [index] fitted to [side] pixels, without the background if [transparent]. */
-    fun animationFrame(index: Int, side: Int, transparent: Boolean): Bitmap? {
-        val t = session?.animationFrame(index.toUInt(), transparent, side.coerceAtLeast(1).toUInt()) ?: return null
+    /** True when the artwork has a Timeline Camera track configured or enabled. */
+    fun hasCameraViewport(): Boolean {
+        val tl = timeline ?: return false
+        return tl.cameraEnabled || tl.cameraTransformKeyframes.isNotEmpty() || tl.cameraFilterKeyframes.isNotEmpty()
+    }
+
+    /** Frame [index] fitted to [side] pixels, without the background if [transparent], framed by Camera if [useCamera]. */
+    fun animationFrame(index: Int, side: Int, transparent: Boolean, useCamera: Boolean = true): Bitmap? {
+        val t = session?.animationFrameWithCamera(index.toUInt(), transparent, side.coerceAtLeast(1).toUInt(), useCamera) ?: return null
         val w = t.width.toInt()
         val h = t.height.toInt()
         val argb = IntArray(w * h) { i ->
@@ -6692,6 +6719,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     /**
      * The animation written as [format] into the cache, to share, [fps] frames a second: Web Ready
      * fits 480 pixels, else the canvas size (a video as large as the encoder takes, up to 4096).
+     * When [useCamera] is true, the global Camera Track frames the exported viewport.
      */
     suspend fun exportAnimation(
         format: Animated,
@@ -6700,6 +6728,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         perFramePalette: Boolean,
         transparent: Boolean,
         fps: Float,
+        useCamera: Boolean = true,
         cancelled: () -> Boolean = { false },
     ): File? {
         val s = session ?: return null
@@ -6710,8 +6739,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             val side = if (webReady) WEB_READY_SIDE else 0
             try {
                 when (format) {
-                    Animated.GIF -> s.exportGif(file.path, side.toUInt(), fps, dither, perFramePalette, transparent)
-                    Animated.PNG -> s.exportApng(file.path, side.toUInt(), fps, transparent)
+                    Animated.GIF -> s.exportGifWithCamera(file.path, side.toUInt(), fps, dither, perFramePalette, transparent, useCamera)
+                    Animated.PNG -> s.exportApngWithCamera(file.path, side.toUInt(), fps, transparent, useCamera)
                     Animated.MP4, Animated.HEVC -> {
                         val mime = if (format == Animated.HEVC) android.media.MediaFormat.MIMETYPE_VIDEO_HEVC else android.media.MediaFormat.MIMETYPE_VIDEO_AVC
                         val (cw, ch) = canvasSize()
@@ -6741,7 +6770,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                             ) { i, pixels ->
                                 if (cancelled()) return@writeWithAudio false
                                 videoDone = i.toFloat() / order.size
-                                val picture = animationFrame(order[i].toInt(), maxOf(w, h), false) ?: return@writeWithAudio false
+                                val picture = animationFrame(order[i].toInt(), maxOf(w, h), false, useCamera) ?: return@writeWithAudio false
                                 android.graphics.Canvas(frame).drawBitmap(picture, null, android.graphics.Rect(0, 0, w, h), paint)
                                 picture.recycle()
                                 frame.getPixels(pixels, 0, w, 0, 0, w, h)
@@ -6762,12 +6791,20 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** [exportAnimation] with the export card (as every export has), how far it has come shown; Cancel stops a video. */
-    suspend fun shareAnimation(format: Animated, webReady: Boolean, dither: Boolean, perFramePalette: Boolean, transparent: Boolean, fps: Float): File? {
+    suspend fun shareAnimation(
+        format: Animated,
+        webReady: Boolean,
+        dither: Boolean,
+        perFramePalette: Boolean,
+        transparent: Boolean,
+        fps: Float,
+        useCamera: Boolean = true,
+    ): File? {
         val s = session ?: return null
         s.resetExportProgress()
         videoDone = 0f
         return withCard("The animation could not be exported.", { if (format.video) videoDone else s.exportProgress() }) {
-            exportAnimation(format, webReady, dither, perFramePalette, transparent, fps) { exportCancelled }
+            exportAnimation(format, webReady, dither, perFramePalette, transparent, fps, useCamera) { exportCancelled }
         }
     }
 
@@ -8728,58 +8765,172 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     // ---- Live Perform Motion Recording ----
 
     private var lastPerformCommitRev: ULong? = null
+    private var performIsCamera = false
+    private var performClipId: ULong? = null
+    private var performStartFrame: UInt = 0u
+    private var activePerformTransform: io.github.artcraftandroid.procraft.core.TimelineTransformInfo? = null
+    private var activePerformDeform: io.github.artcraftandroid.procraft.core.TimelineDeformInfo? = null
 
-    fun beginPerformRecording() {
+    /** Start frame of the most recent Perform take (for 1-tap Replay). */
+    var lastPerformStartFrame by androidx.compose.runtime.mutableIntStateOf(0)
+        private set
+
+    /** True once a Perform take has been recorded in this session so Replay is available. */
+    var hasRecentPerformTake by mutableStateOf(false)
+        private set
+
+    /** Live canvas-space motion trail points `(x, y)` drawn behind the object while performing. */
+    var performTrailPoints by mutableStateOf<List<Pair<Float, Float>>>(emptyList())
+        private set
+
+    fun beginPerformRecording(
+        isCamera: Boolean = false,
+        initialTransform: io.github.artcraftandroid.procraft.core.TimelineTransformInfo? = null,
+        initialDeform: io.github.artcraftandroid.procraft.core.TimelineDeformInfo? = null,
+    ) {
         val s = session ?: return
         val tl = timeline ?: return
+        val cid = if (isCamera) null else tl.activeClipId
+        if (!isCamera && cid == null) return
+
         stopPlaying()
         recordedPerformSamples.clear()
         recordedPerformDeforms.clear()
         lastPerformCommitRev = null
         performSamplesCount = 0
+        performIsCamera = isCamera
+        performClipId = cid
+        performStartFrame = tl.playhead
+        lastPerformStartFrame = tl.playhead.toInt()
+        activePerformDeform = initialDeform
+        val startTransform = initialTransform ?: if (isCamera) tl.cameraTransform else tl.activeEvaluatedTransform
+        activePerformTransform = if (initialDeform == null) startTransform else null
+        performTrailPoints = if (initialDeform == null) listOf(startTransform.x to startTransform.y) else emptyList()
+
         s.timelineBeginPerform()
         performRecording = true
-        val startTransform = tl.activeEvaluatedTransform
-        recordedPerformSamples.add(
-            io.github.artcraftandroid.procraft.core.PerformSampleInfo(tl.playhead, startTransform),
-        )
-        performSamplesCount = 1
+
+        if (initialDeform != null) {
+            recordedPerformDeforms.add(
+                io.github.artcraftandroid.procraft.core.PerformDeformSampleInfo(tl.playhead, initialDeform),
+            )
+            performSamplesCount = 1
+            if (cid != null) {
+                s.timelinePreviewPerformDeform(cid, tl.playhead, initialDeform)
+            }
+        } else {
+            recordedPerformSamples.add(
+                io.github.artcraftandroid.procraft.core.PerformSampleInfo(tl.playhead, startTransform),
+            )
+            performSamplesCount = 1
+            if (isCamera) {
+                s.timelinePreviewPerformCamera(tl.playhead, startTransform)
+            } else if (cid != null) {
+                s.timelinePreviewPerformTransform(cid, tl.playhead, startTransform)
+            }
+        }
 
         val fps = tl.fps.toInt().coerceIn(1, 60)
         val duration = tl.durationFrames.toInt().coerceAtLeast(1)
+        val endLimit = tl.workArea?.end?.toInt()?.coerceIn(0, duration - 1) ?: (duration - 1)
         performPlayJob?.cancel()
         performPlayJob = viewModelScope.launch {
             while (performRecording) {
                 kotlinx.coroutines.delay(1000L / fps)
-                val curr = timeline?.playhead?.toInt() ?: 0
-                val next = (curr + 1) % duration
-                s.timelineSetPlayhead(next.toUInt())
+                if (!performRecording) break
+                val curr = timeline?.playhead?.toInt() ?: performStartFrame.toInt()
+                val next = curr + 1
+                if (next > endLimit) {
+                    finishPerformRecording()
+                    break
+                }
+                val nextU = next.toUInt()
+                val heldDeform = activePerformDeform
+                val heldTransform = activePerformTransform
+                when {
+                    heldDeform != null && performClipId != null -> {
+                        if (recordedPerformDeforms.lastOrNull()?.frame == nextU) {
+                            recordedPerformDeforms[recordedPerformDeforms.lastIndex] =
+                                io.github.artcraftandroid.procraft.core.PerformDeformSampleInfo(nextU, heldDeform)
+                        } else {
+                            recordedPerformDeforms.add(
+                                io.github.artcraftandroid.procraft.core.PerformDeformSampleInfo(nextU, heldDeform),
+                            )
+                        }
+                        performSamplesCount = recordedPerformDeforms.size
+                        s.timelineStepPerformDeform(performClipId!!, nextU, heldDeform)
+                    }
+                    performIsCamera && heldTransform != null -> {
+                        if (recordedPerformSamples.lastOrNull()?.frame == nextU) {
+                            recordedPerformSamples[recordedPerformSamples.lastIndex] =
+                                io.github.artcraftandroid.procraft.core.PerformSampleInfo(nextU, heldTransform)
+                        } else {
+                            recordedPerformSamples.add(
+                                io.github.artcraftandroid.procraft.core.PerformSampleInfo(nextU, heldTransform),
+                            )
+                        }
+                        performSamplesCount = recordedPerformSamples.size
+                        s.timelineStepPerformCamera(nextU, heldTransform)
+                    }
+                    performClipId != null && heldTransform != null -> {
+                        if (recordedPerformSamples.lastOrNull()?.frame == nextU) {
+                            recordedPerformSamples[recordedPerformSamples.lastIndex] =
+                                io.github.artcraftandroid.procraft.core.PerformSampleInfo(nextU, heldTransform)
+                        } else {
+                            recordedPerformSamples.add(
+                                io.github.artcraftandroid.procraft.core.PerformSampleInfo(nextU, heldTransform),
+                            )
+                        }
+                        performSamplesCount = recordedPerformSamples.size
+                        s.timelineStepPerformTransform(performClipId!!, nextU, heldTransform)
+                    }
+                    else -> {
+                        s.timelineSetPlayhead(nextU)
+                    }
+                }
                 timeline = s.timelineState()
             }
         }
     }
 
-    fun recordPerformTransform(transform: io.github.artcraftandroid.procraft.core.TimelineTransformInfo) {
+    fun recordPerformTransform(
+        transform: io.github.artcraftandroid.procraft.core.TimelineTransformInfo,
+        isCamera: Boolean = performIsCamera,
+    ) {
         val s = session ?: return
         val tl = timeline ?: return
-        val cid = tl.activeClipId ?: return
         val frame = tl.playhead
-        recordedPerformSamples.add(
-            io.github.artcraftandroid.procraft.core.PerformSampleInfo(frame, transform),
-        )
+        activePerformTransform = transform
+        val sample = io.github.artcraftandroid.procraft.core.PerformSampleInfo(frame, transform)
+        if (recordedPerformSamples.lastOrNull()?.frame == frame) {
+            recordedPerformSamples[recordedPerformSamples.lastIndex] = sample
+        } else {
+            recordedPerformSamples.add(sample)
+        }
         performSamplesCount = recordedPerformSamples.size
-        s.timelinePreviewPerformTransform(cid, frame, transform)
+        val nextTrail = (performTrailPoints + (transform.x to transform.y)).takeLast(240)
+        performTrailPoints = nextTrail
+        if (isCamera) {
+            s.timelinePreviewPerformCamera(frame, transform)
+        } else {
+            val cid = performClipId ?: tl.activeClipId ?: return
+            s.timelinePreviewPerformTransform(cid, frame, transform)
+        }
         canUndo = true
     }
 
     fun recordPerformDeform(deform: io.github.artcraftandroid.procraft.core.TimelineDeformInfo) {
         val s = session ?: return
         val tl = timeline ?: return
-        val cid = tl.activeClipId ?: return
+        val cid = performClipId ?: tl.activeClipId ?: return
         val frame = tl.playhead
-        recordedPerformDeforms.add(
-            io.github.artcraftandroid.procraft.core.PerformDeformSampleInfo(frame, deform),
-        )
+        activePerformDeform = deform
+        val sample = io.github.artcraftandroid.procraft.core.PerformDeformSampleInfo(frame, deform)
+        if (recordedPerformDeforms.lastOrNull()?.frame == frame) {
+            recordedPerformDeforms[recordedPerformDeforms.lastIndex] = sample
+        } else {
+            recordedPerformDeforms.add(sample)
+        }
         performSamplesCount = recordedPerformDeforms.size
         s.timelinePreviewPerformDeform(cid, frame, deform)
         canUndo = true
@@ -8789,6 +8940,9 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         performPlayJob?.cancel()
         performPlayJob = null
         performRecording = false
+        activePerformTransform = null
+        activePerformDeform = null
+        performTrailPoints = emptyList()
         recordedPerformSamples.clear()
         recordedPerformDeforms.clear()
         performSamplesCount = 0
@@ -8804,40 +8958,75 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         performRecording = false
         val s = session ?: return
         val tl = timeline ?: return
-        val cid = tl.activeClipId ?: return
         val filtering = tl.motionFiltering
+        val wasCamera = performIsCamera
+        val cid = performClipId ?: tl.activeClipId
+        val startFrame = performStartFrame
+        activePerformTransform = null
+        activePerformDeform = null
+        performTrailPoints = emptyList()
+
         val deformSamples = recordedPerformDeforms.toList()
-        if (deformSamples.isNotEmpty()) {
+        var committed = false
+        if (deformSamples.isNotEmpty() && cid != null) {
             val written = s.timelineCommitPerformDeform(cid, deformSamples, filtering)
             lastPerformCommitRev = s.info().revision
+            committed = written > 0u
             message = "Perform Warp recorded $written keyframes"
         } else {
             val samples = recordedPerformSamples.toList()
             if (samples.isNotEmpty()) {
-                val written = s.timelineCommitPerform(cid, samples, filtering)
+                val written = if (wasCamera) {
+                    s.timelineCommitPerformCamera(samples, filtering)
+                } else if (cid != null) {
+                    s.timelineCommitPerform(cid, samples, filtering)
+                } else {
+                    0u
+                }
                 lastPerformCommitRev = s.info().revision
-                message = "Perform recorded $written keyframes"
+                committed = written > 0u
+                message = if (wasCamera) {
+                    "Perform Camera recorded $written keyframes"
+                } else {
+                    "Perform recorded $written keyframes"
+                }
             } else {
                 s.timelineCancelPerform()
             }
         }
+        if (committed) {
+            hasRecentPerformTake = true
+            // Return playhead to where the Perform take began so pressing Play immediately replays the motion!
+            s.timelineSetPlayhead(startFrame)
+        }
         refresh()
+    }
+
+    /** Rewinds to the start of the most recent Perform take and plays it back immediately. */
+    fun replayLastPerform() {
+        val s = session ?: return
+        stopPlaying()
+        s.timelineSetPlayhead(lastPerformStartFrame.coerceAtLeast(0).toUInt())
+        timeline = s.timelineState()
+        play()
     }
 
     fun updatePerformMotionFiltering(filtering: Float) {
         val s = session ?: return
         val clamped = filtering.coerceIn(0f, 1f)
         s.timelineSetMotionFiltering(clamped)
-        val cid = timeline?.activeClipId
-        if (cid != null && (recordedPerformDeforms.isNotEmpty() || recordedPerformSamples.isNotEmpty())) {
+        val cid = performClipId ?: timeline?.activeClipId
+        if (recordedPerformDeforms.isNotEmpty() || recordedPerformSamples.isNotEmpty()) {
             // If the user is adjusting Motion Filtering right after a Perform take, replace that
             // single Perform undo step instead of stacking duplicate Perform steps!
             if (lastPerformCommitRev != null && s.info().revision == lastPerformCommitRev) {
                 s.undo()
             }
-            if (recordedPerformDeforms.isNotEmpty()) {
+            if (recordedPerformDeforms.isNotEmpty() && cid != null) {
                 s.timelineCommitPerformDeform(cid, recordedPerformDeforms.toList(), clamped)
-            } else {
+            } else if (performIsCamera) {
+                s.timelineCommitPerformCamera(recordedPerformSamples.toList(), clamped)
+            } else if (cid != null) {
                 s.timelineCommitPerform(cid, recordedPerformSamples.toList(), clamped)
             }
             lastPerformCommitRev = s.info().revision

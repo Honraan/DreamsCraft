@@ -6929,6 +6929,265 @@ fn dreamscraft_v2_2_camera_tools_align_colordrop_selection_and_zoomed_dirty() {
 }
 
 #[test]
+fn dreamscraft_v2_3_procraft_package_preserves_full_timeline_camera_and_audio() {
+    let Some(s) = session(64, 64) else { return };
+    s.set_timeline_enabled(true);
+    s.timeline_set_fps(18);
+    s.timeline_set_duration(48);
+
+    // Draw a red dot on cel 0, add cel 1 with a green dot and hold = 3
+    s.set_brush_size(0.3);
+    s.set_color(1.0, 0.0, 0.0);
+    s.stroke_begin(PointerKind::Finger, vec![sample(16.0, 16.0, 0.0)]);
+    s.stroke_end(vec![]);
+
+    let tl = s.timeline_state().unwrap();
+    let clip_id = tl.active_clip_id.unwrap();
+    let _cel2 = s.timeline_add_cel(clip_id).unwrap();
+    s.timeline_set_cel_hold(clip_id, 1, 3, true);
+    s.set_color(0.0, 1.0, 0.0);
+    s.stroke_begin(PointerKind::Finger, vec![sample(48.0, 48.0, 0.0)]);
+    s.stroke_end(vec![]);
+
+    // Add keyframe transform on the clip + Camera Track keyframe
+    let xf = crate::TimelineTransformInfo {
+        x: 12.0,
+        y: -8.0,
+        scale_x: 1.25,
+        scale_y: 1.25,
+        rotation: 0.35,
+        anchor_x: 0.5,
+        anchor_y: 0.5,
+    };
+    assert!(s.timeline_set_transform_keyframe(clip_id, 4, xf, true));
+    let cam = crate::TimelineTransformInfo {
+        x: 6.0,
+        y: -4.0,
+        scale_x: 0.75,
+        scale_y: 0.75,
+        rotation: 0.1,
+        anchor_x: 0.5,
+        anchor_y: 0.5,
+    };
+    assert!(s.timeline_set_camera_transform_keyframe(10, cam, true));
+
+    // Import an audio track (16-bit WAV)
+    let wav = procraft_engine::audio::encode_wav_pcm(&[0.25, -0.25, 0.5, -0.5, 0.75, -0.75, 0.0, 0.0], 22_050, 1);
+    assert!(s.timeline_import_audio_wav("SFX".into(), wav, 0).is_some());
+
+    // Export as `.procraft` package and re-open it
+    let dir = std::env::temp_dir().join(format!("dreamscraft-v23-pkg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let pkg_path = dir.join("scene.procraft");
+    s.export_package(pkg_path.to_string_lossy().into_owned(), 42, None).unwrap();
+
+    let reopened = CanvasSession::open_package(pkg_path.to_string_lossy().into_owned()).unwrap();
+    assert!(reopened.prepare_offscreen());
+    let rtl = reopened.timeline_state().expect("timeline restored from .procraft package");
+    assert_eq!(rtl.fps, 18);
+    assert_eq!(rtl.duration_frames, 48);
+    assert!(rtl.has_audio, "audio clip must survive .procraft export/import");
+    assert!(!rtl.camera_transform_keyframes.is_empty(), "camera keyframes must survive .procraft export/import");
+    assert!((rtl.camera_transform_keyframes[0].transform.as_ref().unwrap().scale_x - 0.75).abs() < 1e-3);
+
+    // Verify mixed audio PCM is non-zero after reopening `.procraft`
+    let mixed = reopened.timeline_mix_audio_pcm(0, 5, 22_050);
+    assert!(mixed.iter().any(|&v| v != 0), "audio PCM must be restored from DreamsCraft/audio/*.wav");
+
+    // Verify local gallery folder save + reopen also preserves audio PCM!
+    let folder = dir.join("gallery-art");
+    s.save(folder.to_string_lossy().into_owned()).unwrap();
+    let from_folder = CanvasSession::open(folder.to_string_lossy().into_owned()).unwrap();
+    let mixed_folder = from_folder.timeline_mix_audio_pcm(0, 5, 22_050);
+    assert!(mixed_folder.iter().any(|&v| v != 0), "audio PCM must survive local gallery save/open");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn dreamscraft_v2_3_perform_step_holds_auto_extend_and_camera_perform() {
+    let Some(s) = session(64, 64) else { return };
+    s.set_timeline_enabled(true);
+    let tl0 = s.timeline_state().unwrap();
+    let cid = tl0.active_clip_id.unwrap();
+    let orig_end = tl0.tracks[0].clips[0].start_frame + tl0.tracks[0].clips[0].duration_frames;
+
+    // Live Perform advancing past the clip's original end_frame with holds
+    s.timeline_begin_perform();
+    let mut samples = Vec::new();
+    for f in 0u32..=(orig_end + 8) {
+        let tf = crate::TimelineTransformInfo {
+            x: if f < 5 { (f as f32) * 4.0 } else { 16.0 },
+            y: 0.0,
+            scale_x: 1.0,
+            scale_y: 1.0,
+            rotation: 0.0,
+            anchor_x: 0.5,
+            anchor_y: 0.5,
+        };
+        assert!(s.timeline_step_perform_transform(cid, f, tf.clone()));
+        samples.push(crate::PerformSampleInfo { frame: f, transform: tf });
+    }
+    let written = s.timeline_commit_perform(cid, samples, 0.2);
+    assert!(written >= 2);
+    let tl1 = s.timeline_state().unwrap();
+    let new_end = tl1.tracks[0].clips[0].start_frame + tl1.tracks[0].clips[0].duration_frames;
+    assert!(new_end > orig_end, "clip should auto-extend during Perform so object stays visible");
+
+    // 1 single Undo restores both keyframes AND original clip duration
+    assert_eq!(s.undo().as_deref(), Some("perform motion"));
+    let tl_undone = s.timeline_state().unwrap();
+    assert_eq!(tl_undone.tracks[0].clips[0].start_frame + tl_undone.tracks[0].clips[0].duration_frames, orig_end);
+    assert!(tl_undone.tracks[0].clips[0].transform_keyframes.is_empty());
+
+    // Live Camera Perform + 1-tap atomic Undo
+    s.timeline_begin_perform();
+    let mut cam_samples = Vec::new();
+    for f in 0u32..=10 {
+        let cam = crate::TimelineTransformInfo {
+            x: (f as f32) * 2.0,
+            y: -(f as f32),
+            scale_x: 1.0 - (f as f32) * 0.03,
+            scale_y: 1.0 - (f as f32) * 0.03,
+            rotation: 0.0,
+            anchor_x: 0.5,
+            anchor_y: 0.5,
+        };
+        assert!(s.timeline_step_perform_camera(f, cam.clone()));
+        cam_samples.push(crate::PerformSampleInfo { frame: f, transform: cam });
+    }
+    let cam_written = s.timeline_commit_perform_camera(cam_samples, 0.2);
+    assert!(cam_written >= 2);
+    assert!(!s.timeline_state().unwrap().camera_transform_keyframes.is_empty());
+    assert_eq!(s.undo().as_deref(), Some("perform camera"));
+    assert!(s.timeline_state().unwrap().camera_transform_keyframes.is_empty());
+}
+
+#[test]
+fn dreamscraft_v2_3_camera_viewport_video_export_and_toggle() {
+    let Some(s) = session(64, 64) else { return };
+    s.set_timeline_enabled(true);
+    let cid = s.timeline_state().unwrap().active_clip_id.unwrap();
+    // Hold the cel across 16 frames and draw a bright red dot at (10, 10)
+    s.timeline_set_cel_hold(cid, 0, 15, true);
+    s.set_brush_size(0.25);
+    s.set_color(1.0, 0.0, 0.0);
+    s.stroke_begin(PointerKind::Finger, vec![sample(10.0, 10.0, 0.0)]);
+    s.stroke_end(vec![]);
+
+    // Animate Camera panning right/zooming in from frame 0 to frame 19, then disable edit-mode preview
+    assert!(s.timeline_set_camera_transform_keyframe(
+        0,
+        crate::TimelineTransformInfo {
+            x: 0.0,
+            y: 0.0,
+            scale_x: 1.0,
+            scale_y: 1.0,
+            rotation: 0.0,
+            anchor_x: 0.5,
+            anchor_y: 0.5,
+        },
+        true,
+    ));
+    assert!(s.timeline_set_camera_transform_keyframe(
+        19,
+        crate::TimelineTransformInfo {
+            x: -22.0,
+            y: -22.0,
+            scale_x: 0.5,
+            scale_y: 0.5,
+            rotation: 0.0,
+            anchor_x: 0.5,
+            anchor_y: 0.5,
+        },
+        true,
+    ));
+    // Artist switches to Draw 1:1 mode — Camera keyframes should STILL expand export & frame video!
+    s.timeline_set_camera_enabled(false);
+    assert_eq!(s.animation_frame_count(), 20, "camera keyframes must expand exported frame count");
+
+    let with_cam = s.animation_frame_with_camera(15, false, 0, true).unwrap();
+    let without_cam = s.animation_frame_with_camera(15, false, 0, false).unwrap();
+    // With Camera centred near (10, 10) zoomed 2x, center pixel (32, 32) sees the red dot; without Camera it's white!
+    let center = (32 * 64 + 32) * 4;
+    assert!(
+        with_cam.rgba[center] > 200 && with_cam.rgba[center + 1] < 80,
+        "Camera viewport export must frame red dot at center, got {:?}",
+        &with_cam.rgba[center..center + 4]
+    );
+    assert!(
+        without_cam.rgba[center] > 220 && without_cam.rgba[center + 1] > 220,
+        "Full stage export (use_camera=false) keeps center white, got {:?}",
+        &without_cam.rgba[center..center + 4]
+    );
+}
+
+#[test]
+fn dreamscraft_v2_3_krita_plugin_export_and_animation_interop() {
+    let dir = std::env::temp_dir().join(format!("dreamscraft-v23-kra-plugin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = dir.join("plugins");
+    let plugins = crate::Plugins::with_bundled(store.to_string_lossy().into_owned());
+    let kra_id = "io.github.artcraftandroid.krita-kra";
+    let card = plugins.plugins().into_iter().find(|p| p.id == kra_id).expect("krita-kra bundled plugin present");
+    assert!(!card.on, "bundled plugin starts off until user enables it");
+
+    let Some(s) = session(64, 64) else { return };
+    s.use_plugins(plugins.clone());
+    assert!(!s.plugin_exports().iter().any(|e| e.extension == "kra"), "Krita export stays hidden while plugin is OFF");
+
+    // Enable the Krita Documents (.kra) plugin!
+    assert!(plugins.set_on(kra_id.into(), true));
+    let exports = s.plugin_exports();
+    let kra_export =
+        exports.iter().find(|e| e.extension == "kra").expect("Krita (.kra) export appears when plugin is ON");
+    assert_eq!(kra_export.key, "io.github.artcraftandroid.krita-kra.kra");
+
+    // Build a 2-cel animation on Timeline and export through the plugin!
+    s.set_timeline_enabled(true);
+    s.timeline_set_fps(12);
+    s.timeline_set_duration(20);
+    s.set_brush_size(0.4);
+    s.set_color(1.0, 0.0, 0.0);
+    s.stroke_begin(PointerKind::Finger, vec![sample(32.0, 32.0, 0.0)]);
+    s.stroke_end(vec![]);
+
+    let cid = s.timeline_state().unwrap().active_clip_id.unwrap();
+    s.timeline_set_cel_hold(cid, 0, 2, true); // frames 0..3
+    let _c2 = s.timeline_add_cel(cid).unwrap();
+    s.timeline_set_cel_hold(cid, 1, 1, true); // frames 3..5
+    s.set_color(0.0, 0.0, 1.0);
+    s.stroke_begin(PointerKind::Finger, vec![sample(32.0, 32.0, 0.0)]);
+    s.stroke_end(vec![]);
+
+    let kra_path = dir.join("hero.kra");
+    s.export_plugin(kra_export.key.clone(), kra_path.to_string_lossy().into_owned()).unwrap();
+    assert!(kra_path.exists());
+
+    // Re-import via CanvasSession::open_kra AND import_kra and verify full animation interop!
+    let imported = CanvasSession::open_kra(kra_path.to_string_lossy().into_owned()).unwrap();
+    let itl = imported.timeline_state().expect("imported .kra preserves animation timeline");
+    assert_eq!(itl.fps, 12);
+    assert_eq!(itl.duration_frames, 20);
+    assert_eq!(itl.tracks.len(), 1);
+    assert_eq!(itl.tracks[0].clips[0].cels.len(), 2);
+    assert_eq!(itl.tracks[0].clips[0].cels[0].hold, 2);
+    assert_eq!(itl.tracks[0].clips[0].cels[1].hold, 1);
+
+    let gallery_dir = dir.join("imported-kra-gallery");
+    assert_eq!(
+        crate::import_kra(
+            kra_path.to_string_lossy().into_owned(),
+            gallery_dir.to_string_lossy().into_owned(),
+            "Hero Krita".into(),
+        ),
+        crate::PsdOutcome::Imported
+    );
+    assert!(crate::artwork_plays(gallery_dir.to_string_lossy().into_owned()));
+}
+
+#[test]
 fn animation_assist_shows_onion_skins_and_plays() {
     let Some(s) = session(40, 40) else { return };
     s.set_brush_size(0.6);

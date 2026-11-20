@@ -841,6 +841,26 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
                 write_beside(&path, |p| fs::write(p, data).map_err(|e| file_error("writing the plugin's artwork", e)));
             stage(written, path, &mut staged)?;
         }
+        // DreamsCraft timeline audio assets, each kept once as a 16-bit PCM WAV under `audio/`
+        if let Some(tl) = file.document.timeline.as_ref()
+            && tl.audio_assets.iter().any(|a| !a.pcm.is_empty())
+        {
+            let audio_dir = dir.join("audio");
+            fs::create_dir_all(&audio_dir).map_err(|e| file_error("making the audio folder", e))?;
+            for asset in &tl.audio_assets {
+                if asset.pcm.is_empty() {
+                    continue;
+                }
+                let path = audio_dir.join(format!("{}.wav", asset.id.0));
+                if path.exists() {
+                    continue;
+                }
+                let wav = procraft_engine::audio::encode_wav_pcm(&asset.pcm, asset.sample_rate, asset.channels);
+                let written =
+                    write_beside(&path, |p| fs::write(p, &wav).map_err(|e| file_error("writing timeline audio", e)));
+                stage(written, path, &mut staged)?;
+            }
+        }
         let json = serde_json::to_string(&file).map_err(|e| file_error("writing the artwork", e))?;
         let doc = dir.join("artwork.json");
         stage(
@@ -988,6 +1008,26 @@ impl CanvasSession {
             });
         }
         let mut doc = file.document.repaired();
+        if let Some(tl) = doc.timeline.as_mut() {
+            let audio_dir = dir.join("audio");
+            for asset in &mut tl.audio_assets {
+                let path = audio_dir.join(format!("{}.wav", asset.id.0));
+                if let Ok(wav) = fs::read(&path)
+                    && let Some(decoded) = procraft_engine::audio::decode_wav_pcm(&wav)
+                {
+                    let ch = usize::from(decoded.channels.clamp(1, 2));
+                    asset.sample_rate = decoded.sample_rate;
+                    asset.channels = decoded.channels;
+                    asset.duration_samples = (decoded.samples.len() / ch) as u64;
+                    if asset.peaks.is_empty() {
+                        let buckets = ((asset.duration_samples as usize) / 256).clamp(16, 4096);
+                        asset.peaks =
+                            procraft_engine::audio::compute_waveform_peaks(&decoded.samples, decoded.channels, buckets);
+                    }
+                    asset.pcm = decoded.samples;
+                }
+            }
+        }
         // plugins' layers' data, as it is (an empty file: none yet). One whose file is gone or can't
         // be read takes no strokes, which would draw it again without what its pixels show, and
         // its file is left as it is
@@ -1280,6 +1320,76 @@ impl CanvasSession {
         write_file_atomically(Path::new(&path), |out| procraft_engine::native::write_to(&export, out).map(|_| ()))?;
         self.exported(1.0);
         Ok(())
+    }
+
+    /// The artwork as a Krita `.kra` document at `path`, preserving layers, groups, blend modes,
+    /// and DreamsCraft multi-track animation (cels, holds, FPS, gaps).
+    pub fn export_kra(&self, path: String) -> Result<(), MobileError> {
+        self.export_kra_with_options(path, true, true)
+    }
+
+    /// Like [`CanvasSession::export_kra`], with explicit options from the Krita Documents plugin.
+    pub fn export_kra_with_options(
+        &self,
+        path: String,
+        export_animation: bool,
+        include_preview: bool,
+    ) -> Result<(), MobileError> {
+        self.exported(0.0);
+        let (doc, composite, name, author, edits) = {
+            let mut guard = self.shared.lock_finished();
+            let st = &mut *guard;
+            st.finish_stroke();
+            st.settle();
+            let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else {
+                return Err(file_error("reading the picture", "the canvas is not shown yet"));
+            };
+            let private = st.doc.private_layers();
+            let composite = canvas
+                .read_composite_without(gpu, &mut st.doc, &private)
+                .map_err(|e| file_error("reading the picture", e))?;
+            let edits = st.edits();
+            (st.doc.clone(), composite, st.name.clone(), st.info.author.clone(), edits)
+        };
+        let (w, h) = (doc.width(), doc.height());
+        let (merged_png, preview_png) = if include_preview {
+            let mut straight = composite;
+            straighten(&mut straight);
+            let merged = png_bytes(w, h, &straight, &doc.picture_icc())?;
+            let (pw, ph, small) = thumbnail(&straight, w, h, 256);
+            let preview = png_bytes(pw, ph, &small, &doc.picture_icc())?;
+            (merged, preview)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let count = doc.layers().iter().filter(|l| l.kind == LayerKind::Paint).count();
+        let pixels = ExportLayers::new(self, edits, count, (0.1, 0.9));
+        let export = procraft_engine::kra::Export {
+            document: &doc,
+            pixels: &pixels,
+            merged_png: &merged_png,
+            preview_png: &preview_png,
+            name: &name,
+            author: &author,
+            options: procraft_engine::kra::ExportOptions { export_animation, include_preview },
+        };
+        write_file_atomically(Path::new(&path), |out| procraft_engine::kra::write_to(&export, out).map(|_| ()))?;
+        self.exported(1.0);
+        Ok(())
+    }
+
+    /// Opens a Krita `.kra` document (including animated Krita layers/keyframes) from `path`.
+    #[uniffi::constructor]
+    pub fn open_kra(path: String) -> Result<Arc<CanvasSession>, MobileError> {
+        let bytes = fs::read(&path).map_err(|e| file_error("opening the file", e))?;
+        let imported =
+            procraft_engine::kra::read(&bytes).map_err(|e| file_error("opening the Krita file", format!("{e:?}")))?;
+        let session = CanvasSession::with_document(imported.document, imported.name, imported.pixels);
+        {
+            let mut st = session.shared.lock();
+            st.info.author = imported.author;
+        }
+        Ok(session)
     }
 
     /// The artwork as a layered PSD (groups, masks, clipping, blend modes kept) at `path`, its
@@ -2343,6 +2453,41 @@ pub fn import_psd(path: String, dir: String, name: String) -> PsdOutcome {
         {
             log::error!("an imported PSD's thumbnail: {e}");
         }
+    }
+    PsdOutcome::Imported
+}
+
+/// Imports a Krita `.kra` document (including animated frames, holds, FPS, layers, groups, and
+/// blend modes) at `path` into a gallery artwork folder `dir`.
+#[uniffi::export]
+pub fn import_kra(path: String, dir: String, name: String) -> PsdOutcome {
+    use procraft_engine::kra::{self, ReadError};
+    let Ok(bytes) = fs::read(&path) else { return PsdOutcome::Unreadable };
+    let imported = match kra::read(&bytes) {
+        Ok(i) => i,
+        Err(ReadError::TooLarge) => return PsdOutcome::TooManyLayers { most: 2048 },
+        Err(e) => {
+            log::error!("reading a Krita .kra: {e:?}");
+            return PsdOutcome::Unreadable;
+        }
+    };
+    let name = if name.trim().is_empty() { imported.name } else { name };
+    let session = CanvasSession::with_document(imported.document, name, imported.pixels);
+    {
+        let mut st = session.shared.lock();
+        st.info.author = imported.author;
+    }
+    if let Err(e) = session.save(dir.clone()) {
+        log::error!("saving an imported Krita .kra: {e}");
+        return PsdOutcome::Unreadable;
+    }
+    if let Some(zip) = procraft_engine::zip::ZipReader::new(&bytes)
+        && let Some(preview_png) = zip.read("preview.png").or_else(|| zip.read("mergedimage.png"))
+        && let Err(e) = write_atomically(&Path::new(&dir).join("thumbnail.png"), |p| {
+            fs::write(p, &preview_png).map_err(|err| file_error("saving thumbnail", err))
+        })
+    {
+        log::error!("an imported Krita .kra's thumbnail: {e}");
     }
     PsdOutcome::Imported
 }

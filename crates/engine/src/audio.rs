@@ -272,6 +272,36 @@ pub fn float_pcm_to_i16(samples: &[f32]) -> Vec<i16> {
         .collect()
 }
 
+/// Encodes interleaved normalized float PCM (`-1.0..=1.0`) as a standard 16-bit PCM RIFF/WAVE file.
+pub fn encode_wav_pcm(samples: &[f32], sample_rate: u32, channels: u8) -> Vec<u8> {
+    let ch = u16::from(channels.clamp(1, 2));
+    let rate = sample_rate.clamp(8_000, 192_000);
+    let pcm = float_pcm_to_i16(samples);
+    let data_bytes = u32::try_from(pcm.len().saturating_mul(2)).unwrap_or(u32::MAX);
+    let max_samples = (data_bytes / 2) as usize;
+    let riff_size = data_bytes.saturating_add(36);
+    let block_align = ch.saturating_mul(2);
+    let byte_rate = rate.saturating_mul(u32::from(block_align));
+    let mut out = Vec::with_capacity(44usize.saturating_add(max_samples.saturating_mul(2)));
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&riff_size.to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&ch.to_le_bytes());
+    out.extend_from_slice(&rate.to_le_bytes());
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    out.extend_from_slice(&block_align.to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_bytes.to_le_bytes());
+    for &s in pcm.iter().take(max_samples) {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
 /// Constant-power stereo pan gains `(left_gain, right_gain)` for `pan` in `-1.0..=1.0`.
 pub fn stereo_pan_gains(pan: f32) -> (f32, f32) {
     let p = if pan.is_finite() { pan.clamp(-1.0, 1.0) } else { 0.0 };

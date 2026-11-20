@@ -74,6 +74,8 @@ pub enum PluginPart {
     Hooks,
     /// A filter, under Adjustments while the plugin is on.
     Filter,
+    /// A document file format added to Share and Import while the plugin is on.
+    Format,
 }
 
 impl PluginPart {
@@ -82,6 +84,7 @@ impl PluginPart {
         match name {
             "hooks" => Some(PluginPart::Hooks),
             "filter" => Some(PluginPart::Filter),
+            "format" => Some(PluginPart::Format),
             _ => None,
         }
     }
@@ -417,6 +420,7 @@ fn read_chosen(store: &std::path::Path, plugin: &mut PluginInfo) {
 
 fn from_file(manifest: Manifest) -> (PluginInfo, Shape) {
     let only_filter = manifest.holds == [PluginPart::Filter];
+    let only_format = manifest.holds == [PluginPart::Format];
     // one filter's controls are its panel's alone; filters it lists have theirs on its card
     let on_panel = only_filter && manifest.shape.filters.is_empty();
     let info = PluginInfo {
@@ -429,7 +433,7 @@ fn from_file(manifest: Manifest) -> (PluginInfo, Shape) {
         version: manifest.version,
         publisher: manifest.publisher,
         experimental: manifest.experimental,
-        on: only_filter,
+        on: only_filter || only_format,
         problem: None,
         controls: if on_panel { Vec::new() } else { manifest.controls },
         brush_controls: manifest.brush_controls,
@@ -558,13 +562,16 @@ fn carry(to: &mut PluginInfo, replaced: &Replaced, from: &PluginInfo) {
 /// What the offer says `manifest` can do.
 fn can_do(manifest: &Manifest) -> String {
     let filter = manifest.holds.contains(&PluginPart::Filter);
+    let format = manifest.holds.contains(&PluginPart::Format);
     let adds = filter.then_some(if manifest.shape.filters.len() > 1 {
         "This plugin adds filters to Adjustments, which change only the layer you use them on."
     } else {
-        "This plugin adds a filter to Adjustments, which changes only the layer you use it on."
+        "This plugin adds a filter to Adjustments, which change only the layer you use it on."
     });
+    let adds_format = format.then_some("This plugin adds document file formats to Share and Import.");
     let sentences: Vec<&str> = adds
         .into_iter()
+        .chain(adds_format)
         .chain(manifest.hooks.iter().map(|hook| hook.sentence()))
         .chain(manifest.permissions.iter().map(|permission| permission.sentence()))
         .collect();
@@ -575,8 +582,11 @@ fn can_do(manifest: &Manifest) -> String {
                 | crate::plugin_commands::PluginPermission::ArtworkWrite
         )
     });
-    let reach =
-        if filter || artwork { "your files or the internet" } else { "your files, your layers or the internet" };
+    let reach = if filter || format || artwork {
+        "your files or the internet"
+    } else {
+        "your files, your layers or the internet"
+    };
     format!("{} It can't reach {reach}.", sentences.join(" "))
 }
 
@@ -838,10 +848,25 @@ impl Plugins {
     /// `id` off its hooks, and its panel closed.
     fn take_off(&self, id: &str) {
         self.hooks.take_off(id);
+        self.hooks.remove_format(id);
         let mut panel = self.open_panel();
         if panel.as_ref().is_some_and(|open| open.id == id) {
             *panel = None;
         }
+    }
+
+    fn sync_format(&self, plugin: &PluginInfo, shape: Option<&Shape>) {
+        if !plugin.holds(PluginPart::Format) || !plugin.on || plugin.problem.is_some() {
+            self.hooks.remove_format(&plugin.id);
+            return;
+        }
+        let exports = shape.map(|s| s.formats.clone()).unwrap_or_default();
+        if exports.is_empty() {
+            self.hooks.remove_format(&plugin.id);
+            return;
+        }
+        let controls: HashMap<String, f32> = plugin.controls.iter().map(|c| (c.key().to_owned(), c.number())).collect();
+        self.hooks.set_format(plugin.id.clone(), exports, controls);
     }
 
     fn open_panel(&self) -> MutexGuard<'_, Option<OpenPanel>> {
@@ -968,8 +993,10 @@ impl Plugins {
     /// plugins here, once all its values are in and something will go through them.
     pub(crate) fn hooks(&self) -> Arc<Hooks> {
         let mut list = self.listed();
-        for plugin in &mut list.files {
+        let Listed { files, shapes, .. } = &mut *list;
+        for plugin in files.iter_mut() {
             self.start(plugin);
+            self.sync_format(plugin, shapes.get(&plugin.id));
         }
         Arc::clone(&self.hooks)
     }
@@ -987,6 +1014,9 @@ impl Plugins {
         let mut kept = None;
         if let Some(control) = plugin.controls.get(at) {
             self.hooks.control(&plugin.id, at, control.number());
+            if plugin.holds(PluginPart::Format) {
+                self.hooks.set_format_control(&plugin.id, key, control.number());
+            }
             if shapes.get(&plugin.id).is_some_and(|shape| shape.artwork.get(at) == Some(&true)) {
                 kept = Some((key.to_owned(), control.number()));
             }
@@ -1101,6 +1131,9 @@ impl Plugins {
             None => list.files.push(fresh),
         }
         list.shapes.insert(id.clone(), shape);
+        if let Some(plugin) = list.files.iter().find(|p| p.id == id) {
+            self.sync_format(plugin, list.shapes.get(&id));
+        }
         // what it takes the place of goes, what that had set taken over (on, if that was, from
         // when the hooks are next asked for)
         for gone in list.give_way(store) {
@@ -1694,7 +1727,8 @@ impl Plugins {
     /// stays off, and says why.
     pub fn set_on(&self, id: String, on: bool) -> bool {
         let mut list = self.listed();
-        let Some(plugin) = list.files.iter_mut().find(|p| p.id == id) else { return false };
+        let Listed { files, shapes, .. } = &mut *list;
+        let Some(plugin) = files.iter_mut().find(|p| p.id == id) else { return false };
         plugin.on = on;
         plugin.problem = None;
         if let Some(store) = &self.store {
@@ -1702,6 +1736,7 @@ impl Plugins {
         }
         self.take_off(&id);
         self.start(plugin);
+        self.sync_format(plugin, shapes.get(&plugin.id));
         true
     }
 

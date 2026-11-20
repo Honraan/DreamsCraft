@@ -1635,7 +1635,38 @@ impl CanvasSession {
             return false;
         }
         let Some(clip) = tl.clip_mut(cid) else { return false };
+        ensure_clip_covers_frame(clip, frame);
         clip.keyframes.set_transform(frame, t2d, None);
+        if let Some(canvas) = st.canvas.as_mut() {
+            canvas.invalidate();
+        }
+        st.revision += 1;
+        self.shared.frame(st);
+        true
+    }
+
+    /// Atomically advances the playhead to `frame` AND stamps `clip_id`'s held Perform `transform`
+    /// in one lock & render pass so the object stays glued to the user's finger with zero snap-back.
+    pub fn timeline_step_perform_transform(&self, clip_id: u64, frame: u32, transform: TimelineTransformInfo) -> bool {
+        let t2d = Transform2D::from(&transform);
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        st.finish_stroke();
+        if st.pending_doc.is_none() {
+            st.pending_doc = Some(st.doc.clone());
+            st.pending_name = Some("perform motion".to_owned());
+        }
+        let tl = st.doc.ensure_timeline();
+        let target = frame.min(tl.duration_frames.saturating_sub(1));
+        tl.playhead = target;
+        let cid = ClipId(clip_id);
+        if tl.track_of_clip(cid).and_then(|t| tl.track(t)).is_some_and(|t| t.locked) {
+            return false;
+        }
+        let Some(clip) = tl.clip_mut(cid) else { return false };
+        ensure_clip_covers_frame(clip, target);
+        clip.keyframes.set_transform(target, t2d, None);
+        sync_current_layer_to_playhead(&mut st.doc);
         if let Some(canvas) = st.canvas.as_mut() {
             canvas.invalidate();
         }
@@ -1661,7 +1692,82 @@ impl CanvasSession {
             return false;
         }
         let Some(clip) = tl.clip_mut(cid) else { return false };
+        ensure_clip_covers_frame(clip, frame);
         clip.keyframes.set_deform(frame, def, None);
+        if let Some(canvas) = st.canvas.as_mut() {
+            canvas.invalidate();
+        }
+        st.revision += 1;
+        self.shared.frame(st);
+        true
+    }
+
+    /// Atomically advances playhead to `frame` and stamps `clip_id`'s held Perform deformation.
+    pub fn timeline_step_perform_deform(&self, clip_id: u64, frame: u32, deform: TimelineDeformInfo) -> bool {
+        let def = Deform2D::from(&deform);
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        st.finish_stroke();
+        if st.pending_doc.is_none() {
+            st.pending_doc = Some(st.doc.clone());
+            st.pending_name = Some("perform warp".to_owned());
+        }
+        let tl = st.doc.ensure_timeline();
+        let target = frame.min(tl.duration_frames.saturating_sub(1));
+        tl.playhead = target;
+        let cid = ClipId(clip_id);
+        if tl.track_of_clip(cid).and_then(|t| tl.track(t)).is_some_and(|t| t.locked) {
+            return false;
+        }
+        let Some(clip) = tl.clip_mut(cid) else { return false };
+        ensure_clip_covers_frame(clip, target);
+        clip.keyframes.set_deform(target, def, None);
+        sync_current_layer_to_playhead(&mut st.doc);
+        if let Some(canvas) = st.canvas.as_mut() {
+            canvas.invalidate();
+        }
+        st.revision += 1;
+        self.shared.frame(st);
+        true
+    }
+
+    /// Updates the global Camera Track live during Perform playback without extra undo steps.
+    pub fn timeline_preview_perform_camera(&self, frame: u32, transform: TimelineTransformInfo) -> bool {
+        let t2d = Transform2D::from(&transform);
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        st.finish_stroke();
+        if st.pending_doc.is_none() {
+            st.pending_doc = Some(st.doc.clone());
+            st.pending_name = Some("perform camera".to_owned());
+        }
+        let tl = st.doc.ensure_timeline();
+        tl.camera_enabled = true;
+        tl.camera.set_transform(frame, t2d, None);
+        if let Some(canvas) = st.canvas.as_mut() {
+            canvas.invalidate();
+        }
+        st.revision += 1;
+        self.shared.frame(st);
+        true
+    }
+
+    /// Atomically advances playhead to `frame` and stamps the held Camera transform during Perform.
+    pub fn timeline_step_perform_camera(&self, frame: u32, transform: TimelineTransformInfo) -> bool {
+        let t2d = Transform2D::from(&transform);
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        st.finish_stroke();
+        if st.pending_doc.is_none() {
+            st.pending_doc = Some(st.doc.clone());
+            st.pending_name = Some("perform camera".to_owned());
+        }
+        let tl = st.doc.ensure_timeline();
+        let target = frame.min(tl.duration_frames.saturating_sub(1));
+        tl.playhead = target;
+        tl.camera_enabled = true;
+        tl.camera.set_transform(target, t2d, None);
+        sync_current_layer_to_playhead(&mut st.doc);
         if let Some(canvas) = st.canvas.as_mut() {
             canvas.invalidate();
         }
@@ -1734,6 +1840,7 @@ impl CanvasSession {
         if let Some(orig) = orig_transform_kfs {
             clip.keyframes.transform = orig;
         }
+        ensure_clip_covers_frame(clip, last_frame);
         // Replace any existing transform keyframes within the recorded range [first_frame..=last_frame]
         clip.keyframes.transform.retain(|k| k.frame < first_frame || k.frame > last_frame);
         for kf in &simplified {
@@ -1742,6 +1849,52 @@ impl CanvasSession {
 
         if let Some(canvas) = st.canvas.as_mut() {
             canvas.name_next_step("perform motion");
+            canvas.record_document(before);
+        }
+        st.revision += 1;
+        self.shared.frame(st);
+        count
+    }
+
+    /// Commits a live Perform motion recording on the global Camera Track as **one** atomic undo step.
+    pub fn timeline_commit_perform_camera(&self, samples: Vec<PerformSampleInfo>, filtering: f32) -> u32 {
+        if samples.is_empty() {
+            let _ = self.timeline_cancel_perform();
+            return 0;
+        }
+        let engine_samples: Vec<MotionSample> = samples
+            .iter()
+            .map(|s| MotionSample { frame: s.frame, transform: Transform2D::from(&s.transform) })
+            .collect();
+        let simplified = simplify_motion_samples(&engine_samples, filtering);
+        if simplified.is_empty() {
+            let _ = self.timeline_cancel_perform();
+            return 0;
+        }
+        let first_frame = simplified.first().map_or(0, |k| k.frame);
+        let last_frame = simplified.last().map_or(first_frame, |k| k.frame);
+        let count = u32::try_from(simplified.len()).unwrap_or(0);
+
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        st.finish_stroke();
+        let before = st.pending_doc.take().unwrap_or_else(|| st.doc.clone());
+        st.pending_name = None;
+
+        let orig_cam_kfs = before.timeline.as_ref().map(|t| t.camera.transform.clone());
+        let tl = st.doc.ensure_timeline();
+        tl.motion_filtering = if filtering.is_finite() { filtering.clamp(0.0, 1.0) } else { tl.motion_filtering };
+        tl.camera_enabled = true;
+        if let Some(orig) = orig_cam_kfs {
+            tl.camera.transform = orig;
+        }
+        tl.camera.transform.retain(|k| k.frame < first_frame || k.frame > last_frame);
+        for kf in &simplified {
+            tl.camera.set_transform(kf.frame, kf.value, Some(kf.easing));
+        }
+
+        if let Some(canvas) = st.canvas.as_mut() {
+            canvas.name_next_step("perform camera");
             canvas.record_document(before);
         }
         st.revision += 1;
@@ -2159,6 +2312,7 @@ impl CanvasSession {
         if let Some(orig) = orig_deform_kfs {
             clip.keyframes.deform = orig;
         }
+        ensure_clip_covers_frame(clip, last_frame);
         clip.keyframes.deform.retain(|k| k.frame < first_frame || k.frame > last_frame);
         for kf in &simplified {
             clip.keyframes.set_deform(kf.frame, kf.value, Some(kf.easing));
@@ -2454,5 +2608,26 @@ impl CanvasSession {
             (a || b).then_some(())
         })
         .is_some()
+    }
+}
+
+/// Extends `clip` if needed so it remains visible through `frame` during live Perform recording.
+fn ensure_clip_covers_frame(clip: &mut procraft_engine::timeline::Clip, frame: u32) {
+    if frame < clip.start_frame || frame < clip.end_frame() {
+        return;
+    }
+    let needed_extra = frame.saturating_sub(clip.end_frame()).saturating_add(1);
+    match &mut clip.kind {
+        ClipKind::Cel { cels } => {
+            if let Some(last) = cels.last_mut() {
+                last.hold = last.hold.saturating_add(needed_extra).min(600);
+            }
+            clip.sync_duration();
+        }
+        ClipKind::Layer { .. } | ClipKind::Group { .. } | ClipKind::Text { .. } => {
+            clip.duration_frames =
+                clip.duration_frames.saturating_add(needed_extra).min(procraft_engine::timeline::MAX_TIMELINE_DURATION);
+        }
+        ClipKind::Audio { .. } | ClipKind::Video { .. } => {}
     }
 }

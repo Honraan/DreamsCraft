@@ -50,10 +50,18 @@ pub(crate) struct Picture {
     pub(crate) values: Vec<f32>,
 }
 
+struct ActiveFormat {
+    id: String,
+    exports: Vec<crate::PluginExport>,
+    controls: std::collections::HashMap<String, f32>,
+}
+
 #[derive(Default)]
 struct Working {
     /// In id order, so plugins go in the same order however they were turned on.
     on: Vec<OnHook>,
+    /// Active document format plugins (`holds: ["format"]`), in id order.
+    formats: Vec<ActiveFormat>,
     /// What stopped since the list last asked, and why.
     stopped: Vec<(String, Stop)>,
     /// What the app hasn't told yet: whoever is drawing sees the stroke change, not the list.
@@ -662,6 +670,52 @@ impl Hooks {
         }
         let working = self.working();
         working.on.iter().find_map(|p| p.layer_kinds.iter().find(|k| k.key == kind).map(|k| k.label.clone()))
+    }
+
+    /// Registers an enabled document-format plugin (`holds: ["format"]`) with its exports and
+    /// current control values.
+    pub(crate) fn set_format(
+        &self,
+        id: String,
+        exports: Vec<crate::PluginExport>,
+        controls: std::collections::HashMap<String, f32>,
+    ) {
+        let mut working = self.working();
+        working.formats.retain(|f| f.id != id);
+        let at = working.formats.partition_point(|f| f.id < id);
+        working.formats.insert(at, ActiveFormat { id, exports, controls });
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Removes a disabled document-format plugin.
+    pub(crate) fn remove_format(&self, id: &str) {
+        let mut working = self.working();
+        let before = working.formats.len();
+        working.formats.retain(|f| f.id != id);
+        if working.formats.len() != before {
+            self.generation.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Updates a control value for an active document-format plugin.
+    pub(crate) fn set_format_control(&self, id: &str, key: &str, value: f32) {
+        let mut working = self.working();
+        if let Some(entry) = working.formats.iter_mut().find(|f| f.id == id) {
+            entry.controls.insert(key.to_owned(), value);
+            self.generation.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// All document exports currently provided by enabled format plugins.
+    pub(crate) fn format_exports(&self) -> Vec<crate::PluginExport> {
+        let working = self.working();
+        working.formats.iter().flat_map(|f| f.exports.iter().cloned()).collect()
+    }
+
+    /// Reads a numeric control value (`1.0` / `0.0` for switches) from an active format plugin.
+    pub(crate) fn format_control(&self, key: &str) -> Option<f32> {
+        let working = self.working();
+        working.formats.iter().find_map(|f| f.controls.get(key).copied())
     }
 
     /// What layers of `kind` can be exported as by the plugin on that adds them.

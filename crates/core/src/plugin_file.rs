@@ -175,6 +175,8 @@ pub(crate) struct Shape {
     pub filters: Vec<ListedFilter>,
     pub replaces: Vec<Replaced>,
     pub menu: Option<Menu>,
+    /// Document file formats this plugin adds to Share and Import (`holds: ["format"]`).
+    pub formats: Vec<crate::PluginExport>,
 }
 
 /// A menu a plugin with code has somewhere in the interface, from a button of the app's: where,
@@ -305,6 +307,8 @@ struct RawManifest {
     replaces: Vec<RawReplaced>,
     #[serde(default)]
     menu: Option<RawMenu>,
+    #[serde(default)]
+    formats: Vec<RawExport>,
 }
 
 /// A menu of a plugin's own, from a button the app puts at `place`: its choices, each an icon and
@@ -871,6 +875,27 @@ fn read_manifest(text: &[u8]) -> Result<Manifest, Refusal> {
     if !module || !filter || !filters {
         return Err(Refusal::Described);
     }
+    if has(PluginPart::Format) {
+        let mut format_keys = HashSet::new();
+        if raw.formats.is_empty()
+            || raw.formats.len() > MOST_EXPORTS
+            || !raw.formats.iter().all(|e| export_fits(e) && format_keys.insert(e.key.clone()))
+        {
+            return Err(Refusal::Described);
+        }
+        shape.formats = raw
+            .formats
+            .into_iter()
+            .map(|e| crate::PluginExport {
+                key: format!("{id}.{}", e.key),
+                label: e.label,
+                extension: e.extension,
+                mime: e.mime,
+            })
+            .collect();
+    } else if !raw.formats.is_empty() {
+        return Err(Refusal::Described);
+    }
     let mut hooks = Vec::new();
     if has(PluginPart::Hooks) {
         // a hook this app doesn't have is a plugin for a newer one
@@ -1138,7 +1163,18 @@ fn shape_of(
         }
         replaces.push(Replaced { id: r.id.clone(), switch: r.switch.as_deref().map(switch_at).transpose()?, controls });
     }
-    Ok(Shape { under, action_under, places, presses, action_presses, artwork, filters, replaces, menu: None })
+    Ok(Shape {
+        under,
+        action_under,
+        places,
+        presses,
+        action_presses,
+        artwork,
+        filters,
+        replaces,
+        menu: None,
+        formats: Vec::new(),
+    })
 }
 
 /// The press a manifest writes for a switch or an action, if it is one a keyboard sends (not one

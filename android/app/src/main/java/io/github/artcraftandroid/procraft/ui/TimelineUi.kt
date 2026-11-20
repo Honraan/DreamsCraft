@@ -2733,7 +2733,7 @@ private fun BoxScope.StageKeyTransformOverlay(
                                 isInteracting = true
                                 didMutateTransform = true
                                 if (vm.dreamsMode == DreamsWorkMode.PERFORM && !vm.performRecording) {
-                                    vm.beginPerformRecording()
+                                    vm.beginPerformRecording(isCamera = isCamera, initialTransform = liveTransform)
                                 }
                                 val rotRad = (rotationDeg * Math.PI / 180.0).toFloat()
                                 val canvasDelta = canvasDeltaFromScreen(latestViewMatrix, pan.x, pan.y)
@@ -2770,8 +2770,8 @@ private fun BoxScope.StageKeyTransformOverlay(
                                 }
                                 liveTransform = updated
                                 when {
+                                    vm.dreamsMode == DreamsWorkMode.PERFORM -> vm.recordPerformTransform(updated, isCamera = isCamera)
                                     isCamera -> vm.setCameraTransformKeyframe(currentPlayhead, updated, done = false)
-                                    vm.dreamsMode == DreamsWorkMode.PERFORM -> vm.recordPerformTransform(updated)
                                     activeClipId != null -> vm.setClipTransformKeyframe(activeClipId, currentPlayhead, updated, done = false)
                                 }
                             }
@@ -2828,7 +2828,18 @@ private fun BoxScope.StageKeyTransformOverlay(
                                 if (bestIdx >= 0) {
                                     isInteracting = true
                                     if (vm.dreamsMode == DreamsWorkMode.PERFORM && !vm.performRecording) {
-                                        vm.beginPerformRecording()
+                                        val initDeform = if (isDistort) {
+                                            TimelineDeformInfo(
+                                                distortCorners = distortCorners.flatMap { listOf(it.first, it.second) },
+                                                warpMesh = emptyList(),
+                                            )
+                                        } else {
+                                            TimelineDeformInfo(
+                                                distortCorners = emptyList(),
+                                                warpMesh = warpPoints,
+                                            )
+                                        }
+                                        vm.beginPerformRecording(isCamera = false, initialDeform = initDeform)
                                     }
                                 }
                             },
@@ -2901,6 +2912,29 @@ private fun BoxScope.StageKeyTransformOverlay(
     ) {
         // Visual Stage Gizmo Canvas (Move & Scale + Motion Path, Distort 4-pin, Warp 4x4 Mesh, or Camera Viewport)
         Canvas(modifier = Modifier.fillMaxSize()) {
+            // Live red Perform trail following the finger in real time
+            val liveTrail = vm.performTrailPoints
+            if (vm.performRecording && !isWarp && !isDistort && liveTrail.size >= 2) {
+                val trailPath = Path()
+                liveTrail.forEachIndexed { idx, (tx, ty) ->
+                    val pt = applyViewMatrix(
+                        latestViewMatrix,
+                        stageCanvasW * 0.5f + if (isCamera) -tx else tx,
+                        stageCanvasH * 0.5f + if (isCamera) -ty else ty,
+                    )
+                    if (idx == 0) trailPath.moveTo(pt.x, pt.y) else trailPath.lineTo(pt.x, pt.y)
+                }
+                drawPath(
+                    path = trailPath,
+                    color = PerformRed.copy(alpha = 0.28f),
+                    style = Stroke(width = 9f),
+                )
+                drawPath(
+                    path = trailPath,
+                    color = PerformRed.copy(alpha = 0.92f),
+                    style = Stroke(width = 3f),
+                )
+            }
             // Draw Motion Path across transform keyframes accurately in screen space
             val pathKeyframes = if (isCamera) tl.cameraTransformKeyframes else activeClip?.transformKeyframes.orEmpty()
             if (!isWarp && !isDistort && pathKeyframes.size >= 2) {
@@ -3139,8 +3173,8 @@ private fun BoxScope.StageKeyTransformOverlay(
                 }
             }
 
-            // Second Row when in Perform Mode: Recording indicator + Undo + Motion Filtering + Perform Motion Ghost
-            if (vm.dreamsMode == DreamsWorkMode.PERFORM && activeClip != null) {
+            // Second Row when in Perform Mode: Recording indicator + Replay + Undo + Motion Filtering + Perform Motion Ghost
+            if (vm.dreamsMode == DreamsWorkMode.PERFORM && (activeClip != null || isCamera)) {
                 Row(
                     modifier = Modifier
                         .shadow(10.dp, RoundedCornerShape(18.dp))
@@ -3163,12 +3197,38 @@ private fun BoxScope.StageKeyTransformOverlay(
                                 .background(PerformRed),
                         )
                         Text(
-                            text = if (vm.performRecording) "REC (${vm.performSamplesCount})" else "Perform Ready",
+                            text = when {
+                                vm.performRecording -> "REC F${tl.playhead.toInt() + 1} (${vm.performSamplesCount})"
+                                isCamera -> "Drag Camera to Perform"
+                                else -> "Drag Object to Perform"
+                            },
                             color = PerformRed,
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Bold,
                             fontFamily = if (vm.performRecording) FontFamily.Monospace else FontFamily.Default,
                         )
+                    }
+                    if (vm.hasRecentPerformTake && !vm.performRecording) {
+                        Row(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(DreamsAccent.copy(alpha = 0.22f))
+                                .border(1.dp, DreamsAccent.copy(alpha = 0.65f), RoundedCornerShape(8.dp))
+                                .clickable {
+                                    view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                                    vm.replayLastPerform()
+                                }
+                                .padding(horizontal = 8.dp, vertical = 3.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            Text(
+                                text = "▶ Replay",
+                                color = DreamsInk,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                            )
+                        }
                     }
                     val undoReady = vm.canUndo || vm.performRecording
                     Row(
@@ -3215,32 +3275,34 @@ private fun BoxScope.StageKeyTransformOverlay(
                             }
                             .padding(horizontal = 8.dp, vertical = 3.dp),
                     )
-                    // DreamsCraft v2.0 Pilar 2: Perform Motion Ghost (Onion Skin of 1st frame along Perform motion)
-                    val ghostOn = activeClip.performOnionGuide
-                    Row(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(if (ghostOn) OpacityCyan else DreamsPillBg)
-                            .clickable {
-                                vm.setPerformOnionGuide(
-                                    clipId = activeClip.id,
-                                    enabled = !ghostOn,
-                                    isolateFirstFrame = true,
-                                    opacity = activeClip.performGuideOpacity.coerceIn(0.2f, 0.85f),
-                                    colorRgb = activeClip.performGuideColor.ifEmpty { listOf(0.15f, 0.85f, 1.0f) },
-                                )
-                            }
-                            .padding(horizontal = 8.dp, vertical = 3.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(5.dp),
-                    ) {
-                        DreamsGhostIcon(if (ghostOn) Color.Black else OpacityCyan, 12.dp)
-                        Text(
-                            text = if (ghostOn) "Ghost ${(activeClip.performGuideOpacity * 100).roundToInt()}%" else "Ghost 1st",
-                            color = if (ghostOn) Color.Black else OpacityCyan,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold,
-                        )
+                    // Perform Motion Ghost (Onion Skin of 1st frame along Perform motion)
+                    if (activeClip != null && !isCamera) {
+                        val ghostOn = activeClip.performOnionGuide
+                        Row(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(if (ghostOn) OpacityCyan else DreamsPillBg)
+                                .clickable {
+                                    vm.setPerformOnionGuide(
+                                        clipId = activeClip.id,
+                                        enabled = !ghostOn,
+                                        isolateFirstFrame = true,
+                                        opacity = activeClip.performGuideOpacity.coerceIn(0.2f, 0.85f),
+                                        colorRgb = activeClip.performGuideColor.ifEmpty { listOf(0.15f, 0.85f, 1.0f) },
+                                    )
+                                }
+                                .padding(horizontal = 8.dp, vertical = 3.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(5.dp),
+                        ) {
+                            DreamsGhostIcon(if (ghostOn) Color.Black else OpacityCyan, 12.dp)
+                            Text(
+                                text = if (ghostOn) "Ghost ${(activeClip.performGuideOpacity * 100).roundToInt()}%" else "Ghost 1st",
+                                color = if (ghostOn) Color.Black else OpacityCyan,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                            )
+                        }
                     }
                 }
             }

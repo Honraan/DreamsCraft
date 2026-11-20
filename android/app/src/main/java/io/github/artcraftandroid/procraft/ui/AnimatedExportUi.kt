@@ -84,19 +84,28 @@ fun AnimatedExport(vm: CanvasViewModel, format: CanvasViewModel.Animated) {
     var dither by remember { mutableStateOf(true) }
     var perFramePalette by remember { mutableStateOf(false) }
     var transparent by remember { mutableStateOf(false) }
+    val hasTimeline = vm.timeline != null
+    val hasCamera = remember(vm.timeline) { vm.hasCameraViewport() }
+    var useCamera by remember { mutableStateOf(true) }
     // where the frame rate slider is, starting at the artwork's own rate; the rate as it shows it
     var fpsAt by remember { mutableFloatStateOf(exportFpsFraction(vm.artworkFps())) }
     val fps = exportFpsAt(fpsAt)
     var exporting by remember { mutableStateOf(false) }
     val canTransparent = format == CanvasViewModel.Animated.GIF || format == CanvasViewModel.Animated.PNG
-    // the file as the settings make it, for its size
+    val frameCount = remember(vm.timeline, vm.animation) { vm.animationFrameCount() }
+    // the file as the settings make it, for its size (debounced so sliding FPS stays smooth)
     var bytes by remember { mutableStateOf<Long?>(null) }
-    LaunchedEffect(webReady, dither, perFramePalette, transparent, fps) {
+    LaunchedEffect(webReady, dither, perFramePalette, transparent, fps, useCamera) {
         bytes = null
-        bytes = vm.exportAnimation(format, webReady, dither, perFramePalette, transparent, fps)?.length()
+        delay(220L)
+        bytes = vm.exportAnimation(format, webReady, dither, perFramePalette, transparent, fps, useCamera)?.length()
     }
     ExportScreen(
-        title = format.title,
+        title = if (hasTimeline && format.video) {
+            if (format == CanvasViewModel.Animated.HEVC) "Export Video (HEVC)" else "Export Video (MP4)"
+        } else {
+            format.title
+        },
         name = vm.artworkTitle(),
         size = bytes?.let(::fileSize),
         exporting = exporting,
@@ -105,7 +114,7 @@ fun AnimatedExport(vm: CanvasViewModel, format: CanvasViewModel.Animated) {
             exporting = true
             scope.launch {
                 // the export card shows how far it has come, and says if it couldn't be made
-                val file = vm.shareAnimation(format, webReady, dither, perFramePalette, transparent, fps)
+                val file = vm.shareAnimation(format, webReady, dither, perFramePalette, transparent, fps, useCamera)
                 exporting = false
                 if (file != null) {
                     vm.endAnimatedExport()
@@ -114,17 +123,21 @@ fun AnimatedExport(vm: CanvasViewModel, format: CanvasViewModel.Animated) {
             }
         },
         preview = { side ->
-            // the frames, fitted to the box, played over and over
+            // the frames, fitted to the box, played over and over at the selected FPS
             var frames by remember { mutableStateOf<List<Bitmap>>(emptyList()) }
             var shown by remember { mutableIntStateOf(0) }
-            LaunchedEffect(transparent && canTransparent, side) {
-                val loaded = withContext(Dispatchers.IO) { List(vm.animationFrameCount()) { vm.animationFrame(it, side, transparent && canTransparent) }.filterNotNull() }
+            LaunchedEffect(transparent && canTransparent, useCamera, side) {
+                val loaded = withContext(Dispatchers.IO) {
+                    List(vm.animationFrameCount()) {
+                        vm.animationFrame(it, side, transparent && canTransparent, useCamera)
+                    }.filterNotNull()
+                }
                 frames = loaded
                 shown = 0
             }
-            LaunchedEffect(frames) {
+            LaunchedEffect(frames, fps) {
                 while (frames.size > 1) {
-                    delay(1000L / CanvasViewModel.ANIMATION_FPS)
+                    delay((1000f / fps.coerceIn(1f, 60f)).toLong().coerceAtLeast(16L))
                     shown = (shown + 1) % frames.size
                 }
             }
@@ -133,6 +146,24 @@ fun AnimatedExport(vm: CanvasViewModel, format: CanvasViewModel.Animated) {
     ) {
         Segments(listOf("Max Resolution", "Web Ready"), if (webReady) 1 else 0) { webReady = it == 1 }
         FpsSlider(fpsAt, exportFpsLabel(fps)) { fpsAt = it }
+        if (hasTimeline) {
+            SettingRow(
+                if (hasCamera) "Camera viewport (Active)" else "Camera viewport",
+                useCamera,
+            ) { useCamera = it }
+            val secs = if (fps > 0.1f) frameCount / fps else 0f
+            val info = buildString {
+                append("$frameCount frames • ${"%.1f".format(secs)}s")
+                if (format.video && vm.timeline?.hasAudio == true) append(" • Audio")
+                if (useCamera && hasCamera) append(" • Camera")
+            }
+            Text(
+                text = info,
+                color = SizeInk,
+                fontSize = 13.sp,
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 6.dp),
+            )
+        }
         if (format == CanvasViewModel.Animated.GIF) {
             SettingRow("Dithering", dither) { dither = it }
             SettingRow("Per frame color palette", perFramePalette) { perFramePalette = it }

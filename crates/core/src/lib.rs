@@ -208,7 +208,7 @@ pub use project::{
     ArtworkInfo, PdfBook, export_file_name, read_signature, save_failure_said, write_photo, write_signature,
 };
 pub use project::{PackageTimeLapse, artwork_plays, package_time_lapse};
-pub use project::{PagesOutcome, PsdOutcome, import_pages, import_psd};
+pub use project::{PagesOutcome, PsdOutcome, import_kra, import_pages, import_psd};
 pub use quick_menu::{
     QuickAction, QuickMenuSet, quick_action_adjusts, quick_action_label, quick_actions_listed,
     quick_adjustments_listed, quick_menu_active_after, quick_menu_added, quick_menu_saved, quick_menu_slots,

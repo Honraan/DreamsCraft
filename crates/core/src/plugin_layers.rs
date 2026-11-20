@@ -2211,8 +2211,8 @@ impl CanvasSession {
         id
     }
 
-    /// The files plugins on make of the artwork's layers of the kinds they add, as Share offers them:
-    /// those of each kind the artwork has a layer of.
+    /// The files plugins on make of the artwork's layers of the kinds they add, plus document
+    /// formats provided by enabled format plugins, as Share offers them.
     pub fn plugin_exports(&self) -> Vec<crate::PluginExport> {
         let st = self.shared.lock();
         let Some(hooks) = st.hooks.as_ref() else { return Vec::new() };
@@ -2227,12 +2227,30 @@ impl CanvasSession {
                 }
             }
         }
+        for export in hooks.format_exports() {
+            if !out.iter().any(|e| e.key == export.key) {
+                out.push(export);
+            }
+        }
         out
     }
 
     /// The file plugin export `key` makes (see [`CanvasSession::plugin_exports`]) written to `path`,
     /// whole.
     pub fn export_plugin(&self, key: String, path: String) -> Result<(), crate::MobileError> {
+        if key == "io.github.artcraftandroid.krita-kra.kra" {
+            let (export_animation, include_preview) = {
+                let st = self.shared.lock();
+                match st.hooks.as_ref() {
+                    Some(hooks) => (
+                        hooks.format_control("io.github.artcraftandroid.krita-kra.animation").is_none_or(|v| v >= 0.5),
+                        hooks.format_control("io.github.artcraftandroid.krita-kra.preview").is_none_or(|v| v >= 0.5),
+                    ),
+                    None => (true, true),
+                }
+            };
+            return self.export_kra_with_options(path, export_animation, include_preview);
+        }
         let reason = |why: &str| crate::MobileError::File { reason: why.to_owned() };
         let bytes = self.plugin_export_bytes(&key).ok_or_else(|| reason("the plugin couldn't make it"))?;
         crate::project::write_atomically(std::path::Path::new(&path), |p| {

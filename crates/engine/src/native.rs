@@ -86,6 +86,55 @@ pub struct Imported {
 
 /// Where a package keeps the Reference window's picture (some writers put it at the top).
 const REFERENCE_PICTURE: &str = "ReferenceImage/ReferenceImage.png";
+/// Where a `.procraft` package keeps the full multi-track DreamsCraft animation timeline.
+const TIMELINE_ENTRY: &str = "DreamsCraft/timeline.json";
+/// Prefix inside a `.procraft` package for embedded timeline audio WAV files.
+const TIMELINE_AUDIO_PREFIX: &str = "DreamsCraft/audio/";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PackageTimeline {
+    version: u32,
+    layer_uuids: std::collections::BTreeMap<u64, String>,
+    timeline: crate::timeline::Timeline,
+}
+
+fn remap_timeline_layers(
+    timeline: &mut crate::timeline::Timeline,
+    old_to_new: &std::collections::HashMap<LayerId, LayerId>,
+) {
+    let map = |id: LayerId| old_to_new.get(&id).copied();
+    for track in &mut timeline.tracks {
+        for clip in &mut track.clips {
+            match &mut clip.kind {
+                crate::timeline::ClipKind::Cel { cels } => {
+                    for cel in cels.iter_mut() {
+                        if let Some(new_id) = map(cel.layer) {
+                            cel.layer = new_id;
+                        }
+                    }
+                }
+                crate::timeline::ClipKind::Layer { layer }
+                | crate::timeline::ClipKind::Video { layer, .. }
+                | crate::timeline::ClipKind::Text { layer } => {
+                    if let Some(new_id) = map(*layer) {
+                        *layer = new_id;
+                    }
+                }
+                crate::timeline::ClipKind::Group { members } => {
+                    for member in members.iter_mut() {
+                        if let Some(new_id) = map(*member) {
+                            *member = new_id;
+                        }
+                    }
+                }
+                crate::timeline::ClipKind::Audio { .. } => {}
+            }
+            if let Some(guide) = clip.perform_guide_layer {
+                clip.perform_guide_layer = map(guide);
+            }
+        }
+    }
+}
 
 /// Why a package couldn't be read.
 #[derive(Debug, PartialEq, Eq)]
@@ -176,6 +225,35 @@ pub fn read(bytes: &[u8]) -> Result<Imported, ReadError> {
         a.foreground = root.bool("isFirstItemAnimationForeground").unwrap_or(false);
         a.background = root.bool("isLastItemAnimationBackground").unwrap_or(false);
         document.animation = Some(a);
+    }
+    if let Some(tl_bytes) = zip.read(TIMELINE_ENTRY)
+        && let Ok(mut saved) = serde_json::from_slice::<PackageTimeline>(&tl_bytes)
+    {
+        let uuid_to_id: std::collections::HashMap<&str, LayerId> =
+            uuids.iter().map(|(u, id)| (u.as_str(), *id)).collect();
+        let old_to_new: std::collections::HashMap<LayerId, LayerId> = saved
+            .layer_uuids
+            .iter()
+            .filter_map(|(&old_id, uuid)| uuid_to_id.get(uuid.as_str()).map(|&new_id| (LayerId(old_id), new_id)))
+            .collect();
+        remap_timeline_layers(&mut saved.timeline, &old_to_new);
+        for asset in &mut saved.timeline.audio_assets {
+            let wav_name = format!("{TIMELINE_AUDIO_PREFIX}{}.wav", asset.id.0);
+            if let Some(wav) = zip.read(&wav_name)
+                && let Some(decoded) = crate::audio::decode_wav_pcm(&wav)
+            {
+                let ch = usize::from(decoded.channels.clamp(1, 2));
+                asset.sample_rate = decoded.sample_rate;
+                asset.channels = decoded.channels;
+                asset.duration_samples = (decoded.samples.len() / ch) as u64;
+                if asset.peaks.is_empty() {
+                    let buckets = ((asset.duration_samples as usize) / 256).clamp(16, 4096);
+                    asset.peaks = crate::audio::compute_waveform_peaks(&decoded.samples, decoded.channels, buckets);
+                }
+                asset.pcm = decoded.samples;
+            }
+        }
+        document.timeline = Some(saved.timeline);
     }
     let document = document.repaired();
     let reference_picture = zip
@@ -867,9 +945,19 @@ fn write_into<W: std::io::Write>(e: &Export<'_>, zip: &mut ZipWriter<W>) {
     // layers and groups, top first, as nested lists
     let tops = top_first(doc, None);
     let (mut selected, mut sampled) = (Builder::null(), Builder::null());
+    let mut layer_uuids = std::collections::BTreeMap::new();
     let mut items = Vec::new();
     for id in tops {
-        items.push(write_item(&mut b, zip, &mut uuids, e, &doc_ref, id, [&mut selected, &mut sampled]));
+        items.push(write_item(
+            &mut b,
+            zip,
+            &mut uuids,
+            e,
+            &doc_ref,
+            id,
+            [&mut selected, &mut sampled],
+            &mut layer_uuids,
+        ));
     }
     let layers = b.array(items.clone(), true);
     let unwrapped = b.array(items, false);
@@ -968,6 +1056,18 @@ fn write_into<W: std::io::Write>(e: &Export<'_>, zip: &mut ZipWriter<W>) {
     zip.add("QuickLook/Thumbnail.png", e.thumbnail_png);
     if let Some(png) = e.reference_picture {
         zip.add(REFERENCE_PICTURE, png);
+    }
+    if let Some(tl) = doc.timeline.as_ref() {
+        let payload = PackageTimeline { version: 1, layer_uuids, timeline: tl.clone() };
+        if let Ok(json) = serde_json::to_vec(&payload) {
+            zip.add(TIMELINE_ENTRY, &json);
+        }
+        for asset in &tl.audio_assets {
+            if !asset.pcm.is_empty() {
+                let wav = crate::audio::encode_wav_pcm(&asset.pcm, asset.sample_rate, asset.channels);
+                zip.add(&format!("{TIMELINE_AUDIO_PREFIX}{}.wav", asset.id.0), &wav);
+            }
+        }
     }
 }
 
@@ -1098,6 +1198,7 @@ fn top_first(doc: &Document, group: Option<LayerId>) -> Vec<LayerId> {
 }
 
 /// Writes a layer (with its mask and tiles) or a group (with what it holds); gives its record.
+#[allow(clippy::too_many_arguments)]
 fn write_item<W: std::io::Write>(
     b: &mut Builder,
     zip: &mut ZipWriter<W>,
@@ -1106,6 +1207,7 @@ fn write_item<W: std::io::Write>(
     doc_ref: &Value,
     id: LayerId,
     [selected, sampled]: [&mut Value; 2],
+    layer_uuids: &mut std::collections::BTreeMap<u64, String>,
 ) -> Value {
     let doc = e.document;
     let (w, h) = (doc.width(), doc.height());
@@ -1113,7 +1215,7 @@ fn write_item<W: std::io::Write>(
     if l.kind == LayerKind::Group {
         let children: Vec<Value> = top_first(doc, Some(id))
             .into_iter()
-            .map(|c| write_item(b, zip, uuids, e, doc_ref, c, [&mut *selected, &mut *sampled]))
+            .map(|c| write_item(b, zip, uuids, e, doc_ref, c, [&mut *selected, &mut *sampled], layer_uuids))
             .collect();
         let children = b.array(children, true);
         let name = b.string(&l.name);
@@ -1134,6 +1236,7 @@ fn write_item<W: std::io::Write>(
         );
     }
     let uuid = uuids.next();
+    layer_uuids.insert(id.0, uuid.clone());
     // (one that can't be read leaves the package unfinished)
     let px = e.pixels.pixels(id).unwrap_or_else(|err| {
         zip.fail(err);

@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "id": "io.github.artcraftandroid.krita-kra",
+  "name": "Krita Documents (.kra)",
+  "version": "1.0.0",
+  "holds": ["format"],
+  "publisher": { "name": "DreamsCraft" },
+  "description": "Export and import Krita (.kra) documents with multi-track animation interoperability (frames, holds, FPS, layers, groups, and blend modes).",
+  "experimental": false,
+  "compat": { "procraft": { "interface": 8 } },
+  "formats": [
+    { "key": "kra", "label": "Krita (.kra)", "extension": "kra", "mime": "application/x-krita" }
+  ],
+  "controls": [
+    { "key": "animation", "type": "switch", "label": "Export animation frames", "starts": true },
+    { "key": "preview", "type": "switch", "label": "Include flattened preview", "starts": true }
+  ]
+}

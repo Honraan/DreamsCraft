@@ -59,41 +59,35 @@ enum FrameTarget {
     Layer(LayerId),
 }
 
+fn keyframe_track_end(kf: &procraft_engine::timeline::KeyframeTrack) -> u32 {
+    kf.transform
+        .iter()
+        .map(|k| k.frame.saturating_add(1))
+        .chain(kf.opacity.iter().map(|k| k.frame.saturating_add(1)))
+        .chain(kf.filter.iter().map(|k| k.frame.saturating_add(1)))
+        .chain(kf.deform.iter().map(|k| k.frame.saturating_add(1)))
+        .chain(kf.volume.iter().map(|k| k.frame.saturating_add(1)))
+        .chain(kf.pan.iter().map(|k| k.frame.saturating_add(1)))
+        .max()
+        .unwrap_or(1)
+}
+
 fn timeline_export_frames(tl: &procraft_engine::timeline::Timeline) -> Vec<u32> {
     if let Some(w) = tl.work_area {
         return (w.start..=w.end).collect();
     }
-    let content_end = tl
+    let camera_end = keyframe_track_end(&tl.camera);
+    let tracks_end = tl
         .tracks
         .iter()
         .filter(|t| t.visible)
         .flat_map(|t| {
-            let t_kf = t
-                .keyframes
-                .transform
-                .iter()
-                .map(|k| k.frame.saturating_add(1))
-                .chain(t.keyframes.opacity.iter().map(|k| k.frame.saturating_add(1)))
-                .max()
-                .unwrap_or(1);
-            t.clips
-                .iter()
-                .map(|c| {
-                    let c_kf = c
-                        .keyframes
-                        .transform
-                        .iter()
-                        .map(|k| k.frame.saturating_add(1))
-                        .chain(c.keyframes.opacity.iter().map(|k| k.frame.saturating_add(1)))
-                        .max()
-                        .unwrap_or(1);
-                    c.end_frame().max(c_kf)
-                })
-                .chain(std::iter::once(t_kf))
+            let t_kf = keyframe_track_end(&t.keyframes);
+            t.clips.iter().map(|c| c.end_frame().max(keyframe_track_end(&c.keyframes))).chain(std::iter::once(t_kf))
         })
         .max()
-        .unwrap_or(1)
-        .clamp(1, tl.duration_frames);
+        .unwrap_or(1);
+    let content_end = tracks_end.max(camera_end).clamp(1, tl.duration_frames);
     (0..content_end).collect()
 }
 
@@ -172,8 +166,22 @@ impl CanvasSession {
 
     /// Played frame `index` (bottom first) with a background frame under it and a foreground
     /// frame over it, straight alpha, scaled to fit `max_side` (0: full size), over the background
-    /// unless `transparent`; none if there is no such frame.
+    /// unless `transparent`; none if there is no such frame. Uses the Camera Track viewport when
+    /// present.
     pub fn animation_frame(&self, index: u32, transparent: bool, max_side: u32) -> Option<ThumbnailImage> {
+        self.animation_frame_with_camera(index, transparent, max_side, true)
+    }
+
+    /// Like [`CanvasSession::animation_frame`], with explicit control over whether the global
+    /// Camera Track frames the exported viewport (`use_camera = true`) or the raw full stage is
+    /// rendered (`use_camera = false`).
+    pub fn animation_frame_with_camera(
+        &self,
+        index: u32,
+        transparent: bool,
+        max_side: u32,
+        use_camera: bool,
+    ) -> Option<ThumbnailImage> {
         let target = {
             let doc = &self.shared.lock().doc;
             let idx = usize::try_from(index).ok()?;
@@ -183,7 +191,7 @@ impl CanvasSession {
                 FrameTarget::Layer(*played(doc).get(idx)?)
             }
         };
-        match self.render_target(target, transparent, max_side) {
+        match self.render_target(target, transparent, max_side, use_camera) {
             Ok((width, height, rgba)) => Some(ThumbnailImage { width, height, rgba }),
             Err(e) => {
                 log::warn!("animation frame: {e}");
@@ -206,6 +214,21 @@ impl CanvasSession {
         per_frame_palette: bool,
         transparent: bool,
     ) -> Result<(), MobileError> {
+        self.export_gif_with_camera(path, max_side, fps, dither, per_frame_palette, transparent, true)
+    }
+
+    /// Like [`CanvasSession::export_gif`], with explicit `use_camera` viewport selection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn export_gif_with_camera(
+        &self,
+        path: String,
+        max_side: u32,
+        fps: f32,
+        dither: bool,
+        per_frame_palette: bool,
+        transparent: bool,
+        use_camera: bool,
+    ) -> Result<(), MobileError> {
         let units = sequence_targets(&self.shared.lock().doc);
         let delay = (100.0 / fps.clamp(0.1, 100.0)).round() as u16;
         // the frames made take it to 0.95 (sharing a palette, its look at them to 0.45 first), the
@@ -214,7 +237,7 @@ impl CanvasSession {
         let (mut gif, start): (Option<GifWriter>, f32) = if per_frame_palette {
             (None, 0.0)
         } else {
-            (self.shared_palette_gif(&units, transparent, max_side)?, 0.45)
+            (self.shared_palette_gif(&units, transparent, max_side, use_camera)?, 0.45)
         };
         // drawn a few at a time (a frame to a core, as many as fit in GIF_BATCH_BYTES), each few
         // made into the GIF's frames side by side, then added in order
@@ -225,7 +248,7 @@ impl CanvasSession {
                 .iter()
                 .skip(next)
                 .take(few)
-                .map(|&unit| self.render_target(unit, transparent, max_side))
+                .map(|&unit| self.render_target(unit, transparent, max_side, use_camera))
                 .collect::<Result<Vec<_>, _>>()?;
             next += frames.len();
             let Some(&(w, h, _)) = frames.first() else { break };
@@ -253,6 +276,18 @@ impl CanvasSession {
     /// The animation as a looping animated PNG at `path`, `fps` frames a second, scaled to fit
     /// `max_side` (0: full size), `transparent` leaving the background out.
     pub fn export_apng(&self, path: String, max_side: u32, fps: f32, transparent: bool) -> Result<(), MobileError> {
+        self.export_apng_with_camera(path, max_side, fps, transparent, true)
+    }
+
+    /// Like [`CanvasSession::export_apng`], with explicit `use_camera` viewport selection.
+    pub fn export_apng_with_camera(
+        &self,
+        path: String,
+        max_side: u32,
+        fps: f32,
+        transparent: bool,
+        use_camera: bool,
+    ) -> Result<(), MobileError> {
         let units = sequence_targets(&self.shared.lock().doc);
         let count = u32::try_from(units.len()).unwrap_or(u32::MAX);
         let Some((&first, rest)) = units.split_first() else {
@@ -261,7 +296,7 @@ impl CanvasSession {
         // as the GIF's: the frames to 0.95, the file to 1
         self.exported(0.0);
         let made = |k: usize| self.exported(0.95 * k as f32 / count.max(1) as f32);
-        let (w, h, rgba) = self.render_target(first, transparent, max_side)?;
+        let (w, h, rgba) = self.render_target(first, transparent, max_side, use_camera)?;
         // a frame lasts 1/fps seconds, in thousandths
         let delay = (1000.0 / fps.clamp(0.1, 1000.0)).round().clamp(1.0, 65535.0) as u16;
         write_atomically(Path::new(&path), |f| {
@@ -276,7 +311,7 @@ impl CanvasSession {
             writer.write_image_data(&rgba).map_err(|e| file_error("saving", e))?;
             made(1);
             for (k, &unit) in rest.iter().enumerate() {
-                let (fw, fh, frame) = self.render_target(unit, transparent, max_side)?;
+                let (fw, fh, frame) = self.render_target(unit, transparent, max_side, use_camera)?;
                 if (fw, fh) != (w, h) {
                     return Err(file_error("saving", "the frames differ in size"));
                 }
@@ -298,6 +333,7 @@ impl CanvasSession {
         units: &[FrameTarget],
         transparent: bool,
         max_side: u32,
+        use_camera: bool,
     ) -> Result<Option<GifWriter>, MobileError> {
         // a held frame is drawn once, however many places it holds
         let mut seen = std::collections::HashSet::new();
@@ -307,7 +343,7 @@ impl CanvasSession {
         let mut samples: Vec<[u8; 4]> = Vec::new();
         let mut size = None;
         for (k, &unit) in units.iter().enumerate() {
-            let (w, h, rgba) = self.render_target(unit, transparent, max_side)?;
+            let (w, h, rgba) = self.render_target(unit, transparent, max_side, use_camera)?;
             size.get_or_insert((w, h));
             let pixels = rgba.as_chunks::<4>().0;
             let step = (pixels.len() / per_frame).max(1);
@@ -322,20 +358,23 @@ impl CanvasSession {
         target: FrameTarget,
         transparent: bool,
         max_side: u32,
+        use_camera: bool,
     ) -> Result<(u32, u32, Vec<u8>), MobileError> {
         match target {
-            FrameTarget::TimelineFrame(frame) => self.render_timeline_frame(frame, transparent, max_side),
+            FrameTarget::TimelineFrame(frame) => self.render_timeline_frame(frame, transparent, max_side, use_camera),
             FrameTarget::Layer(unit) => self.render_frame(unit, transparent, max_side),
         }
     }
 
-    /// Renders multi-track timeline `frame` (including all visible tracks, clips, cels, and
-    /// non-destructive keyframe transforms/opacities, without onion skins).
+    /// Renders multi-track timeline `frame` (including all visible tracks, clips, cels,
+    /// non-destructive keyframe transforms/opacities, and Camera viewport when `use_camera` is
+    /// true, without onion skins).
     fn render_timeline_frame(
         &self,
         frame: u32,
         transparent: bool,
         max_side: u32,
+        use_camera: bool,
     ) -> Result<(u32, u32, Vec<u8>), MobileError> {
         let (w, h, rgba) = {
             let mut guard = self.shared.lock();
@@ -345,6 +384,16 @@ impl CanvasSession {
             let mut doc = st.doc.clone();
             if transparent {
                 doc.background_visible = false;
+            }
+            if let Some(tl) = doc.timeline.as_mut() {
+                if use_camera {
+                    if !tl.camera.is_empty() {
+                        tl.camera_enabled = true;
+                    }
+                } else {
+                    tl.camera_enabled = false;
+                    tl.camera = procraft_engine::timeline::KeyframeTrack::default();
+                }
             }
             let (w, h) = (doc.width(), doc.height());
             let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else {

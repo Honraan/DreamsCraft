@@ -278,15 +278,27 @@ fun ActionsPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier)
                 // files plugins make of the artwork's layers of kinds they add, under their own names
                 *vm.session?.pluginExports().orEmpty().map { e -> Act(e.label) { share(e) } }.toTypedArray(),
             ),
-            listOf(
-                Heading("Share Layers"),
-                Act("PDF") { pdfAsking = CanvasViewModel.Export.LAYERS_PDF },
-                Act("PNG Files") { share(CanvasViewModel.Export.LAYER_PNGS) },
-                Act("Animated GIF") { vm.animatedExport = CanvasViewModel.Animated.GIF },
-                Act("Animated PNG") { vm.animatedExport = CanvasViewModel.Animated.PNG },
-                Act("Animated MP4") { vm.animatedExport = CanvasViewModel.Animated.MP4 },
-                Act("Animated HEVC") { vm.animatedExport = CanvasViewModel.Animated.HEVC },
-            ),
+            if (vm.timeline != null) {
+                listOf(
+                    Heading("Share Video & Animation"),
+                    Act("Export Video (MP4)", value = if (vm.hasCameraViewport()) "Camera" else null) { vm.animatedExport = CanvasViewModel.Animated.MP4 },
+                    Act("Export Video (HEVC)", value = if (vm.hasCameraViewport()) "Camera" else null) { vm.animatedExport = CanvasViewModel.Animated.HEVC },
+                    Act("Animated GIF") { vm.animatedExport = CanvasViewModel.Animated.GIF },
+                    Act("Animated PNG") { vm.animatedExport = CanvasViewModel.Animated.PNG },
+                    Act("PDF (Layers)") { pdfAsking = CanvasViewModel.Export.LAYERS_PDF },
+                    Act("PNG Files") { share(CanvasViewModel.Export.LAYER_PNGS) },
+                )
+            } else {
+                listOf(
+                    Heading("Share Layers"),
+                    Act("PDF") { pdfAsking = CanvasViewModel.Export.LAYERS_PDF },
+                    Act("PNG Files") { share(CanvasViewModel.Export.LAYER_PNGS) },
+                    Act("Animated GIF") { vm.animatedExport = CanvasViewModel.Animated.GIF },
+                    Act("Animated PNG") { vm.animatedExport = CanvasViewModel.Animated.PNG },
+                    Act("Animated MP4") { vm.animatedExport = CanvasViewModel.Animated.MP4 },
+                    Act("Animated HEVC") { vm.animatedExport = CanvasViewModel.Animated.HEVC },
+                )
+            },
         )
         3 -> listOf(
             listOf(

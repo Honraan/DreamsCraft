@@ -30,6 +30,7 @@ pub mod icc;
 pub mod input;
 pub mod jpeg;
 pub mod keyed;
+pub mod kra;
 pub mod krita;
 pub mod library;
 pub mod lzo;

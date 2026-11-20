@@ -559,6 +559,7 @@ pub fn open_artwork_files(paths: Vec<PathBuf>) -> Option<(Arc<CanvasSession>, Op
     }
     let opened = match extension.as_str() {
         "psd" | "psb" => open_psd(&path, &name),
+        "kra" => CanvasSession::open_kra(path.to_string_lossy().into_owned()).map_err(|e| e.to_string()),
         "pdf" => open_pdf(&path, &name),
         "png" => read_png(&path).map(|image| CanvasSession::from_image(image, name)),
         "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tif" | "tiff" => image::open(&path)
