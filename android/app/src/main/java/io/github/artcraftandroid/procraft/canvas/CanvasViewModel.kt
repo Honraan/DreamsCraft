@@ -8499,6 +8499,14 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setBlend(l: LayerInfo, blend: UInt) = layerChange(thumbs = false) { it.setLayerBlend(l.id, blend) }
 
+    fun previewBlend(owner: CanvasSession?, id: ULong, blend: UInt) {
+        if (session === owner && owner?.previewLayerBlend(id, blend) == true) refresh()
+    }
+
+    fun finishBlend(owner: CanvasSession?) {
+        if (owner?.finishLayerBlend() == true && session === owner) refresh()
+    }
+
     fun toggleAlphaLock(l: LayerInfo) = layerChange(thumbs = false) { it.setLayerAlphaLock(l.id, !l.alphaLock) }
 
     /** A mask's layer; anything else itself. */
