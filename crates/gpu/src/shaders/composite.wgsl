@@ -92,6 +92,7 @@ const CLIP_BASE: u32 = 3u;
 @group(0) @binding(7) var second_tex: texture_2d<f32>;
 @group(0) @binding(8) var clip_mask_tex: texture_2d<f32>;
 @group(0) @binding(9) var paper_tex: texture_2d<f32>;
+@group(0) @binding(10) var layer_smp: sampler;
 @group(1) @binding(0) var<uniform> lu: LayerUniform;
 
 // one triangle covering the target
@@ -251,28 +252,19 @@ fn with_stroke(c0: vec4<f32>, p: vec2<i32>) -> vec4<f32> {
     return c;
 }
 
-fn load_texel(tex: texture_2d<f32>, dims: vec2<i32>, i: vec2<i32>) -> vec4<f32> {
-    if (i.x < 0 || i.y < 0 || i.x >= dims.x || i.y >= dims.y) {
-        return vec4<f32>(0.0);
-    }
-    return textureLoad(tex, i, 0);
-}
-
 fn load_layer_at_f(tex: texture_2d<f32>, pf: vec2<f32>) -> vec4<f32> {
-    let dims = vec2<i32>(textureDimensions(tex));
-    let pt = pf + 0.5;
-    var s = pf;
+    let dims = vec2<f32>(textureDimensions(tex));
+    var pt = pf + 0.5;
     if (lu.xform1.z > 0.5) {
-        s = vec2<f32>(
+        pt = vec2<f32>(
             lu.xform0.x * pt.x + lu.xform0.z * pt.y + lu.xform1.x,
             lu.xform0.y * pt.x + lu.xform0.w * pt.y + lu.xform1.y,
-        ) - 0.5;
+        );
     }
-    let base = vec2<i32>(floor(s));
-    let f = s - floor(s);
-    let top = mix(load_texel(tex, dims, base), load_texel(tex, dims, base + vec2<i32>(1, 0)), f.x);
-    let bottom = mix(load_texel(tex, dims, base + vec2<i32>(0, 1)), load_texel(tex, dims, base + vec2<i32>(1, 1)), f.x);
-    return mix(top, bottom, f.y);
+    if (pt.x < 0.0 || pt.y < 0.0 || pt.x > dims.x || pt.y > dims.y) {
+        return vec4<f32>(0.0);
+    }
+    return textureSampleLevel(tex, layer_smp, pt / dims, 0.0);
 }
 
 fn load_layer_at(tex: texture_2d<f32>, p: vec2<i32>) -> vec4<f32> {
@@ -305,28 +297,19 @@ fn sample_layer_filtered(tex: texture_2d<f32>, p: vec2<i32>) -> vec4<f32> {
     let blur = lu.fx0.w;
     let sharp = lu.fx1.x;
     if (blur > 0.05) {
+        // Hardware-bilinear 9-tap circular Gaussian approximation (9 TMU ops vs 68 textureLoads)
         let pf = vec2<f32>(p);
-        let r1 = blur * 0.5;
-        let r2 = blur;
-        let d1 = r1 * 0.70710678;
-        let d2 = r2 * 0.70710678;
-        var acc = load_layer_at_f(tex, pf) * 0.20;
+        let r1 = blur * 0.55;
+        let d2 = blur * 0.70710678;
+        var acc = load_layer_at_f(tex, pf) * 0.24;
         acc += (load_layer_at_f(tex, pf + vec2<f32>(r1, 0.0))
             + load_layer_at_f(tex, pf + vec2<f32>(-r1, 0.0))
             + load_layer_at_f(tex, pf + vec2<f32>(0.0, r1))
-            + load_layer_at_f(tex, pf + vec2<f32>(0.0, -r1))) * 0.10;
-        acc += (load_layer_at_f(tex, pf + vec2<f32>(d1, d1))
-            + load_layer_at_f(tex, pf + vec2<f32>(-d1, d1))
-            + load_layer_at_f(tex, pf + vec2<f32>(d1, -d1))
-            + load_layer_at_f(tex, pf + vec2<f32>(-d1, -d1))) * 0.05;
-        acc += (load_layer_at_f(tex, pf + vec2<f32>(r2, 0.0))
-            + load_layer_at_f(tex, pf + vec2<f32>(-r2, 0.0))
-            + load_layer_at_f(tex, pf + vec2<f32>(0.0, r2))
-            + load_layer_at_f(tex, pf + vec2<f32>(0.0, -r2))) * 0.03;
+            + load_layer_at_f(tex, pf + vec2<f32>(0.0, -r1))) * 0.11;
         acc += (load_layer_at_f(tex, pf + vec2<f32>(d2, d2))
             + load_layer_at_f(tex, pf + vec2<f32>(-d2, d2))
             + load_layer_at_f(tex, pf + vec2<f32>(d2, -d2))
-            + load_layer_at_f(tex, pf + vec2<f32>(-d2, -d2))) * 0.02;
+            + load_layer_at_f(tex, pf + vec2<f32>(-d2, -d2))) * 0.08;
         return acc;
     }
     var c = load_layer_at(tex, p);
@@ -374,84 +357,86 @@ fn apply_live_color_filters(c0: vec4<f32>, p: vec2<i32>) -> vec4<f32> {
 }
 
 fn apply_track_effects(tex: texture_2d<f32>, base_c: vec4<f32>, p: vec2<i32>) -> vec4<f32> {
+    // Fast exit when no spatial track effects (outline, shadow, glow) are enabled
+    if (lu.fx3.x == 0u && lu.fx3.y == 0u && lu.fx3.z == 0u) {
+        return base_c;
+    }
     var out = base_c;
     let pf = vec2<f32>(p);
 
-    // 1. Stroke / Outline around alpha silhouette
+    // 1. Stroke / Outline around alpha silhouette (early-out inside opaque strokes)
     let ow = lu.fx1.z;
-    let ocol = unpack4x8unorm(lu.fx3.x);
-    if (ow > 0.05 && ocol.a > 0.001) {
-        let od = ow * 0.70710678;
-        var max_a = out.a;
-        max_a = max(max_a, load_layer_at_f(tex, pf + vec2<f32>(ow, 0.0)).a);
-        max_a = max(max_a, load_layer_at_f(tex, pf + vec2<f32>(-ow, 0.0)).a);
-        max_a = max(max_a, load_layer_at_f(tex, pf + vec2<f32>(0.0, ow)).a);
-        max_a = max(max_a, load_layer_at_f(tex, pf + vec2<f32>(0.0, -ow)).a);
-        max_a = max(max_a, load_layer_at_f(tex, pf + vec2<f32>(od, od)).a);
-        max_a = max(max_a, load_layer_at_f(tex, pf + vec2<f32>(-od, od)).a);
-        max_a = max(max_a, load_layer_at_f(tex, pf + vec2<f32>(od, -od)).a);
-        max_a = max(max_a, load_layer_at_f(tex, pf + vec2<f32>(-od, -od)).a);
-        let oa = clamp(max_a * ocol.a, 0.0, 1.0);
-        let outline_px = vec4<f32>(ocol.rgb * oa, oa);
-        out = over_premul(out, outline_px);
+    if (ow > 0.05 && lu.fx3.x != 0u && out.a < 0.995) {
+        let ocol = unpack4x8unorm(lu.fx3.x);
+        if (ocol.a > 0.001) {
+            let od = ow * 0.70710678;
+            var max_a = out.a;
+            max_a = max(max_a, load_layer_at_f(tex, pf + vec2<f32>(ow, 0.0)).a);
+            max_a = max(max_a, load_layer_at_f(tex, pf + vec2<f32>(-ow, 0.0)).a);
+            max_a = max(max_a, load_layer_at_f(tex, pf + vec2<f32>(0.0, ow)).a);
+            max_a = max(max_a, load_layer_at_f(tex, pf + vec2<f32>(0.0, -ow)).a);
+            max_a = max(max_a, load_layer_at_f(tex, pf + vec2<f32>(od, od)).a);
+            max_a = max(max_a, load_layer_at_f(tex, pf + vec2<f32>(-od, od)).a);
+            max_a = max(max_a, load_layer_at_f(tex, pf + vec2<f32>(od, -od)).a);
+            max_a = max(max_a, load_layer_at_f(tex, pf + vec2<f32>(-od, -od)).a);
+            let oa = clamp(max_a * ocol.a, 0.0, 1.0);
+            let outline_px = vec4<f32>(ocol.rgb * oa, oa);
+            out = over_premul(out, outline_px);
+        }
     }
 
-    // 2. Outer / Inner Glow
+    // 2. Outer / Inner Glow (8 hardware taps + opaque/transparent early-outs)
     let gr = lu.fx2.z;
     let gi = lu.fx2.w;
-    let gcol = unpack4x8unorm(lu.fx3.z);
-    if (gr > 0.05 && abs(gi) > 0.001 && gcol.a > 0.001) {
-        let gd = gr * 0.70710678;
-        let gr2 = gr * 0.5;
-        let avg_a = (
-            load_layer_at_f(tex, pf + vec2<f32>(gr, 0.0)).a
-            + load_layer_at_f(tex, pf + vec2<f32>(-gr, 0.0)).a
-            + load_layer_at_f(tex, pf + vec2<f32>(0.0, gr)).a
-            + load_layer_at_f(tex, pf + vec2<f32>(0.0, -gr)).a
-            + load_layer_at_f(tex, pf + vec2<f32>(gd, gd)).a
-            + load_layer_at_f(tex, pf + vec2<f32>(-gd, gd)).a
-            + load_layer_at_f(tex, pf + vec2<f32>(gd, -gd)).a
-            + load_layer_at_f(tex, pf + vec2<f32>(-gd, -gd)).a
-            + load_layer_at_f(tex, pf + vec2<f32>(gr2, 0.0)).a
-            + load_layer_at_f(tex, pf + vec2<f32>(-gr2, 0.0)).a
-            + load_layer_at_f(tex, pf + vec2<f32>(0.0, gr2)).a
-            + load_layer_at_f(tex, pf + vec2<f32>(0.0, -gr2)).a
-        ) / 12.0;
-        if (gi > 0.0) {
-            let ga = clamp(avg_a * gi * gcol.a, 0.0, 1.0);
-            let glow_px = vec4<f32>(gcol.rgb * ga, ga);
-            out = over_premul(out, glow_px);
-        } else {
-            // Inner glow / rim light along the inside contour
-            let edge = clamp((1.0 - avg_a) * (-gi) * gcol.a, 0.0, 1.0) * out.a;
-            let rgb = mix(out.rgb / max(out.a, 1e-6), gcol.rgb, edge);
-            out = vec4<f32>(rgb * out.a, out.a);
+    if (gr > 0.05 && abs(gi) > 0.001 && lu.fx3.z != 0u) {
+        let gcol = unpack4x8unorm(lu.fx3.z);
+        let need_outer = gi > 0.0 && out.a < 0.995;
+        let need_inner = gi < 0.0 && out.a > 0.005;
+        if (gcol.a > 0.001 && (need_outer || need_inner)) {
+            let gd = gr * 0.70710678;
+            let avg_a = (
+                load_layer_at_f(tex, pf + vec2<f32>(gr, 0.0)).a
+                + load_layer_at_f(tex, pf + vec2<f32>(-gr, 0.0)).a
+                + load_layer_at_f(tex, pf + vec2<f32>(0.0, gr)).a
+                + load_layer_at_f(tex, pf + vec2<f32>(0.0, -gr)).a
+                + load_layer_at_f(tex, pf + vec2<f32>(gd, gd)).a
+                + load_layer_at_f(tex, pf + vec2<f32>(-gd, gd)).a
+                + load_layer_at_f(tex, pf + vec2<f32>(gd, -gd)).a
+                + load_layer_at_f(tex, pf + vec2<f32>(-gd, -gd)).a
+            ) * 0.125;
+            if (gi > 0.0) {
+                let ga = clamp(avg_a * gi * gcol.a, 0.0, 1.0);
+                let glow_px = vec4<f32>(gcol.rgb * ga, ga);
+                out = over_premul(out, glow_px);
+            } else {
+                let edge = clamp((1.0 - avg_a) * (-gi) * gcol.a, 0.0, 1.0) * out.a;
+                let rgb = mix(out.rgb / max(out.a, 1e-6), gcol.rgb, edge);
+                out = vec4<f32>(rgb * out.a, out.a);
+            }
         }
     }
 
-    // 3. Drop Shadow
-    let scol = unpack4x8unorm(lu.fx3.y);
-    if (scol.a > 0.001) {
-        let sp = pf - lu.fx2.xy;
-        let sb = lu.fx1.w;
-        var sa = load_layer_at_f(tex, sp).a;
-        if (sb > 0.05) {
-            let sd = sb * 0.70710678;
-            sa = (
-                sa * 2.0
-                + load_layer_at_f(tex, sp + vec2<f32>(sb, 0.0)).a
-                + load_layer_at_f(tex, sp + vec2<f32>(-sb, 0.0)).a
-                + load_layer_at_f(tex, sp + vec2<f32>(0.0, sb)).a
-                + load_layer_at_f(tex, sp + vec2<f32>(0.0, -sb)).a
-                + load_layer_at_f(tex, sp + vec2<f32>(sd, sd)).a
-                + load_layer_at_f(tex, sp + vec2<f32>(-sd, sd)).a
-                + load_layer_at_f(tex, sp + vec2<f32>(sd, -sd)).a
-                + load_layer_at_f(tex, sp + vec2<f32>(-sd, -sd)).a
-            ) / 10.0;
+    // 3. Drop Shadow (5 hardware taps + opaque early-out)
+    if (lu.fx3.y != 0u && out.a < 0.995) {
+        let scol = unpack4x8unorm(lu.fx3.y);
+        if (scol.a > 0.001) {
+            let sp = pf - lu.fx2.xy;
+            let sb = lu.fx1.w;
+            var sa = load_layer_at_f(tex, sp).a;
+            if (sb > 0.05) {
+                let sd = sb * 0.70710678;
+                sa = (
+                    sa * 2.0
+                    + load_layer_at_f(tex, sp + vec2<f32>(sd, sd)).a
+                    + load_layer_at_f(tex, sp + vec2<f32>(-sd, sd)).a
+                    + load_layer_at_f(tex, sp + vec2<f32>(sd, -sd)).a
+                    + load_layer_at_f(tex, sp + vec2<f32>(-sd, -sd)).a
+                ) * (1.0 / 6.0);
+            }
+            let s_alpha = clamp(sa * scol.a, 0.0, 1.0);
+            let shadow_px = vec4<f32>(scol.rgb * s_alpha, s_alpha);
+            out = over_premul(out, shadow_px);
         }
-        let s_alpha = clamp(sa * scol.a, 0.0, 1.0);
-        let shadow_px = vec4<f32>(scol.rgb * s_alpha, s_alpha);
-        out = over_premul(out, shadow_px);
     }
 
     return out;

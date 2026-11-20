@@ -2828,6 +2828,7 @@ private fun BoxScope.TrackOptionsPopover(
 ) {
     var tab by remember(track.id) { mutableIntStateOf(0) } // 0 = Options, 1 = Layer Effects
     var editName by remember(track.id, track.name) { mutableStateOf(track.name) }
+    var trackOpacity by remember(track.id, track.opacity) { mutableFloatStateOf(track.opacity) }
     var fx by remember(track.id, track.effects) { mutableStateOf(track.effects) }
     val scroll = rememberScrollState()
 
@@ -2920,11 +2921,14 @@ private fun BoxScope.TrackOptionsPopover(
             // Opacity Slider
             CompactSliderRow(
                 label = "Opacity",
-                valueText = "${(track.opacity * 100).roundToInt()}%",
-                value = track.opacity,
+                valueText = "${(trackOpacity * 100).roundToInt()}%",
+                value = trackOpacity,
                 range = 0f..1f,
-                onValueChange = { vm.setTimelineTrackOpacity(track.id, it, done = false) },
-                onValueChangeFinished = { vm.setTimelineTrackOpacity(track.id, track.opacity, done = true) },
+                onValueChange = {
+                    trackOpacity = it
+                    vm.setTimelineTrackOpacity(track.id, it, done = false)
+                },
+                onValueChangeFinished = { vm.setTimelineTrackOpacity(track.id, trackOpacity, done = true) },
             )
 
             // Blend Mode Chips
@@ -3190,9 +3194,9 @@ private fun BoxScope.LiveFilterPopover(
         )
         CompactSliderRow(
             label = "Hue Shift",
-            valueText = "${(filter.hueShift * 360f).roundToInt()}°",
+            valueText = "${filter.hueShift.roundToInt()}°",
             value = filter.hueShift,
-            range = -0.5f..0.5f,
+            range = -180f..180f,
             onValueChange = { pushFilter(filter.copy(hueShift = it), done = false) },
             onValueChangeFinished = { pushFilter(filter, done = true) },
         )

@@ -1426,11 +1426,13 @@ impl CanvasSession {
         let mut guard = self.shared.lock();
         let st = &mut *guard;
         st.finish_stroke();
-        let before = st.doc.clone();
+        let before = if st.pending_doc.is_none() { Some(st.doc.clone()) } else { None };
         if !f(&mut st.doc) {
             return false;
         }
-        st.pending_doc.get_or_insert(before);
+        if let Some(before) = before {
+            st.pending_doc = Some(before);
+        }
         st.pending_name = Some(name.to_owned());
         if let Some(canvas) = st.canvas.as_mut() {
             canvas.invalidate();

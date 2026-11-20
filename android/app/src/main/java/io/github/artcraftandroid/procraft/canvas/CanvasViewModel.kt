@@ -8693,15 +8693,13 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     ) {
         val s = session ?: return
         s.timelineSetTransformKeyframe(clipId, frame.coerceAtLeast(0).toUInt(), transform, done)
-        timeline = s.timelineState()
-        if (done) refresh() else refreshFlags()
+        if (done) refresh() else canUndo = true
     }
 
     fun setClipOpacityKeyframe(clipId: ULong, frame: Int, opacity: Float, done: Boolean) {
         val s = session ?: return
         s.timelineSetOpacityKeyframe(clipId, frame.coerceAtLeast(0).toUInt(), opacity.coerceIn(0f, 1f), done)
-        timeline = s.timelineState()
-        if (done) refresh() else refreshFlags()
+        if (done) refresh() else canUndo = true
     }
 
     fun deleteClipTransformKeyframe(clipId: ULong, frame: Int) {
@@ -8766,8 +8764,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         )
         performSamplesCount = recordedPerformSamples.size
         s.timelinePreviewPerformTransform(cid, frame, transform)
-        timeline = s.timelineState()
-        refreshFlags()
+        canUndo = true
     }
 
     fun recordPerformDeform(deform: io.github.artcraftandroid.procraft.core.TimelineDeformInfo) {
@@ -8780,8 +8777,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         )
         performSamplesCount = recordedPerformDeforms.size
         s.timelinePreviewPerformDeform(cid, frame, deform)
-        timeline = s.timelineState()
-        refreshFlags()
+        canUndo = true
     }
 
     fun cancelPerformRecording() {
@@ -8899,8 +8895,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     fun setTimelineTrackOpacity(trackId: ULong, opacity: Float, done: Boolean) {
         val s = session ?: return
         s.timelineSetTrackOpacity(trackId, opacity.coerceIn(0f, 1f), done)
-        timeline = s.timelineState()
-        if (done) refresh() else refreshFlags()
+        if (done) refresh() else canUndo = true
     }
 
     fun setTimelineTrackClipToBelow(trackId: ULong, enabled: Boolean) {
@@ -8922,8 +8917,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     ) {
         val s = session ?: return
         s.timelineSetTrackEffects(trackId, effects, done)
-        timeline = s.timelineState()
-        if (done) refresh() else refreshFlags()
+        if (done) refresh() else canUndo = true
     }
 
     fun setClipFilterKeyframe(
@@ -8934,8 +8928,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     ) {
         val s = session ?: return
         s.timelineSetFilterKeyframe(clipId, frame.coerceAtLeast(0).toUInt(), filter, done)
-        timeline = s.timelineState()
-        if (done) refresh() else refreshFlags()
+        if (done) refresh() else canUndo = true
     }
 
     fun deleteClipFilterKeyframe(clipId: ULong, frame: Int) {
@@ -8955,8 +8948,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     ) {
         val s = session ?: return
         s.timelineSetDeformKeyframe(clipId, frame.coerceAtLeast(0).toUInt(), deform, done)
-        timeline = s.timelineState()
-        if (done) refresh() else refreshFlags()
+        if (done) refresh() else canUndo = true
     }
 
     fun deleteClipDeformKeyframe(clipId: ULong, frame: Int) {
@@ -8988,15 +8980,13 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     fun setAudioVolumeKeyframe(clipId: ULong, frame: Int, volume: Float, done: Boolean) {
         val s = session ?: return
         s.timelineSetAudioVolumeKeyframe(clipId, frame.coerceAtLeast(0).toUInt(), volume.coerceIn(0f, 2f), done)
-        timeline = s.timelineState()
-        if (done) refresh() else refreshFlags()
+        if (done) refresh() else canUndo = true
     }
 
     fun setAudioPanKeyframe(clipId: ULong, frame: Int, pan: Float, done: Boolean) {
         val s = session ?: return
         s.timelineSetAudioPanKeyframe(clipId, frame.coerceAtLeast(0).toUInt(), pan.coerceIn(-1f, 1f), done)
-        timeline = s.timelineState()
-        if (done) refresh() else refreshFlags()
+        if (done) refresh() else canUndo = true
     }
 
     fun importTimelineVideo(uri: android.net.Uri) {
@@ -9066,8 +9056,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     ) {
         val s = session ?: return
         s.timelineSetCameraTransformKeyframe(frame.coerceAtLeast(0).toUInt(), transform, done)
-        timeline = s.timelineState()
-        if (done) refresh() else refreshFlags()
+        if (done) refresh() else canUndo = true
     }
 
     fun setCameraFilterKeyframe(
@@ -9077,8 +9066,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     ) {
         val s = session ?: return
         s.timelineSetCameraFilterKeyframe(frame.coerceAtLeast(0).toUInt(), filter, done)
-        timeline = s.timelineState()
-        if (done) refresh() else refreshFlags()
+        if (done) refresh() else canUndo = true
     }
 
     fun deleteCameraKeyframe(frame: Int) {

@@ -532,9 +532,15 @@ fn unit(c: f32) -> f32 {
     if c.is_finite() { c.clamp(0.0, 1.0) } else { 0.0 }
 }
 
-/// The canvas pixel under window point (`x`, `y`), if it is on the canvas.
+/// The active layer texel under window point (`x`, `y`), accounting for Camera/Perform transforms.
 fn seed_at(st: &crate::State, x: f32, y: f32) -> Option<(u32, u32)> {
-    st.window_texel(x, y)
+    let canvas_pt = st.window_to_canvas(x, y)?;
+    let p = st.active_layer_inv_transform().apply(canvas_pt);
+    if !p.is_finite() || p.x < 0.0 || p.y < 0.0 {
+        return None;
+    }
+    let (ix, iy) = (p.x.floor() as u32, p.y.floor() as u32);
+    (ix < st.doc.width() && iy < st.doc.height()).then_some((ix, iy))
 }
 
 #[uniffi::export]

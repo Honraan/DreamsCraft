@@ -3215,14 +3215,21 @@ impl Canvas {
         );
         let paper_texture = paper_texture(gpu);
         let paper_view = paper_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let stroke_bind =
-            quad_bind(device, &pipelines.quad_layout, [&stroke_view; 7], &grains_view, &grain_sampler, &paper_view);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("linear"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let stroke_bind = quad_bind(
+            device,
+            &pipelines.quad_layout,
+            [&stroke_view; 7],
+            &grains_view,
+            &grain_sampler,
+            &paper_view,
+            &sampler,
+        );
         let display_bind = sampled_bind(device, &pipelines.sampled_layout, &composite_view, &sampler);
         let crisp_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("crisp"),
@@ -3575,6 +3582,7 @@ impl Canvas {
             self.grain_view(),
             &self.grain_sampler,
             &self.paper_view,
+            &self.sampler,
         );
     }
 
@@ -6895,10 +6903,50 @@ impl Canvas {
         self.make_groups(device, group_levels(doc));
         self.ensure_caches(gpu, doc, &mut encoder, &mut uniforms);
         // after the caches: caches just made want the whole picture composited again
-        let dirty = if !self.dirty.is_empty() && doc.timeline.is_some() {
-            self.full()
+        let full = self.full();
+        let active_layer_xform = doc
+            .timeline
+            .as_ref()
+            .map_or(Affine::IDENTITY, |tl| tl.layer_transform(doc, self.active.map_or(doc.current(), |a| a.layer)));
+        let dirty = if self.dirty.is_empty() {
+            IRect::EMPTY
+        } else if self.dirty.x0 <= full.x0
+            && self.dirty.y0 <= full.y0
+            && self.dirty.x1 >= full.x1
+            && self.dirty.y1 >= full.y1
+        {
+            full
+        } else if let Some(tl) = doc.timeline.as_ref() {
+            let target_layer = self.active.map_or(doc.current(), |a| a.layer);
+            let (xform, pad, needs_full) = tl.layer_dirty_info(doc, target_layer);
+            if needs_full {
+                full
+            } else {
+                let d = self.dirty;
+                let corners = [
+                    xform.apply(procraft_engine::geom::Vec2::new(d.x0 as f32, d.y0 as f32)),
+                    xform.apply(procraft_engine::geom::Vec2::new(d.x1 as f32, d.y0 as f32)),
+                    xform.apply(procraft_engine::geom::Vec2::new(d.x1 as f32, d.y1 as f32)),
+                    xform.apply(procraft_engine::geom::Vec2::new(d.x0 as f32, d.y1 as f32)),
+                ];
+                let min_x = corners.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+                let min_y = corners.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+                let max_x = corners.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
+                let max_y = corners.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
+                if min_x.is_finite() && min_y.is_finite() && max_x.is_finite() && max_y.is_finite() {
+                    IRect {
+                        x0: (min_x.floor() as i32).saturating_sub(pad),
+                        y0: (min_y.floor() as i32).saturating_sub(pad),
+                        x1: (max_x.ceil() as i32).saturating_add(pad),
+                        y1: (max_y.ceil() as i32).saturating_add(pad),
+                    }
+                    .intersect(full)
+                } else {
+                    full
+                }
+            }
         } else {
-            self.dirty.intersect(self.full())
+            self.dirty.intersect(full)
         };
         let device = &gpu.device;
         // while caches are remade, or a stroke laid again over several renders, the composite stays
@@ -6938,7 +6986,7 @@ impl Canvas {
             let shows = |b: &Backdrop<'_>| !(b.regions.is_empty() && b.windows.is_empty()) && b.sigma > 0.0;
             let backdrop = target.backdrop.filter(shows);
             let glass = backdrop.map(|b| (b, self.frost_ready(device, &mut encoder, &mut uniforms, &target, b, None)));
-            self.display(device, &mut encoder, &mut uniforms, &target, predicted, glass);
+            self.display(device, &mut encoder, &mut uniforms, &target, predicted, glass, active_layer_xform);
         }
         self.write_uniforms(gpu, &uniforms);
         let at = std::time::Instant::now();
@@ -7676,7 +7724,15 @@ impl Canvas {
             let quad = |layer: &wgpu::TextureView| {
                 let views = [layer, stroke_view, stroke_view, stroke_view, stroke_view, second, stroke_view];
                 let grain = self.grain_view_of(&stroke.style);
-                quad_bind(device, &self.pipelines.quad_layout, views, grain, &self.grain_sampler, &self.paper_view)
+                quad_bind(
+                    device,
+                    &self.pipelines.quad_layout,
+                    views,
+                    grain,
+                    &self.grain_sampler,
+                    &self.paper_view,
+                    &self.sampler,
+                )
             };
             let laid = stroke.style.tool == StrokeTool::Laid;
             match (stroke.style.tool, laid || locked || stroke.style.blend != 0 || burns || stroke.style.luminance) {
@@ -9915,6 +9971,7 @@ impl Canvas {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn display(
         &mut self,
         device: &wgpu::Device,
@@ -9923,6 +9980,7 @@ impl Canvas {
         target: &Target<'_>,
         predicted: std::ops::Range<u32>,
         glass: Option<(Backdrop<'_>, f32)>,
+        active_layer_xform: Affine,
     ) {
         let srgb = target.format.is_srgb();
         let Pipelines {
@@ -10158,10 +10216,11 @@ impl Canvas {
                     cache: kept,
                 })
             });
-            let c = target.to_screen.then(to_clip);
+            let layer_to_screen = active_layer_xform.then(target.to_screen);
+            let c = layer_to_screen.then(to_clip);
             let offset = uniforms.push(&OverlayUniform {
                 m0: [c.a, c.b, c.c, c.d],
-                m1: [c.e, c.f, target.to_screen.scale_factor(), style.hardness.clamp(0.0, 1.0)],
+                m1: [c.e, c.f, layer_to_screen.scale_factor(), style.hardness.clamp(0.0, 1.0)],
                 color: {
                     let [r, g, b] = convert_colour(style.color, target.convert);
                     [r, g, b, style.opacity.clamp(0.0, 1.0)]
@@ -11117,6 +11176,7 @@ impl Canvas {
             self.grain_view(),
             &self.grain_sampler,
             &self.paper_view,
+            &self.sampler,
         )
     }
 
@@ -11199,7 +11259,7 @@ impl Pipelines {
             binding,
             visibility: wgpu::ShaderStages::FRAGMENT,
             ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
                 view_dimension: wgpu::TextureViewDimension::D2,
                 multisampled: false,
             },
@@ -11244,6 +11304,7 @@ impl Pipelines {
                     },
                     count: None,
                 },
+                sampler_entry(10),
             ],
         });
         let brush_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -12689,6 +12750,7 @@ fn quad_bind(
     grains: &wgpu::TextureView,
     grain_sampler: &wgpu::Sampler,
     paper: &wgpu::TextureView,
+    layer_sampler: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
     let [a, b, c, d, mask, second, clip_mask] = views;
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -12705,6 +12767,7 @@ fn quad_bind(
             wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(second) },
             wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(clip_mask) },
             wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(paper) },
+            wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::Sampler(layer_sampler) },
         ],
     })
 }

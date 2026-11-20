@@ -6806,6 +6806,73 @@ fn dreamscraft_v2_1_perform_and_timeline_undo_redo_are_atomic() {
 }
 
 #[test]
+fn dreamscraft_v2_1_1_stylus_aligns_under_camera_and_perform_transforms() {
+    let Some(s) = session(64, 64) else { return };
+    assert!(s.set_timeline_enabled(true));
+    let tl = s.timeline_state().unwrap();
+    let clip0 = tl.tracks[0].clips[0].id;
+
+    // 1. Move the clip via Perform / keyframe (+14px X, -6px Y) AND pan the Camera (-4px X, +4px Y)
+    assert!(s.timeline_set_transform_keyframe(
+        clip0,
+        0,
+        crate::TimelineTransformInfo {
+            x: 14.0,
+            y: -6.0,
+            scale_x: 1.0,
+            scale_y: 1.0,
+            rotation: 0.0,
+            anchor_x: 0.5,
+            anchor_y: 0.5,
+        },
+        true,
+    ));
+    s.timeline_set_camera_enabled(true);
+    assert!(s.timeline_set_camera_transform_keyframe(
+        0,
+        crate::TimelineTransformInfo {
+            x: -4.0,
+            y: 4.0,
+            scale_x: 1.0,
+            scale_y: 1.0,
+            rotation: 0.0,
+            anchor_x: 0.5,
+            anchor_y: 0.5,
+        },
+        true,
+    ));
+
+    // 2. Touch the stylus at the exact screen pixel corresponding to canvas (44, 28)
+    let screen_pt = s.shared.lock().view.unwrap().to_screen().apply(procraft_engine::geom::Vec2::new(44.0, 28.0));
+    s.set_brush_size(0.35);
+    s.set_color(1.0, 0.0, 0.0);
+    s.stroke_begin(PointerKind::Stylus, vec![sample(screen_pt.x, screen_pt.y, 0.0)]);
+    s.stroke_end(vec![]);
+
+    // 3. Rendered composited pixel at canvas (44, 28) MUST be painted red (no misalignment!)
+    let frame = {
+        let mut st = s.shared.lock();
+        let st = &mut *st;
+        let (canvas, gpu) = (st.canvas.as_mut().unwrap(), st.gpu.as_ref().unwrap());
+        canvas.render(gpu, &mut st.doc, None);
+        canvas.read_composite(gpu).unwrap()
+    };
+    let idx = ((28 * 64 + 44) * 4) as usize;
+    assert!(
+        frame[idx] > 200 && frame[idx + 1] < 60 && frame[idx + 2] < 60,
+        "expected red at touched pixel (44,28), got {:?}",
+        &frame[idx..idx + 4]
+    );
+    // Meanwhile, where an uncompensated bug would have stamped (+18, -10 shifted -> (62, 18)) must stay unpainted
+    let wrong_idx = ((18 * 64 + 62) * 4) as usize;
+    assert!(
+        frame[wrong_idx + 1] > 200 && frame[wrong_idx + 2] > 200,
+        "unexpected stray stroke at shifted pixel (62,18): {:?}",
+        &frame[wrong_idx..wrong_idx + 4]
+    );
+}
+
+#[test]
 fn animation_assist_shows_onion_skins_and_plays() {
     let Some(s) = session(40, 40) else { return };
     s.set_brush_size(0.6);

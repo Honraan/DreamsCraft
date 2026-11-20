@@ -1257,9 +1257,25 @@ impl State {
         }
     }
 
-    /// Samples in canvas pixels.
+    /// Inverse of the active layer's timeline display transform (`CanvasSpace -> LayerSpace`),
+    /// so strokes and fills land directly under the stylus even when Camera, Perform, or Move
+    /// keyframes transform the active clip or track.
+    pub(crate) fn active_layer_inv_transform(&self) -> procraft_engine::geom::Affine {
+        if self.pad_strokes.is_some() {
+            return procraft_engine::geom::Affine::IDENTITY;
+        }
+        let Some(tl) = self.doc.timeline.as_ref() else { return procraft_engine::geom::Affine::IDENTITY };
+        let t = tl.layer_transform(&self.doc, self.doc.current());
+        t.inverse().unwrap_or(procraft_engine::geom::Affine::IDENTITY)
+    }
+
+    /// Samples in active-layer pixels (canvas pixels mapped through the inverse of any active
+    /// timeline Camera / Perform / Move transform).
     fn to_canvas(&self, samples: &[PenSample]) -> Vec<Sample> {
-        let Some(inv) = self.view.and_then(|v| v.to_screen().inverse()) else { return Vec::new() };
+        let Some(view_inv) = self.view.and_then(|v| v.to_screen().inverse()) else { return Vec::new() };
+        let layer_inv = self.active_layer_inv_transform();
+        let inv = view_inv.then(layer_inv);
+        let rot = layer_inv.b.atan2(layer_inv.a);
         samples
             .iter()
             .map(|s| {
@@ -1268,7 +1284,7 @@ impl State {
                     pos: inv.apply(Vec2::new(x, y)),
                     pressure: s.pressure,
                     tilt: s.tilt,
-                    azimuth: s.orientation,
+                    azimuth: s.orientation + rot,
                     roll: s.roll,
                     time_ms: s.time_ms,
                 }
@@ -2160,10 +2176,13 @@ impl CanvasSession {
             }
             return;
         }
+        let layer_inv = st.active_layer_inv_transform();
+        let layer_inv_scale = layer_inv.scale_factor().clamp(0.05, 20.0);
+        let layer_rot = -layer_inv.b.atan2(layer_inv.a);
         let tool = if pointer == PointerKind::StylusEraser { ToolKind::Erase } else { st.tool };
         let (brush, style, diameter) = st.stroke_brush(tool, current);
         let second = st.second_brush(tool, current, &brush, &style);
-        let diameter = diameter * st.brush_scale();
+        let diameter = diameter * st.brush_scale() * layer_inv_scale;
         st.strokes = st.strokes.wrapping_add(1);
         // the tool's brush is one of the Recent set's now (unless pinned there)
         st.note_recent(st.brush_ref(tool));
@@ -2178,9 +2197,9 @@ impl CanvasSession {
         let make = |st: &State, brush: Brush, diameter: f32, seed: u32| {
             let preview_tilt = brush.setting("preview_tilt") >= 0.5;
             let mut builder = StrokeBuilder::with_seed(brush, diameter, pointer.into(), seed)
-                .scaled(st.brush_scale())
+                .scaled(st.brush_scale() * layer_inv_scale)
                 .with_input(st.input.clone())
-                .on_view_turned(st.view.map_or(0.0, |v| v.rotation()))
+                .on_view_turned(st.view.map_or(0.0, |v| v.rotation()) + layer_rot)
                 .seen_at(st.view.map_or(1.0, |v| v.zoom()) / st.display_scale);
             if let Some(zoom) = whole_pixels {
                 builder = builder.read_in_whole_pixels(zoom);
@@ -2198,8 +2217,9 @@ impl CanvasSession {
             builder
         };
         let mut builder = make(st, brush.clone(), diameter, seed);
-        let mut second_builder =
-            second.as_ref().map(|(b, _, d)| make(st, b.clone(), d * st.brush_scale(), seed ^ 0x5eed_0002));
+        let mut second_builder = second
+            .as_ref()
+            .map(|(b, _, d)| make(st, b.clone(), d * st.brush_scale() * layer_inv_scale, seed ^ 0x5eed_0002));
         // a brush a plugin's brush engine made is drawn by it while it is on: its stamps, how they
         // are laid and its second stroke are the engine's
         let first = st.to_canvas(samples.get(..1).unwrap_or_default()).first().map(|s| (s.pos.x, s.pos.y));
