@@ -20164,6 +20164,74 @@ fn a_wet_dual_brushs_second_is_put_together_in_its_paints_window_as_in_one_of_it
     assert!(joined * 5 <= apart * 4, "{joined} windows in all, against {apart}");
 }
 
+/// A thin brush's stroke painting in place keeps its layer in tiles a thin brush's side across, a
+/// big brush's in tiles twice as wide (each window copies each tile it covers in and out, a copy at
+/// a time, and on OpenGL a big brush's whatever the brush: copies are dear there): in a big brush's
+/// tiles a thin stroke held two to three times the memory, its tiles and its marks' copies of them.
+/// Either way it comes out the same, pixel for pixel. Prints what each holds.
+#[test]
+fn a_thin_stroke_painting_in_place_keeps_thin_tiles_and_comes_out_the_same() {
+    let side = 1024;
+    let point = |k: usize| PenSample {
+        pressure: 0.5 + 0.3 * (k as f32 * 0.05).sin(),
+        ..sample(40.0 + k as f32 * 2.0, 512.0 + (k as f32 * 0.02).sin() * 400.0, k as f64 * 4.17)
+    };
+    for (name, size, thin) in [("Kingsley", 0.05, true), ("Lundy", 0.15, true), ("Shorewalker", 0.4, false)] {
+        // the layer, the most the canvas held past what it held before, the side of its tiles, and
+        // whether it is on OpenGL
+        let drawn = |tiles: Option<u32>| -> Option<(Vec<u8>, u64, u32, bool)> {
+            let s = session(side, side)?;
+            let (set, index) = library_brush(&s, |b| b.name == name)?;
+            assert!(s.select_brush(set, index));
+            s.set_brush_size(size);
+            s.set_color(0.3, 0.2, 0.6);
+            s.shared.lock().canvas.as_mut()?.set_smudge_tiles(tiles);
+            let gl = s.shared.lock().gpu.as_ref()?.is_gl();
+            picture(&s);
+            let held =
+                |s: &CanvasSession| s.shared.lock().canvas.as_ref().map_or(0, procraft_gpu::Canvas::texture_bytes);
+            let before = held(&s);
+            let (mut most, mut tile) = (0, 0);
+            s.stroke_begin(PointerKind::Stylus, vec![point(0)]);
+            for e in 1..=240 {
+                s.stroke_add(vec![point(2 * e - 1), point(2 * e)]);
+                if e % 2 == 0 {
+                    picture(&s);
+                    most = most.max(held(&s).saturating_sub(before));
+                    tile = s.shared.lock().canvas.as_ref()?.smudge_tile_side().unwrap_or(tile);
+                }
+            }
+            s.stroke_end(vec![point(481)]);
+            picture(&s);
+            let current = s.layers().iter().find(|l| l.current).map_or(0, |l| l.id);
+            Some((layer_rgba(&s, current), most, tile, gl))
+        };
+        let (Some((own, held_own, tile, gl)), Some((thin_tiles, held_thin, ..)), Some((big_tiles, held_big, ..))) =
+            (drawn(None), drawn(Some(256)), drawn(Some(512)))
+        else {
+            panic!("{name}: no stock brush of that name");
+        };
+        let mb = |b: u64| b as f64 / 1048576.0;
+        println!(
+            "{name}@{size}: tiles {tile} across, the stroke holding {:.1} MB; {:.1} MB in tiles 256 across, {:.1} MB in tiles 512 across",
+            mb(held_own),
+            mb(held_thin),
+            mb(held_big)
+        );
+        assert_eq!(tile, if thin && !gl { 256 } else { 512 }, "{name}@{size}: its tiles");
+        assert_eq!(differ(&thin_tiles, &big_tiles), (0, 0), "{name}@{size}: unlike in tiles of the other side");
+        assert_eq!(differ(&own, &big_tiles), (0, 0), "{name}@{size}: unlike in tiles 512 across");
+        if thin {
+            assert!(
+                held_thin * 3 <= held_big * 2,
+                "{name}@{size}: {} MB in thin tiles, against {}",
+                mb(held_thin),
+                mb(held_big)
+            );
+        }
+    }
+}
+
 /// A stroke painting in place whose marks can't all be kept (past the most bytes they may take) is
 /// laid again from its start as it ends, or from a mark it still has: either way as laid whole.
 #[test]
