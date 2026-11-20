@@ -6860,10 +6860,11 @@ fn dreamscraft_perform_holds_a_single_drawing_for_flipbook_tracing() {
     let st = s.shared.lock();
     let tl = st.doc.timeline.as_ref().unwrap();
     let items = tl.evaluate(&st.doc, 8.0, false).items;
-    assert_eq!(items.len(), 2);
-    assert!(items[0].is_perform_guide);
-    assert_eq!(items[0].transform.e, 10.0);
-    assert_eq!(items[1].transform.e, 0.0);
+    let ghost = items.iter().find(|item| item.is_perform_guide).unwrap();
+    let drawing = items.iter().find(|item| !item.is_onion).unwrap();
+    assert_ne!(ghost.layer, drawing.layer);
+    assert_eq!(ghost.transform.e, 10.0);
+    assert_eq!(drawing.transform.e, 0.0);
 }
 
 #[test]
