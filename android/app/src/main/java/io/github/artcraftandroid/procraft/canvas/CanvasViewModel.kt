@@ -9040,7 +9040,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         layerChange(thumbs = false) { it.timelineDeleteCameraKeyframe(frame.coerceAtLeast(0).toUInt()) }
     }
 
-    fun setSelectedClipIds(ids: Set<ULong>) {
+    fun selectClips(ids: Set<ULong>) {
         selectedClipIds = ids
     }
 

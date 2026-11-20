@@ -1224,7 +1224,7 @@ private fun MultiTrackDopesheet(
                                             view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
                                             for (cid in hit) vm.deleteTimelineClip(cid)
                                         } else if (hit.isNotEmpty()) {
-                                            vm.setSelectedClipIds(hit)
+                                            vm.selectClips(hit)
                                         }
                                     },
                                     onDragCancel = { lassoPoints = emptyList() },
