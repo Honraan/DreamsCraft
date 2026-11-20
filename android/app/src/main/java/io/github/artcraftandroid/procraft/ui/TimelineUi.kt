@@ -2893,7 +2893,7 @@ private fun BoxScope.StageKeyTransformOverlay(
                         .clickable {
                             vm.stageGizmoActive = false
                             if (vm.dreamsMode == DreamsWorkMode.PERFORM) {
-                                vm.dreamsMode = DreamsWorkMode.DRAW
+                                vm.dreamsMode = DreamsWorkMode.DRAW_PAINT
                             }
                         },
                     contentAlignment = Alignment.Center,
