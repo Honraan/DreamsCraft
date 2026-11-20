@@ -1574,6 +1574,17 @@ impl StrokeBuilder {
         })
     }
 
+    /// Whether its end may change only its last stamps handed out, so that those are laid again as
+    /// it ends: an end taper, or pressure that falls over one. Not with a newer start taper, whose
+    /// reach, known only once the stroke is under way, changes its first stamps as it ends (laid
+    /// again from its start), nor a brush engine's stroke, whose stamps stay as they came.
+    pub fn end_may_change_laid(&self) -> bool {
+        let taper = self.taper();
+        !self.is_outside()
+            && (taper.start <= 0.0 || self.classic())
+            && (taper.end > 0.0 || self.pressure_taper(1) > 0.0)
+    }
+
     /// Whether the stroke shows its tapers as it is drawn, through a tip redrawn as it goes: one
     /// that lasts a time at its start (until that time has passed), and at its end with the tip
     /// animation on.
