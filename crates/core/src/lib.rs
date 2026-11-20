@@ -243,8 +243,9 @@ pub use timelapse::{
     time_lapse_setting_names, time_lapse_side,
 };
 pub use timeline::{
-    PerformSampleInfo, TimelineCelInfo, TimelineClipInfo, TimelineClipKind, TimelineEasingInfo, TimelineEasingKind,
-    TimelineKeyframeInfo, TimelineOnionInfo, TimelineState, TimelineTrackInfo, TimelineTransformInfo,
+    PerformDeformSampleInfo, PerformSampleInfo, TimelineCelInfo, TimelineClipInfo, TimelineClipKind,
+    TimelineDeformInfo, TimelineEasingInfo, TimelineEasingKind, TimelineKeyframeInfo, TimelineLiveFilterInfo,
+    TimelineOnionInfo, TimelineState, TimelineTrackEffectsInfo, TimelineTrackInfo, TimelineTransformInfo,
     TimelineWorkAreaInfo,
 };
 pub use touch::{
@@ -704,6 +705,9 @@ pub(crate) struct State {
     pending_doc: Option<Document>,
     /// What undo calls that change.
     pending_name: Option<String>,
+    /// The document snapshot before an auto-created timeline cel/clip was inserted at `stroke_begin`,
+    /// attached to the stroke's undo step so 1 undo reverses both the paint and the auto-frame.
+    pub(crate) pending_draw_doc: Option<Document>,
     /// The artwork's title.
     pub(crate) name: String,
     /// What the artwork keeps about itself: when it was made, strokes, time spent, its author.
@@ -927,6 +931,9 @@ impl State {
             return;
         }
         if let (Some(open), Some(canvas)) = (self.stroke.take(), self.canvas.as_mut()) {
+            if let Some(before) = self.pending_draw_doc.take() {
+                canvas.attach_next_step_doc(Some(before));
+            }
             close_stroke(canvas, open, self.second.take(), &self.doc.stroke_guide());
             self.bake_painted_on();
         }
@@ -1887,6 +1894,7 @@ impl CanvasSession {
             light: false,
             pending_doc: None,
             pending_name: None,
+            pending_draw_doc: None,
             info: project::ArtworkInfo {
                 created_ms: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -2083,9 +2091,59 @@ impl CanvasSession {
             self.shared.frame(st);
             return;
         }
-        let current = st.doc.current();
         st.finish_stroke();
         st.settle();
+        // DreamsCraft v2.0 Pilar 1: Draw-to-Create Frame/Cel on empty timeline spots (or split held cel).
+        if st.pad_strokes.is_none() && st.doc.timeline.is_some() {
+            let before = st.doc.clone();
+            if let Some(mut tl) = st.doc.timeline.take() {
+                let outcome = tl.ensure_frame_for_drawing(|| st.doc.has_room(1).then(|| st.doc.add_layer()));
+                st.doc.timeline = Some(tl);
+                if let Some((target_layer, mutated)) = outcome {
+                    let paint_layer = if st
+                        .doc
+                        .layer(target_layer)
+                        .is_some_and(|l| l.kind == procraft_engine::document::LayerKind::Group)
+                    {
+                        let members = st.doc.members(Some(target_layer));
+                        if members.contains(&st.doc.current()) {
+                            st.doc.current()
+                        } else {
+                            members
+                                .iter()
+                                .rev()
+                                .copied()
+                                .find(|&id| {
+                                    st.doc
+                                        .layer(id)
+                                        .is_some_and(|l| l.kind == procraft_engine::document::LayerKind::Paint)
+                                })
+                                .unwrap_or(target_layer)
+                        }
+                    } else {
+                        target_layer
+                    };
+                    if st
+                        .doc
+                        .timeline
+                        .as_ref()
+                        .and_then(|t| t.active_track.and_then(|id| t.track(id)))
+                        .is_some_and(|t| t.alpha_lock)
+                    {
+                        st.doc.set_alpha_lock(paint_layer, true);
+                    }
+                    st.doc.set_current(paint_layer);
+                    if mutated {
+                        st.pending_draw_doc = Some(before);
+                        st.revision += 1;
+                        if let Some(c) = st.canvas.as_mut() {
+                            c.invalidate();
+                        }
+                    }
+                }
+            }
+        }
+        let current = st.doc.current();
         // locked layers, those that don't show (hidden themselves or by a group, or left out
         // while another is shown alone), groups, text layers and plugins' layers their plugins
         // can't take strokes on take no paint
@@ -2097,6 +2155,9 @@ impl CanvasSession {
                 .layer(current)
                 .is_none_or(|l| l.kind == procraft_engine::document::LayerKind::Group || l.text.is_some())
         {
+            if let Some(before) = st.pending_draw_doc.take() {
+                st.doc = before;
+            }
             return;
         }
         let tool = if pointer == PointerKind::StylusEraser { ToolKind::Erase } else { st.tool };
@@ -2190,7 +2251,12 @@ impl CanvasSession {
                 line: builder.clone(),
                 seed,
             });
-        let Some(canvas) = st.canvas.as_mut() else { return };
+        let Some(canvas) = st.canvas.as_mut() else {
+            if let Some(before) = st.pending_draw_doc.take() {
+                st.doc = before;
+            }
+            return;
+        };
         let (style, second) = match laid {
             Some(laid) => laid,
             None => (style, second.map(|(_, s, _)| s)),
@@ -2329,10 +2395,18 @@ impl CanvasSession {
         match st.recording.take() {
             // on a plugin's layer, handed to the plugin
             Some(mut recording) => {
+                if let Some(before) = st.pending_draw_doc.take() {
+                    canvas.attach_next_step_doc(Some(before));
+                }
                 recording.lift(&canvas_samples);
                 st.end_recorded(recording, builder, second);
             }
-            None => close_stroke(canvas, builder, second, &st.doc.stroke_guide()),
+            None => {
+                if let Some(before) = st.pending_draw_doc.take() {
+                    canvas.attach_next_step_doc(Some(before));
+                }
+                close_stroke(canvas, builder, second, &st.doc.stroke_guide());
+            }
         }
         st.redraw_painted_on();
         st.bake_painted_on();
@@ -2370,6 +2444,12 @@ impl CanvasSession {
         st.shape = None;
         st.began = None;
         st.recording = None;
+        if let Some(before) = st.pending_draw_doc.take() {
+            st.doc = before;
+            if let Some(canvas) = st.canvas.as_mut() {
+                canvas.invalidate();
+            }
+        }
         if let Some(canvas) = st.canvas.as_mut() {
             canvas.cancel_stroke();
             // what it painted on is in the adjustment's mask: start that again

@@ -49,7 +49,7 @@ const MULTIPLY_MODE: u32 = 1;
 const STROKE_LUMINANCE: u32 = 0x100;
 
 /// The largest uniform block a shader reads.
-const UNIFORM_SIZE: u64 = 192;
+const UNIFORM_SIZE: u64 = 256;
 const _: () = assert!(
     size_of::<LayerUniform>() as u64 <= UNIFORM_SIZE
         && size_of::<StampUniform>() as u64 <= UNIFORM_SIZE
@@ -1128,6 +1128,11 @@ struct LayerUniform {
     /// `xform0 = [a, b, c, d]`, `xform1 = [e, f, active, 0]`.
     xform0: [f32; 4],
     xform1: [f32; 4],
+    /// v2.0 Live Filters & Track Layer Effects (64 bytes -> 256 bytes total = SLOT).
+    fx0: [f32; 4],
+    fx1: [f32; 4],
+    fx2: [f32; 4],
+    fx3: [u32; 4],
 }
 
 impl Default for LayerUniform {
@@ -1163,22 +1168,66 @@ impl Default for LayerUniform {
             paper: [0.0, 1.0, 0.0, 0.0],
             xform0: [1.0, 0.0, 0.0, 1.0],
             xform1: [0.0; 4],
+            fx0: [0.0, 1.0, 0.0, 0.0],
+            fx1: [0.0; 4],
+            fx2: [0.0; 4],
+            fx3: [0; 4],
         }
     }
 }
 
+fn pack_rgba8(c: [f32; 4]) -> u32 {
+    let ch = |v: f32| if v.is_finite() { (v.clamp(0.0, 1.0) * 255.0).round() as u32 } else { 0 };
+    ch(c[0]) | (ch(c[1]) << 8) | (ch(c[2]) << 16) | (ch(c[3]) << 24)
+}
+
 /// How a layer shows besides its own settings: Animation Assist's onion skins and Timeline
-/// keyframe transforms.
+/// keyframe transforms, live filters, deformations, and Track Layer Effects.
 #[derive(Clone, Copy)]
 struct Look {
     tint: [f32; 4],
     opacity: f32,
     transform: Affine,
     blend_override: Option<BlendMode>,
+    filter: procraft_engine::timeline::LiveFilterState,
+    effects: procraft_engine::timeline::TrackEffects,
+    deform: procraft_engine::timeline::Deform2D,
+    clip_to_below: Option<LayerId>,
 }
 
 impl Look {
-    const PLAIN: Look = Look { tint: [0.0; 4], opacity: 1.0, transform: Affine::IDENTITY, blend_override: None };
+    const PLAIN: Look = Look {
+        tint: [0.0; 4],
+        opacity: 1.0,
+        transform: Affine::IDENTITY,
+        blend_override: None,
+        filter: procraft_engine::timeline::LiveFilterState {
+            gaussian_blur: 0.0,
+            hue_shift: 0.0,
+            saturation: 1.0,
+            brightness: 0.0,
+            sharpen: 0.0,
+            noise: 0.0,
+        },
+        effects: procraft_engine::timeline::TrackEffects {
+            outline_enabled: false,
+            outline_width: 0.0,
+            outline_color: [0.0; 4],
+            shadow_enabled: false,
+            shadow_offset: [0.0; 2],
+            shadow_blur: 0.0,
+            shadow_color: [0.0; 4],
+            glow_enabled: false,
+            glow_radius: 0.0,
+            glow_intensity: 0.0,
+            glow_color: [0.0; 4],
+            glow_inner: false,
+            color_overlay_enabled: false,
+            color_overlay_color: [0.0; 4],
+        },
+        deform: procraft_engine::timeline::Deform2D { distort_corners: None, warp_mesh: None },
+        clip_to_below: None,
+    };
 
     fn has_transform(&self) -> bool {
         (self.transform.a - 1.0).abs() >= 1e-4
@@ -1187,6 +1236,9 @@ impl Look {
             || (self.transform.d - 1.0).abs() >= 1e-4
             || self.transform.e.abs() >= 1e-4
             || self.transform.f.abs() >= 1e-4
+            || !self.filter.is_identity()
+            || self.effects.is_active()
+            || !self.deform.is_identity()
     }
 }
 
@@ -1203,6 +1255,30 @@ impl LayerUniform {
             self.xform0 = [inv.a, inv.b, inv.c, inv.d];
             self.xform1 = [inv.e, inv.f, 1.0, 0.0];
         }
+        self
+    }
+
+    /// Packs v2.0 Live Filters (Gaussian Blur, HSB, Sharpen, Noise) and Track Layer Effects
+    /// (Outline, Drop Shadow, Glow, Color Overlay) into `fx0..fx3`.
+    fn with_effects(
+        mut self,
+        filter: procraft_engine::timeline::LiveFilterState,
+        effects: procraft_engine::timeline::TrackEffects,
+    ) -> LayerUniform {
+        let f = filter.repaired();
+        let e = effects.repaired();
+        self.fx0 = [f.hue_shift.to_radians(), f.saturation, f.brightness, f.gaussian_blur];
+        let ow = if e.outline_enabled { e.outline_width } else { 0.0 };
+        let sb = if e.shadow_enabled { e.shadow_blur } else { 0.0 };
+        self.fx1 = [f.sharpen, f.noise, ow, sb];
+        let gr = if e.glow_enabled { e.glow_radius } else { 0.0 };
+        let gi = if e.glow_enabled { if e.glow_inner { -e.glow_intensity } else { e.glow_intensity } } else { 0.0 };
+        self.fx2 = [e.shadow_offset[0], e.shadow_offset[1], gr, gi];
+        let ocol = if e.outline_enabled { pack_rgba8(e.outline_color) } else { 0 };
+        let scol = if e.shadow_enabled { pack_rgba8(e.shadow_color) } else { 0 };
+        let gcol = if e.glow_enabled { pack_rgba8(e.glow_color) } else { 0 };
+        let ccol = if e.color_overlay_enabled { pack_rgba8(e.color_overlay_color) } else { 0 };
+        self.fx3 = [ocol, scol, gcol, ccol];
         self
     }
 
@@ -2059,6 +2135,8 @@ enum Op {
     },
     /// The next step made is named so.
     Name(String),
+    /// The next step made attaches this pre-change document snapshot (queued in order with stroke ops).
+    AttachDoc(Option<Box<Document>>),
     /// A step that changes nothing here, named so (see [`Canvas::record_outside_change`]).
     OutsideChange(String),
     /// Where the history is now is marked.
@@ -2843,6 +2921,8 @@ pub struct Canvas {
     mark: Option<u64>,
     /// The name the next step made takes.
     next_name: Option<String>,
+    /// Optional document snapshot to attach to the next undo step (e.g. auto-created timeline frame + stroke).
+    next_doc: Option<Box<Document>>,
     /// Where the next stroke committed changes pixels, if known more closely than its bounds.
     within: Option<Vec<IRect>>,
     /// Where strokes begun from now on lay their pixels, when only part of a layer is laid again
@@ -3235,6 +3315,7 @@ impl Canvas {
             steps_made: 0,
             mark: None,
             next_name: None,
+            next_doc: None,
             within: None,
             lay_within: None,
             measuring: false,
@@ -3581,6 +3662,12 @@ impl Canvas {
     /// Names the next step made (what undo and redo call it), queued with the work that makes it.
     pub fn name_next_step(&mut self, name: &str) {
         self.ops.push(Op::Name(name.to_owned()));
+    }
+
+    /// Attaches a pre-change [`Document`] snapshot to the next undo step (for example, combining
+    /// automatic timeline frame/cel creation with the brush stroke that triggered it into one undo).
+    pub fn attach_next_step_doc(&mut self, before: Option<Document>) {
+        self.ops.push(Op::AttachDoc(before.map(Box::new)));
     }
 
     /// The name of the step undo would undo next, and of the step redo would redo, as the
@@ -6067,6 +6154,7 @@ impl Canvas {
                 Op::Within(rects) => self.within = Some(rects),
                 Op::Mark => self.mark = Some(self.steps_made),
                 Op::Name(name) => self.next_name = Some(name),
+                Op::AttachDoc(doc) => self.next_doc = doc,
                 Op::Collapse => {
                     let since = self.mark.take().unwrap_or(u64::MAX);
                     let first = self.undo.iter().position(|s| s.made > since).unwrap_or(self.undo.len());
@@ -8481,6 +8569,9 @@ impl Canvas {
         if step.name.is_none() {
             step.name = self.next_name.take();
         }
+        if step.doc.is_none() {
+            step.doc = self.next_doc.take();
+        }
         for dropped in std::mem::take(&mut self.redo) {
             self.keep_spare_snapshot(dropped);
         }
@@ -9297,6 +9388,7 @@ impl Canvas {
             | Op::Untip(_)
             | Op::Mark
             | Op::Name(_)
+            | Op::AttachDoc(_)
             | Op::OutsideChange(_)
             | Op::Collapse
             | Op::Within(_) => true,
@@ -9429,16 +9521,26 @@ impl Canvas {
         let playing = self.play_frame.is_some();
         let frame = self.play_frame.map_or(tl.playhead as f32, |f| f as f32);
         let scene = tl.evaluate(doc, frame, playing);
+        let mut last_track_layer: Option<(procraft_engine::timeline::TrackId, LayerId)> = None;
         for eval in &scene.items {
             let Some(layer) = doc.layer(eval.layer) else { continue };
             if doc.soloed_out(eval.layer) {
                 continue;
             }
+            let clip_below = if eval.clip_to_below && !eval.is_onion {
+                last_track_layer.filter(|(tid, _)| *tid != eval.track).map(|(_, lid)| lid)
+            } else {
+                None
+            };
             let look = Look {
                 tint: eval.tint,
                 opacity: eval.opacity,
                 transform: eval.transform,
                 blend_override: (eval.blend != BlendMode::Normal).then_some(eval.blend),
+                filter: eval.filter,
+                effects: eval.effects,
+                deform: eval.deform,
+                clip_to_below: clip_below,
             };
             let pos = items.iter().position(|&x| x == eval.layer).map_or(items.len(), |p| p + 1);
             let mut at = pos;
@@ -9446,7 +9548,71 @@ impl Canvas {
             self.composite_one_item(
                 device, doc, encoder, uniforms, rect, items, &mut at, layer, look, &look_of, stack, current,
             );
+            if !eval.is_onion {
+                last_track_layer = Some((eval.track, eval.layer));
+            }
         }
+    }
+
+    /// Renders `source_view` through a non-destructive 4×4 bicubic Warp or 4-corner Distort mesh
+    /// onto `self.clip_group` scratch texture and returns its view.
+    fn deform_into_scratch<'a>(
+        &'a self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        uniforms: &mut UniformData,
+        source_view: &wgpu::TextureView,
+        deform: procraft_engine::timeline::Deform2D,
+    ) -> Option<&'a wgpu::TextureView> {
+        let mesh = deform.to_canvas_mesh(self.width, self.height)?;
+        let (cw, ch) = (self.width as f32, self.height as f32);
+        let src_quad = [
+            procraft_engine::geom::Vec2::new(0.0, 0.0),
+            procraft_engine::geom::Vec2::new(cw, 0.0),
+            procraft_engine::geom::Vec2::new(cw, ch),
+            procraft_engine::geom::Vec2::new(0.0, ch),
+        ];
+        let vertices = procraft_engine::warp::triangles(&mesh, src_quad, 12);
+        let count = u32::try_from(vertices.len()).ok()?;
+        if count == 0 {
+            return None;
+        }
+        let bytes: &[u8] = bytemuck::cast_slice(&vertices);
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("timeline deform mesh"),
+            size: (bytes.len() as u64).max(16),
+            usage: wgpu::BufferUsages::VERTEX,
+            mapped_at_creation: true,
+        });
+        {
+            let Ok(mut mapped) = buffer.slice(..bytes.len() as u64).get_mapped_range_mut() else {
+                return None;
+            };
+            mapped.copy_from_slice(bytes);
+        }
+        buffer.unmap();
+
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("timeline deform"),
+            layout: &self.pipelines.transform_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(source_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.stroke_view) },
+            ],
+        });
+        let offset =
+            uniforms.push(&TransformUniform { r0: [0.0; 4], r1: [0.0; 4], r2: [0.0; 4], p: [1.0, cw, ch, 0.0] });
+        let (_, scratch_view) = self.clip_group.get(device);
+        let mut pass =
+            render_pass(encoder, "timeline deform", scratch_view, wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT));
+        pass.set_pipeline(&self.pipelines.mesh);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.set_bind_group(1, &self.uniform_bind, &[offset]);
+        pass.set_vertex_buffer(0, buffer.slice(..));
+        pass.draw(0..count, 0..1);
+        drop(pass);
+        Some(scratch_view)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9490,6 +9656,7 @@ impl Canvas {
                     && look.tint[3] == 0.0
                     && !look.has_transform()
                     && look.blend_override.is_none()
+                    && look.clip_to_below.is_none()
                 {
                     let members = doc.members(Some(id));
                     self.composite_items(device, doc, encoder, uniforms, rect, &members, false, stack, current);
@@ -9499,21 +9666,29 @@ impl Canvas {
                 let Some(view) = self.composite_group(device, doc, encoder, uniforms, group_rect, id) else {
                     return;
                 };
+                let src_view = if !look.deform.is_identity() {
+                    self.deform_into_scratch(device, encoder, uniforms, view, look.deform).unwrap_or(view)
+                } else {
+                    view
+                };
+                let clip_view = look.clip_to_below.and_then(|cid| self.layers.get(&cid)).map(|c| &c.view);
                 let blend = look.blend_override.unwrap_or(layer.blend);
                 let uniform = LayerUniform {
                     opacity: layer.opacity.clamp(0.0, 1.0) * look.opacity,
                     blend: blend.id(),
                     tint: look.tint,
+                    clipped: if clip_view.is_some() { CLIP_BY_BASE } else { CLIP_NONE },
                     ..Default::default()
                 }
-                .with_transform(look.transform);
+                .with_transform(look.transform)
+                .with_effects(look.filter, look.effects);
                 self.draw_onto(
                     device,
                     encoder,
                     uniforms,
                     rect,
-                    view,
-                    None,
+                    src_view,
+                    clip_view.map(|cv| (cv, &self.stroke_view)),
                     &self.stroke_view,
                     uniform,
                     blend,
@@ -9595,7 +9770,8 @@ impl Canvas {
         let view = if at == 0 { view } else { inner.second().1 };
         let blend = look.blend_override.unwrap_or(base.blend);
         let uniform = LayerUniform { opacity, blend: blend.id(), tint: look.tint, ..Default::default() }
-            .with_transform(look.transform);
+            .with_transform(look.transform)
+            .with_effects(look.filter, look.effects);
         self.draw_onto(device, encoder, uniforms, rect, view, None, &self.stroke_view, uniform, blend, stack, current);
     }
 
@@ -9618,7 +9794,7 @@ impl Canvas {
         stack: &Stack<'_>,
         current: &mut usize,
     ) {
-        let clip = doc.clip_base(layer.id).filter(|_| role == CLIP_NONE);
+        let clip = if role == CLIP_NONE { doc.clip_base(layer.id).or(look.clip_to_below) } else { None };
         let clip_visible = clip.is_none_or(|id| doc.layer(id).is_some_and(|l| l.visible));
         let effective_blend = look.blend_override.unwrap_or(layer.blend);
         let (opacity, blend) =
@@ -9627,6 +9803,11 @@ impl Canvas {
             return;
         }
         let Some(gpu_layer) = self.layers.get(&layer.id) else { return };
+        let src_view = if !look.deform.is_identity() && role == CLIP_NONE {
+            self.deform_into_scratch(device, encoder, uniforms, &gpu_layer.view, look.deform).unwrap_or(&gpu_layer.view)
+        } else {
+            &gpu_layer.view
+        };
         let clip_view = clip.and_then(|id| self.layers.get(&id)).map_or(&self.stroke_view, |c| &c.view);
         // clipping follows the base as its mask shows it
         let clip_mask_view = clip
@@ -9664,14 +9845,15 @@ impl Canvas {
         .with_grain(stroke.as_ref().map(|s| &s.style))
         .with_paper(stroke.is_some(), self.paper_look())
         .with_dual(stroke.as_ref())
-        .with_transform(look.transform);
+        .with_transform(look.transform)
+        .with_effects(look.filter, look.effects);
         let mask_view = mask_view.unwrap_or(&self.stroke_view);
         self.draw_onto(
             device,
             encoder,
             uniforms,
             rect,
-            &gpu_layer.view,
+            src_view,
             Some((clip_view, clip_mask_view.unwrap_or(&self.stroke_view))),
             mask_view,
             uniform,

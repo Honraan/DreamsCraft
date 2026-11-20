@@ -1,6 +1,8 @@
 package io.github.artcraftandroid.procraft.ui
 
 import android.view.HapticFeedbackConstants
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -42,12 +44,16 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -59,11 +65,14 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -72,22 +81,28 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.artcraftandroid.procraft.canvas.CanvasViewModel
 import io.github.artcraftandroid.procraft.canvas.DreamsWorkMode
+import io.github.artcraftandroid.procraft.canvas.StageGizmoSubMode
 import io.github.artcraftandroid.procraft.core.AnimationPlayback
 import io.github.artcraftandroid.procraft.core.TimelineClipInfo
 import io.github.artcraftandroid.procraft.core.TimelineClipKind
+import io.github.artcraftandroid.procraft.core.TimelineDeformInfo
 import io.github.artcraftandroid.procraft.core.TimelineEasingKind
 import io.github.artcraftandroid.procraft.core.TimelineKeyframeInfo
+import io.github.artcraftandroid.procraft.core.TimelineLiveFilterInfo
 import io.github.artcraftandroid.procraft.core.TimelineState
+import io.github.artcraftandroid.procraft.core.TimelineTrackEffectsInfo
 import io.github.artcraftandroid.procraft.core.TimelineTrackInfo
 import io.github.artcraftandroid.procraft.core.TimelineTransformInfo
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.hypot
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sin
 
-// ---- Pure Layout, Timecode, Pinch-Zoom, and Snap Math (Unit-Tested) ----
+// ---- Pure Layout, Timecode, Pinch-Zoom, Stylus Gestures, Warp & Snap Math (Unit-Tested) ----
 
 internal const val MIN_TIME_ZOOM_DP = 8f
 internal const val MAX_TIME_ZOOM_DP = 96f
@@ -200,6 +215,127 @@ internal fun splitViewHandleDrag(
     )
 }
 
+/** Even-odd ray-casting polygon test for Stylus Lasso Selection on the Dopesheet. */
+internal fun pointInPolygon(x: Float, y: Float, poly: List<Pair<Float, Float>>): Boolean {
+    if (poly.size < 3) return false
+    var inside = false
+    var j = poly.size - 1
+    for (i in poly.indices) {
+        val (xi, yi) = poly[i]
+        val (xj, yj) = poly[j]
+        val intersects = ((yi > y) != (yj > y)) &&
+            (x < (xj - xi) * (y - yi) / ((yj - yi).let { if (abs(it) < 1e-6f) 1e-6f else it }) + xi)
+        if (intersects) inside = !inside
+        j = i
+    }
+    return inside
+}
+
+/** Bounding box of a clip in Dopesheet coordinates for Lasso hit-testing. */
+internal data class ClipBounds(
+    val id: ULong,
+    val left: Float,
+    val top: Float,
+    val right: Float,
+    val bottom: Float,
+)
+
+/** Returns the IDs of all clips whose center or any corner falls inside [lasso]. */
+internal fun clipsInLasso(lasso: List<Pair<Float, Float>>, clips: List<ClipBounds>): Set<ULong> {
+    if (lasso.size < 3) return emptySet()
+    val out = mutableSetOf<ULong>()
+    for (c in clips) {
+        val cx = (c.left + c.right) * 0.5f
+        val cy = (c.top + c.bottom) * 0.5f
+        if (pointInPolygon(cx, cy, lasso) ||
+            pointInPolygon(c.left, c.top, lasso) ||
+            pointInPolygon(c.right, c.top, lasso) ||
+            pointInPolygon(c.left, c.bottom, lasso) ||
+            pointInPolygon(c.right, c.bottom, lasso)
+        ) {
+            out.add(c.id)
+        }
+    }
+    return out
+}
+
+/**
+ * Detects a Stylus **Scratch-to-Delete** zig-zag gesture: at least 3 horizontal direction reversals
+ * of meaningful amplitude (`>= 18px`) in a compact vertical band.
+ */
+internal fun isScratchToDeleteGesture(points: List<Pair<Float, Float>>): Boolean {
+    if (points.size < 6) return false
+    var reversals = 0
+    var lastDir = 0
+    var accumDx = 0f
+    var totalPath = 0f
+    var minX = Float.MAX_VALUE
+    var maxX = -Float.MAX_VALUE
+    var minY = Float.MAX_VALUE
+    var maxY = -Float.MAX_VALUE
+    for (i in points.indices) {
+        val (x, y) = points[i]
+        minX = min(minX, x)
+        maxX = max(maxX, x)
+        minY = min(minY, y)
+        maxY = max(maxY, y)
+        if (i > 0) {
+            val dx = x - points[i - 1].first
+            val dy = y - points[i - 1].second
+            totalPath += hypot(dx, dy)
+            if (abs(dx) > 1.5f) {
+                val dir = if (dx > 0f) 1 else -1
+                if (lastDir == 0) {
+                    lastDir = dir
+                    accumDx = abs(dx)
+                } else if (dir == lastDir) {
+                    accumDx += abs(dx)
+                } else if (accumDx >= 18f) {
+                    reversals++
+                    lastDir = dir
+                    accumDx = abs(dx)
+                }
+            }
+        }
+    }
+    val spanX = (maxX - minX).coerceAtLeast(1f)
+    val spanY = (maxY - minY).coerceAtLeast(1f)
+    return reversals >= 3 && spanX >= 28f && totalPath >= spanX * 2.2f && spanY <= spanX * 2.5f
+}
+
+/** Returns the 32-float identity 4x4 Warp mesh (`[u, v]` pairs in `0..1`). */
+internal fun defaultIdentityDeformPoints(): List<Float> = buildList(32) {
+    for (row in 0..3) {
+        for (col in 0..3) {
+            add(col / 3f)
+            add(row / 3f)
+        }
+    }
+}
+
+/** Bilinearly expands 4 normalized corner pins `[TL, TR, BR, BL]` into a 4x4 Warp mesh (32 floats). */
+internal fun distortCornersToDeformPoints(corners: List<Pair<Float, Float>>): List<Float> {
+    if (corners.size < 4) return defaultIdentityDeformPoints()
+    val tl = corners[0]
+    val tr = corners[1]
+    val br = corners[2]
+    val bl = corners[3]
+    return buildList(32) {
+        for (row in 0..3) {
+            val v = row / 3f
+            for (col in 0..3) {
+                val u = col / 3f
+                val topX = tl.first + (tr.first - tl.first) * u
+                val topY = tl.second + (tr.second - tl.second) * u
+                val botX = bl.first + (br.first - bl.first) * u
+                val botY = bl.second + (br.second - bl.second) * u
+                add(topX + (botX - topX) * v)
+                add(topY + (botY - topY) * v)
+            }
+        }
+    }
+}
+
 // ---- Theme Tokens for DreamsCraft Workspace ----
 
 private val CenterBarHeight = 46.dp
@@ -218,16 +354,49 @@ private val DreamsEdge get() = if (Pc.light) Color(0xFFBDBDC4) else Color(0xFF38
 private val PerformRed = Color(0xFFFF2D55)
 private val KeyframeGold = Color(0xFFFFB800)
 private val OpacityCyan = Color(0xFF06B6D4)
+private val FilterPurple = Color(0xFFA855F7)
+private val WarpPink = Color(0xFFEC4899)
+private val AudioGreen = Color(0xFF22C55E)
+private val CameraSky = Color(0xFF38BDF8)
+
+private val TrackColorPalette = listOf(
+    0xFF3B82F6u, // Blue
+    0xFFEC4899u, // Pink
+    0xFF10B981u, // Emerald
+    0xFFF59E0Bu, // Amber
+    0xFF8B5CF6u, // Violet
+    0xFFEF4444u, // Red
+    0xFF06B6D4u, // Cyan
+    0xFF6B7280u, // Slate
+)
+
+private val TrackBlendPresets = listOf(
+    0u to "Normal",
+    1u to "Multiply",
+    7u to "Screen",
+    11u to "Overlay",
+    8u to "Add",
+    2u to "Darken",
+    6u to "Lighten",
+)
+
+private fun activeClipOf(tl: TimelineState): TimelineClipInfo? {
+    val cid = tl.activeClipId ?: return tl.tracks.lastOrNull()?.clips?.firstOrNull()
+    return tl.tracks.asSequence().flatMap { it.clips.asSequence() }.firstOrNull { it.id == cid }
+}
+
+private fun hasAnyTrackEffect(fx: TimelineTrackEffectsInfo): Boolean =
+    fx.outlineEnabled || fx.shadowEnabled || fx.glowEnabled || fx.colorOverlayEnabled
 
 /**
  * Root DreamsCraft Animation Workspace overlay:
  * - When `timeline == null`, falls back to legacy `AnimationBar` (for Page Assist).
  * - When `timeline.flipbookOpen == true`, maximizes the Stage and shows the floating Flipbook dock
- *   with a 1-tap expand button back to the Multi-Track Timeline.
+ *   with 1-tap expand, Onion Skin, **Perform Motion Ghost**, and **Multi-Layer Cel** controls.
  * - Otherwise, shows the Stage above the timeline:
- *   1. Stage Backstage & Non-Destructive Keyframe/Perform Gizmo on top
+ *   1. Stage Backstage & Non-Destructive Keyframe / Warp / Distort / Camera / Live Perform Gizmo
  *   2. Draggable **Center Action Bar** in the middle
- *   3. Touch-first **Multi-Track Dopesheet & KeyTracks** on the bottom
+ *   3. Touch-first **Multi-Track Dopesheet, Camera Track, Audio Waveforms & KeyTracks** on bottom
  */
 @Composable
 fun BoxScope.DreamsWorkspaceOverlay(
@@ -257,9 +426,9 @@ fun BoxScope.DreamsWorkspaceOverlay(
         vm.updateStageBottomInset(dockBottomPx)
     }
 
-    // 1. Stage Backstage Frame & Interactive Keyframe / Live Perform Gizmo in the upper Stage area
+    // 1. Stage Backstage Frame & Interactive Keyframe / Warp / Distort / Camera / Live Perform Gizmo
     val stageHeightDp = if (tl.flipbookOpen) windowHeight else (windowHeight - timelineHeightDp - CenterBarHeight)
-    if (vm.dreamsMode == DreamsWorkMode.PERFORM || vm.stageGizmoActive) {
+    if (vm.dreamsMode == DreamsWorkMode.PERFORM || vm.stageGizmoActive || vm.stageGizmoMode == StageGizmoSubMode.CAMERA) {
         StageKeyTransformOverlay(
             vm = vm,
             tl = tl,
@@ -270,9 +439,10 @@ fun BoxScope.DreamsWorkspaceOverlay(
 
     // 2. Flipbook Mode vs Full Multi-Track Split View
     if (tl.flipbookOpen) {
+        val activeClip = remember(tl) { activeClipOf(tl) }
         Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth()) {
             AnimationBar(vm)
-            // Floating Pill above the Flipbook bar to return to the Multi-Track Timeline or toggle Onion Skin
+            // Floating Pill above the Flipbook bar: Timeline, Onion Skin, Perform Motion Ghost, Cel Sub-Layers, Timecode
             Row(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -282,7 +452,7 @@ fun BoxScope.DreamsWorkspaceOverlay(
                     .border(1.dp, DreamsEdge, RoundedCornerShape(20.dp))
                     .padding(horizontal = 12.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 Text(
                     text = "Timeline",
@@ -293,7 +463,7 @@ fun BoxScope.DreamsWorkspaceOverlay(
                 )
                 Box(Modifier.width(1.dp).height(14.dp).background(DreamsEdge))
                 Text(
-                    text = if (tl.onion.enabled) "Onion Skin: ON" else "Onion Skin: OFF",
+                    text = if (tl.onion.enabled) "Onion: ON" else "Onion: OFF",
                     color = if (tl.onion.enabled) KeyframeGold else DreamsDimInk,
                     fontSize = 13.sp,
                     fontWeight = FontWeight.Medium,
@@ -301,6 +471,51 @@ fun BoxScope.DreamsWorkspaceOverlay(
                         vm.updateTimelineOnion { it.copy(enabled = !it.enabled) }
                     },
                 )
+                if (activeClip != null) {
+                    Box(Modifier.width(1.dp).height(14.dp).background(DreamsEdge))
+                    Text(
+                        text = if (activeClip.performOnionGuide) "👻 Ghost: ON" else "👻 Ghost",
+                        color = if (activeClip.performOnionGuide) OpacityCyan else DreamsDimInk,
+                        fontSize = 13.sp,
+                        fontWeight = if (activeClip.performOnionGuide) FontWeight.Bold else FontWeight.Medium,
+                        modifier = Modifier.clickable {
+                            vm.setPerformOnionGuide(
+                                clipId = activeClip.id,
+                                enabled = !activeClip.performOnionGuide,
+                                isolateFirstFrame = true,
+                                opacity = activeClip.performGuideOpacity.coerceIn(0.15f, 0.9f),
+                                colorRgb = activeClip.performGuideColor.ifEmpty { listOf(0.15f, 0.85f, 1.0f) },
+                            )
+                        },
+                    )
+                    if (activeClip.kind == TimelineClipKind.CEL && activeClip.cels.isNotEmpty()) {
+                        val relFrame = (tl.playhead.toInt() - activeClip.startFrame.toInt()).coerceAtLeast(0)
+                        var cursor = 0
+                        var celIdx = 0
+                        for ((idx, cel) in activeClip.cels.withIndex()) {
+                            val end = cursor + cel.durationFrames.toInt()
+                            if (relFrame < end) {
+                                celIdx = idx
+                                break
+                            }
+                            cursor = end
+                            celIdx = idx
+                        }
+                        val sublayers = remember(activeClip.id, celIdx, vm.layers) {
+                            vm.celSublayerIds(activeClip.id, celIdx)
+                        }
+                        Box(Modifier.width(1.dp).height(14.dp).background(DreamsEdge))
+                        Text(
+                            text = "Cel L${sublayers.size.coerceAtLeast(1)} +",
+                            color = FilterPurple,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.clickable {
+                                vm.addCelSublayer(activeClip.id, celIdx)
+                            },
+                        )
+                    }
+                }
                 Box(Modifier.width(1.dp).height(14.dp).background(DreamsEdge))
                 Text(
                     text = formatTimecode(tl.playhead.toInt(), tl.fps.toInt()),
@@ -337,27 +552,45 @@ fun BoxScope.DreamsWorkspaceOverlay(
         )
     }
 
+    val popoverBottom = timelineHeightDp + CenterBarHeight + 6.dp
     // Popovers standing above the Center Action Bar
     if (vm.movieSettingsOpen) {
         MovieSettingsPopover(
             vm = vm,
             tl = tl,
-            bottomOffset = timelineHeightDp + CenterBarHeight + 6.dp,
+            bottomOffset = popoverBottom,
         )
     }
     if (vm.addTrackMenuOpen) {
         TimelineAddMenuPopover(
             vm = vm,
             tl = tl,
-            bottomOffset = timelineHeightDp + CenterBarHeight + 6.dp,
+            bottomOffset = popoverBottom,
         )
     }
     if (vm.playheadActionMenuOpen) {
         PlayheadActionPopover(
             vm = vm,
             tl = tl,
-            bottomOffset = timelineHeightDp + CenterBarHeight + 6.dp,
+            bottomOffset = popoverBottom,
         )
+    }
+    if (vm.liveFilterPopoverOpen) {
+        LiveFilterPopover(
+            vm = vm,
+            tl = tl,
+            bottomOffset = popoverBottom,
+        )
+    }
+    vm.trackOptionsTrackId?.let { tid ->
+        tl.tracks.firstOrNull { it.id == tid }?.let { targetTrack ->
+            TrackOptionsPopover(
+                vm = vm,
+                tl = tl,
+                track = targetTrack,
+                bottomOffset = popoverBottom,
+            )
+        }
     }
     vm.editingKeyframe?.let { (clipId, frame) ->
         KeyframeEasingPopover(
@@ -365,16 +598,16 @@ fun BoxScope.DreamsWorkspaceOverlay(
             tl = tl,
             clipId = clipId,
             frame = frame.toInt(),
-            bottomOffset = timelineHeightDp + CenterBarHeight + 6.dp,
+            bottomOffset = popoverBottom,
         )
     }
 }
 
 /**
  * The center action bar between the Stage and the timeline:
- * - Left: Play/Pause + Timecode (`MM:SS:FF` & FPS) + Onion Skin badge
+ * - Left: Play/Pause + Timecode (`MM:SS:FF` & FPS) + Onion Skin badge + Camera badge
  * - Center: Draggable Split Handle (pull down to collapse into Flipbook!) + Flipbook button
- * - Right: Mode switches (`Draw & Paint`, `Perform (Rec)`, `Timeline Edit`, `+ Add`)
+ * - Right: Mode switches (`Draw`, `Perform`, `Move`, `FX`, `Edit`, `+ Add`)
  */
 @Composable
 private fun CenterActionBar(
@@ -389,13 +622,13 @@ private fun CenterActionBar(
             .height(CenterBarHeight)
             .background(DreamsBarFill)
             .border(0.5.dp, DreamsEdge)
-            .padding(horizontal = 12.dp),
+            .padding(horizontal = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        // Left: Play/Pause + Timecode + Quick Onion Toggle
+        // Left: Play/Pause + Timecode + Quick Onion Toggle + Camera Track toggle
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             val isPlaying = vm.playingFrame != null
             Box(
@@ -406,17 +639,17 @@ private fun CenterActionBar(
                         view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
                         vm.togglePlaying()
                     }
-                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
             ) {
                 Text(
                     text = if (isPlaying) "Pause" else "Play",
                     color = if (isPlaying) Color.White else DreamsInk,
-                    fontSize = 14.sp,
+                    fontSize = 13.sp,
                     fontWeight = FontWeight.Bold,
                 )
             }
 
-            // Timecode Pill -> opens Movie & Onion Skin Settings
+            // Timecode Pill -> opens Movie, Auto-Draw & Onion Skin Settings
             Row(
                 modifier = Modifier
                     .clip(RoundedCornerShape(10.dp))
@@ -430,21 +663,23 @@ private fun CenterActionBar(
                         vm.movieSettingsOpen = !vm.movieSettingsOpen
                         vm.addTrackMenuOpen = false
                         vm.playheadActionMenuOpen = false
+                        vm.liveFilterPopoverOpen = false
+                        vm.trackOptionsTrackId = null
                     }
-                    .padding(horizontal = 10.dp, vertical = 5.dp),
+                    .padding(horizontal = 8.dp, vertical = 5.dp),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
             ) {
                 Text(
                     text = formatTimecode(tl.playhead.toInt(), tl.fps.toInt()),
                     color = DreamsInk,
-                    fontSize = 13.sp,
+                    fontSize = 12.sp,
                     fontWeight = FontWeight.SemiBold,
                 )
                 Text(
                     text = "${tl.fps}fps",
                     color = DreamsDimInk,
-                    fontSize = 11.sp,
+                    fontSize = 10.sp,
                 )
             }
 
@@ -457,13 +692,41 @@ private fun CenterActionBar(
                     .clickable {
                         vm.updateTimelineOnion { it.copy(enabled = !it.enabled) }
                     }
-                    .padding(horizontal = 8.dp, vertical = 5.dp),
+                    .padding(horizontal = 7.dp, vertical = 5.dp),
             ) {
                 Text(
                     text = "Onion",
                     color = if (tl.onion.enabled) KeyframeGold else DreamsDimInk,
-                    fontSize = 12.sp,
+                    fontSize = 11.sp,
                     fontWeight = FontWeight.Medium,
+                )
+            }
+
+            // Camera Track gizmo pill
+            val camActive = vm.stageGizmoActive && vm.stageGizmoMode == StageGizmoSubMode.CAMERA
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(if (camActive || tl.cameraEnabled) CameraSky.copy(alpha = 0.2f) else Color.Transparent)
+                    .border(1.dp, if (camActive) CameraSky else DreamsEdge, RoundedCornerShape(8.dp))
+                    .clickable {
+                        if (camActive) {
+                            vm.stageGizmoActive = false
+                            vm.stageGizmoMode = StageGizmoSubMode.MOVE_SCALE
+                        } else {
+                            vm.setCameraEnabled(true)
+                            vm.stageGizmoMode = StageGizmoSubMode.CAMERA
+                            vm.stageGizmoActive = true
+                            vm.dreamsMode = DreamsWorkMode.TIMELINE
+                        }
+                    }
+                    .padding(horizontal = 7.dp, vertical = 5.dp),
+            ) {
+                Text(
+                    text = "Cam",
+                    color = if (camActive || tl.cameraEnabled) CameraSky else DreamsDimInk,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
                 )
             }
         }
@@ -492,7 +755,7 @@ private fun CenterActionBar(
             ) {
                 Box(
                     modifier = Modifier
-                        .width(42.dp)
+                        .width(36.dp)
                         .height(5.dp)
                         .clip(CircleShape)
                         .background(DreamsDimInk.copy(alpha = 0.6f)),
@@ -500,20 +763,20 @@ private fun CenterActionBar(
                 Text(
                     text = "Flipbook",
                     color = DreamsDimInk,
-                    fontSize = 12.sp,
+                    fontSize = 11.sp,
                     fontWeight = FontWeight.Medium,
                     modifier = Modifier
                         .clip(RoundedCornerShape(6.dp))
                         .clickable { vm.setFlipbookMode(true) }
-                        .padding(horizontal = 6.dp, vertical = 3.dp),
+                        .padding(horizontal = 5.dp, vertical = 3.dp),
                 )
             }
         }
 
-        // Right: Workspace mode controls (Draw & Paint, Perform, Timeline Edit, + Add)
+        // Right: Workspace mode controls (Draw, Perform, Move/Warp, FX, Edit, + Add)
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            horizontalArrangement = Arrangement.spacedBy(5.dp),
         ) {
             ModeChip(
                 label = "Draw",
@@ -522,6 +785,7 @@ private fun CenterActionBar(
                 onClick = {
                     vm.dreamsMode = DreamsWorkMode.DRAW_PAINT
                     vm.stageGizmoActive = false
+                    vm.stageGizmoMode = StageGizmoSubMode.MOVE_SCALE
                     if (vm.performRecording) vm.finishPerformRecording()
                 },
             )
@@ -537,17 +801,35 @@ private fun CenterActionBar(
                     } else {
                         vm.dreamsMode = DreamsWorkMode.PERFORM
                         vm.stageGizmoActive = true
+                        if (vm.stageGizmoMode == StageGizmoSubMode.CAMERA) {
+                            vm.stageGizmoMode = StageGizmoSubMode.MOVE_SCALE
+                        }
                     }
                 },
             )
             ModeChip(
-                label = "Move",
-                selected = vm.stageGizmoActive && vm.dreamsMode != DreamsWorkMode.PERFORM,
-                activeColor = KeyframeGold,
+                label = if (vm.stageGizmoMode == StageGizmoSubMode.WARP) "Warp" else "Move",
+                selected = vm.stageGizmoActive && vm.dreamsMode != DreamsWorkMode.PERFORM && vm.stageGizmoMode != StageGizmoSubMode.CAMERA,
+                activeColor = if (vm.stageGizmoMode == StageGizmoSubMode.WARP) WarpPink else KeyframeGold,
                 onClick = {
                     if (vm.performRecording) vm.finishPerformRecording()
                     vm.dreamsMode = DreamsWorkMode.TIMELINE
+                    if (vm.stageGizmoMode == StageGizmoSubMode.CAMERA) {
+                        vm.stageGizmoMode = StageGizmoSubMode.MOVE_SCALE
+                    }
                     vm.stageGizmoActive = !vm.stageGizmoActive
+                },
+            )
+            ModeChip(
+                label = "FX",
+                selected = vm.liveFilterPopoverOpen,
+                activeColor = FilterPurple,
+                onClick = {
+                    vm.liveFilterPopoverOpen = !vm.liveFilterPopoverOpen
+                    vm.movieSettingsOpen = false
+                    vm.addTrackMenuOpen = false
+                    vm.playheadActionMenuOpen = false
+                    vm.trackOptionsTrackId = null
                 },
             )
             ModeChip(
@@ -572,10 +854,18 @@ private fun CenterActionBar(
                     onClick = { vm.groupSelectedTracks() },
                 )
             }
+            if (vm.dreamsMode == DreamsWorkMode.TIMELINE_EDIT && vm.selectedClipIds.isNotEmpty()) {
+                ModeChip(
+                    label = "Del (${vm.selectedClipIds.size})",
+                    selected = true,
+                    activeColor = PerformRed,
+                    onClick = { vm.deleteSelectedClips() },
+                )
+            }
             // + Add Button
             Box(
                 modifier = Modifier
-                    .size(32.dp)
+                    .size(30.dp)
                     .clip(CircleShape)
                     .background(if (vm.addTrackMenuOpen) Pc.Accent else DreamsClipFill)
                     .border(1.dp, DreamsEdge, CircleShape)
@@ -583,6 +873,8 @@ private fun CenterActionBar(
                         vm.addTrackMenuOpen = !vm.addTrackMenuOpen
                         vm.movieSettingsOpen = false
                         vm.playheadActionMenuOpen = false
+                        vm.liveFilterPopoverOpen = false
+                        vm.trackOptionsTrackId = null
                     },
                 contentAlignment = Alignment.Center,
             ) {
@@ -833,18 +1125,56 @@ private fun MultiTrackDopesheet(
 
         // Tracks Body (Displayed Top-to-Bottom, i.e., reversed from bottom-to-top compositing order)
         val tracksTopDown = remember(tl.tracks) { tl.tracks.asReversed() }
+        val showCameraRow = tl.cameraEnabled || tl.cameraTransformKeyframes.isNotEmpty() || tl.cameraFilterKeyframes.isNotEmpty()
+        var lassoPoints by remember { mutableStateOf<List<Pair<Float, Float>>>(emptyList()) }
+        val trackHeightPx = with(density) { trackHeight.toPx() }
+        val keySubHeightPx = with(density) { KeySubTrackHeight.toPx() }
+        val camRowHeight = 32.dp
+        val camRowHeightPx = with(density) { camRowHeight.toPx() }
+
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f)
                 .verticalScroll(verticalScroll),
         ) {
-            // Left Column: Track Headers
+            // Left Column: Camera Header (if active) + Track Headers
             Column(
                 modifier = Modifier
                     .width(TrackHeaderWidth)
                     .background(DreamsHeaderBg),
             ) {
+                if (showCameraRow) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(camRowHeight)
+                            .background(CameraSky.copy(alpha = 0.14f))
+                            .border(0.5.dp, CameraSky.copy(alpha = 0.5f))
+                            .clickable {
+                                vm.setCameraEnabled(true)
+                                vm.stageGizmoMode = StageGizmoSubMode.CAMERA
+                                vm.stageGizmoActive = true
+                            }
+                            .padding(horizontal = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Text(
+                            text = "🎥 Camera",
+                            color = CameraSky,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                        )
+                        Text(
+                            text = if (tl.cameraEnabled) "ON" else "OFF",
+                            color = if (tl.cameraEnabled) CameraSky else DreamsDimInk,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.clickable { vm.setCameraEnabled(!tl.cameraEnabled) },
+                        )
+                    }
+                }
                 for (track in tracksTopDown) {
                     TrackHeaderRow(
                         vm = vm,
@@ -858,13 +1188,87 @@ private fun MultiTrackDopesheet(
 
             Box(Modifier.width(1.dp).fillMaxHeight().background(DreamsEdge))
 
-            // Right Column: Scrollable Track Lanes, Clips, Cels, KeyTracks & Playhead Line
+            // Right Column: Scrollable Camera Lane, Track Lanes, Clips, Waveforms, KeyTracks & Playhead
             Box(
                 modifier = Modifier
                     .weight(1f)
-                    .horizontalScroll(horizontalScroll),
+                    .horizontalScroll(horizontalScroll)
+                    .then(
+                        if (vm.dreamsMode == DreamsWorkMode.TIMELINE_EDIT) {
+                            Modifier.pointerInput(tracksTopDown, zoomPx, trackHeightPx, showCameraRow) {
+                                detectDragGestures(
+                                    onDragStart = { start ->
+                                        lassoPoints = listOf(start.x to start.y)
+                                    },
+                                    onDrag = { change, _ ->
+                                        change.consume()
+                                        lassoPoints = lassoPoints + (change.position.x to change.position.y)
+                                    },
+                                    onDragEnd = {
+                                        val pts = lassoPoints
+                                        lassoPoints = emptyList()
+                                        if (pts.size < 4) return@detectDragGestures
+                                        // Build current clip bounds in lane coordinates
+                                        val bounds = mutableListOf<ClipBounds>()
+                                        var yCursor = if (showCameraRow) camRowHeightPx else 0f
+                                        for (t in tracksTopDown) {
+                                            for (c in t.clips) {
+                                                val left = c.startFrame.toFloat() * zoomPx
+                                                val right = (c.startFrame + c.durationFrames).toFloat() * zoomPx
+                                                bounds.add(ClipBounds(c.id, left, yCursor, right, yCursor + trackHeightPx))
+                                            }
+                                            yCursor += trackHeightPx + trackSubTrackCount(t) * keySubHeightPx
+                                        }
+                                        val hit = clipsInLasso(pts, bounds)
+                                        if (isScratchToDeleteGesture(pts) && hit.isNotEmpty()) {
+                                            view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                                            for (cid in hit) vm.deleteTimelineClip(cid)
+                                        } else if (hit.isNotEmpty()) {
+                                            vm.setSelectedClipIds(hit)
+                                        }
+                                    },
+                                    onDragCancel = { lassoPoints = emptyList() },
+                                )
+                            }
+                        } else {
+                            Modifier
+                        },
+                    ),
             ) {
                 Column(modifier = Modifier.width(contentWidthDp)) {
+                    if (showCameraRow) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(camRowHeight)
+                                .background(CameraSky.copy(alpha = 0.08f))
+                                .border(0.5.dp, CameraSky.copy(alpha = 0.35f)),
+                        ) {
+                            for (kf in tl.cameraTransformKeyframes) {
+                                KeyframeDiamond(
+                                    frame = kf.frame.toInt(),
+                                    zoomDp = zoomDp,
+                                    color = CameraSky,
+                                    onClick = {
+                                        vm.setTimelinePlayhead(kf.frame.toInt())
+                                        vm.stageGizmoMode = StageGizmoSubMode.CAMERA
+                                        vm.stageGizmoActive = true
+                                    },
+                                )
+                            }
+                            for (kf in tl.cameraFilterKeyframes) {
+                                KeyframeDiamond(
+                                    frame = kf.frame.toInt(),
+                                    zoomDp = zoomDp,
+                                    color = FilterPurple,
+                                    onClick = {
+                                        vm.setTimelinePlayhead(kf.frame.toInt())
+                                        vm.liveFilterPopoverOpen = true
+                                    },
+                                )
+                            }
+                        }
+                    }
                     for (track in tracksTopDown) {
                         TrackLaneRow(
                             vm = vm,
@@ -878,13 +1282,40 @@ private fun MultiTrackDopesheet(
                     Spacer(Modifier.height(36.dp))
                 }
 
+                // Stylus Lasso / Scratch-to-Delete live feedback stroke
+                if (lassoPoints.size >= 2) {
+                    val scratch = isScratchToDeleteGesture(lassoPoints)
+                    Canvas(modifier = Modifier.matchParentSize()) {
+                        val path = Path().apply {
+                            moveTo(lassoPoints[0].first, lassoPoints[0].second)
+                            for (i in 1 until lassoPoints.size) {
+                                lineTo(lassoPoints[i].first, lassoPoints[i].second)
+                            }
+                        }
+                        drawPath(
+                            path = path,
+                            color = if (scratch) PerformRed else Pc.Accent,
+                            style = Stroke(
+                                width = 3f,
+                                pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 6f)),
+                            ),
+                        )
+                    }
+                }
+
                 // Continuous Playhead Line across all tracks
                 val playheadX = zoomDp * tl.playhead.toInt() + zoomDp * 0.5f
+                val totalSubTracks = tracksTopDown.sumOf { trackSubTrackCount(it) }
                 Box(
                     modifier = Modifier
                         .offset(x = playheadX)
                         .width(2.dp)
-                        .height((trackHeight + KeySubTrackHeight * 2) * tracksTopDown.size.coerceAtLeast(1) + 36.dp)
+                        .height(
+                            (if (showCameraRow) camRowHeight else 0.dp) +
+                                trackHeight * tracksTopDown.size.coerceAtLeast(1) +
+                                KeySubTrackHeight * totalSubTracks +
+                                36.dp,
+                        )
                         .background(PerformRed),
                 )
             }
@@ -892,6 +1323,23 @@ private fun MultiTrackDopesheet(
     }
 }
 
+private fun trackSubTrackCount(track: TimelineTrackInfo): Int {
+    if (!track.expanded) return 0
+    var count = 0
+    val hasTransform = track.transformKeyframes.isNotEmpty() || track.clips.any { it.transformKeyframes.isNotEmpty() }
+    val hasOpacity = track.opacityKeyframes.isNotEmpty() || track.clips.any { it.opacityKeyframes.isNotEmpty() }
+    val hasFilter = track.filterKeyframes.isNotEmpty() || track.clips.any { it.filterKeyframes.isNotEmpty() }
+    val hasDeform = track.clips.any { it.deformKeyframes.isNotEmpty() }
+    val hasAudio = track.clips.any { it.kind == TimelineClipKind.AUDIO || it.volumeKeyframes.isNotEmpty() }
+    if (hasTransform) count++
+    if (hasOpacity) count++
+    if (hasFilter) count++
+    if (hasDeform) count++
+    if (hasAudio) count++
+    return count
+}
+
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun TrackHeaderRow(
     vm: CanvasViewModel,
@@ -900,13 +1348,15 @@ private fun TrackHeaderRow(
     trackHeight: Dp,
 ) {
     val isSelected = tl.activeTrackId == track.id || vm.selectedTrackIds.contains(track.id)
-    val hasKeySubTracks = track.expanded && (
-        track.transformKeyframes.isNotEmpty() ||
-            track.opacityKeyframes.isNotEmpty() ||
-            track.clips.any { it.transformKeyframes.isNotEmpty() || it.opacityKeyframes.isNotEmpty() }
-        )
-    val totalRowHeight = trackHeight + if (hasKeySubTracks) KeySubTrackHeight * 2 else 0.dp
+    val hasTransform = track.expanded && (track.transformKeyframes.isNotEmpty() || track.clips.any { it.transformKeyframes.isNotEmpty() })
+    val hasOpacity = track.expanded && (track.opacityKeyframes.isNotEmpty() || track.clips.any { it.opacityKeyframes.isNotEmpty() })
+    val hasFilter = track.expanded && (track.filterKeyframes.isNotEmpty() || track.clips.any { it.filterKeyframes.isNotEmpty() })
+    val hasDeform = track.expanded && (track.clips.any { it.deformKeyframes.isNotEmpty() })
+    val hasAudio = track.expanded && track.clips.any { it.kind == TimelineClipKind.AUDIO || it.volumeKeyframes.isNotEmpty() }
+    val subCount = listOf(hasTransform, hasOpacity, hasFilter, hasDeform, hasAudio).count { it }
+    val totalRowHeight = trackHeight + KeySubTrackHeight * subCount
     val tagColor = Color(0xFF000000L or (track.colorTag.toLong() and 0xFFFFFFL))
+    val hasFx = hasAnyTrackEffect(track.effects)
 
     Column(
         modifier = Modifier
@@ -914,19 +1364,29 @@ private fun TrackHeaderRow(
             .height(totalRowHeight)
             .background(if (isSelected) Pc.Accent.copy(alpha = 0.16f) else DreamsHeaderBg)
             .border(0.5.dp, DreamsEdge)
-            .clickable {
-                if (vm.dreamsMode == DreamsWorkMode.TIMELINE_EDIT) {
-                    vm.toggleTrackMultiSelection(track.id)
-                } else {
+            .combinedClickable(
+                onClick = {
+                    if (vm.dreamsMode == DreamsWorkMode.TIMELINE_EDIT) {
+                        vm.toggleTrackMultiSelection(track.id)
+                    } else {
+                        vm.selectTimelineTrack(track.id)
+                    }
+                },
+                onLongClick = {
                     vm.selectTimelineTrack(track.id)
-                }
-            },
+                    vm.trackOptionsTrackId = track.id
+                    vm.movieSettingsOpen = false
+                    vm.addTrackMenuOpen = false
+                    vm.playheadActionMenuOpen = false
+                    vm.liveFilterPopoverOpen = false
+                },
+            ),
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(trackHeight)
-                .padding(start = if (track.parentGroup != null) 12.dp else 4.dp, end = 6.dp),
+                .padding(start = if (track.parentGroup != null) 10.dp else 4.dp, end = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             // Color accent bar
@@ -937,39 +1397,76 @@ private fun TrackHeaderRow(
                     .clip(CircleShape)
                     .background(tagColor),
             )
-            Spacer(Modifier.width(6.dp))
+            Spacer(Modifier.width(4.dp))
 
-            // Expand/Collapse KeyTracks or Group chevron
+            // Expand/Collapse KeyTracks chevron
             Text(
                 text = if (track.expanded) "▾" else "▸",
                 color = DreamsDimInk,
-                fontSize = 12.sp,
+                fontSize = 11.sp,
                 modifier = Modifier
                     .clickable { vm.toggleTrackExpanded(track.id, !track.expanded) }
                     .padding(2.dp),
             )
 
-            // Track Name
-            Column(modifier = Modifier.weight(1f).padding(horizontal = 4.dp)) {
+            // Track Name + Status badges (Opacity, FX, CLIP, α, Mute)
+            Column(modifier = Modifier.weight(1f).padding(horizontal = 3.dp)) {
                 Text(
                     text = if (track.isGroup) "📁 ${track.name}" else track.name,
                     color = if (track.visible) DreamsInk else DreamsDimInk,
-                    fontSize = 12.sp,
+                    fontSize = 11.sp,
                     fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(3.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("${(track.opacity * 100).roundToInt()}%", color = DreamsDimInk, fontSize = 9.sp)
+                    if (hasFx) {
+                        Text("FX", color = FilterPurple, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+                    }
+                    if (track.clipToBelow) {
+                        Text("CLIP", color = OpacityCyan, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+                    }
+                    if (track.alphaLock) {
+                        Text("α", color = KeyframeGold, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                    }
+                    if (track.muted) {
+                        Text("🔇", fontSize = 8.sp)
+                    }
+                }
+            }
+
+            // Track Options & Layer Effects trigger ("⋯")
+            Box(
+                modifier = Modifier
+                    .size(20.dp)
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(if (vm.trackOptionsTrackId == track.id) Pc.Accent else Color.Transparent)
+                    .clickable {
+                        vm.selectTimelineTrack(track.id)
+                        vm.trackOptionsTrackId = if (vm.trackOptionsTrackId == track.id) null else track.id
+                        vm.movieSettingsOpen = false
+                        vm.addTrackMenuOpen = false
+                        vm.playheadActionMenuOpen = false
+                        vm.liveFilterPopoverOpen = false
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
                 Text(
-                    text = "${(track.opacity * 100).roundToInt()}%",
-                    color = DreamsDimInk,
-                    fontSize = 10.sp,
+                    text = "⋯",
+                    color = if (vm.trackOptionsTrackId == track.id) Color.White else DreamsInk,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
                 )
             }
 
             // Solo toggle ("S")
             Box(
                 modifier = Modifier
-                    .size(20.dp)
+                    .size(18.dp)
                     .clip(RoundedCornerShape(4.dp))
                     .background(if (track.solo) KeyframeGold else Color.Transparent)
                     .clickable { vm.toggleTrackSolo(track.id, !track.solo) },
@@ -978,29 +1475,15 @@ private fun TrackHeaderRow(
                 Text(
                     text = "S",
                     color = if (track.solo) Color.Black else DreamsDimInk,
-                    fontSize = 10.sp,
+                    fontSize = 9.sp,
                     fontWeight = FontWeight.Bold,
-                )
-            }
-
-            // Lock toggle
-            Box(
-                modifier = Modifier
-                    .size(20.dp)
-                    .clip(RoundedCornerShape(4.dp))
-                    .clickable { vm.toggleTrackLocked(track.id, !track.locked) },
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    text = if (track.locked) "🔒" else "🔓",
-                    fontSize = 10.sp,
                 )
             }
 
             // Visibility toggle
             Box(
                 modifier = Modifier
-                    .size(22.dp)
+                    .size(20.dp)
                     .clip(RoundedCornerShape(4.dp))
                     .clickable { vm.toggleTrackVisible(track.id, !track.visible) },
                 contentAlignment = Alignment.Center,
@@ -1008,34 +1491,40 @@ private fun TrackHeaderRow(
                 Text(
                     text = if (track.visible) "👁" else "—",
                     color = if (track.visible) DreamsInk else DreamsDimInk,
-                    fontSize = 11.sp,
+                    fontSize = 10.sp,
                 )
             }
         }
 
-        if (hasKeySubTracks) {
-            // Sub-track labels for Move & Opacity keyframes
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(KeySubTrackHeight)
-                    .background(DreamsTrackBg.copy(alpha = 0.5f))
-                    .padding(horizontal = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text("◆ Move & Scale", color = KeyframeGold, fontSize = 10.sp, fontWeight = FontWeight.Medium)
-            }
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(KeySubTrackHeight)
-                    .background(DreamsTrackBg.copy(alpha = 0.7f))
-                    .padding(horizontal = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text("◆ Opacity", color = OpacityCyan, fontSize = 10.sp, fontWeight = FontWeight.Medium)
-            }
+        if (hasTransform) {
+            SubTrackLabelRow("◆ Move & Scale", KeyframeGold, 0.5f)
         }
+        if (hasOpacity) {
+            SubTrackLabelRow("◆ Opacity", OpacityCyan, 0.65f)
+        }
+        if (hasFilter) {
+            SubTrackLabelRow("◆ Live Filters", FilterPurple, 0.5f)
+        }
+        if (hasDeform) {
+            SubTrackLabelRow("◆ Warp / Distort", WarpPink, 0.65f)
+        }
+        if (hasAudio) {
+            SubTrackLabelRow("◆ Vol / Pan", AudioGreen, 0.5f)
+        }
+    }
+}
+
+@Composable
+private fun SubTrackLabelRow(label: String, color: Color, alpha: Float) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(KeySubTrackHeight)
+            .background(DreamsTrackBg.copy(alpha = alpha))
+            .padding(horizontal = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(label, color = color, fontSize = 10.sp, fontWeight = FontWeight.Medium)
     }
 }
 
@@ -1049,12 +1538,13 @@ private fun TrackLaneRow(
     zoomDp: Dp,
     zoomPx: Float,
 ) {
-    val hasKeySubTracks = track.expanded && (
-        track.transformKeyframes.isNotEmpty() ||
-            track.opacityKeyframes.isNotEmpty() ||
-            track.clips.any { it.transformKeyframes.isNotEmpty() || it.opacityKeyframes.isNotEmpty() }
-        )
-    val totalRowHeight = trackHeight + if (hasKeySubTracks) KeySubTrackHeight * 2 else 0.dp
+    val hasTransform = track.expanded && (track.transformKeyframes.isNotEmpty() || track.clips.any { it.transformKeyframes.isNotEmpty() })
+    val hasOpacity = track.expanded && (track.opacityKeyframes.isNotEmpty() || track.clips.any { it.opacityKeyframes.isNotEmpty() })
+    val hasFilter = track.expanded && (track.filterKeyframes.isNotEmpty() || track.clips.any { it.filterKeyframes.isNotEmpty() })
+    val hasDeform = track.expanded && (track.clips.any { it.deformKeyframes.isNotEmpty() })
+    val hasAudio = track.expanded && track.clips.any { it.kind == TimelineClipKind.AUDIO || it.volumeKeyframes.isNotEmpty() }
+    val subCount = listOf(hasTransform, hasOpacity, hasFilter, hasDeform, hasAudio).count { it }
+    val totalRowHeight = trackHeight + KeySubTrackHeight * subCount
     val tagColor = Color(0xFF000000L or (track.colorTag.toLong() and 0xFFFFFFL))
     var contextMenuClip by remember { mutableStateOf<TimelineClipInfo?>(null) }
 
@@ -1092,6 +1582,12 @@ private fun TrackLaneRow(
                 val clipWidthDp = (zoomDp * clip.durationFrames.toInt()).coerceAtLeast(18.dp)
                 var dragAccumPx by remember(clip.id, clip.startFrame) { mutableFloatStateOf(0f) }
                 var resizeAccumPx by remember(clip.id, clip.durationFrames) { mutableFloatStateOf(0f) }
+                val clipAccent = when (clip.kind) {
+                    TimelineClipKind.AUDIO -> AudioGreen
+                    TimelineClipKind.VIDEO -> CameraSky
+                    TimelineClipKind.TEXT -> FilterPurple
+                    else -> tagColor
+                }
 
                 Box(
                     modifier = Modifier
@@ -1099,10 +1595,10 @@ private fun TrackLaneRow(
                         .width(clipWidthDp)
                         .height(trackHeight - 6.dp)
                         .clip(RoundedCornerShape(8.dp))
-                        .background(if (isClipSelected) tagColor.copy(alpha = 0.28f) else DreamsClipFill)
+                        .background(if (isClipSelected) clipAccent.copy(alpha = 0.28f) else DreamsClipFill)
                         .border(
                             width = if (isClipSelected) 2.dp else 1.dp,
-                            color = if (isClipSelected) tagColor else DreamsEdge,
+                            color = if (isClipSelected) clipAccent else DreamsEdge,
                             shape = RoundedCornerShape(8.dp),
                         )
                         .combinedClickable(
@@ -1145,66 +1641,131 @@ private fun TrackLaneRow(
                             )
                         },
                 ) {
-                    // Render Cels inside a CelClip with thumbnails and hold bars, or static LayerClip preview
-                    if (clip.kind == TimelineClipKind.CEL && clip.cels.isNotEmpty()) {
-                        Row(modifier = Modifier.fillMaxSize()) {
-                            for (cel in clip.cels) {
-                                val celWidthDp = (zoomDp * cel.durationFrames.toInt()).coerceAtLeast(10.dp)
-                                Box(
-                                    modifier = Modifier
-                                        .width(celWidthDp)
-                                        .fillMaxHeight()
-                                        .border(0.5.dp, DreamsEdge.copy(alpha = 0.6f)),
-                                ) {
-                                    vm.frameThumbnails[cel.layerId]?.let { thumb ->
-                                        Image(
-                                            bitmap = thumb,
-                                            contentDescription = null,
-                                            contentScale = ContentScale.Fit,
-                                            modifier = Modifier
-                                                .padding(2.dp)
-                                                .width((zoomDp * 2).coerceAtMost(celWidthDp))
-                                                .fillMaxHeight(),
-                                        )
-                                    }
-                                    if (cel.hold > 0u) {
-                                        Text(
-                                            text = "+${cel.hold}",
-                                            color = DreamsDimInk,
-                                            fontSize = 9.sp,
-                                            modifier = Modifier
-                                                .align(Alignment.BottomEnd)
-                                                .padding(end = 3.dp, bottom = 2.dp),
+                    // Render Audio Waveform, Cel strips, Video/Text badge, or LayerClip thumbnail
+                    when {
+                        clip.kind == TimelineClipKind.AUDIO -> {
+                            Canvas(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(horizontal = 4.dp, vertical = 4.dp),
+                            ) {
+                                val peaks = clip.waveformPeaks
+                                val midY = size.height * 0.5f
+                                drawLine(
+                                    color = AudioGreen.copy(alpha = 0.35f),
+                                    start = Offset(0f, midY),
+                                    end = Offset(size.width, midY),
+                                    strokeWidth = 1f,
+                                )
+                                val pairCount = peaks.size / 2
+                                if (pairCount > 0) {
+                                    val barW = (size.width / pairCount).coerceAtLeast(1.5f)
+                                    for (i in 0 until pairCount) {
+                                        val lo = peaks[i * 2].coerceIn(-1f, 1f)
+                                        val hi = peaks[i * 2 + 1].coerceIn(-1f, 1f)
+                                        val yTop = (midY - hi * size.height * 0.46f).coerceIn(0f, size.height)
+                                        val yBot = (midY - lo * size.height * 0.46f).coerceIn(0f, size.height)
+                                        val x = (i.toFloat() / pairCount) * size.width
+                                        drawLine(
+                                            color = if (track.muted) DreamsDimInk else AudioGreen,
+                                            start = Offset(x, min(yTop, midY - 1.5f)),
+                                            end = Offset(x, max(yBot, midY + 1.5f)),
+                                            strokeWidth = (barW * 0.7f).coerceIn(1.5f, 4f),
                                         )
                                     }
                                 }
                             }
-                        }
-                    } else {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .padding(horizontal = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        ) {
-                            vm.frameThumbnails[clip.primaryLayerId]?.let { thumb ->
-                                Image(
-                                    bitmap = thumb,
-                                    contentDescription = null,
-                                    contentScale = ContentScale.Fit,
-                                    modifier = Modifier.size(trackHeight - 14.dp),
-                                )
-                            }
                             Text(
-                                text = clip.name,
+                                text = "🔊 ${clip.name}",
                                 color = DreamsInk,
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Medium,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.SemiBold,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier
+                                    .align(Alignment.TopStart)
+                                    .padding(start = 6.dp, top = 2.dp),
                             )
                         }
+
+                        clip.kind == TimelineClipKind.CEL && clip.cels.isNotEmpty() -> {
+                            Row(modifier = Modifier.fillMaxSize()) {
+                                for (cel in clip.cels) {
+                                    val celWidthDp = (zoomDp * cel.durationFrames.toInt()).coerceAtLeast(10.dp)
+                                    Box(
+                                        modifier = Modifier
+                                            .width(celWidthDp)
+                                            .fillMaxHeight()
+                                            .border(0.5.dp, DreamsEdge.copy(alpha = 0.6f)),
+                                    ) {
+                                        vm.frameThumbnails[cel.layerId]?.let { thumb ->
+                                            Image(
+                                                bitmap = thumb,
+                                                contentDescription = null,
+                                                contentScale = ContentScale.Fit,
+                                                modifier = Modifier
+                                                    .padding(2.dp)
+                                                    .width((zoomDp * 2).coerceAtMost(celWidthDp))
+                                                    .fillMaxHeight(),
+                                            )
+                                        }
+                                        if (cel.hold > 0u) {
+                                            Text(
+                                                text = "+${cel.hold}",
+                                                color = DreamsDimInk,
+                                                fontSize = 9.sp,
+                                                modifier = Modifier
+                                                    .align(Alignment.BottomEnd)
+                                                    .padding(end = 3.dp, bottom = 2.dp),
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        else -> {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(horizontal = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                val prefix = when (clip.kind) {
+                                    TimelineClipKind.VIDEO -> "🎞 "
+                                    TimelineClipKind.TEXT -> "T "
+                                    else -> ""
+                                }
+                                vm.frameThumbnails[clip.primaryLayerId]?.let { thumb ->
+                                    Image(
+                                        bitmap = thumb,
+                                        contentDescription = null,
+                                        contentScale = ContentScale.Fit,
+                                        modifier = Modifier.size(trackHeight - 14.dp),
+                                    )
+                                }
+                                Text(
+                                    text = "$prefix${clip.name}",
+                                    color = DreamsInk,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                    }
+
+                    // Perform Motion Ghost badge on clips with Ghost 1st Frame enabled
+                    if (clip.performOnionGuide) {
+                        Text(
+                            text = "👻",
+                            fontSize = 10.sp,
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .padding(end = 14.dp, top = 2.dp),
+                        )
                     }
 
                     // Right-edge Drag Handle to resize duration / hold
@@ -1213,7 +1774,7 @@ private fun TrackLaneRow(
                             .align(Alignment.CenterEnd)
                             .width(12.dp)
                             .fillMaxHeight()
-                            .background(tagColor.copy(alpha = 0.65f))
+                            .background(clipAccent.copy(alpha = 0.65f))
                             .pointerInput(clip.id, clip.durationFrames, zoomPx) {
                                 detectHorizontalDragGestures(
                                     onDragStart = { resizeAccumPx = 0f },
@@ -1236,55 +1797,71 @@ private fun TrackLaneRow(
             }
         }
 
-        // Sub-tracks for Move & Opacity Keyframes
-        if (hasKeySubTracks) {
-            // 1. Move & Scale Keyframe Row
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(KeySubTrackHeight)
-                    .background(DreamsTrackBg.copy(alpha = 0.45f)),
-            ) {
+        // Sub-tracks for Move, Opacity, Live Filters, Warp/Distort, and Audio Volume/Pan Keyframes
+        if (hasTransform) {
+            KeyframeSubTrackLane(zoomDp, KeyframeGold, 0.45f) {
                 for (clip in track.clips) {
                     for (kf in clip.transformKeyframes) {
-                        KeyframeDiamond(
-                            frame = kf.frame.toInt(),
-                            zoomDp = zoomDp,
-                            color = KeyframeGold,
-                            onClick = {
-                                vm.setTimelinePlayhead(kf.frame.toInt())
-                                vm.editingKeyframe = clip.id to kf.frame
-                            },
-                        )
+                        KeyframeDiamond(kf.frame.toInt(), zoomDp, KeyframeGold) {
+                            vm.setTimelinePlayhead(kf.frame.toInt())
+                            vm.editingKeyframe = clip.id to kf.frame
+                        }
                     }
                 }
             }
-
-            // 2. Opacity Keyframe Row
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(KeySubTrackHeight)
-                    .background(DreamsTrackBg.copy(alpha = 0.65f)),
-            ) {
+        }
+        if (hasOpacity) {
+            KeyframeSubTrackLane(zoomDp, OpacityCyan, 0.65f) {
                 for (clip in track.clips) {
                     for (kf in clip.opacityKeyframes) {
-                        KeyframeDiamond(
-                            frame = kf.frame.toInt(),
-                            zoomDp = zoomDp,
-                            color = OpacityCyan,
-                            onClick = {
-                                vm.setTimelinePlayhead(kf.frame.toInt())
-                                vm.editingKeyframe = clip.id to kf.frame
-                            },
-                        )
+                        KeyframeDiamond(kf.frame.toInt(), zoomDp, OpacityCyan) {
+                            vm.setTimelinePlayhead(kf.frame.toInt())
+                            vm.editingKeyframe = clip.id to kf.frame
+                        }
+                    }
+                }
+            }
+        }
+        if (hasFilter) {
+            KeyframeSubTrackLane(zoomDp, FilterPurple, 0.45f) {
+                for (clip in track.clips) {
+                    for (kf in clip.filterKeyframes) {
+                        KeyframeDiamond(kf.frame.toInt(), zoomDp, FilterPurple) {
+                            vm.setTimelinePlayhead(kf.frame.toInt())
+                            vm.editingKeyframe = clip.id to kf.frame
+                        }
+                    }
+                }
+            }
+        }
+        if (hasDeform) {
+            KeyframeSubTrackLane(zoomDp, WarpPink, 0.65f) {
+                for (clip in track.clips) {
+                    for (kf in clip.deformKeyframes) {
+                        KeyframeDiamond(kf.frame.toInt(), zoomDp, WarpPink) {
+                            vm.setTimelinePlayhead(kf.frame.toInt())
+                            vm.stageGizmoMode = StageGizmoSubMode.WARP
+                            vm.stageGizmoActive = true
+                        }
+                    }
+                }
+            }
+        }
+        if (hasAudio) {
+            KeyframeSubTrackLane(zoomDp, AudioGreen, 0.45f) {
+                for (clip in track.clips) {
+                    for (kf in clip.volumeKeyframes) {
+                        KeyframeDiamond(kf.frame.toInt(), zoomDp, AudioGreen) {
+                            vm.setTimelinePlayhead(kf.frame.toInt())
+                            vm.editingKeyframe = clip.id to kf.frame
+                        }
                     }
                 }
             }
         }
     }
 
-    // Long-press Clip Context Menu Dialog/Card
+    // Long-press Clip Context Menu Card
     contextMenuClip?.let { clip ->
         ClipContextMenuCard(
             vm = vm,
@@ -1292,6 +1869,22 @@ private fun TrackLaneRow(
             onDismiss = { contextMenuClip = null },
         )
     }
+}
+
+@Composable
+private fun KeyframeSubTrackLane(
+    @Suppress("UNUSED_PARAMETER") zoomDp: Dp,
+    @Suppress("UNUSED_PARAMETER") color: Color,
+    alpha: Float,
+    content: @Composable BoxScope.() -> Unit,
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(KeySubTrackHeight)
+            .background(DreamsTrackBg.copy(alpha = alpha)),
+        content = content,
+    )
 }
 
 @Composable
@@ -1323,12 +1916,12 @@ private fun KeyframeDiamond(
 }
 
 /**
- * Interactive **Stage Keyframe & Live Perform Gizmo** rendered over the upper Stage area:
- * - Shows a bounding frame with corner handles and a draggable **Anchor Point** (crosshair pivot).
- * - 1-finger drag moves `(x, y)`; 2-finger pinch/rotate moves, scales, and rotates around the Anchor Point.
- * - In **Perform** mode (`DreamsWorkMode.PERFORM`), touching the Stage automatically starts playback
- *   and records live motion samples in real time; releasing commits the RDP-filtered keyframes and
- *   displays the **Motion Filtering** slider!
+ * Interactive **Stage Keyframe, Warp/Distort, Camera & Live Perform Gizmo** rendered over the upper Stage:
+ * - **Move & Scale**: 1-finger pan, 2-finger scale/rotate, Anchor Point pivot, and Motion Path curve.
+ * - **Distort**: 4 interactive corner pins driving non-destructive `TimelineDeformInfo.distortCorners`.
+ * - **Warp**: 4x4 interactive 16-node mesh driving `TimelineDeformInfo.warpMesh` (plus live **Perform Warp**!).
+ * - **Camera**: Global Camera Track framing rectangle over Backstage + Pan/Zoom/Rotate camera keyframes.
+ * - **Perform Banner**: Includes **Motion Filtering** and the **Perform Motion Ghost (Ghost 1st Frame)** toggle!
  */
 @Composable
 private fun BoxScope.StageKeyTransformOverlay(
@@ -1337,154 +1930,406 @@ private fun BoxScope.StageKeyTransformOverlay(
     stageWidth: Dp,
     stageHeight: Dp,
 ) {
-    val activeClipId = tl.activeClipId ?: return
-    val currentTransform = tl.activeEvaluatedTransform
-    var liveTransform by remember(activeClipId, tl.playhead, currentTransform) {
-        mutableStateOf(currentTransform)
+    val activeClip = remember(tl) { activeClipOf(tl) }
+    val activeClipId = activeClip?.id
+    val isCamera = vm.stageGizmoMode == StageGizmoSubMode.CAMERA
+    val isDistort = vm.stageGizmoMode == StageGizmoSubMode.DISTORT
+    val isWarp = vm.stageGizmoMode == StageGizmoSubMode.WARP
+    if (!isCamera && activeClipId == null) return
+
+    val baseTransform = if (isCamera) tl.cameraTransform else tl.activeEvaluatedTransform
+    var liveTransform by remember(activeClipId, isCamera, tl.playhead, baseTransform) {
+        mutableStateOf(baseTransform)
     }
-    var draggingAnchor by remember { mutableStateOf(false) }
+    var warpPoints by remember(activeClipId, tl.playhead, tl.activeEvaluatedDeform) {
+        val raw = tl.activeEvaluatedDeform.warpMesh
+        mutableStateOf(if (raw.size >= 32) raw.take(32) else defaultIdentityDeformPoints())
+    }
+    var distortCorners by remember(activeClipId, tl.playhead, tl.activeEvaluatedDeform) {
+        val raw = tl.activeEvaluatedDeform.distortCorners
+        mutableStateOf(
+            if (raw.size >= 8) {
+                listOf(raw[0] to raw[1], raw[2] to raw[3], raw[4] to raw[5], raw[6] to raw[7])
+            } else {
+                listOf(0f to 0f, 1f to 0f, 1f to 1f, 0f to 1f)
+            },
+        )
+    }
+    var activeDeformHandle by remember { mutableIntStateOf(-1) }
+
+    val gizmoColor = when {
+        vm.dreamsMode == DreamsWorkMode.PERFORM -> PerformRed
+        isCamera -> CameraSky
+        isWarp || isDistort -> WarpPink
+        else -> KeyframeGold
+    }
 
     Box(
         modifier = Modifier
             .align(Alignment.TopCenter)
             .width(stageWidth)
             .height(stageHeight)
-            // Multi-touch transform gesture (1 finger = move, 2 fingers = move + scale + rotate)
-            .pointerInput(activeClipId, vm.dreamsMode) {
-                detectTransformGestures { _, pan, zoom, rotationDeg ->
-                    if (draggingAnchor) return@detectTransformGestures
-                    if (vm.dreamsMode == DreamsWorkMode.PERFORM && !vm.performRecording) {
-                        vm.beginPerformRecording()
+            // Move & Scale / Camera multi-touch gestures
+            .then(
+                if (!isWarp && !isDistort) {
+                    Modifier
+                        .pointerInput(activeClipId, isCamera, vm.dreamsMode) {
+                            detectTransformGestures { _, pan, zoom, rotationDeg ->
+                                if (vm.dreamsMode == DreamsWorkMode.PERFORM && !vm.performRecording) {
+                                    vm.beginPerformRecording()
+                                }
+                                val rotRad = (rotationDeg * Math.PI / 180.0).toFloat()
+                                val updated = TimelineTransformInfo(
+                                    x = liveTransform.x + pan.x,
+                                    y = liveTransform.y + pan.y,
+                                    scaleX = (liveTransform.scaleX * zoom).coerceIn(0.05f, 16f),
+                                    scaleY = (liveTransform.scaleY * zoom).coerceIn(0.05f, 16f),
+                                    rotation = liveTransform.rotation + rotRad,
+                                    anchorX = liveTransform.anchorX,
+                                    anchorY = liveTransform.anchorY,
+                                )
+                                liveTransform = updated
+                                when {
+                                    isCamera -> vm.setCameraTransformKeyframe(tl.playhead.toInt(), updated, done = false)
+                                    vm.dreamsMode == DreamsWorkMode.PERFORM -> vm.recordPerformTransform(updated)
+                                    activeClipId != null -> vm.setClipTransformKeyframe(activeClipId, tl.playhead.toInt(), updated, done = false)
+                                }
+                            }
+                        }
+                        .pointerInput(activeClipId, isCamera, vm.dreamsMode) {
+                            awaitEachGesture {
+                                awaitFirstDown(requireUnconsumed = false)
+                                do {
+                                    val event = awaitPointerEvent()
+                                } while (event.changes.any { it.pressed })
+                                when {
+                                    vm.dreamsMode == DreamsWorkMode.PERFORM && vm.performRecording -> vm.finishPerformRecording()
+                                    isCamera -> vm.setCameraTransformKeyframe(tl.playhead.toInt(), liveTransform, done = true)
+                                    vm.stageGizmoActive && activeClipId != null -> vm.setClipTransformKeyframe(activeClipId, tl.playhead.toInt(), liveTransform, done = true)
+                                }
+                            }
+                        }
+                } else {
+                    // Distort (4 corners) or Warp (4x4 16 nodes) drag interaction (+ Perform Warp!)
+                    Modifier.pointerInput(activeClipId, isWarp, isDistort, vm.dreamsMode) {
+                        detectDragGestures(
+                            onDragStart = { pos ->
+                                val bx = size.width * 0.25f
+                                val by = size.height * 0.22f
+                                val bw = size.width * 0.50f
+                                val bh = size.height * 0.56f
+                                var bestIdx = -1
+                                var bestDist = 72f
+                                if (isDistort) {
+                                    for (i in 0..3) {
+                                        val hx = bx + distortCorners[i].first * bw
+                                        val hy = by + distortCorners[i].second * bh
+                                        val d = hypot(pos.x - hx, pos.y - hy)
+                                        if (d < bestDist) {
+                                            bestDist = d
+                                            bestIdx = i
+                                        }
+                                    }
+                                } else {
+                                    for (i in 0 until 16) {
+                                        val hx = bx + warpPoints[i * 2] * bw
+                                        val hy = by + warpPoints[i * 2 + 1] * bh
+                                        val d = hypot(pos.x - hx, pos.y - hy)
+                                        if (d < bestDist) {
+                                            bestDist = d
+                                            bestIdx = i
+                                        }
+                                    }
+                                }
+                                activeDeformHandle = bestIdx
+                                if (bestIdx >= 0 && vm.dreamsMode == DreamsWorkMode.PERFORM && !vm.performRecording) {
+                                    vm.beginPerformRecording()
+                                }
+                            },
+                            onDrag = { change, drag ->
+                                val idx = activeDeformHandle
+                                if (idx < 0 || activeClipId == null) return@detectDragGestures
+                                change.consume()
+                                val bw = (size.width * 0.50f).coerceAtLeast(1f)
+                                val bh = (size.height * 0.56f).coerceAtLeast(1f)
+                                val du = drag.x / bw
+                                val dv = drag.y / bh
+                                val info = if (isDistort) {
+                                    val next = distortCorners.toMutableList()
+                                    val cur = next[idx]
+                                    next[idx] = (cur.first + du).coerceIn(-0.5f, 1.5f) to (cur.second + dv).coerceIn(-0.5f, 1.5f)
+                                    distortCorners = next
+                                    TimelineDeformInfo(
+                                        distortCorners = next.flatMap { listOf(it.first, it.second) },
+                                        warpMesh = emptyList(),
+                                    )
+                                } else {
+                                    val next = warpPoints.toMutableList()
+                                    next[idx * 2] = (next[idx * 2] + du).coerceIn(-0.5f, 1.5f)
+                                    next[idx * 2 + 1] = (next[idx * 2 + 1] + dv).coerceIn(-0.5f, 1.5f)
+                                    warpPoints = next
+                                    TimelineDeformInfo(
+                                        distortCorners = emptyList(),
+                                        warpMesh = next,
+                                    )
+                                }
+                                if (vm.dreamsMode == DreamsWorkMode.PERFORM) {
+                                    vm.recordPerformDeform(info)
+                                } else {
+                                    vm.setClipDeformKeyframe(activeClipId, tl.playhead.toInt(), info, done = false)
+                                }
+                            },
+                            onDragEnd = {
+                                if (activeDeformHandle >= 0 && activeClipId != null) {
+                                    if (vm.dreamsMode == DreamsWorkMode.PERFORM && vm.performRecording) {
+                                        vm.finishPerformRecording()
+                                    } else {
+                                        val info = if (isDistort) {
+                                            TimelineDeformInfo(
+                                                distortCorners = distortCorners.flatMap { listOf(it.first, it.second) },
+                                                warpMesh = emptyList(),
+                                            )
+                                        } else {
+                                            TimelineDeformInfo(
+                                                distortCorners = emptyList(),
+                                                warpMesh = warpPoints,
+                                            )
+                                        }
+                                        vm.setClipDeformKeyframe(activeClipId, tl.playhead.toInt(), info, done = true)
+                                    }
+                                }
+                                activeDeformHandle = -1
+                            },
+                            onDragCancel = { activeDeformHandle = -1 },
+                        )
                     }
-                    val rotRad = (rotationDeg * Math.PI / 180.0).toFloat()
-                    val updated = TimelineTransformInfo(
-                        x = liveTransform.x + pan.x,
-                        y = liveTransform.y + pan.y,
-                        scaleX = (liveTransform.scaleX * zoom).coerceIn(0.05f, 16f),
-                        scaleY = (liveTransform.scaleY * zoom).coerceIn(0.05f, 16f),
-                        rotation = liveTransform.rotation + rotRad,
-                        anchorX = liveTransform.anchorX,
-                        anchorY = liveTransform.anchorY,
-                    )
-                    liveTransform = updated
-                    if (vm.dreamsMode == DreamsWorkMode.PERFORM) {
-                        vm.recordPerformTransform(updated)
-                    } else {
-                        vm.setClipTransformKeyframe(activeClipId, tl.playhead.toInt(), updated, done = false)
-                    }
-                }
-            }
-            .pointerInput(activeClipId, vm.dreamsMode) {
-                awaitEachGesture {
-                    awaitFirstDown(requireUnconsumed = false)
-                    do {
-                        val event = awaitPointerEvent()
-                    } while (event.changes.any { it.pressed })
-                    draggingAnchor = false
-                    if (vm.dreamsMode == DreamsWorkMode.PERFORM && vm.performRecording) {
-                        vm.finishPerformRecording()
-                    } else if (vm.stageGizmoActive) {
-                        vm.setClipTransformKeyframe(activeClipId, tl.playhead.toInt(), liveTransform, done = true)
-                    }
-                }
-            },
+                },
+            ),
     ) {
-        val gizmoColor = if (vm.dreamsMode == DreamsWorkMode.PERFORM) PerformRed else KeyframeGold
-        // Visual Stage Gizmo Frame & Anchor Point Crosshair
+        // Visual Stage Gizmo Canvas (Move & Scale + Motion Path, Distort 4-pin, Warp 4x4 Mesh, or Camera Viewport)
         Canvas(modifier = Modifier.fillMaxSize()) {
-            val cx = size.width * 0.5f + liveTransform.x * 0.25f
-            val cy = size.height * 0.5f + liveTransform.y * 0.25f
-            val boxW = (size.width * 0.42f * liveTransform.scaleX).coerceIn(40f, size.width * 0.9f)
-            val boxH = (size.height * 0.42f * liveTransform.scaleY).coerceIn(40f, size.height * 0.9f)
-
-            // Bounding Box
-            drawRoundRect(
-                color = gizmoColor,
-                topLeft = Offset(cx - boxW / 2f, cy - boxH / 2f),
-                size = Size(boxW, boxH),
-                cornerRadius = CornerRadius(8f, 8f),
-                style = Stroke(width = 3f),
-            )
-
-            // Corner Handles
-            val corners = listOf(
-                Offset(cx - boxW / 2f, cy - boxH / 2f),
-                Offset(cx + boxW / 2f, cy - boxH / 2f),
-                Offset(cx + boxW / 2f, cy + boxH / 2f),
-                Offset(cx - boxW / 2f, cy + boxH / 2f),
-            )
-            for (c in corners) {
-                drawCircle(color = Color.White, radius = 8f, center = c)
-                drawCircle(color = gizmoColor, radius = 6f, center = c)
+            // Draw Motion Path across transform keyframes when in Move/Perform/Camera mode
+            val pathKeyframes = if (isCamera) tl.cameraTransformKeyframes else activeClip?.transformKeyframes.orEmpty()
+            if (!isWarp && !isDistort && pathKeyframes.size >= 2) {
+                val motionPath = Path()
+                pathKeyframes.forEachIndexed { i, kf ->
+                    val t = kf.transform ?: return@forEachIndexed
+                    val px = size.width * 0.5f + t.x * 0.25f
+                    val py = size.height * 0.5f + t.y * 0.25f
+                    if (i == 0) motionPath.moveTo(px, py) else motionPath.lineTo(px, py)
+                    drawCircle(color = gizmoColor.copy(alpha = 0.85f), radius = 4.5f, center = Offset(px, py))
+                }
+                drawPath(
+                    path = motionPath,
+                    color = gizmoColor.copy(alpha = 0.65f),
+                    style = Stroke(width = 2.5f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f, 6f))),
+                )
             }
 
-            // Anchor Point Pivot Crosshair
-            val ax = (cx - boxW / 2f) + boxW * liveTransform.anchorX
-            val ay = (cy - boxH / 2f) + boxH * liveTransform.anchorY
-            drawCircle(color = gizmoColor, radius = 12f, center = Offset(ax, ay), style = Stroke(width = 2.5f))
-            drawLine(color = gizmoColor, start = Offset(ax - 16f, ay), end = Offset(ax + 16f, ay), strokeWidth = 2.5f)
-            drawLine(color = gizmoColor, start = Offset(ax, ay - 16f), end = Offset(ax, ay + 16f), strokeWidth = 2.5f)
+            if (isDistort || isWarp) {
+                val bx = size.width * 0.25f
+                val by = size.height * 0.22f
+                val bw = size.width * 0.50f
+                val bh = size.height * 0.56f
+                val mesh = if (isDistort) distortCornersToDeformPoints(distortCorners) else warpPoints
+                fun pt(row: Int, col: Int): Offset {
+                    val idx = (row * 4 + col) * 2
+                    return Offset(bx + mesh[idx] * bw, by + mesh[idx + 1] * bh)
+                }
+                // Draw 4x4 grid lines
+                for (r in 0..3) {
+                    for (c in 0..2) {
+                        drawLine(gizmoColor.copy(alpha = 0.7f), pt(r, c), pt(r, c + 1), strokeWidth = 2f)
+                    }
+                }
+                for (c in 0..3) {
+                    for (r in 0..2) {
+                        drawLine(gizmoColor.copy(alpha = 0.7f), pt(r, c), pt(r + 1, c), strokeWidth = 2f)
+                    }
+                }
+                // Draw draggable handles
+                if (isDistort) {
+                    for ((i, c) in distortCorners.withIndex()) {
+                        val o = Offset(bx + c.first * bw, by + c.second * bh)
+                        drawCircle(Color.White, radius = if (i == activeDeformHandle) 12f else 9f, center = o)
+                        drawCircle(gizmoColor, radius = if (i == activeDeformHandle) 9f else 6.5f, center = o)
+                    }
+                } else {
+                    for (i in 0 until 16) {
+                        val o = Offset(bx + warpPoints[i * 2] * bw, by + warpPoints[i * 2 + 1] * bh)
+                        drawCircle(Color.White, radius = if (i == activeDeformHandle) 10f else 7f, center = o)
+                        drawCircle(gizmoColor, radius = if (i == activeDeformHandle) 7.5f else 5f, center = o)
+                    }
+                }
+            } else {
+                val cx = size.width * 0.5f + liveTransform.x * 0.25f
+                val cy = size.height * 0.5f + liveTransform.y * 0.25f
+                val boxW = (size.width * (if (isCamera) 0.60f else 0.42f) * liveTransform.scaleX).coerceIn(40f, size.width * 0.92f)
+                val boxH = (size.height * (if (isCamera) 0.58f else 0.42f) * liveTransform.scaleY).coerceIn(40f, size.height * 0.92f)
+
+                drawRoundRect(
+                    color = gizmoColor,
+                    topLeft = Offset(cx - boxW / 2f, cy - boxH / 2f),
+                    size = Size(boxW, boxH),
+                    cornerRadius = CornerRadius(if (isCamera) 2f else 8f, if (isCamera) 2f else 8f),
+                    style = Stroke(
+                        width = 3f,
+                        pathEffect = if (isCamera) PathEffect.dashPathEffect(floatArrayOf(12f, 6f)) else null,
+                    ),
+                )
+                val corners = listOf(
+                    Offset(cx - boxW / 2f, cy - boxH / 2f),
+                    Offset(cx + boxW / 2f, cy - boxH / 2f),
+                    Offset(cx + boxW / 2f, cy + boxH / 2f),
+                    Offset(cx - boxW / 2f, cy + boxH / 2f),
+                )
+                for (c in corners) {
+                    drawCircle(color = Color.White, radius = 8f, center = c)
+                    drawCircle(color = gizmoColor, radius = 6f, center = c)
+                }
+                val ax = (cx - boxW / 2f) + boxW * liveTransform.anchorX
+                val ay = (cy - boxH / 2f) + boxH * liveTransform.anchorY
+                drawCircle(color = gizmoColor, radius = 12f, center = Offset(ax, ay), style = Stroke(width = 2.5f))
+                drawLine(color = gizmoColor, start = Offset(ax - 16f, ay), end = Offset(ax + 16f, ay), strokeWidth = 2.5f)
+                drawLine(color = gizmoColor, start = Offset(ax, ay - 16f), end = Offset(ax, ay + 16f), strokeWidth = 2.5f)
+            }
         }
 
-        // Top Stage Pill: Perform Status / Motion Filtering / Anchor Reset
-        Row(
+        // Top Stage Pill: Sub-mode tabs (Move | Distort | Warp | Cam) + Perform Status & Ghost 1st Frame toggle!
+        Column(
             modifier = Modifier
                 .align(Alignment.TopCenter)
-                .padding(top = Pc.barShown + 10.dp)
-                .clip(RoundedCornerShape(18.dp))
-                .background(DreamsBarFill.copy(alpha = 0.94f))
-                .border(1.dp, gizmoColor, RoundedCornerShape(18.dp))
-                .padding(horizontal = 14.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                .padding(top = Pc.barShown + 8.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            if (vm.dreamsMode == DreamsWorkMode.PERFORM) {
-                Text(
-                    text = if (vm.performRecording) "● PERFORMING (${vm.performSamplesCount} samples)" else "● Perform Armed: Touch Stage to Record",
-                    color = PerformRed,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Bold,
-                )
-                val filterPct = (tl.motionFiltering * 100).roundToInt()
-                Text(
-                    text = "Filter: $filterPct%",
-                    color = DreamsInk,
-                    fontSize = 12.sp,
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(DreamsClipFill)
-                        .clickable {
-                            val next = when {
-                                tl.motionFiltering < 0.25f -> 0.35f
-                                tl.motionFiltering < 0.55f -> 0.70f
-                                tl.motionFiltering < 0.85f -> 1.0f
-                                else -> 0.0f
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(DreamsBarFill.copy(alpha = 0.95f))
+                    .border(1.dp, gizmoColor, RoundedCornerShape(18.dp))
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                // Sub-mode switcher
+                for ((sub, label) in listOf(
+                    StageGizmoSubMode.MOVE_SCALE to "Move",
+                    StageGizmoSubMode.DISTORT to "Distort",
+                    StageGizmoSubMode.WARP to "Warp",
+                    StageGizmoSubMode.CAMERA to "Camera",
+                )) {
+                    val chosen = vm.stageGizmoMode == sub
+                    Text(
+                        text = label,
+                        color = if (chosen) Color.White else DreamsDimInk,
+                        fontSize = 11.sp,
+                        fontWeight = if (chosen) FontWeight.Bold else FontWeight.Medium,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(if (chosen) gizmoColor else Color.Transparent)
+                            .clickable {
+                                vm.stageGizmoMode = sub
+                                if (sub == StageGizmoSubMode.CAMERA) vm.setCameraEnabled(true)
                             }
-                            vm.updatePerformMotionFiltering(next)
-                        }
-                        .padding(horizontal = 8.dp, vertical = 4.dp),
-                )
-            } else {
-                Text(
-                    text = "Move & Scale  •  (${liveTransform.x.roundToInt()}, ${liveTransform.y.roundToInt()})  •  ${(liveTransform.scaleX * 100).roundToInt()}%",
-                    color = KeyframeGold,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.SemiBold,
-                )
+                            .padding(horizontal = 8.dp, vertical = 3.dp),
+                    )
+                }
+
+                Box(Modifier.width(1.dp).height(14.dp).background(DreamsEdge))
+
+                // Reset current gizmo property
                 Text(
                     text = "Reset",
                     color = DreamsInk,
-                    fontSize = 12.sp,
+                    fontSize = 11.sp,
                     modifier = Modifier
                         .clip(RoundedCornerShape(6.dp))
                         .background(DreamsClipFill)
                         .clickable {
-                            val id = TimelineTransformInfo(0f, 0f, 1f, 1f, 0f, 0.5f, 0.5f)
-                            liveTransform = id
-                            vm.setClipTransformKeyframe(activeClipId, tl.playhead.toInt(), id, done = true)
+                            when {
+                                isCamera -> {
+                                    val id = TimelineTransformInfo(0f, 0f, 1f, 1f, 0f, 0.5f, 0.5f)
+                                    liveTransform = id
+                                    vm.setCameraTransformKeyframe(tl.playhead.toInt(), id, done = true)
+                                }
+                                isDistort && activeClipId != null -> {
+                                    distortCorners = listOf(0f to 0f, 1f to 0f, 1f to 1f, 0f to 1f)
+                                    vm.deleteClipDeformKeyframe(activeClipId, tl.playhead.toInt())
+                                }
+                                isWarp && activeClipId != null -> {
+                                    warpPoints = defaultIdentityDeformPoints()
+                                    vm.deleteClipDeformKeyframe(activeClipId, tl.playhead.toInt())
+                                }
+                                activeClipId != null -> {
+                                    val id = TimelineTransformInfo(0f, 0f, 1f, 1f, 0f, 0.5f, 0.5f)
+                                    liveTransform = id
+                                    vm.setClipTransformKeyframe(activeClipId, tl.playhead.toInt(), id, done = true)
+                                }
+                            }
                         }
-                        .padding(horizontal = 8.dp, vertical = 3.dp),
+                        .padding(horizontal = 7.dp, vertical = 3.dp),
                 )
+            }
+
+            // Second Row when in Perform Mode: Recording indicator + Motion Filtering + Perform Motion Ghost (1st Frame Onion Skin)!
+            if (vm.dreamsMode == DreamsWorkMode.PERFORM && activeClip != null) {
+                Row(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(DreamsBarFill.copy(alpha = 0.94f))
+                        .border(1.dp, PerformRed, RoundedCornerShape(16.dp))
+                        .padding(horizontal = 12.dp, vertical = 5.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text(
+                        text = if (vm.performRecording) "● REC (${vm.performSamplesCount})" else "● Perform Ready",
+                        color = PerformRed,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    val filterPct = (tl.motionFiltering * 100).roundToInt()
+                    Text(
+                        text = "Filter: $filterPct%",
+                        color = DreamsInk,
+                        fontSize = 11.sp,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(DreamsClipFill)
+                            .clickable {
+                                val next = when {
+                                    tl.motionFiltering < 0.25f -> 0.35f
+                                    tl.motionFiltering < 0.55f -> 0.70f
+                                    tl.motionFiltering < 0.85f -> 1.0f
+                                    else -> 0.0f
+                                }
+                                vm.updatePerformMotionFiltering(next)
+                            }
+                            .padding(horizontal = 7.dp, vertical = 3.dp),
+                    )
+                    // DreamsCraft v2.0 Pilar 2: Perform Motion Ghost (Onion Skin of 1st frame along Perform motion)
+                    val ghostOn = activeClip.performOnionGuide
+                    Text(
+                        text = if (ghostOn) "👻 Ghost 1st Frame: ON (${(activeClip.performGuideOpacity * 100).roundToInt()}%)" else "👻 Ghost 1st Frame: OFF",
+                        color = if (ghostOn) Color.Black else OpacityCyan,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(if (ghostOn) OpacityCyan else DreamsClipFill)
+                            .clickable {
+                                vm.setPerformOnionGuide(
+                                    clipId = activeClip.id,
+                                    enabled = !ghostOn,
+                                    isolateFirstFrame = true,
+                                    opacity = activeClip.performGuideOpacity.coerceIn(0.2f, 0.85f),
+                                    colorRgb = activeClip.performGuideColor.ifEmpty { listOf(0.15f, 0.85f, 1.0f) },
+                                )
+                            }
+                            .padding(horizontal = 8.dp, vertical = 3.dp),
+                    )
+                }
             }
         }
     }
@@ -1502,19 +2347,19 @@ private fun BoxScope.MovieSettingsPopover(
         modifier = Modifier
             .align(Alignment.BottomStart)
             .padding(start = 16.dp, bottom = bottomOffset)
-            .width(320.dp)
+            .width(340.dp)
             .clip(RoundedCornerShape(20.dp))
             .background(DreamsBarFill)
             .border(1.dp, DreamsEdge, RoundedCornerShape(20.dp))
             .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text("Movie & Onion Skin", color = DreamsInk, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+            Text("Movie, Auto-Draw & Onion Skin", color = DreamsInk, fontSize = 16.sp, fontWeight = FontWeight.Bold)
             Text(
                 text = "Done",
                 color = Pc.Accent,
@@ -1534,12 +2379,12 @@ private fun BoxScope.MovieSettingsPopover(
                         .clip(RoundedCornerShape(8.dp))
                         .background(if (chosen) Pc.Accent else DreamsClipFill)
                         .clickable { vm.setTimelineFps(presetFps) }
-                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                        .padding(horizontal = 10.dp, vertical = 5.dp),
                 ) {
                     Text(
                         text = "$presetFps",
                         color = if (chosen) Color.White else DreamsInk,
-                        fontSize = 13.sp,
+                        fontSize = 12.sp,
                         fontWeight = FontWeight.SemiBold,
                     )
                 }
@@ -1561,21 +2406,21 @@ private fun BoxScope.MovieSettingsPopover(
                         .clip(RoundedCornerShape(8.dp))
                         .background(if (chosen) Pc.Accent else DreamsClipFill)
                         .clickable { vm.setTimelinePlayback(mode) }
-                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                        .padding(horizontal = 10.dp, vertical = 5.dp),
                 ) {
                     Text(label, color = if (chosen) Color.White else DreamsInk, fontSize = 12.sp)
                 }
             }
         }
 
-        // Onion Skin Frames & Opacity
+        // Onion Skin Frames
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text("Onion Skin Frames (${tl.onion.beforeFrames})", color = DreamsInk, fontSize = 13.sp)
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("Onion Skin Frames (${tl.onion.beforeFrames})", color = DreamsInk, fontSize = 12.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                 for (count in listOf(0u, 1u, 3u, 6u, 12u)) {
                     val chosen = tl.onion.beforeFrames == count && tl.onion.enabled == (count > 0u)
                     Box(
@@ -1591,16 +2436,30 @@ private fun BoxScope.MovieSettingsPopover(
                                     )
                                 }
                             }
-                            .padding(horizontal = 8.dp, vertical = 4.dp),
+                            .padding(horizontal = 7.dp, vertical = 4.dp),
                     ) {
                         Text(
                             text = if (count == 0u) "Off" else "$count",
                             color = if (chosen) Color.Black else DreamsInk,
-                            fontSize = 12.sp,
+                            fontSize = 11.sp,
                         )
                     }
                 }
             }
+        }
+
+        // DreamsCraft v2.0 Pilar 1: Auto-Draw Frame & Auto-Split Hold Toggles
+        ToggleRow("Auto-Create Frame on Empty Draw", tl.autoCreateFrameOnDraw) {
+            vm.setAutoDrawOptions(!tl.autoCreateFrameOnDraw, tl.autoSplitCelOnDraw)
+        }
+        ToggleRow("Auto-Split Held Cel on Draw", tl.autoSplitCelOnDraw) {
+            vm.setAutoDrawOptions(tl.autoCreateFrameOnDraw, !tl.autoSplitCelOnDraw)
+        }
+        ToggleRow("Lip-Sync Audio Scrubbing", vm.audioScrubbingEnabled) {
+            vm.audioScrubbingEnabled = !vm.audioScrubbingEnabled
+        }
+        ToggleRow("Global Camera Track", tl.cameraEnabled) {
+            vm.setCameraEnabled(!tl.cameraEnabled)
         }
 
         // Work Area & Backstage Toggles
@@ -1610,9 +2469,9 @@ private fun BoxScope.MovieSettingsPopover(
         ) {
             val hasWorkArea = tl.workArea != null
             Text(
-                text = if (hasWorkArea) "Clear Work Area" else "Set Work Area Around Playhead",
+                text = if (hasWorkArea) "Clear Work Area" else "Set Work Area",
                 color = Pc.Accent,
-                fontSize = 13.sp,
+                fontSize = 12.sp,
                 modifier = Modifier.clickable {
                     if (hasWorkArea) {
                         vm.setTimelineWorkArea(null, null)
@@ -1639,16 +2498,25 @@ private fun BoxScope.TimelineAddMenuPopover(
     tl: TimelineState,
     bottomOffset: Dp,
 ) {
+    val audioPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        vm.addTrackMenuOpen = false
+        uri?.let { vm.importTimelineAudio(it) }
+    }
+    val videoPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        vm.addTrackMenuOpen = false
+        uri?.let { vm.importTimelineVideo(it) }
+    }
+
     Column(
         modifier = Modifier
             .align(Alignment.BottomEnd)
             .padding(end = 16.dp, bottom = bottomOffset)
-            .width(240.dp)
+            .width(265.dp)
             .clip(RoundedCornerShape(18.dp))
             .background(DreamsBarFill)
             .border(1.dp, DreamsEdge, RoundedCornerShape(18.dp))
             .padding(12.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         Text("Add to Timeline", color = DreamsDimInk, fontSize = 12.sp, fontWeight = FontWeight.Bold)
         MenuActionRow("+ New Drawing Track (Flipbook)") {
@@ -1660,22 +2528,23 @@ private fun BoxScope.TimelineAddMenuPopover(
             vm.addTimelineTrack("Content Track", withDrawingClip = false)
             vm.addLayerClipToActiveTrack()
         }
+        MenuActionRow("+ New Text Clip (Animated Title)") {
+            vm.addTrackMenuOpen = false
+            vm.addTextClipToActiveTrack("Title")
+        }
+        MenuActionRow("🔊 Import Audio Track (WAV/MP3/AAC)", color = AudioGreen) {
+            audioPicker.launch(arrayOf("audio/*"))
+        }
+        MenuActionRow("🎞 Import Video Clip (Rotoscope)", color = CameraSky) {
+            videoPicker.launch(arrayOf("video/*"))
+        }
         MenuActionRow("+ New Cel / Frame in Active Clip") {
             vm.addTrackMenuOpen = false
             vm.addTimelineCel()
         }
-        MenuActionRow("◆ Add Move & Scale Keyframe") {
+        MenuActionRow("◆ Add Live Filter Keyframe (FX)", color = FilterPurple) {
             vm.addTrackMenuOpen = false
-            tl.activeClipId?.let { cid ->
-                vm.setClipTransformKeyframe(cid, tl.playhead.toInt(), tl.activeEvaluatedTransform, done = true)
-                vm.stageGizmoActive = true
-            }
-        }
-        MenuActionRow("◆ Add Opacity Keyframe") {
-            vm.addTrackMenuOpen = false
-            tl.activeClipId?.let { cid ->
-                vm.setClipOpacityKeyframe(cid, tl.playhead.toInt(), tl.activeEvaluatedOpacity, done = true)
-            }
+            vm.liveFilterPopoverOpen = true
         }
         MenuActionRow("✂ Split Clip at Playhead") {
             vm.addTrackMenuOpen = false
@@ -1694,12 +2563,12 @@ private fun BoxScope.PlayheadActionPopover(
         modifier = Modifier
             .align(Alignment.BottomCenter)
             .padding(bottom = bottomOffset)
-            .width(250.dp)
+            .width(260.dp)
             .clip(RoundedCornerShape(18.dp))
             .background(DreamsBarFill)
             .border(1.dp, PerformRed, RoundedCornerShape(18.dp))
             .padding(12.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(7.dp),
     ) {
         Text(
             text = "Playhead Action (Frame ${tl.playhead + 1u})",
@@ -1707,18 +2576,28 @@ private fun BoxScope.PlayheadActionPopover(
             fontSize = 13.sp,
             fontWeight = FontWeight.Bold,
         )
-        MenuActionRow("Move & Scale (Keyframe)") {
+        MenuActionRow("Move & Scale (Keyframe)", color = KeyframeGold) {
             vm.playheadActionMenuOpen = false
             tl.activeClipId?.let { cid ->
                 vm.setClipTransformKeyframe(cid, tl.playhead.toInt(), tl.activeEvaluatedTransform, done = true)
+                vm.stageGizmoMode = StageGizmoSubMode.MOVE_SCALE
                 vm.stageGizmoActive = true
             }
         }
-        MenuActionRow("Filter: Opacity Keyframe") {
+        MenuActionRow("Warp / Distort (Keyframe)", color = WarpPink) {
             vm.playheadActionMenuOpen = false
-            tl.activeClipId?.let { cid ->
-                vm.setClipOpacityKeyframe(cid, tl.playhead.toInt(), tl.activeEvaluatedOpacity, done = true)
-            }
+            vm.stageGizmoMode = StageGizmoSubMode.WARP
+            vm.stageGizmoActive = true
+        }
+        MenuActionRow("Live Filters (Blur / HSB / Noise)", color = FilterPurple) {
+            vm.playheadActionMenuOpen = false
+            vm.liveFilterPopoverOpen = true
+        }
+        MenuActionRow("Camera Track Keyframe", color = CameraSky) {
+            vm.playheadActionMenuOpen = false
+            vm.setCameraTransformKeyframe(tl.playhead.toInt(), tl.cameraTransform, done = true)
+            vm.stageGizmoMode = StageGizmoSubMode.CAMERA
+            vm.stageGizmoActive = true
         }
         MenuActionRow("Split Clip Here") {
             vm.playheadActionMenuOpen = false
@@ -1728,6 +2607,425 @@ private fun BoxScope.PlayheadActionPopover(
             vm.playheadActionMenuOpen = false
             vm.setFlipbookMode(true)
         }
+    }
+}
+
+/**
+ * DreamsCraft v2.0 Pilar 3: **Complete Track Options & GPU Layer Effects Popover**:
+ * - Tab 1 (**Options**): Rename, Color Swatches, Blend Mode, Opacity, Clip to Track Below,
+ *   Alpha Lock, Mute Audio, Lock, Move Up/Down, Duplicate, Merge Down, Clear Clips, Delete Track.
+ * - Tab 2 (**Layer Effects**): Non-destructive GPU Outline/Stroke, Drop Shadow, Outer/Inner Glow,
+ *   and Color Overlay applied across the entire track!
+ */
+@Composable
+private fun BoxScope.TrackOptionsPopover(
+    vm: CanvasViewModel,
+    tl: TimelineState,
+    track: TimelineTrackInfo,
+    bottomOffset: Dp,
+) {
+    var tab by remember(track.id) { mutableIntStateOf(0) } // 0 = Options, 1 = Layer Effects
+    var editName by remember(track.id, track.name) { mutableStateOf(track.name) }
+    var fx by remember(track.id, track.effects) { mutableStateOf(track.effects) }
+    val scroll = rememberScrollState()
+
+    Column(
+        modifier = Modifier
+            .align(Alignment.BottomStart)
+            .padding(start = 12.dp, bottom = bottomOffset)
+            .width(340.dp)
+            .heightIn(max = 420.dp)
+            .clip(RoundedCornerShape(20.dp))
+            .background(DreamsBarFill)
+            .border(1.dp, Pc.Accent, RoundedCornerShape(20.dp))
+            .padding(14.dp)
+            .verticalScroll(scroll),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        // Header + Tab Switcher
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                ModeChip("Track Options", tab == 0, Pc.Accent) { tab = 0 }
+                ModeChip("Layer Effects", tab == 1, FilterPurple) { tab = 1 }
+            }
+            Text(
+                text = "Done",
+                color = Pc.Accent,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.clickable { vm.trackOptionsTrackId = null },
+            )
+        }
+
+        if (tab == 0) {
+            // Rename Track
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                BasicTextField(
+                    value = editName,
+                    onValueChange = { editName = it },
+                    singleLine = true,
+                    textStyle = TextStyle(color = DreamsInk, fontSize = 13.sp, fontWeight = FontWeight.Medium),
+                    cursorBrush = SolidColor(Pc.Accent),
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(DreamsClipFill)
+                        .border(1.dp, DreamsEdge, RoundedCornerShape(8.dp))
+                        .padding(horizontal = 10.dp, vertical = 7.dp),
+                )
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(Pc.Accent)
+                        .clickable { vm.renameTimelineTrack(track.id, editName) }
+                        .padding(horizontal = 10.dp, vertical = 7.dp),
+                ) {
+                    Text("Save", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+
+            // Color Tag Swatches
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Color", color = DreamsDimInk, fontSize = 12.sp)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    for (argb in TrackColorPalette) {
+                        val c = Color(0xFF000000L or (argb.toLong() and 0xFFFFFFL))
+                        val chosen = (track.colorTag and 0xFFFFFFu) == (argb and 0xFFFFFFu)
+                        Box(
+                            modifier = Modifier
+                                .size(22.dp)
+                                .clip(CircleShape)
+                                .background(c)
+                                .border(if (chosen) 2.5.dp else 1.dp, if (chosen) Color.White else DreamsEdge, CircleShape)
+                                .clickable { vm.setTimelineTrackColor(track.id, argb) },
+                        )
+                    }
+                }
+            }
+
+            // Opacity Slider
+            CompactSliderRow(
+                label = "Opacity",
+                valueText = "${(track.opacity * 100).roundToInt()}%",
+                value = track.opacity,
+                range = 0f..1f,
+                onValueChange = { vm.setTimelineTrackOpacity(track.id, it, done = false) },
+                onValueChangeFinished = { vm.setTimelineTrackOpacity(track.id, track.opacity, done = true) },
+            )
+
+            // Blend Mode Chips
+            Text("Blend Mode", color = DreamsDimInk, fontSize = 11.sp)
+            Row(
+                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                for ((blendId, blendName) in TrackBlendPresets) {
+                    val chosen = track.blend == blendId
+                    Text(
+                        text = blendName,
+                        color = if (chosen) Color.White else DreamsInk,
+                        fontSize = 11.sp,
+                        fontWeight = if (chosen) FontWeight.Bold else FontWeight.Normal,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(if (chosen) Pc.Accent else DreamsClipFill)
+                            .clickable { vm.setTimelineTrackBlend(track.id, blendId) }
+                            .padding(horizontal = 9.dp, vertical = 5.dp),
+                    )
+                }
+            }
+
+            // Masking, Alpha Lock, Mute & Lock toggles
+            ToggleRow("Clip to Track Below (Mask)", track.clipToBelow) {
+                vm.setTimelineTrackClipToBelow(track.id, !track.clipToBelow)
+            }
+            ToggleRow("Alpha Lock (All Cels)", track.alphaLock) {
+                vm.setTimelineTrackAlphaLock(track.id, !track.alphaLock)
+            }
+            ToggleRow("Mute Track Audio", track.muted) {
+                vm.setTimelineTrackMuted(track.id, !track.muted)
+            }
+            ToggleRow("Lock Track", track.locked) {
+                vm.toggleTrackLocked(track.id, !track.locked)
+            }
+
+            // Reorder & Management Actions
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Box(Modifier.weight(1f)) { MenuActionRow("▲ Move Up") { vm.moveTimelineTrack(track.id, 1) } }
+                Box(Modifier.weight(1f)) { MenuActionRow("▼ Move Down") { vm.moveTimelineTrack(track.id, -1) } }
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Box(Modifier.weight(1f)) { MenuActionRow("Duplicate") { vm.duplicateTimelineTrack(track.id) } }
+                Box(Modifier.weight(1f)) { MenuActionRow("Merge Down") { vm.mergeTimelineTrackDown(track.id) } }
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Box(Modifier.weight(1f)) { MenuActionRow("Clear Clips") { vm.clearTimelineTrackClips(track.id) } }
+                Box(Modifier.weight(1f)) {
+                    MenuActionRow("Delete Track", color = PerformRed) {
+                        vm.deleteTimelineTrack(track.id)
+                    }
+                }
+            }
+        } else {
+            // GPU Non-Destructive Track Layer Effects
+            ToggleRow("Outline / Stroke", fx.outlineEnabled) {
+                fx = fx.copy(outlineEnabled = !fx.outlineEnabled)
+                vm.setTimelineTrackEffects(track.id, fx, done = true)
+            }
+            if (fx.outlineEnabled) {
+                CompactSliderRow(
+                    label = "Outline Size",
+                    valueText = "${fx.outlineWidth.roundToInt()}px",
+                    value = fx.outlineWidth,
+                    range = 1f..24f,
+                    onValueChange = {
+                        fx = fx.copy(outlineWidth = it)
+                        vm.setTimelineTrackEffects(track.id, fx, done = false)
+                    },
+                    onValueChangeFinished = { vm.setTimelineTrackEffects(track.id, fx, done = true) },
+                )
+            }
+
+            ToggleRow("Drop Shadow", fx.shadowEnabled) {
+                fx = fx.copy(shadowEnabled = !fx.shadowEnabled)
+                vm.setTimelineTrackEffects(track.id, fx, done = true)
+            }
+            if (fx.shadowEnabled) {
+                CompactSliderRow(
+                    label = "Shadow Offset X",
+                    valueText = "${fx.shadowOffsetX.roundToInt()}px",
+                    value = fx.shadowOffsetX,
+                    range = -32f..32f,
+                    onValueChange = {
+                        fx = fx.copy(shadowOffsetX = it)
+                        vm.setTimelineTrackEffects(track.id, fx, done = false)
+                    },
+                    onValueChangeFinished = { vm.setTimelineTrackEffects(track.id, fx, done = true) },
+                )
+                CompactSliderRow(
+                    label = "Shadow Offset Y",
+                    valueText = "${fx.shadowOffsetY.roundToInt()}px",
+                    value = fx.shadowOffsetY,
+                    range = -32f..32f,
+                    onValueChange = {
+                        fx = fx.copy(shadowOffsetY = it)
+                        vm.setTimelineTrackEffects(track.id, fx, done = false)
+                    },
+                    onValueChangeFinished = { vm.setTimelineTrackEffects(track.id, fx, done = true) },
+                )
+            }
+
+            ToggleRow(if (fx.glowInner) "Inner Glow" else "Outer Glow", fx.glowEnabled) {
+                fx = fx.copy(glowEnabled = !fx.glowEnabled)
+                vm.setTimelineTrackEffects(track.id, fx, done = true)
+            }
+            if (fx.glowEnabled) {
+                ToggleRow("Inner Glow Mode", fx.glowInner) {
+                    fx = fx.copy(glowInner = !fx.glowInner)
+                    vm.setTimelineTrackEffects(track.id, fx, done = true)
+                }
+                CompactSliderRow(
+                    label = "Glow Radius",
+                    valueText = "${fx.glowRadius.roundToInt()}px",
+                    value = fx.glowRadius,
+                    range = 1f..24f,
+                    onValueChange = {
+                        fx = fx.copy(glowRadius = it)
+                        vm.setTimelineTrackEffects(track.id, fx, done = false)
+                    },
+                    onValueChangeFinished = { vm.setTimelineTrackEffects(track.id, fx, done = true) },
+                )
+                CompactSliderRow(
+                    label = "Glow Intensity",
+                    valueText = "${(fx.glowIntensity * 100).roundToInt()}%",
+                    value = fx.glowIntensity,
+                    range = 0f..1f,
+                    onValueChange = {
+                        fx = fx.copy(glowIntensity = it)
+                        vm.setTimelineTrackEffects(track.id, fx, done = false)
+                    },
+                    onValueChangeFinished = { vm.setTimelineTrackEffects(track.id, fx, done = true) },
+                )
+            }
+
+            ToggleRow("Color Overlay", fx.colorOverlayEnabled) {
+                fx = fx.copy(colorOverlayEnabled = !fx.colorOverlayEnabled)
+                vm.setTimelineTrackEffects(track.id, fx, done = true)
+            }
+            if (fx.colorOverlayEnabled) {
+                val curAlpha = fx.colorOverlayColor.getOrNull(3) ?: 0.5f
+                CompactSliderRow(
+                    label = "Overlay Opacity",
+                    valueText = "${(curAlpha * 100).roundToInt()}%",
+                    value = curAlpha,
+                    range = 0f..1f,
+                    onValueChange = { a ->
+                        val base = fx.colorOverlayColor
+                        val r = base.getOrNull(0) ?: 1f
+                        val g = base.getOrNull(1) ?: 0.2f
+                        val b = base.getOrNull(2) ?: 0.4f
+                        fx = fx.copy(colorOverlayColor = listOf(r, g, b, a))
+                        vm.setTimelineTrackEffects(track.id, fx, done = false)
+                    },
+                    onValueChangeFinished = { vm.setTimelineTrackEffects(track.id, fx, done = true) },
+                )
+            }
+        }
+    }
+}
+
+/**
+ * DreamsCraft v2.0 Pilar 5: **Animated Live Filters Popover** (Opacity, Gaussian Blur, HSB,
+ * Sharpen, Noise). Every slider change automatically inserts/updates a non-destructive keyframe
+ * at `tl.playhead` on the active clip (or Camera Track when Camera mode is active).
+ */
+@Composable
+private fun BoxScope.LiveFilterPopover(
+    vm: CanvasViewModel,
+    tl: TimelineState,
+    bottomOffset: Dp,
+) {
+    val activeClipId = tl.activeClipId
+    val isCam = vm.stageGizmoMode == StageGizmoSubMode.CAMERA
+    val baseFilter = if (isCam) tl.cameraFilter else tl.activeEvaluatedFilter
+    var filter by remember(activeClipId, isCam, tl.playhead, baseFilter) { mutableStateOf(baseFilter) }
+    var opacity by remember(activeClipId, tl.playhead, tl.activeEvaluatedOpacity) { mutableFloatStateOf(tl.activeEvaluatedOpacity) }
+
+    fun pushFilter(next: TimelineLiveFilterInfo, done: Boolean) {
+        filter = next
+        if (isCam) {
+            vm.setCameraFilterKeyframe(tl.playhead.toInt(), next, done)
+        } else if (activeClipId != null) {
+            vm.setClipFilterKeyframe(activeClipId, tl.playhead.toInt(), next, done)
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .align(Alignment.BottomEnd)
+            .padding(end = 16.dp, bottom = bottomOffset)
+            .width(320.dp)
+            .clip(RoundedCornerShape(20.dp))
+            .background(DreamsBarFill)
+            .border(1.dp, FilterPurple, RoundedCornerShape(20.dp))
+            .padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = if (isCam) "Camera Live Filters @ F${tl.playhead + 1u}" else "Live Filters @ F${tl.playhead + 1u}",
+                color = FilterPurple,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    text = "Reset",
+                    color = DreamsDimInk,
+                    fontSize = 12.sp,
+                    modifier = Modifier.clickable {
+                        pushFilter(TimelineLiveFilterInfo(0f, 0f, 1f, 0f, 0f, 0f), done = true)
+                    },
+                )
+                Text(
+                    text = "Done",
+                    color = Pc.Accent,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.clickable { vm.liveFilterPopoverOpen = false },
+                )
+            }
+        }
+
+        if (!isCam && activeClipId != null) {
+            CompactSliderRow(
+                label = "Opacity",
+                valueText = "${(opacity * 100).roundToInt()}%",
+                value = opacity,
+                range = 0f..1f,
+                onValueChange = {
+                    opacity = it
+                    vm.setClipOpacityKeyframe(activeClipId, tl.playhead.toInt(), it, done = false)
+                },
+                onValueChangeFinished = {
+                    vm.setClipOpacityKeyframe(activeClipId, tl.playhead.toInt(), opacity, done = true)
+                },
+            )
+        }
+
+        CompactSliderRow(
+            label = "Gaussian Blur",
+            valueText = "${filter.gaussianBlur.roundToInt()}px",
+            value = filter.gaussianBlur,
+            range = 0f..48f,
+            onValueChange = { pushFilter(filter.copy(gaussianBlur = it), done = false) },
+            onValueChangeFinished = { pushFilter(filter, done = true) },
+        )
+        CompactSliderRow(
+            label = "Hue Shift",
+            valueText = "${(filter.hueShift * 360f).roundToInt()}°",
+            value = filter.hueShift,
+            range = -0.5f..0.5f,
+            onValueChange = { pushFilter(filter.copy(hueShift = it), done = false) },
+            onValueChangeFinished = { pushFilter(filter, done = true) },
+        )
+        CompactSliderRow(
+            label = "Saturation",
+            valueText = "${(filter.saturation * 100).roundToInt()}%",
+            value = filter.saturation,
+            range = 0f..2f,
+            onValueChange = { pushFilter(filter.copy(saturation = it), done = false) },
+            onValueChangeFinished = { pushFilter(filter, done = true) },
+        )
+        CompactSliderRow(
+            label = "Brightness",
+            valueText = "${(filter.brightness * 100).roundToInt()}%",
+            value = filter.brightness,
+            range = -1f..1f,
+            onValueChange = { pushFilter(filter.copy(brightness = it), done = false) },
+            onValueChangeFinished = { pushFilter(filter, done = true) },
+        )
+        CompactSliderRow(
+            label = "Sharpen",
+            valueText = "${(filter.sharpen * 100).roundToInt()}%",
+            value = filter.sharpen,
+            range = 0f..2f,
+            onValueChange = { pushFilter(filter.copy(sharpen = it), done = false) },
+            onValueChangeFinished = { pushFilter(filter, done = true) },
+        )
+        CompactSliderRow(
+            label = "Noise / Grain",
+            valueText = "${(filter.noise * 100).roundToInt()}%",
+            value = filter.noise,
+            range = 0f..1f,
+            onValueChange = { pushFilter(filter.copy(noise = it), done = false) },
+            onValueChangeFinished = { pushFilter(filter, done = true) },
+        )
     }
 }
 
@@ -1775,12 +3073,15 @@ private fun BoxScope.KeyframeEasingPopover(
             MenuActionRow(label) {
                 vm.setClipTransformEasing(clipId, frame, kind)
                 vm.setClipOpacityEasing(clipId, frame, kind)
+                vm.setClipFilterEasing(clipId, frame, kind)
                 vm.editingKeyframe = null
             }
         }
         MenuActionRow("Delete Keyframe", color = PerformRed) {
             vm.deleteClipTransformKeyframe(clipId, frame)
             vm.deleteClipOpacityKeyframe(clipId, frame)
+            vm.deleteClipFilterKeyframe(clipId, frame)
+            vm.deleteClipDeformKeyframe(clipId, frame)
             vm.editingKeyframe = null
         }
     }
@@ -1812,6 +3113,20 @@ private fun ClipContextMenuCard(
                 },
             )
         }
+        Text(
+            text = if (clip.performOnionGuide) "👻 Ghost:ON" else "👻 Ghost",
+            color = if (clip.performOnionGuide) OpacityCyan else DreamsInk,
+            fontSize = 12.sp,
+            modifier = Modifier.clickable {
+                vm.setPerformOnionGuide(
+                    clipId = clip.id,
+                    enabled = !clip.performOnionGuide,
+                    isolateFirstFrame = true,
+                    opacity = clip.performGuideOpacity.coerceIn(0.2f, 0.85f),
+                    colorRgb = clip.performGuideColor.ifEmpty { listOf(0.15f, 0.85f, 1.0f) },
+                )
+            },
+        )
         Text(
             text = "Split",
             color = DreamsInk,
@@ -1850,6 +3165,63 @@ private fun ClipContextMenuCard(
 }
 
 @Composable
+private fun ToggleRow(
+    label: String,
+    checked: Boolean,
+    onToggle: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(DreamsClipFill)
+            .clickable(onClick = onToggle)
+            .padding(horizontal = 10.dp, vertical = 7.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(label, color = DreamsInk, fontSize = 12.sp)
+        Text(
+            text = if (checked) "ON" else "OFF",
+            color = if (checked) Pc.Accent else DreamsDimInk,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold,
+        )
+    }
+}
+
+@Composable
+private fun CompactSliderRow(
+    label: String,
+    valueText: String,
+    value: Float,
+    range: ClosedFloatingPointRange<Float>,
+    onValueChange: (Float) -> Unit,
+    onValueChangeFinished: () -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text(label, color = DreamsInk, fontSize = 11.sp)
+            Text(valueText, color = DreamsDimInk, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+        }
+        Slider(
+            value = value.coerceIn(range.start, range.endInclusive),
+            onValueChange = onValueChange,
+            onValueChangeFinished = onValueChangeFinished,
+            valueRange = range,
+            colors = SliderDefaults.colors(
+                thumbColor = Pc.Accent,
+                activeTrackColor = Pc.Accent,
+            ),
+            modifier = Modifier.height(26.dp),
+        )
+    }
+}
+
+@Composable
 private fun MenuActionRow(
     label: String,
     color: Color = DreamsInk,
@@ -1863,6 +3235,6 @@ private fun MenuActionRow(
             .clickable(onClick = onClick)
             .padding(horizontal = 12.dp, vertical = 8.dp),
     ) {
-        Text(text = label, color = color, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+        Text(text = label, color = color, fontSize = 12.sp, fontWeight = FontWeight.Medium)
     }
 }

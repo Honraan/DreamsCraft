@@ -62,6 +62,53 @@ class TimelineUiTest {
         // Pulling the Center Action Bar handle all the way down enters Flipbook Mode automatically
         val collapsed = splitViewHandleDrag(currentRatio = 0.30f, deltaY = 200f, containerHeight = 1000f)
         assertTrue(collapsed.enterFlipbook)
-        assertEquals(0.38f, collapsed.ratio, 0.001f)
+        assertEquals(0.30f, collapsed.ratio, 0.001f)
+    }
+
+    @Test
+    fun lassoSelectionAndPointInPolygonSelectEnclosedClips() {
+        val square = listOf(0f to 0f, 200f to 0f, 200f to 100f, 0f to 100f)
+        assertTrue(pointInPolygon(100f, 50f, square))
+        assertFalse(pointInPolygon(250f, 50f, square))
+
+        val clips = listOf(
+            ClipBounds(1uL, 20f, 10f, 80f, 60f),
+            ClipBounds(2uL, 120f, 20f, 180f, 80f),
+            ClipBounds(3uL, 300f, 20f, 360f, 80f),
+        )
+        val selected = clipsInLasso(square, clips)
+        assertEquals(setOf(1uL, 2uL), selected)
+    }
+
+    @Test
+    fun scratchToDeleteDetectsZigZagAndRejectsSimpleLines() {
+        val straightLine = listOf(0f to 20f, 30f to 20f, 60f to 20f, 90f to 20f, 120f to 20f, 150f to 20f)
+        assertFalse(isScratchToDeleteGesture(straightLine))
+
+        val zigZag = listOf(
+            10f to 20f, 60f to 22f,
+            15f to 28f, 65f to 30f,
+            12f to 36f, 62f to 38f,
+            15f to 42f,
+        )
+        assertTrue(isScratchToDeleteGesture(zigZag))
+    }
+
+    @Test
+    fun distortCornersExpandBilinearlyIntoFourByFourWarpMesh() {
+        val id = defaultIdentityDeformPoints()
+        assertEquals(32, id.size)
+        assertEquals(0f, id[0], 0.001f)
+        assertEquals(0f, id[1], 0.001f)
+        assertEquals(1f, id[30], 0.001f)
+        assertEquals(1f, id[31], 0.001f)
+
+        val skewed = distortCornersToDeformPoints(
+            listOf(0.1f to 0f, 0.9f to 0f, 1f to 1f, 0f to 1f),
+        )
+        assertEquals(32, skewed.size)
+        assertEquals(0.1f, skewed[0], 0.001f)
+        assertEquals(0.9f, skewed[6], 0.001f)
+        assertEquals(0.5f, (skewed[0] + skewed[6]) / 2f, 0.001f)
     }
 }

@@ -6597,6 +6597,129 @@ fn multitrack_timeline_tracks_clips_keyframes_perform_and_png_sequence_export() 
 }
 
 #[test]
+fn dreamscraft_v2_auto_draw_perform_ghost_track_effects_audio_filters_warp_and_camera() {
+    let Some(s) = session(40, 40) else { return };
+    s.enable_animation_for_new_artwork();
+    let tl0 = s.timeline_state().unwrap();
+    let track0 = tl0.tracks[0].id;
+    let clip0 = tl0.active_clip_id.unwrap();
+
+    // 1. Auto-Draw Frame on Empty Timeline + 1-step atomic Undo
+    s.set_brush_size(0.4);
+    s.set_color(1.0, 0.0, 0.0);
+    s.stroke_begin(PointerKind::Finger, vec![sample(20.0, 20.0, 0.0)]);
+    s.stroke_end(vec![]);
+    // Move playhead to an empty frame (frame 6) and draw -> auto-creates frame/clip
+    s.timeline_set_playhead(6);
+    s.set_color(0.0, 0.0, 1.0);
+    s.stroke_begin(PointerKind::Finger, vec![sample(15.0, 15.0, 0.0)]);
+    s.stroke_end(vec![]);
+    let after_auto = s.timeline_state().unwrap();
+    assert!(
+        after_auto.tracks[0].clips.iter().any(|c| c.start_frame <= 6 && 6 < c.start_frame + c.duration_frames),
+        "drawing on empty playhead auto-creates frame/clip at frame 6"
+    );
+    // One single Undo reverses BOTH the paint stroke AND the auto-created frame!
+    assert!(s.undo().is_some());
+    let after_undo = s.timeline_state().unwrap();
+    assert!(
+        !after_undo.tracks[0].clips.iter().any(|c| c.start_frame <= 6 && 6 < c.start_frame + c.duration_frames),
+        "single undo reverts auto-created frame together with stroke"
+    );
+
+    // 2. Perform Motion Ghost (Onion Skin of 1st frame moving along Perform path)
+    s.timeline_set_playhead(0);
+    assert!(s.timeline_set_perform_onion_guide(clip0, true, true, 0.55, vec![0.1, 0.9, 1.0]));
+    let ghost_state = s.timeline_state().unwrap();
+    assert!(ghost_state.tracks[0].clips[0].perform_onion_guide);
+    assert!(ghost_state.tracks[0].clips[0].perform_guide_isolated);
+
+    // 3. Track Options & Layer Effects (Color, Alpha Lock, Clip to Below, Effects, Duplicate, Delete)
+    assert!(s.timeline_set_track_color(track0, 0xFFE91E63));
+    assert!(s.timeline_set_track_alpha_lock(track0, true));
+    let mut fx = crate::TimelineTrackEffectsInfo {
+        outline_enabled: true,
+        outline_width: 2.0,
+        outline_color: vec![1.0, 1.0, 0.0, 1.0],
+        shadow_enabled: true,
+        shadow_offset_x: 3.0,
+        shadow_offset_y: 3.0,
+        shadow_blur: 2.0,
+        shadow_color: vec![0.0, 0.0, 0.0, 0.5],
+        glow_enabled: false,
+        glow_inner: false,
+        glow_radius: 4.0,
+        glow_intensity: 0.5,
+        glow_color: vec![0.3, 0.8, 1.0, 1.0],
+        color_overlay_enabled: false,
+        color_overlay_color: vec![1.0, 0.0, 0.0, 0.5],
+    };
+    assert!(s.timeline_set_track_effects(track0, fx.clone(), true));
+    let dup_track = s.timeline_duplicate_track(track0).unwrap();
+    assert!(s.timeline_set_track_clip_to_below(dup_track, true));
+    assert_eq!(s.timeline_state().unwrap().tracks.len(), 2);
+    assert!(s.timeline_delete_track(dup_track));
+    assert_eq!(s.timeline_state().unwrap().tracks.len(), 1);
+    fx.outline_enabled = false;
+    assert!(s.timeline_set_track_effects(track0, fx, true));
+
+    // 4. Live Filters + Warp/Distort + Perform Warp
+    let flt = crate::TimelineLiveFilterInfo {
+        gaussian_blur: 4.0,
+        hue_shift: 0.25,
+        saturation: 1.2,
+        brightness: 0.05,
+        sharpen: 0.3,
+        noise: 0.1,
+    };
+    assert!(s.timeline_set_filter_keyframe(clip0, 0, flt, true));
+    assert_eq!(s.timeline_state().unwrap().tracks[0].clips[0].filter_keyframes.len(), 1);
+    let mut pts = Vec::with_capacity(32);
+    for r in 0..4 {
+        for c in 0..4 {
+            pts.push(c as f32 / 3.0);
+            pts.push(r as f32 / 3.0 + if r == 3 { 0.1 } else { 0.0 });
+        }
+    }
+    let deform = crate::TimelineDeformInfo { distort_corners: Vec::new(), warp_mesh: pts };
+    assert!(s.timeline_set_deform_keyframe(clip0, 0, deform, true));
+    assert_eq!(s.timeline_state().unwrap().tracks[0].clips[0].deform_keyframes.len(), 1);
+
+    // 5. Audio Track Import + Stereo Mix
+    let pcm: Vec<i16> = (0..4800).map(|i| if i % 2 == 0 { 10_000 } else { -10_000 }).collect();
+    let audio_clip = s.timeline_import_audio_pcm("SFX".to_owned(), 48_000, 1, pcm, 0).unwrap();
+    assert!(s.timeline_set_audio_volume_keyframe(audio_clip, 0, 0.75, true));
+    assert!(s.timeline_set_audio_pan_keyframe(audio_clip, 0, -0.5, true));
+    let mixed = s.timeline_mix_audio_pcm(0, 1, 48_000);
+    assert!(!mixed.is_empty());
+    assert!(mixed.iter().any(|&v| v != 0));
+
+    // 6. Multi-layer Cel Sub-layers + Camera Track
+    let sub = s.timeline_add_cel_sublayer(clip0, 0).unwrap();
+    assert!(sub > 0);
+    let sublayers = s.timeline_cel_sublayer_ids(clip0, 0);
+    assert_eq!(sublayers.len(), 2, "cel upgraded to group holding original + new sub-layer");
+
+    assert!(s.timeline_set_camera_transform_keyframe(
+        0,
+        crate::TimelineTransformInfo {
+            x: 4.0,
+            y: -2.0,
+            scale_x: 1.5,
+            scale_y: 1.5,
+            rotation: 0.0,
+            anchor_x: 0.5,
+            anchor_y: 0.5,
+        },
+        true,
+    ));
+    let cam_state = s.timeline_state().unwrap();
+    assert!(cam_state.camera_enabled);
+    assert_eq!(cam_state.camera_transform_keyframes.len(), 1);
+    assert!((cam_state.camera_transform.scale_x - 1.5).abs() < 1e-4);
+}
+
+#[test]
 fn animation_assist_shows_onion_skins_and_plays() {
     let Some(s) = session(40, 40) else { return };
     s.set_brush_size(0.6);

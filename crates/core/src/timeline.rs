@@ -7,10 +7,12 @@ use std::io::BufWriter;
 use std::path::Path;
 
 use procraft_engine::animation::Playback;
-use procraft_engine::document::{BlendMode, Document, LayerId};
+use procraft_engine::audio::{decode_wav_pcm, float_pcm_to_i16};
+use procraft_engine::document::{BlendMode, Document, LayerId, LayerKind};
 use procraft_engine::timeline::{
-    Cel, Clip, ClipId, ClipKind, Easing, Keyframe, MotionSample, OnionSkinSettings, Timeline, Track, TrackId,
-    Transform2D, WorkArea, simplify_motion_samples,
+    Cel, Clip, ClipId, ClipKind, Deform2D, DeformSample, Easing, Keyframe, LiveFilterState, MotionSample,
+    OnionSkinSettings, Timeline, Track, TrackEffects, TrackId, Transform2D, WorkArea, simplify_deform_samples,
+    simplify_motion_samples,
 };
 
 use crate::animation::AnimationPlayback;
@@ -120,13 +122,176 @@ impl From<&TimelineTransformInfo> for Transform2D {
     }
 }
 
-/// A keyframe on a clip or track property sub-track.
+/// Non-destructive live image filter parameters exposed over UniFFI.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct TimelineLiveFilterInfo {
+    pub gaussian_blur: f32,
+    pub hue_shift: f32,
+    pub saturation: f32,
+    pub brightness: f32,
+    pub sharpen: f32,
+    pub noise: f32,
+}
+
+impl Default for TimelineLiveFilterInfo {
+    fn default() -> Self {
+        Self::from(LiveFilterState::default())
+    }
+}
+
+impl From<LiveFilterState> for TimelineLiveFilterInfo {
+    fn from(f: LiveFilterState) -> Self {
+        TimelineLiveFilterInfo {
+            gaussian_blur: f.gaussian_blur,
+            hue_shift: f.hue_shift,
+            saturation: f.saturation,
+            brightness: f.brightness,
+            sharpen: f.sharpen,
+            noise: f.noise,
+        }
+    }
+}
+
+impl From<&TimelineLiveFilterInfo> for LiveFilterState {
+    fn from(info: &TimelineLiveFilterInfo) -> Self {
+        LiveFilterState {
+            gaussian_blur: info.gaussian_blur,
+            hue_shift: info.hue_shift,
+            saturation: info.saturation,
+            brightness: info.brightness,
+            sharpen: info.sharpen,
+            noise: info.noise,
+        }
+        .repaired()
+    }
+}
+
+/// Non-destructive Warp (4×4 mesh = 32 floats) / Distort (4 corners = 8 floats) exposed over UniFFI.
+#[derive(Clone, Debug, Default, PartialEq, uniffi::Record)]
+pub struct TimelineDeformInfo {
+    /// Flattened 4 normalized `(x, y)` corners (8 floats), or empty when unused.
+    pub distort_corners: Vec<f32>,
+    /// Flattened 16 normalized `(x, y)` control points (32 floats), or empty when unused.
+    pub warp_mesh: Vec<f32>,
+}
+
+impl From<Deform2D> for TimelineDeformInfo {
+    fn from(d: Deform2D) -> Self {
+        TimelineDeformInfo {
+            distort_corners: d.distort_corners.map(|c| c.iter().flat_map(|p| *p).collect()).unwrap_or_default(),
+            warp_mesh: d.warp_mesh.map(|m| m.iter().flat_map(|p| *p).collect()).unwrap_or_default(),
+        }
+    }
+}
+
+impl From<&TimelineDeformInfo> for Deform2D {
+    fn from(info: &TimelineDeformInfo) -> Self {
+        let distort_corners = if info.distort_corners.len() >= 8 {
+            Some(std::array::from_fn(|i| {
+                [
+                    info.distort_corners.get(i * 2).copied().unwrap_or(0.0),
+                    info.distort_corners.get(i * 2 + 1).copied().unwrap_or(0.0),
+                ]
+            }))
+        } else {
+            None
+        };
+        let warp_mesh = if info.warp_mesh.len() >= 32 {
+            Some(std::array::from_fn(|i| {
+                [
+                    info.warp_mesh.get(i * 2).copied().unwrap_or(0.0),
+                    info.warp_mesh.get(i * 2 + 1).copied().unwrap_or(0.0),
+                ]
+            }))
+        } else {
+            None
+        };
+        Deform2D { distort_corners, warp_mesh }.repaired()
+    }
+}
+
+/// Non-destructive Layer Effects attached to a Track, exposed over UniFFI.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct TimelineTrackEffectsInfo {
+    pub outline_enabled: bool,
+    pub outline_width: f32,
+    pub outline_color: Vec<f32>,
+    pub shadow_enabled: bool,
+    pub shadow_offset_x: f32,
+    pub shadow_offset_y: f32,
+    pub shadow_blur: f32,
+    pub shadow_color: Vec<f32>,
+    pub glow_enabled: bool,
+    pub glow_radius: f32,
+    pub glow_intensity: f32,
+    pub glow_color: Vec<f32>,
+    pub glow_inner: bool,
+    pub color_overlay_enabled: bool,
+    pub color_overlay_color: Vec<f32>,
+}
+
+impl From<TrackEffects> for TimelineTrackEffectsInfo {
+    fn from(e: TrackEffects) -> Self {
+        TimelineTrackEffectsInfo {
+            outline_enabled: e.outline_enabled,
+            outline_width: e.outline_width,
+            outline_color: e.outline_color.to_vec(),
+            shadow_enabled: e.shadow_enabled,
+            shadow_offset_x: e.shadow_offset[0],
+            shadow_offset_y: e.shadow_offset[1],
+            shadow_blur: e.shadow_blur,
+            shadow_color: e.shadow_color.to_vec(),
+            glow_enabled: e.glow_enabled,
+            glow_radius: e.glow_radius,
+            glow_intensity: e.glow_intensity,
+            glow_color: e.glow_color.to_vec(),
+            glow_inner: e.glow_inner,
+            color_overlay_enabled: e.color_overlay_enabled,
+            color_overlay_color: e.color_overlay_color.to_vec(),
+        }
+    }
+}
+
+fn vec4_or(v: &[f32], fallback: [f32; 4]) -> [f32; 4] {
+    match v {
+        [r, g, b, a, ..] => [*r, *g, *b, *a],
+        _ => fallback,
+    }
+}
+
+impl From<&TimelineTrackEffectsInfo> for TrackEffects {
+    fn from(info: &TimelineTrackEffectsInfo) -> Self {
+        let def = TrackEffects::default();
+        TrackEffects {
+            outline_enabled: info.outline_enabled,
+            outline_width: info.outline_width,
+            outline_color: vec4_or(&info.outline_color, def.outline_color),
+            shadow_enabled: info.shadow_enabled,
+            shadow_offset: [info.shadow_offset_x, info.shadow_offset_y],
+            shadow_blur: info.shadow_blur,
+            shadow_color: vec4_or(&info.shadow_color, def.shadow_color),
+            glow_enabled: info.glow_enabled,
+            glow_radius: info.glow_radius,
+            glow_intensity: info.glow_intensity,
+            glow_color: vec4_or(&info.glow_color, def.glow_color),
+            glow_inner: info.glow_inner,
+            color_overlay_enabled: info.color_overlay_enabled,
+            color_overlay_color: vec4_or(&info.color_overlay_color, def.color_overlay_color),
+        }
+        .repaired()
+    }
+}
+
+/// A keyframe on a clip, track, or camera property sub-track.
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
 pub struct TimelineKeyframeInfo {
     pub frame: u32,
     pub easing: TimelineEasingInfo,
     pub transform: Option<TimelineTransformInfo>,
     pub opacity: Option<f32>,
+    pub filter: Option<TimelineLiveFilterInfo>,
+    pub deform: Option<TimelineDeformInfo>,
+    pub scalar: Option<f32>,
 }
 
 /// A hand-drawn cel inside a Flipbook `Cel` clip.
@@ -145,6 +310,9 @@ pub enum TimelineClipKind {
     Cel,
     Layer,
     Group,
+    Audio,
+    Video,
+    Text,
 }
 
 /// Snapshot of a timed content block on a track.
@@ -162,6 +330,17 @@ pub struct TimelineClipInfo {
     pub cels: Vec<TimelineCelInfo>,
     pub transform_keyframes: Vec<TimelineKeyframeInfo>,
     pub opacity_keyframes: Vec<TimelineKeyframeInfo>,
+    pub filter_keyframes: Vec<TimelineKeyframeInfo>,
+    pub deform_keyframes: Vec<TimelineKeyframeInfo>,
+    pub volume_keyframes: Vec<TimelineKeyframeInfo>,
+    pub pan_keyframes: Vec<TimelineKeyframeInfo>,
+    pub perform_onion_guide: bool,
+    pub perform_guide_isolated: bool,
+    pub perform_guide_opacity: f32,
+    pub perform_guide_color: Vec<f32>,
+    pub audio_asset_id: Option<u64>,
+    /// Flattened `[min0, max0, min1, max1, ...]` peaks for AudioClip waveform drawing.
+    pub waveform_peaks: Vec<f32>,
 }
 
 /// Snapshot of a horizontal track on the timeline.
@@ -178,9 +357,14 @@ pub struct TimelineTrackInfo {
     pub parent_group: Option<u64>,
     pub is_group: bool,
     pub expanded: bool,
+    pub clip_to_below: bool,
+    pub alpha_lock: bool,
+    pub muted: bool,
+    pub effects: TimelineTrackEffectsInfo,
     pub clips: Vec<TimelineClipInfo>,
     pub transform_keyframes: Vec<TimelineKeyframeInfo>,
     pub opacity_keyframes: Vec<TimelineKeyframeInfo>,
+    pub filter_keyframes: Vec<TimelineKeyframeInfo>,
 }
 
 /// Onion skin configuration for the timeline.
@@ -234,10 +418,24 @@ pub struct TimelineState {
     pub flipbook_open: bool,
     pub show_backstage: bool,
     pub motion_filtering: f32,
+    pub auto_create_frame_on_draw: bool,
+    pub auto_split_cel_on_draw: bool,
     /// Evaluated Transform2D of the active clip (or active track) at `playhead`.
     pub active_evaluated_transform: TimelineTransformInfo,
     /// Evaluated opacity of the active clip (or active track) at `playhead`.
     pub active_evaluated_opacity: f32,
+    /// Evaluated LiveFilterState of the active clip at `playhead`.
+    pub active_evaluated_filter: TimelineLiveFilterInfo,
+    /// Evaluated Deform2D (Warp/Distort) of the active clip at `playhead`.
+    pub active_evaluated_deform: TimelineDeformInfo,
+    /// Global Camera Track state.
+    pub camera_enabled: bool,
+    pub camera_transform: TimelineTransformInfo,
+    pub camera_filter: TimelineLiveFilterInfo,
+    pub camera_transform_keyframes: Vec<TimelineKeyframeInfo>,
+    pub camera_filter_keyframes: Vec<TimelineKeyframeInfo>,
+    /// True if at least one AudioClip is present on the timeline.
+    pub has_audio: bool,
 }
 
 /// A live-recorded motion sample during Perform mode.
@@ -247,6 +445,13 @@ pub struct PerformSampleInfo {
     pub transform: TimelineTransformInfo,
 }
 
+/// A live-recorded Warp/Distort sample during Perform Warp mode.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct PerformDeformSampleInfo {
+    pub frame: u32,
+    pub deform: TimelineDeformInfo,
+}
+
 fn map_transform_kfs(kfs: &[Keyframe<Transform2D>]) -> Vec<TimelineKeyframeInfo> {
     kfs.iter()
         .map(|k| TimelineKeyframeInfo {
@@ -254,6 +459,9 @@ fn map_transform_kfs(kfs: &[Keyframe<Transform2D>]) -> Vec<TimelineKeyframeInfo>
             easing: TimelineEasingInfo::from(k.easing),
             transform: Some(TimelineTransformInfo::from(k.value)),
             opacity: None,
+            filter: None,
+            deform: None,
+            scalar: None,
         })
         .collect()
 }
@@ -265,11 +473,58 @@ fn map_opacity_kfs(kfs: &[Keyframe<f32>]) -> Vec<TimelineKeyframeInfo> {
             easing: TimelineEasingInfo::from(k.easing),
             transform: None,
             opacity: Some(k.value),
+            filter: None,
+            deform: None,
+            scalar: Some(k.value),
         })
         .collect()
 }
 
-fn snapshot_clip(track_id: TrackId, clip: &Clip, playhead: u32) -> TimelineClipInfo {
+fn map_filter_kfs(kfs: &[Keyframe<LiveFilterState>]) -> Vec<TimelineKeyframeInfo> {
+    kfs.iter()
+        .map(|k| TimelineKeyframeInfo {
+            frame: k.frame,
+            easing: TimelineEasingInfo::from(k.easing),
+            transform: None,
+            opacity: None,
+            filter: Some(TimelineLiveFilterInfo::from(k.value)),
+            deform: None,
+            scalar: None,
+        })
+        .collect()
+}
+
+fn map_deform_kfs(kfs: &[Keyframe<Deform2D>]) -> Vec<TimelineKeyframeInfo> {
+    kfs.iter()
+        .map(|k| TimelineKeyframeInfo {
+            frame: k.frame,
+            easing: TimelineEasingInfo::from(k.easing),
+            transform: None,
+            opacity: None,
+            filter: None,
+            deform: Some(TimelineDeformInfo::from(k.value)),
+            scalar: None,
+        })
+        .collect()
+}
+
+fn map_scalar_kfs(kfs: &[Keyframe<f32>]) -> Vec<TimelineKeyframeInfo> {
+    kfs.iter()
+        .map(|k| TimelineKeyframeInfo {
+            frame: k.frame,
+            easing: TimelineEasingInfo::from(k.easing),
+            transform: None,
+            opacity: None,
+            filter: None,
+            deform: None,
+            scalar: Some(k.value),
+        })
+        .collect()
+}
+
+fn snapshot_clip(tl: &Timeline, track_id: TrackId, clip: &Clip, playhead: u32) -> TimelineClipInfo {
+    let mut audio_asset_id = None;
+    let mut waveform_peaks = Vec::new();
     let (kind, primary_layer_id, cels) = match &clip.kind {
         ClipKind::Cel { cels } => {
             let mut cursor = clip.start_frame;
@@ -294,6 +549,23 @@ fn snapshot_clip(track_id: TrackId, clip: &Clip, playhead: u32) -> TimelineClipI
         }
         ClipKind::Layer { layer } => (TimelineClipKind::Layer, layer.0, Vec::new()),
         ClipKind::Group { members } => (TimelineClipKind::Group, members.first().map_or(0, |l| l.0), Vec::new()),
+        ClipKind::Audio { asset_id, .. } => {
+            audio_asset_id = Some(asset_id.0);
+            if let Some(asset) = tl.audio_asset(*asset_id) {
+                // Downsample peaks to at most 128 buckets for crisp, low-overhead UI rendering
+                let total = asset.peaks.len();
+                let step = (total / 128).max(1);
+                for chunk in asset.peaks.chunks(step) {
+                    let lo = chunk.iter().map(|p| p[0]).fold(0.0_f32, f32::min);
+                    let hi = chunk.iter().map(|p| p[1]).fold(0.0_f32, f32::max);
+                    waveform_peaks.push(lo);
+                    waveform_peaks.push(hi);
+                }
+            }
+            (TimelineClipKind::Audio, 0, Vec::new())
+        }
+        ClipKind::Video { layer, .. } => (TimelineClipKind::Video, layer.0, Vec::new()),
+        ClipKind::Text { layer } => (TimelineClipKind::Text, layer.0, Vec::new()),
     };
     TimelineClipInfo {
         id: clip.id.0,
@@ -308,10 +580,20 @@ fn snapshot_clip(track_id: TrackId, clip: &Clip, playhead: u32) -> TimelineClipI
         cels,
         transform_keyframes: map_transform_kfs(&clip.keyframes.transform),
         opacity_keyframes: map_opacity_kfs(&clip.keyframes.opacity),
+        filter_keyframes: map_filter_kfs(&clip.keyframes.filter),
+        deform_keyframes: map_deform_kfs(&clip.keyframes.deform),
+        volume_keyframes: map_scalar_kfs(&clip.keyframes.volume),
+        pan_keyframes: map_scalar_kfs(&clip.keyframes.pan),
+        perform_onion_guide: clip.perform_onion_guide,
+        perform_guide_isolated: clip.perform_guide_layer.is_some(),
+        perform_guide_opacity: clip.perform_guide_opacity,
+        perform_guide_color: clip.perform_guide_color.to_vec(),
+        audio_asset_id,
+        waveform_peaks,
     }
 }
 
-fn snapshot_track(track: &Track, playhead: u32) -> TimelineTrackInfo {
+fn snapshot_track(tl: &Timeline, track: &Track, playhead: u32) -> TimelineTrackInfo {
     TimelineTrackInfo {
         id: track.id.0,
         name: track.name.clone(),
@@ -324,25 +606,42 @@ fn snapshot_track(track: &Track, playhead: u32) -> TimelineTrackInfo {
         parent_group: track.parent_group.map(|p| p.0),
         is_group: track.is_group,
         expanded: track.expanded,
-        clips: track.clips.iter().map(|c| snapshot_clip(track.id, c, playhead)).collect(),
+        clip_to_below: track.clip_to_below,
+        alpha_lock: track.alpha_lock,
+        muted: track.muted,
+        effects: TimelineTrackEffectsInfo::from(track.effects),
+        clips: track.clips.iter().map(|c| snapshot_clip(tl, track.id, c, playhead)).collect(),
         transform_keyframes: map_transform_kfs(&track.keyframes.transform),
         opacity_keyframes: map_opacity_kfs(&track.keyframes.opacity),
+        filter_keyframes: map_filter_kfs(&track.keyframes.filter),
     }
 }
 
 pub(crate) fn snapshot_timeline(tl: &Timeline) -> TimelineState {
     let playhead = tl.playhead;
-    let (active_transform, active_opacity) = if let Some(cid) = tl.active_clip
+    let pf = playhead as f32;
+    let (active_transform, active_opacity, active_filter, active_deform) = if let Some(cid) = tl.active_clip
         && let Some(clip) = tl.clip(cid)
     {
-        (clip.keyframes.evaluate_transform(playhead as f32), clip.keyframes.evaluate_opacity(playhead as f32))
+        (
+            clip.keyframes.evaluate_transform(pf),
+            clip.keyframes.evaluate_opacity(pf),
+            clip.keyframes.evaluate_filter(pf),
+            clip.keyframes.evaluate_deform(pf),
+        )
     } else if let Some(tid) = tl.active_track
         && let Some(track) = tl.track(tid)
     {
-        (track.keyframes.evaluate_transform(playhead as f32), track.keyframes.evaluate_opacity(playhead as f32))
+        (
+            track.keyframes.evaluate_transform(pf),
+            track.keyframes.evaluate_opacity(pf),
+            track.keyframes.evaluate_filter(pf),
+            Deform2D::default(),
+        )
     } else {
-        (Transform2D::default(), 1.0)
+        (Transform2D::default(), 1.0, LiveFilterState::default(), Deform2D::default())
     };
+    let has_audio = tl.tracks.iter().flat_map(|t| &t.clips).any(|c| matches!(c.kind, ClipKind::Audio { .. }));
 
     TimelineState {
         fps: tl.fps,
@@ -355,14 +654,24 @@ pub(crate) fn snapshot_timeline(tl: &Timeline) -> TimelineState {
         },
         work_area: tl.work_area.map(|w| TimelineWorkAreaInfo { start: w.start, end: w.end }),
         onion: TimelineOnionInfo::from(&tl.onion),
-        tracks: tl.tracks.iter().map(|t| snapshot_track(t, playhead)).collect(),
+        tracks: tl.tracks.iter().map(|t| snapshot_track(tl, t, playhead)).collect(),
         active_track_id: tl.active_track.map(|t| t.0),
         active_clip_id: tl.active_clip.map(|c| c.0),
         flipbook_open: tl.flipbook_open,
         show_backstage: tl.show_backstage,
         motion_filtering: tl.motion_filtering,
+        auto_create_frame_on_draw: tl.auto_create_frame_on_draw,
+        auto_split_cel_on_draw: tl.auto_split_cel_on_draw,
         active_evaluated_transform: TimelineTransformInfo::from(active_transform),
         active_evaluated_opacity: active_opacity,
+        active_evaluated_filter: TimelineLiveFilterInfo::from(active_filter),
+        active_evaluated_deform: TimelineDeformInfo::from(active_deform),
+        camera_enabled: tl.camera_enabled,
+        camera_transform: TimelineTransformInfo::from(tl.camera.evaluate_transform(pf)),
+        camera_filter: TimelineLiveFilterInfo::from(tl.camera.evaluate_filter(pf)),
+        camera_transform_keyframes: map_transform_kfs(&tl.camera.transform),
+        camera_filter_keyframes: map_filter_kfs(&tl.camera.filter),
+        has_audio,
     }
 }
 
@@ -389,9 +698,24 @@ pub(crate) fn sync_current_layer_to_playhead(doc: &mut Document) {
         None
     });
     if let Some(layer) = target_layer
-        && doc.layer(layer).is_some()
+        && let Some(meta) = doc.layer(layer)
     {
-        doc.set_current(layer);
+        let resolved = if meta.kind == LayerKind::Group {
+            let members = doc.members(Some(layer));
+            if members.contains(&doc.current()) {
+                doc.current()
+            } else {
+                members
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|&id| doc.layer(id).is_some_and(|l| l.kind == LayerKind::Paint))
+                    .unwrap_or(layer)
+            }
+        } else {
+            layer
+        };
+        doc.set_current(resolved);
     }
 }
 
@@ -766,26 +1090,21 @@ impl CanvasSession {
         .is_some()
     }
 
-    /// Deletes `track_id` (so long as at least one track remains) as an undo step.
+    /// Deletes `track_id` (and safely removes orphaned layers). If it was the last track, keeps one
+    /// clean empty track so the canvas stays editable.
     pub fn timeline_delete_track(&self, track_id: u64) -> bool {
         self.change("delete track", |d| {
             let tl = d.ensure_timeline();
-            if tl.tracks.len() <= 1 {
-                return None;
+            let removed_layers = tl.delete_track(TrackId(track_id))?;
+            if tl.tracks.is_empty() {
+                tl.add_track(Some("Track 1"), false);
             }
-            let tid = TrackId(track_id);
-            if tl.track(tid).is_some_and(|t| t.locked) {
-                return None;
-            }
-            let pos = tl.tracks.iter().position(|t| t.id == tid)?;
-            tl.tracks.remove(pos);
-            for t in &mut tl.tracks {
-                if t.parent_group == Some(tid) {
-                    t.parent_group = None;
+            let still_managed = tl.managed_layers();
+            for lid in removed_layers {
+                if !still_managed.contains(&lid) && d.layers().len() > 1 {
+                    let _ = d.delete_layer(lid);
                 }
             }
-            tl.active_track = tl.tracks.last().map(|t| t.id);
-            tl.active_clip = tl.active_track.and_then(|a| tl.track(a)).and_then(|t| t.clips.first()).map(|c| c.id);
             sync_current_layer_to_playhead(d);
             Some(())
         })
@@ -904,10 +1223,24 @@ impl CanvasSession {
                 ClipKind::Cel { cels: new_cels }
             }
             ClipKind::Layer { layer } => ClipKind::Layer { layer: map_layer(&mut st.doc, *layer) },
+            ClipKind::Text { layer } => ClipKind::Text { layer: map_layer(&mut st.doc, *layer) },
+            ClipKind::Video { video_id, layer, source_fps, trim_in_frames, frame_count } => ClipKind::Video {
+                video_id: *video_id,
+                layer: map_layer(&mut st.doc, *layer),
+                source_fps: *source_fps,
+                trim_in_frames: *trim_in_frames,
+                frame_count: *frame_count,
+            },
             ClipKind::Group { members } => {
                 let new_members: Vec<LayerId> = members.iter().map(|&m| map_layer(&mut st.doc, m)).collect();
                 ClipKind::Group { members: new_members }
             }
+            ClipKind::Audio { asset_id, trim_start_samples, sample_rate, channels } => ClipKind::Audio {
+                asset_id: *asset_id,
+                trim_start_samples: *trim_start_samples,
+                sample_rate: *sample_rate,
+                channels: *channels,
+            },
         };
         let new_start = clip.end_frame();
         let delta = i64::from(new_start) - i64::from(clip.start_frame);
@@ -925,6 +1258,10 @@ impl CanvasSession {
             opacity: clip.opacity,
             kind: new_kind,
             keyframes: new_kf,
+            perform_onion_guide: clip.perform_onion_guide,
+            perform_guide_layer: clip.perform_guide_layer,
+            perform_guide_opacity: clip.perform_guide_opacity,
+            perform_guide_color: clip.perform_guide_color,
         };
         new_clip.sync_duration();
         let end = new_clip.end_frame();
@@ -1286,5 +1623,641 @@ impl CanvasSession {
         }
         self.exported(1.0);
         Ok(count)
+    }
+
+    // ---- DreamsCraft v2.0: Auto-Draw, Perform Motion Ghost, Track Options & Effects, Audio,
+    // ---- Live Filters, Warp/Distort, Video/Text Clips, Multi-Layer Cels, and Camera Track ----
+
+    /// Configures automatic frame creation when drawing on empty timeline spots and automatic
+    /// hold splitting when drawing inside an extended cel hold.
+    pub fn timeline_set_auto_draw_options(&self, auto_create_frame: bool, auto_split_cel: bool) {
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        let tl = st.doc.ensure_timeline();
+        tl.auto_create_frame_on_draw = auto_create_frame;
+        tl.auto_split_cel_on_draw = auto_split_cel;
+        self.shared.frame(st);
+    }
+
+    /// Configures **Perform Motion Onion Skin (Ghost 1st Frame)** on `clip_id`: when `enabled`,
+    /// renders the first frame (or an isolated guide layer when `isolate_first_frame` is true) as a
+    /// tinted onion skin moving along the Perform motion trajectory so the user can animate
+    /// frame-by-frame right on top of it.
+    pub fn timeline_set_perform_onion_guide(
+        &self,
+        clip_id: u64,
+        enabled: bool,
+        isolate_first_frame: bool,
+        opacity: f32,
+        color_rgb: Vec<f32>,
+    ) -> bool {
+        self.change("perform motion ghost", |d| {
+            let cid = ClipId(clip_id);
+            let tl = d.ensure_timeline();
+            let clip = tl.clip_mut(cid)?;
+            clip.perform_onion_guide = enabled;
+            clip.perform_guide_opacity = if opacity.is_finite() { opacity.clamp(0.0, 1.0) } else { 0.45 };
+            if let [r, g, b, ..] = color_rgb.as_slice() {
+                clip.perform_guide_color = [r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)];
+            }
+            if isolate_first_frame {
+                if clip.perform_guide_layer.is_none() {
+                    clip.perform_guide_layer = clip.first_layer();
+                }
+            } else {
+                clip.perform_guide_layer = None;
+            }
+            Some(())
+        })
+        .is_some()
+    }
+
+    /// Duplicates `track_id` (including all its clips, keyframes, effects, and underlying GPU
+    /// layer pixels) right above `track_id` as a single undo step.
+    pub fn timeline_duplicate_track(&self, track_id: u64) -> Option<u64> {
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        st.finish_stroke();
+        st.settle();
+        let tid = TrackId(track_id);
+        let (pos, src_track) = {
+            let tl = st.doc.ensure_timeline();
+            let idx = tl.tracks.iter().position(|t| t.id == tid)?;
+            (idx, tl.tracks.get(idx)?.clone())
+        };
+        let layers_needed: usize = src_track.clips.iter().map(|c| c.referenced_layers().len()).sum();
+        if !st.doc.has_room(layers_needed) {
+            return None;
+        }
+        let before = st.doc.clone();
+        let mut pairs = Vec::new();
+        let mut map_layer = |doc: &mut Document, old: LayerId| -> LayerId {
+            if let Some((new_id, copy_pairs)) = doc.duplicate(old) {
+                pairs.extend(copy_pairs);
+                new_id
+            } else {
+                old
+            }
+        };
+
+        let mut next_id = {
+            let tl = st.doc.ensure_timeline();
+            tl.tracks
+                .iter()
+                .map(|t| t.id.0)
+                .chain(tl.tracks.iter().flat_map(|t| &t.clips).map(|c| c.id.0))
+                .max()
+                .unwrap_or(0)
+                .saturating_add(100)
+        };
+        let new_track_id = TrackId(next_id);
+        next_id = next_id.saturating_add(1);
+
+        let mut new_clips = Vec::with_capacity(src_track.clips.len());
+        for clip in &src_track.clips {
+            let new_clip_id = ClipId(next_id);
+            next_id = next_id.saturating_add(1);
+            let new_kind = match &clip.kind {
+                ClipKind::Cel { cels } => ClipKind::Cel {
+                    cels: cels.iter().map(|c| Cel { layer: map_layer(&mut st.doc, c.layer), hold: c.hold }).collect(),
+                },
+                ClipKind::Layer { layer } => ClipKind::Layer { layer: map_layer(&mut st.doc, *layer) },
+                ClipKind::Text { layer } => ClipKind::Text { layer: map_layer(&mut st.doc, *layer) },
+                ClipKind::Video { video_id, layer, source_fps, trim_in_frames, frame_count } => ClipKind::Video {
+                    video_id: *video_id,
+                    layer: map_layer(&mut st.doc, *layer),
+                    source_fps: *source_fps,
+                    trim_in_frames: *trim_in_frames,
+                    frame_count: *frame_count,
+                },
+                ClipKind::Group { members } => {
+                    ClipKind::Group { members: members.iter().map(|&m| map_layer(&mut st.doc, m)).collect() }
+                }
+                ClipKind::Audio { asset_id, trim_start_samples, sample_rate, channels } => ClipKind::Audio {
+                    asset_id: *asset_id,
+                    trim_start_samples: *trim_start_samples,
+                    sample_rate: *sample_rate,
+                    channels: *channels,
+                },
+            };
+            new_clips.push(Clip {
+                id: new_clip_id,
+                name: clip.name.clone(),
+                start_frame: clip.start_frame,
+                duration_frames: clip.duration_frames,
+                blend: clip.blend,
+                opacity: clip.opacity,
+                kind: new_kind,
+                keyframes: clip.keyframes.clone(),
+                perform_onion_guide: clip.perform_onion_guide,
+                perform_guide_layer: clip.perform_guide_layer.map(|g| map_layer(&mut st.doc, g)),
+                perform_guide_opacity: clip.perform_guide_opacity,
+                perform_guide_color: clip.perform_guide_color,
+            });
+        }
+        let mut copy_track = src_track;
+        copy_track.id = new_track_id;
+        copy_track.name = format!("{} Copy", copy_track.name);
+        copy_track.clips = new_clips;
+
+        let tl = st.doc.ensure_timeline();
+        let insert_at = (pos + 1).min(tl.tracks.len());
+        tl.tracks.insert(insert_at, copy_track);
+        tl.active_track = Some(new_track_id);
+        tl.active_clip = tl.track(new_track_id).and_then(|t| t.clips.first()).map(|c| c.id);
+        st.doc.repair_timeline();
+        sync_current_layer_to_playhead(&mut st.doc);
+
+        if let Some(canvas) = st.canvas.as_mut() {
+            canvas.name_next_step("duplicate track");
+            canvas.duplicate_layers(pairs, before);
+        }
+        st.revision += 1;
+        self.shared.frame(st);
+        Some(new_track_id.0)
+    }
+
+    /// Reorders `track_id` up (`delta > 0`) or down (`delta < 0`) in the track stack as an undo step.
+    pub fn timeline_move_track(&self, track_id: u64, delta: i32) -> bool {
+        self.change("reorder track", |d| d.ensure_timeline().move_track(TrackId(track_id), delta).then_some(()))
+            .is_some()
+    }
+
+    /// Removes all clips from `track_id` while keeping the track and its effects as an undo step.
+    pub fn timeline_clear_track_clips(&self, track_id: u64) -> bool {
+        self.change("clear track", |d| {
+            let tl = d.ensure_timeline();
+            let removed = tl.clear_track_clips(TrackId(track_id))?;
+            let still_managed = tl.managed_layers();
+            for lid in removed {
+                if !still_managed.contains(&lid) && d.layers().len() > 1 {
+                    let _ = d.delete_layer(lid);
+                }
+            }
+            sync_current_layer_to_playhead(d);
+            Some(())
+        })
+        .is_some()
+    }
+
+    /// Merges `track_id` into the track immediately below it as an undo step.
+    pub fn timeline_merge_track_down(&self, track_id: u64) -> bool {
+        self.change("merge track down", |d| {
+            let ok = d.ensure_timeline().merge_track_down(TrackId(track_id));
+            if ok {
+                sync_current_layer_to_playhead(d);
+            }
+            ok.then_some(())
+        })
+        .is_some()
+    }
+
+    /// Sets the accent color tag (ARGB) of `track_id` as an undo step.
+    pub fn timeline_set_track_color(&self, track_id: u64, color_argb: u32) -> bool {
+        self.change("track color", |d| {
+            let track = d.ensure_timeline().track_mut(TrackId(track_id))?;
+            track.color_tag = color_argb;
+            Some(())
+        })
+        .is_some()
+    }
+
+    /// Toggles track-level Clipping Mask (`Clip to Track Below`) on `track_id` as an undo step.
+    pub fn timeline_set_track_clip_to_below(&self, track_id: u64, enabled: bool) -> bool {
+        self.change("clip to track below", |d| {
+            let track = d.ensure_timeline().track_mut(TrackId(track_id))?;
+            track.clip_to_below = enabled;
+            Some(())
+        })
+        .is_some()
+    }
+
+    /// Toggles Alpha Lock on `track_id` (and synchronizes alpha lock on its cel layers).
+    pub fn timeline_set_track_alpha_lock(&self, track_id: u64, enabled: bool) -> bool {
+        self.change("track alpha lock", |d| {
+            let layers = {
+                let track = d.ensure_timeline().track_mut(TrackId(track_id))?;
+                track.alpha_lock = enabled;
+                track.clips.iter().flat_map(Clip::referenced_layers).collect::<Vec<_>>()
+            };
+            for lid in layers {
+                d.set_alpha_lock(lid, enabled);
+            }
+            Some(())
+        })
+        .is_some()
+    }
+
+    /// Toggles Mute for audio clips on `track_id`.
+    pub fn timeline_set_track_muted(&self, track_id: u64, muted: bool) -> bool {
+        self.change("mute track", |d| {
+            let track = d.ensure_timeline().track_mut(TrackId(track_id))?;
+            track.muted = muted;
+            Some(())
+        })
+        .is_some()
+    }
+
+    /// Updates non-destructive GPU Layer Effects (Outline, Drop Shadow, Outer/Inner Glow, Color
+    /// Overlay) on `track_id`, coalescing slider drags until `done`.
+    pub fn timeline_set_track_effects(&self, track_id: u64, effects: TimelineTrackEffectsInfo, done: bool) -> bool {
+        let fx = TrackEffects::from(&effects);
+        self.change_live("track layer effects", done, |d| {
+            let Some(track) = d.ensure_timeline().track_mut(TrackId(track_id)) else { return false };
+            track.effects = fx;
+            true
+        })
+    }
+
+    /// Sets or updates a non-destructive Live Filter keyframe (`Gaussian Blur`, `HSB`, `Sharpen`,
+    /// `Noise`) on `clip_id` at `frame`, coalescing drags until `done`.
+    pub fn timeline_set_filter_keyframe(
+        &self,
+        clip_id: u64,
+        frame: u32,
+        filter: TimelineLiveFilterInfo,
+        done: bool,
+    ) -> bool {
+        let f = LiveFilterState::from(&filter);
+        self.change_live("filter keyframe", done, |d| {
+            let tl = d.ensure_timeline();
+            let cid = ClipId(clip_id);
+            if tl.track_of_clip(cid).and_then(|t| tl.track(t)).is_some_and(|t| t.locked) {
+                return false;
+            }
+            let Some(clip) = tl.clip_mut(cid) else { return false };
+            clip.keyframes.set_filter(frame, f, None);
+            true
+        })
+    }
+
+    /// Deletes a Live Filter keyframe on `clip_id` at `frame` as an undo step.
+    pub fn timeline_delete_filter_keyframe(&self, clip_id: u64, frame: u32) -> bool {
+        self.change("delete filter keyframe", |d| {
+            let clip = d.ensure_timeline().clip_mut(ClipId(clip_id))?;
+            clip.keyframes.remove_filter(frame).then_some(())
+        })
+        .is_some()
+    }
+
+    /// Changes the outgoing easing curve of the Live Filter keyframe at `frame` on `clip_id`.
+    pub fn timeline_set_filter_easing(&self, clip_id: u64, frame: u32, easing: TimelineEasingInfo) -> bool {
+        let e = Easing::from(&easing);
+        self.change("filter keyframe easing", |d| {
+            let clip = d.ensure_timeline().clip_mut(ClipId(clip_id))?;
+            clip.keyframes.set_filter_easing(frame, e).then_some(())
+        })
+        .is_some()
+    }
+
+    /// Sets or updates a non-destructive `Warp` (4×4 mesh) / `Distort` (4 corners) keyframe on
+    /// `clip_id` at `frame`, coalescing drags until `done`.
+    pub fn timeline_set_deform_keyframe(
+        &self,
+        clip_id: u64,
+        frame: u32,
+        deform: TimelineDeformInfo,
+        done: bool,
+    ) -> bool {
+        let def = Deform2D::from(&deform);
+        self.change_live("warp keyframe", done, |d| {
+            let tl = d.ensure_timeline();
+            let cid = ClipId(clip_id);
+            if tl.track_of_clip(cid).and_then(|t| tl.track(t)).is_some_and(|t| t.locked) {
+                return false;
+            }
+            let Some(clip) = tl.clip_mut(cid) else { return false };
+            clip.keyframes.set_deform(frame, def, None);
+            true
+        })
+    }
+
+    /// Deletes a Warp/Distort keyframe on `clip_id` at `frame` as an undo step.
+    pub fn timeline_delete_deform_keyframe(&self, clip_id: u64, frame: u32) -> bool {
+        self.change("delete warp keyframe", |d| {
+            let clip = d.ensure_timeline().clip_mut(ClipId(clip_id))?;
+            clip.keyframes.remove_deform(frame).then_some(())
+        })
+        .is_some()
+    }
+
+    /// Commits a live Perform Warp/Distort recording on `clip_id` with Ramer–Douglas–Peucker
+    /// simplification as one atomic undo step.
+    pub fn timeline_commit_perform_deform(
+        &self,
+        clip_id: u64,
+        samples: Vec<PerformDeformSampleInfo>,
+        filtering: f32,
+    ) -> u32 {
+        if samples.is_empty() {
+            return 0;
+        }
+        let engine_samples: Vec<DeformSample> =
+            samples.iter().map(|s| DeformSample { frame: s.frame, deform: Deform2D::from(&s.deform) }).collect();
+        let simplified = simplify_deform_samples(&engine_samples, filtering);
+        if simplified.is_empty() {
+            return 0;
+        }
+        let first_frame = simplified.first().map_or(0, |k| k.frame);
+        let last_frame = simplified.last().map_or(first_frame, |k| k.frame);
+        let count = u32::try_from(simplified.len()).unwrap_or(0);
+        let ok = self
+            .change("perform warp", |d| {
+                let tl = d.ensure_timeline();
+                let cid = ClipId(clip_id);
+                if tl.track_of_clip(cid).and_then(|t| tl.track(t)).is_some_and(|t| t.locked) {
+                    return None;
+                }
+                let clip = tl.clip_mut(cid)?;
+                clip.keyframes.deform.retain(|k| k.frame < first_frame || k.frame > last_frame);
+                for kf in &simplified {
+                    clip.keyframes.set_deform(kf.frame, kf.value, Some(kf.easing));
+                }
+                Some(())
+            })
+            .is_some();
+        if ok { count } else { 0 }
+    }
+
+    /// Imports WAV audio bytes (8/16/24-bit PCM or 32-bit float WAV, e.g. from `SoundDecode.kt`)
+    /// onto a new Audio track at `start_frame` as an undo step, returning the new `ClipId`.
+    pub fn timeline_import_audio_wav(&self, name: String, wav_bytes: Vec<u8>, start_frame: u32) -> Option<u64> {
+        let decoded = decode_wav_pcm(&wav_bytes)?;
+        self.change("import audio", |d| {
+            let (_, cid, _) = d.ensure_timeline().add_audio_clip(
+                None,
+                name.clone(),
+                decoded.sample_rate,
+                decoded.channels,
+                decoded.samples.clone(),
+                start_frame,
+            )?;
+            Some(cid.0)
+        })
+    }
+
+    /// Imports interleaved 16-bit PCM audio onto a new Audio track at `start_frame` as an undo step.
+    pub fn timeline_import_audio_pcm(
+        &self,
+        name: String,
+        sample_rate: u32,
+        channels: u8,
+        pcm_i16: Vec<i16>,
+        start_frame: u32,
+    ) -> Option<u64> {
+        let floats: Vec<f32> = pcm_i16.iter().map(|&s| f32::from(s) / 32_768.0).collect();
+        self.change("import audio", |d| {
+            let (_, cid, _) = d.ensure_timeline().add_audio_clip(
+                None,
+                name.clone(),
+                sample_rate,
+                channels,
+                floats.clone(),
+                start_frame,
+            )?;
+            Some(cid.0)
+        })
+    }
+
+    /// Sets an audio volume keyframe (`0.0..=2.0`) on `clip_id` at `frame`.
+    pub fn timeline_set_audio_volume_keyframe(&self, clip_id: u64, frame: u32, volume: f32, done: bool) -> bool {
+        self.change_live("audio volume keyframe", done, |d| {
+            let Some(clip) = d.ensure_timeline().clip_mut(ClipId(clip_id)) else { return false };
+            clip.keyframes.set_volume(frame, volume, None);
+            true
+        })
+    }
+
+    /// Sets an audio stereo pan keyframe (`-1.0..=1.0`) on `clip_id` at `frame`.
+    pub fn timeline_set_audio_pan_keyframe(&self, clip_id: u64, frame: u32, pan: f32, done: bool) -> bool {
+        self.change_live("audio pan keyframe", done, |d| {
+            let Some(clip) = d.ensure_timeline().clip_mut(ClipId(clip_id)) else { return false };
+            clip.keyframes.set_pan(frame, pan, None);
+            true
+        })
+    }
+
+    /// Mixes all visible, unmuted timeline audio tracks over `start_frame..=end_frame` (inclusive)
+    /// into interleaved 16-bit stereo PCM at `sample_rate` Hz (for Android `AudioTrack` playback,
+    /// lip-sync Audio Scrubbing, and `VideoWriter` AAC MP4 muxing).
+    pub fn timeline_mix_audio_pcm(&self, start_frame: u32, end_frame: u32, sample_rate: u32) -> Vec<i16> {
+        let st = self.shared.lock();
+        let Some(tl) = st.doc.timeline.as_ref() else {
+            return Vec::new();
+        };
+        let floats = tl.mix_audio_range(start_frame, end_frame, sample_rate);
+        float_pcm_to_i16(&floats)
+    }
+
+    /// Adds a `VideoClip` (for rotoscoping or video compositing) on `track_id` as an undo step.
+    pub fn timeline_add_video_clip(
+        &self,
+        track_id: u64,
+        start_frame: u32,
+        duration_frames: u32,
+        source_fps: f32,
+        frame_count: u32,
+        name: Option<String>,
+    ) -> u64 {
+        self.change("import video clip", |d| {
+            if !d.has_room(1) {
+                return None;
+            }
+            let layer = d.add_layer();
+            let tl = d.ensure_timeline();
+            let cid = tl.add_video_clip(
+                TrackId(track_id),
+                start_frame,
+                duration_frames,
+                layer,
+                source_fps,
+                frame_count,
+                name.as_deref(),
+            )?;
+            Some(cid.0)
+        })
+        .unwrap_or(0)
+    }
+
+    /// Uploads a decoded RGBA frame (`width × height`) into the managed layer of `VideoClip`
+    /// `clip_id` without pushing an undo step.
+    pub fn timeline_supply_video_frame(&self, clip_id: u64, width: u32, height: u32, rgba: Vec<u8>) -> bool {
+        let expected = (width as usize).saturating_mul(height as usize).saturating_mul(4);
+        if width == 0 || height == 0 || rgba.len() < expected {
+            return false;
+        }
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        let target_layer = st.doc.timeline.as_ref().and_then(|tl| {
+            let clip = tl.clip(ClipId(clip_id))?;
+            match clip.kind {
+                ClipKind::Video { layer, .. } => Some(layer),
+                _ => None,
+            }
+        });
+        let Some(layer) = target_layer else { return false };
+        let (cw, ch) = (st.doc.width(), st.doc.height());
+        if let Some(canvas) = st.canvas.as_mut() {
+            if width == cw && height == ch {
+                canvas.put_layer(layer, rgba);
+            } else {
+                let w = width.min(cw);
+                let h = height.min(ch);
+                let x = (cw.saturating_sub(w)) / 2;
+                let y = (ch.saturating_sub(h)) / 2;
+                let mut cropped = vec![0u8; (w as usize) * (h as usize) * 4];
+                for row in 0..h as usize {
+                    let src_start = row * (width as usize) * 4;
+                    let dst_start = row * (w as usize) * 4;
+                    let row_bytes = (w as usize) * 4;
+                    if let (Some(src), Some(dst)) =
+                        (rgba.get(src_start..src_start + row_bytes), cropped.get_mut(dst_start..dst_start + row_bytes))
+                    {
+                        dst.copy_from_slice(src);
+                    }
+                }
+                canvas.put_layer_region(layer, x, y, w, h, cropped);
+            }
+            canvas.invalidate();
+            self.shared.frame(st);
+            return true;
+        }
+        false
+    }
+
+    /// Adds an animated `TextClip` on `track_id` at `start_frame` for `duration_frames` as an undo step.
+    pub fn timeline_add_text_clip(
+        &self,
+        track_id: u64,
+        start_frame: u32,
+        duration_frames: u32,
+        name: Option<String>,
+    ) -> u64 {
+        self.change("new text clip", |d| {
+            if !d.has_room(1) {
+                return None;
+            }
+            let layer = d.add_layer();
+            let tl = d.ensure_timeline();
+            let cid = tl.add_text_clip(TrackId(track_id), start_frame, duration_frames, layer, name.as_deref())?;
+            sync_current_layer_to_playhead(d);
+            Some(cid.0)
+        })
+        .unwrap_or(0)
+    }
+
+    /// Returns the sub-layer IDs inside a Flipbook `Cel` (if the cel is a `LayerKind::Group`,
+    /// returns all its child paint layers; otherwise returns the single paint layer ID).
+    pub fn timeline_cel_sublayer_ids(&self, clip_id: u64, cel_index: u32) -> Vec<u64> {
+        let st = self.shared.lock();
+        let Some(tl) = st.doc.timeline.as_ref() else {
+            return Vec::new();
+        };
+        let Some(clip) = tl.clip(ClipId(clip_id)) else {
+            return Vec::new();
+        };
+        let ClipKind::Cel { cels } = &clip.kind else {
+            return Vec::new();
+        };
+        let Some(cel) = cels.get(cel_index as usize) else {
+            return Vec::new();
+        };
+        if st.doc.layer(cel.layer).is_some_and(|l| l.kind == LayerKind::Group) {
+            st.doc.members(Some(cel.layer)).into_iter().map(|id| id.0).collect()
+        } else {
+            vec![cel.layer.0]
+        }
+    }
+
+    /// Adds a new sub-layer inside a Flipbook `Cel` (converting a single-layer cel transparently
+    /// into a `LayerKind::Group` holding both the existing drawing and the new sub-layer) so
+    /// artists can separate Lineart, Color, and Shading inside a single animation frame.
+    pub fn timeline_add_cel_sublayer(&self, clip_id: u64, cel_index: u32) -> Option<u64> {
+        self.change("add cel sub-layer", |d| {
+            if !d.has_room(2) {
+                return None;
+            }
+            let cel_layer = {
+                let tl = d.ensure_timeline();
+                let clip = tl.clip(ClipId(clip_id))?;
+                let ClipKind::Cel { cels } = &clip.kind else { return None };
+                cels.get(cel_index as usize)?.layer
+            };
+            let is_group = d.layer(cel_layer).is_some_and(|l| l.kind == LayerKind::Group);
+            let group_id = if is_group {
+                cel_layer
+            } else {
+                d.clear_picks();
+                d.set_current(cel_layer);
+                let new_group = d.group_chosen()?;
+                let tl = d.ensure_timeline();
+                if let Some(clip) = tl.clip_mut(ClipId(clip_id))
+                    && let ClipKind::Cel { cels } = &mut clip.kind
+                    && let Some(slot) = cels.get_mut(cel_index as usize)
+                {
+                    slot.layer = new_group;
+                }
+                new_group
+            };
+            let top_child = d.members(Some(group_id)).last().copied().unwrap_or(group_id);
+            d.set_current(top_child);
+            let sub_layer = d.add_layer();
+            if d.group_of(sub_layer) != Some(group_id) {
+                d.move_to(sub_layer, procraft_engine::document::Place::Onto(group_id));
+            }
+            d.set_current(sub_layer);
+            Some(sub_layer.0)
+        })
+    }
+
+    /// Enables or disables the global Camera Track transform on Stage preview and Export.
+    pub fn timeline_set_camera_enabled(&self, enabled: bool) {
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        st.doc.ensure_timeline().camera_enabled = enabled;
+        if let Some(c) = st.canvas.as_mut() {
+            c.invalidate();
+        }
+        self.shared.frame(st);
+    }
+
+    /// Sets a global Camera Track `Transform2D` keyframe (Pan/Zoom/Rotate) at `frame`,
+    /// automatically enabling the Camera Track.
+    pub fn timeline_set_camera_transform_keyframe(
+        &self,
+        frame: u32,
+        transform: TimelineTransformInfo,
+        done: bool,
+    ) -> bool {
+        let t2d = Transform2D::from(&transform);
+        self.change_live("camera keyframe", done, |d| {
+            let tl = d.ensure_timeline();
+            tl.camera_enabled = true;
+            tl.camera.set_transform(frame, t2d, None);
+            true
+        })
+    }
+
+    /// Sets a global Camera Track `LiveFilterState` keyframe (e.g. Depth-of-Field lens blur or
+    /// fade-to-black) at `frame`.
+    pub fn timeline_set_camera_filter_keyframe(&self, frame: u32, filter: TimelineLiveFilterInfo, done: bool) -> bool {
+        let f = LiveFilterState::from(&filter);
+        self.change_live("camera filter keyframe", done, |d| {
+            let tl = d.ensure_timeline();
+            tl.camera_enabled = true;
+            tl.camera.set_filter(frame, f, None);
+            true
+        })
+    }
+
+    /// Deletes the global Camera Track keyframes at `frame` as an undo step.
+    pub fn timeline_delete_camera_keyframe(&self, frame: u32) -> bool {
+        self.change("delete camera keyframe", |d| {
+            let tl = d.ensure_timeline();
+            let a = tl.camera.remove_transform(frame);
+            let b = tl.camera.remove_filter(frame);
+            (a || b).then_some(())
+        })
+        .is_some()
     }
 }

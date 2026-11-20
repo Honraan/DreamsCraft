@@ -291,4 +291,159 @@ object VideoWriter {
             }
         }
     }
+
+    /**
+     * Writes an MP4 video with an optional stereo 16-bit PCM audio track encoded to AAC
+     * (`audio/mp4a-latm`) and muxed alongside the video track. Falls back cleanly to video-only
+     * if [audioPcmStereo] is null/empty or AAC encoding fails on the device.
+     */
+    fun writeWithAudio(
+        out: File,
+        width: Int,
+        height: Int,
+        fps: Float,
+        count: Int,
+        mime: String = MediaFormat.MIMETYPE_VIDEO_AVC,
+        bitsPerPixel: Int = BITS_PER_PIXEL,
+        audioPcmStereo: ShortArray? = null,
+        audioSampleRate: Int = 44_100,
+        frame: (Int, IntArray) -> Boolean,
+    ): Boolean {
+        if (audioPcmStereo == null || audioPcmStereo.isEmpty()) {
+            return write(out, width, height, fps, count, mime, bitsPerPixel, frame)
+        }
+        val videoOnly = File(out.parentFile, "${out.nameWithoutExtension}_vtmp.mp4")
+        val ok = write(videoOnly, width, height, fps, count, mime, bitsPerPixel, frame)
+        if (!ok) {
+            videoOnly.delete()
+            return false
+        }
+        val muxed = muxAacAudio(videoOnly, out, audioPcmStereo, audioSampleRate)
+        if (muxed) {
+            videoOnly.delete()
+            return true
+        }
+        // Fallback: keep video-only MP4 if AAC muxing failed
+        videoOnly.copyTo(out, overwrite = true)
+        videoOnly.delete()
+        return true
+    }
+
+    /** Encodes [pcmStereo] (interleaved 16-bit stereo at [sampleRate] Hz) to AAC and muxes it with [videoMp4] into [out]. */
+    fun muxAacAudio(videoMp4: File, out: File, pcmStereo: ShortArray, sampleRate: Int): Boolean {
+        val extractor = MediaExtractor()
+        var encoder: MediaCodec? = null
+        var muxer: MediaMuxer? = null
+        var muxerStarted = false
+        return try {
+            extractor.setDataSource(videoMp4.path)
+            val vIndex = (0 until extractor.trackCount).firstOrNull {
+                extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true
+            } ?: return false
+            val vFormat = extractor.getTrackFormat(vIndex)
+
+            val aacFormat = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, 2).apply {
+                setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+                setInteger(MediaFormat.KEY_BIT_RATE, 192_000)
+                setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16_384)
+            }
+            val aac = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+            encoder = aac
+            aac.configure(aacFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            aac.start()
+
+            // First encode all AAC packets in memory so we know the exact output MediaFormat before muxer.start()
+            val encodedPackets = ArrayList<Pair<ByteArray, MediaCodec.BufferInfo>>()
+            var aacOutputFormat: MediaFormat? = null
+            val pcmBytes = ByteBuffer.allocate(pcmStereo.size * 2).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            for (s in pcmStereo) pcmBytes.putShort(s)
+            val rawBytes = pcmBytes.array()
+            var readPos = 0
+            var eosSent = false
+            var eosReceived = false
+            val info = MediaCodec.BufferInfo()
+
+            while (!eosReceived) {
+                if (!eosSent) {
+                    val inIdx = aac.dequeueInputBuffer(TIMEOUT_US)
+                    if (inIdx >= 0) {
+                        val inBuf = aac.getInputBuffer(inIdx) ?: break
+                        inBuf.clear()
+                        val remain = rawBytes.size - readPos
+                        if (remain <= 0) {
+                            val ptsUs = (readPos.toLong() / 4L) * 1_000_000L / sampleRate.toLong().coerceAtLeast(1L)
+                            aac.queueInputBuffer(inIdx, 0, 0, ptsUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            eosSent = true
+                        } else {
+                            val take = minOf(inBuf.capacity(), remain)
+                            val ptsUs = (readPos.toLong() / 4L) * 1_000_000L / sampleRate.toLong().coerceAtLeast(1L)
+                            inBuf.put(rawBytes, readPos, take)
+                            aac.queueInputBuffer(inIdx, 0, take, ptsUs, 0)
+                            readPos += take
+                        }
+                    }
+                }
+                val outIdx = aac.dequeueOutputBuffer(info, TIMEOUT_US)
+                when {
+                    outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> aacOutputFormat = aac.outputFormat
+                    outIdx >= 0 -> {
+                        val outBuf = aac.getOutputBuffer(outIdx)
+                        if (outBuf != null && info.size > 0 && info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
+                            outBuf.position(info.offset)
+                            outBuf.limit(info.offset + info.size)
+                            val copy = ByteArray(info.size)
+                            outBuf.get(copy)
+                            val copyInfo = MediaCodec.BufferInfo().apply {
+                                set(0, copy.size, info.presentationTimeUs, info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM.inv())
+                            }
+                            encodedPackets.add(copy to copyInfo)
+                        }
+                        aac.releaseOutputBuffer(outIdx, false)
+                        if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) eosReceived = true
+                    }
+                }
+            }
+            val finalAudioFormat = aacOutputFormat ?: return false
+
+            val m = MediaMuxer(out.path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            muxer = m
+            val outVideoTrack = m.addTrack(vFormat)
+            val outAudioTrack = m.addTrack(finalAudioFormat)
+            m.start()
+            muxerStarted = true
+
+            // Copy video samples verbatim
+            extractor.selectTrack(vIndex)
+            val vBufSize = maxOf(
+                if (vFormat.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) vFormat.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE) else 0,
+                1 shl 20,
+            )
+            val vBuf = ByteBuffer.allocate(vBufSize)
+            val vInfo = MediaCodec.BufferInfo()
+            while (true) {
+                val sz = extractor.readSampleData(vBuf, 0)
+                if (sz < 0) break
+                val key = extractor.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0
+                vInfo.set(0, sz, extractor.sampleTime, if (key) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
+                m.writeSampleData(outVideoTrack, vBuf, vInfo)
+                extractor.advance()
+            }
+
+            // Write encoded AAC audio packets
+            for ((bytes, aInfo) in encodedPackets) {
+                m.writeSampleData(outAudioTrack, ByteBuffer.wrap(bytes), aInfo)
+            }
+            true
+        } catch (e: Exception) {
+            AppLog.w("DreamsCraft", "AAC audio muxing failed", e)
+            false
+        } finally {
+            runCatching { encoder?.stop() }
+            runCatching { encoder?.release() }
+            runCatching { extractor.release() }
+            runCatching { if (muxerStarted) muxer?.stop() }
+            runCatching { muxer?.release() }
+        }
+    }
 }
+

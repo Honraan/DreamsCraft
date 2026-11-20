@@ -1476,3 +1476,44 @@ fn timeline_composites_non_destructive_keyframe_transforms_and_onion_skins() {
     // And the underlying layer texture pixels must remain 100% untouched (non-destructive)!
     assert_eq!(canvas.read_layer(&gpu, layer).unwrap(), original_layer_pixels);
 }
+
+#[test]
+fn timeline_composites_live_filters_track_effects_and_warp_non_destructively() {
+    let Some(gpu) = Gpu::headless().ok() else { return eprintln!("skipped: no GPU") };
+    let mut doc = Document::new(32, 32);
+    let layer = doc.current();
+    let mut canvas = Canvas::new(&gpu, &doc).unwrap();
+    // Paint a solid red dot at (16, 16)
+    paint(&mut canvas, &doc, layer, [255, 0, 0], Vec2::new(16.0, 16.0), 3.0, StrokeTool::Paint);
+    canvas.render(&gpu, &mut doc, None);
+    let original_pixels = canvas.read_layer(&gpu, layer).unwrap();
+
+    // 1. Live HSB Filter (hue shift 120 deg -> red turns green!) + Track Outline (blue outline 3px)
+    let tl = doc.ensure_timeline();
+    let tid = tl.active_track.unwrap();
+    let cid = tl.active_clip.unwrap();
+    tl.clip_mut(cid).unwrap().keyframes.set_filter(
+        0,
+        procraft_engine::timeline::LiveFilterState { hue_shift: 120.0, ..Default::default() },
+        Some(procraft_engine::timeline::Easing::Linear),
+    );
+    {
+        let tr = tl.track_mut(tid).unwrap();
+        tr.effects.outline_enabled = true;
+        tr.effects.outline_width = 3.0;
+        tr.effects.outline_color = [0.0, 0.0, 1.0, 1.0];
+    }
+    canvas.invalidate();
+    canvas.render(&gpu, &mut doc, None);
+    let comp = canvas.read_composite(&gpu).unwrap();
+    let px = |x: usize, y: usize| {
+        let i = (y * 32 + x) * 4;
+        [comp[i], comp[i + 1], comp[i + 2], comp[i + 3]]
+    };
+    let center = px(16, 16);
+    assert!(center[1] > 180 && center[0] < 60, "120-deg hue shift turned red dot green: {center:?}");
+    let rim = px(20, 16);
+    assert!(rim[2] > 180 && rim[0] < 60, "blue track outline appeared around dot: {rim:?}");
+    assert_eq!(canvas.read_layer(&gpu, layer).unwrap(), original_pixels);
+    assert_eq!(gpu.errors(), 0);
+}

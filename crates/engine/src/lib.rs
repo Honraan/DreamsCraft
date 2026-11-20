@@ -5,6 +5,7 @@
 pub mod abr;
 pub mod animation;
 pub mod applz4;
+pub mod audio;
 pub mod base64;
 pub mod brush;
 pub mod brushfile;
