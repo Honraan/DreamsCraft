@@ -6873,6 +6873,62 @@ fn dreamscraft_v2_1_1_stylus_aligns_under_camera_and_perform_transforms() {
 }
 
 #[test]
+fn dreamscraft_v2_2_camera_tools_align_colordrop_selection_and_zoomed_dirty() {
+    let Some(s) = session(64, 64) else { return };
+    assert!(s.set_timeline_enabled(true));
+    s.timeline_set_camera_enabled(true);
+    // Pan + 2x Zoom In via Camera Track (scale = 0.5 -> camera_inv scales layer 2x)
+    assert!(s.timeline_set_camera_transform_keyframe(
+        0,
+        crate::TimelineTransformInfo {
+            x: 10.0,
+            y: -6.0,
+            scale_x: 0.5,
+            scale_y: 0.5,
+            rotation: 0.0,
+            anchor_x: 0.5,
+            anchor_y: 0.5,
+        },
+        true,
+    ));
+
+    // Paint a solid red dot right at canvas center (32, 32)
+    let center_screen = s.shared.lock().view.unwrap().to_screen().apply(procraft_engine::geom::Vec2::new(32.0, 32.0));
+    s.set_brush_size(0.45);
+    s.set_color(1.0, 0.0, 0.0);
+    s.stroke_begin(PointerKind::Stylus, vec![sample(center_screen.x, center_screen.y, 0.0)]);
+    s.stroke_end(vec![]);
+
+    let read_px = |x: u32, y: u32| -> [u8; 4] {
+        let mut st = s.shared.lock();
+        let st = &mut *st;
+        let (canvas, gpu) = (st.canvas.as_mut().unwrap(), st.gpu.as_ref().unwrap());
+        canvas.render(gpu, &mut st.doc, None);
+        let rgba = canvas.read_composite(gpu).unwrap();
+        let idx = ((y * 64 + x) * 4) as usize;
+        [rgba[idx], rgba[idx + 1], rgba[idx + 2], rgba[idx + 3]]
+    };
+
+    let painted = read_px(32, 32);
+    assert!(painted[0] > 200 && painted[2] < 60, "zoomed camera stroke must paint red at (32,32), got {painted:?}");
+
+    // ColorDrop blue onto that exact screen spot (32, 32): must recolor the red dot to blue without leaking
+    assert!(s.pour_begin(center_screen.x, center_screen.y, 0.0, 0.0, 1.0, 0.35));
+    s.pour_end(true, None);
+
+    let poured = read_px(32, 32);
+    assert!(
+        poured[2] > 200 && poured[0] < 60,
+        "ColorDrop under transformed Camera must turn (32,32) blue, got {poured:?}"
+    );
+    let corner = read_px(2, 2);
+    assert!(
+        corner[0] > 200 && corner[1] > 200 && corner[2] > 200,
+        "ColorDrop must not leak to untouched corner (2,2), got {corner:?}"
+    );
+}
+
+#[test]
 fn animation_assist_shows_onion_skins_and_plays() {
     let Some(s) = session(40, 40) else { return };
     s.set_brush_size(0.6);

@@ -437,7 +437,7 @@ impl State {
     /// over the fill but for a hole that grows. Not with Reduce Motion, nor on a model.
     fn start_reveal(&mut self, point: Vec2, region: [u32; 4]) {
         self.end_reveal();
-        if self.reduce_motion || self.scene_shown() || self.sphere.is_some() {
+        if self.reduce_motion || self.scene_shown() || self.sphere.is_some() || self.active_layer_is_transformed() {
             return;
         }
         let Some(view) = self.view else { return };

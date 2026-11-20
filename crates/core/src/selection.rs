@@ -202,21 +202,20 @@ impl State {
         self.feather_base = None;
     }
 
-    /// The canvas pixel under window point (`x`, `y`), if there is one: through the view, or on a
-    /// shown model the texel of the texture set painted on.
+    /// The canvas pixel under window point (`x`, `y`), if there is one: through the view and any
+    /// active Camera/Perform timeline transform, or on a shown model the texel painted on.
     pub(crate) fn window_texel(&self, x: f32, y: f32) -> Option<(u32, u32)> {
         if self.scene_shown() {
             return self.scene_texel(x, y);
         }
-        let p = self.view?.screen_to_canvas(Vec2::new(x, y))?;
+        let p = self.window_to_layer(x, y)?;
         let (w, h) = (self.doc.width() as f32, self.doc.height() as f32);
         (p.x >= 0.0 && p.y >= 0.0 && p.x < w && p.y < h).then_some((p.x as u32, p.y as u32))
     }
 
-    /// Window points to canvas points.
+    /// Window points to active-layer pixel points.
     fn to_canvas_points(&self, window: &[Vec2]) -> Option<Vec<Vec2>> {
-        let view = self.view?;
-        window.iter().map(|&p| view.screen_to_canvas(p).filter(|c| c.is_finite())).collect()
+        window.iter().map(|&p| self.window_to_layer(p.x, p.y)).collect()
     }
 }
 

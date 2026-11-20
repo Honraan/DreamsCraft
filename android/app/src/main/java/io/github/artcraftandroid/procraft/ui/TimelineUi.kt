@@ -718,6 +718,13 @@ fun BoxScope.DreamsWorkspaceOverlay(
             stageWidth = windowWidth,
             stageHeight = stageHeightDp.coerceAtLeast(120.dp),
         )
+    } else if (tl.cameraEnabled && !isTransformIdentity(tl.cameraTransform)) {
+        CameraActiveDrawIndicator(
+            vm = vm,
+            tl = tl,
+            stageWidth = windowWidth,
+            stageHeight = stageHeightDp.coerceAtLeast(120.dp),
+        )
     }
 
     // 2. Flipbook Mode vs Full Multi-Track Split View
@@ -2480,6 +2487,155 @@ private fun KeyframeDiamond(
     }
 }
 
+private fun isTransformIdentity(t: TimelineTransformInfo): Boolean =
+    abs(t.x) < 0.5f &&
+        abs(t.y) < 0.5f &&
+        abs(t.scaleX - 1f) < 0.005f &&
+        abs(t.scaleY - 1f) < 0.005f &&
+        abs(t.rotation) < 0.002f
+
+private fun applyViewMatrix(m: List<Float>, cx: Float, cy: Float): Offset {
+    if (m.size < 6) return Offset(cx, cy)
+    return Offset(m[0] * cx + m[2] * cy + m[4], m[1] * cx + m[3] * cy + m[5])
+}
+
+private fun canvasDeltaFromScreen(m: List<Float>, dx: Float, dy: Float): Offset {
+    if (m.size < 4) return Offset(dx, dy)
+    val det = m[0] * m[3] - m[1] * m[2]
+    if (abs(det) < 1e-6f) return Offset(dx, dy)
+    return Offset(
+        x = (m[3] * dx - m[2] * dy) / det,
+        y = (-m[1] * dx + m[0] * dy) / det,
+    )
+}
+
+/**
+ * Projects the 4 corners of the drawable layer `[0..cw, 0..ch]` through `t` (or `t.inverse()` when
+ * `invert == true`, i.e. Camera Track) and then through the current viewport matrix [viewMatrix].
+ */
+private fun projectedLayerCorners(
+    cw: Float,
+    ch: Float,
+    t: TimelineTransformInfo,
+    invert: Boolean,
+    viewMatrix: List<Float>,
+): List<Offset> {
+    val ax = cw * t.anchorX
+    val ay = ch * t.anchorY
+    val sx = t.scaleX.let { if (abs(it) < 1e-3f) 1e-3f else it }
+    val sy = t.scaleY.let { if (abs(it) < 1e-3f) 1e-3f else it }
+    val cosR = cos(t.rotation)
+    val sinR = sin(t.rotation)
+    val raw = listOf(0f to 0f, cw to 0f, cw to ch, 0f to ch)
+    return raw.map { (lx, ly) ->
+        val (cx, cy) = if (!invert) {
+            val dx = (lx - ax) * sx
+            val dy = (ly - ay) * sy
+            val rx = dx * cosR - dy * sinR
+            val ry = dx * sinR + dy * cosR
+            (rx + ax + t.x) to (ry + ay + t.y)
+        } else {
+            val dx = lx - ax - t.x
+            val dy = ly - ay - t.y
+            val rx = (dx * cosR + dy * sinR) / sx
+            val ry = (-dx * sinR + dy * cosR) / sy
+            (rx + ax) to (ry + ay)
+        }
+        applyViewMatrix(viewMatrix, cx, cy)
+    }
+}
+
+/**
+ * Non-blocking Draw-mode indicator shown when the global Camera Track is actively transforming the
+ * viewport. Draws a subtle dashed cyan outline around the real drawable layer bounds (so the artist
+ * always sees where layer edges sit under a panned/zoomed camera) plus a 1-tap `Draw 1:1` pill to
+ * toggle Camera Preview off while keeping all Camera keyframes intact for Play & Export.
+ */
+@Composable
+private fun BoxScope.CameraActiveDrawIndicator(
+    vm: CanvasViewModel,
+    tl: TimelineState,
+    stageWidth: Dp,
+    stageHeight: Dp,
+) {
+    val (cwInt, chInt) = remember(vm.session) { vm.canvasSize() }
+    val cw = cwInt.coerceAtLeast(1).toFloat()
+    val ch = chInt.coerceAtLeast(1).toFloat()
+    val viewM = vm.viewMatrix
+    val camZoomPct = (100f / tl.cameraTransform.scaleX.coerceIn(0.05f, 16f)).roundToInt()
+
+    // Non-interactive dashed outline of the real drawable layer bounds under the active Camera
+    Canvas(
+        modifier = Modifier
+            .align(Alignment.TopCenter)
+            .width(stageWidth)
+            .height(stageHeight),
+    ) {
+        val corners = projectedLayerCorners(cw, ch, tl.cameraTransform, invert = true, viewMatrix = viewM)
+        if (corners.size == 4) {
+            val path = Path().apply {
+                moveTo(corners[0].x, corners[0].y)
+                lineTo(corners[1].x, corners[1].y)
+                lineTo(corners[2].x, corners[2].y)
+                lineTo(corners[3].x, corners[3].y)
+                close()
+            }
+            drawPath(
+                path = path,
+                color = CameraSky.copy(alpha = 0.55f),
+                style = Stroke(width = 2f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 8f))),
+            )
+        }
+    }
+
+    // Compact top pill to inspect/edit Camera or switch to 1:1 unclipped Stage drawing
+    Row(
+        modifier = Modifier
+            .align(Alignment.TopCenter)
+            .padding(top = Pc.barShown + 8.dp)
+            .shadow(8.dp, RoundedCornerShape(18.dp))
+            .clip(RoundedCornerShape(18.dp))
+            .background(DreamsCardFill.copy(alpha = 0.94f))
+            .border(1.dp, CameraSky.copy(alpha = 0.65f), RoundedCornerShape(18.dp))
+            .padding(horizontal = 10.dp, vertical = 5.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(8.dp))
+                .clickable {
+                    vm.stageGizmoMode = StageGizmoSubMode.CAMERA
+                    vm.stageGizmoActive = true
+                }
+                .padding(horizontal = 4.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(5.dp),
+        ) {
+            DreamsCameraIcon(CameraSky, 12.dp)
+            Text(
+                text = "Cam $camZoomPct%",
+                color = CameraSky,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.Monospace,
+            )
+        }
+        Box(Modifier.width(1.dp).height(12.dp).background(DreamsEdge))
+        Text(
+            text = "Draw 1:1",
+            color = DreamsInk,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier
+                .clip(RoundedCornerShape(8.dp))
+                .background(DreamsPillBg)
+                .clickable { vm.setCameraEnabled(false) }
+                .padding(horizontal = 8.dp, vertical = 3.dp),
+        )
+    }
+}
+
 /**
  * Interactive **Stage Keyframe, Warp/Distort, Camera & Live Perform Gizmo** rendered over the upper Stage:
  * - **Move & Scale**: 1-finger pan, 2-finger scale/rotate, Anchor Point pivot, and Motion Path curve.
@@ -2504,6 +2660,10 @@ private fun BoxScope.StageKeyTransformOverlay(
 
     val view = LocalView.current
     val currentPlayhead by rememberUpdatedState(tl.playhead.toInt())
+    val latestViewMatrix by rememberUpdatedState(vm.viewMatrix)
+    val (cwInt, chInt) = remember(vm.session) { vm.canvasSize() }
+    val stageCanvasW = cwInt.coerceAtLeast(1).toFloat()
+    val stageCanvasH = chInt.coerceAtLeast(1).toFloat()
     val baseTransform = if (isCamera) tl.cameraTransform else tl.activeEvaluatedTransform
     var isInteracting by remember { mutableStateOf(false) }
     var didMutateTransform by remember { mutableStateOf(false) }
@@ -2562,7 +2722,7 @@ private fun BoxScope.StageKeyTransformOverlay(
                 onUndo = { vm.undo() },
                 onRedo = { vm.redo() },
             )
-            // Move & Scale / Camera multi-touch gestures
+            // Move & Scale / Camera multi-touch gestures (1:1 calibrated with vm.viewMatrix)
             .then(
                 if (!isWarp && !isDistort) {
                     Modifier
@@ -2576,15 +2736,38 @@ private fun BoxScope.StageKeyTransformOverlay(
                                     vm.beginPerformRecording()
                                 }
                                 val rotRad = (rotationDeg * Math.PI / 180.0).toFloat()
-                                val updated = TimelineTransformInfo(
-                                    x = liveTransform.x + pan.x,
-                                    y = liveTransform.y + pan.y,
-                                    scaleX = (liveTransform.scaleX * zoom).coerceIn(0.05f, 16f),
-                                    scaleY = (liveTransform.scaleY * zoom).coerceIn(0.05f, 16f),
-                                    rotation = liveTransform.rotation + rotRad,
-                                    anchorX = liveTransform.anchorX,
-                                    anchorY = liveTransform.anchorY,
-                                )
+                                val canvasDelta = canvasDeltaFromScreen(latestViewMatrix, pan.x, pan.y)
+                                val updated = if (isCamera) {
+                                    // Camera applies camera_inv to the stage: pinch-out zooms IN (smaller
+                                    // camera scale), drag moves the stage 1:1 under the fingers, rotate turns with fingers.
+                                    val safeZoom = zoom.coerceIn(0.25f, 4f)
+                                    val nextSx = (liveTransform.scaleX / safeZoom).coerceIn(0.08f, 12f)
+                                    val nextSy = (liveTransform.scaleY / safeZoom).coerceIn(0.08f, 12f)
+                                    val nextRot = liveTransform.rotation - rotRad
+                                    val cosR = cos(nextRot)
+                                    val sinR = sin(nextRot)
+                                    val camDx = (canvasDelta.x * cosR - canvasDelta.y * sinR) * nextSx
+                                    val camDy = (canvasDelta.x * sinR + canvasDelta.y * cosR) * nextSy
+                                    TimelineTransformInfo(
+                                        x = liveTransform.x - camDx,
+                                        y = liveTransform.y - camDy,
+                                        scaleX = nextSx,
+                                        scaleY = nextSy,
+                                        rotation = nextRot,
+                                        anchorX = liveTransform.anchorX,
+                                        anchorY = liveTransform.anchorY,
+                                    )
+                                } else {
+                                    TimelineTransformInfo(
+                                        x = liveTransform.x + canvasDelta.x,
+                                        y = liveTransform.y + canvasDelta.y,
+                                        scaleX = (liveTransform.scaleX * zoom).coerceIn(0.05f, 16f),
+                                        scaleY = (liveTransform.scaleY * zoom).coerceIn(0.05f, 16f),
+                                        rotation = liveTransform.rotation + rotRad,
+                                        anchorX = liveTransform.anchorX,
+                                        anchorY = liveTransform.anchorY,
+                                    )
+                                }
                                 liveTransform = updated
                                 when {
                                     isCamera -> vm.setCameraTransformKeyframe(currentPlayhead, updated, done = false)
@@ -2718,22 +2901,33 @@ private fun BoxScope.StageKeyTransformOverlay(
     ) {
         // Visual Stage Gizmo Canvas (Move & Scale + Motion Path, Distort 4-pin, Warp 4x4 Mesh, or Camera Viewport)
         Canvas(modifier = Modifier.fillMaxSize()) {
-            // Draw Motion Path across transform keyframes when in Move/Perform/Camera mode
+            // Draw Motion Path across transform keyframes accurately in screen space
             val pathKeyframes = if (isCamera) tl.cameraTransformKeyframes else activeClip?.transformKeyframes.orEmpty()
             if (!isWarp && !isDistort && pathKeyframes.size >= 2) {
                 val motionPath = Path()
-                pathKeyframes.forEachIndexed { i, kf ->
-                    val t = kf.transform ?: return@forEachIndexed
-                    val px = size.width * 0.5f + t.x * 0.25f
-                    val py = size.height * 0.5f + t.y * 0.25f
-                    if (i == 0) motionPath.moveTo(px, py) else motionPath.lineTo(px, py)
-                    drawCircle(color = gizmoColor.copy(alpha = 0.85f), radius = 4.5f, center = Offset(px, py))
+                var started = false
+                for (kf in pathKeyframes) {
+                    val t = kf.transform ?: continue
+                    val pt = applyViewMatrix(
+                        latestViewMatrix,
+                        stageCanvasW * 0.5f + if (isCamera) -t.x else t.x,
+                        stageCanvasH * 0.5f + if (isCamera) -t.y else t.y,
+                    )
+                    if (!started) {
+                        motionPath.moveTo(pt.x, pt.y)
+                        started = true
+                    } else {
+                        motionPath.lineTo(pt.x, pt.y)
+                    }
+                    drawCircle(color = gizmoColor.copy(alpha = 0.85f), radius = 4.5f, center = pt)
                 }
-                drawPath(
-                    path = motionPath,
-                    color = gizmoColor.copy(alpha = 0.65f),
-                    style = Stroke(width = 2.5f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f, 6f))),
-                )
+                if (started) {
+                    drawPath(
+                        path = motionPath,
+                        color = gizmoColor.copy(alpha = 0.65f),
+                        style = Stroke(width = 2.5f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f, 6f))),
+                    )
+                }
             }
 
             if (isDistort || isWarp) {
@@ -2772,36 +2966,53 @@ private fun BoxScope.StageKeyTransformOverlay(
                     }
                 }
             } else {
-                val cx = size.width * 0.5f + liveTransform.x * 0.25f
-                val cy = size.height * 0.5f + liveTransform.y * 0.25f
-                val boxW = (size.width * (if (isCamera) 0.60f else 0.42f) * liveTransform.scaleX).coerceIn(40f, size.width * 0.92f)
-                val boxH = (size.height * (if (isCamera) 0.58f else 0.42f) * liveTransform.scaleY).coerceIn(40f, size.height * 0.92f)
-
-                drawRoundRect(
-                    color = gizmoColor,
-                    topLeft = Offset(cx - boxW / 2f, cy - boxH / 2f),
-                    size = Size(boxW, boxH),
-                    cornerRadius = CornerRadius(if (isCamera) 2f else 8f, if (isCamera) 2f else 8f),
-                    style = Stroke(
-                        width = 3f,
-                        pathEffect = if (isCamera) PathEffect.dashPathEffect(floatArrayOf(12f, 6f)) else null,
-                    ),
-                )
-                val corners = listOf(
-                    Offset(cx - boxW / 2f, cy - boxH / 2f),
-                    Offset(cx + boxW / 2f, cy - boxH / 2f),
-                    Offset(cx + boxW / 2f, cy + boxH / 2f),
-                    Offset(cx - boxW / 2f, cy + boxH / 2f),
-                )
-                for (c in corners) {
-                    drawCircle(color = Color.White, radius = 8f, center = c)
-                    drawCircle(color = gizmoColor, radius = 6f, center = c)
+                val cw = stageCanvasW
+                val ch = stageCanvasH
+                val viewM = latestViewMatrix
+                val corners = projectedLayerCorners(cw, ch, liveTransform, invert = isCamera, viewMatrix = viewM)
+                if (corners.size == 4) {
+                    val path = Path().apply {
+                        moveTo(corners[0].x, corners[0].y)
+                        lineTo(corners[1].x, corners[1].y)
+                        lineTo(corners[2].x, corners[2].y)
+                        lineTo(corners[3].x, corners[3].y)
+                        close()
+                    }
+                    drawPath(
+                        path = path,
+                        color = gizmoColor,
+                        style = Stroke(
+                            width = 2.5f,
+                            pathEffect = if (isCamera) PathEffect.dashPathEffect(floatArrayOf(12f, 6f)) else null,
+                        ),
+                    )
+                    for (c in corners) {
+                        drawCircle(color = Color.White, radius = 7.5f, center = c)
+                        drawCircle(color = gizmoColor, radius = 5.5f, center = c)
+                    }
+                    val cx = (corners[0].x + corners[2].x) * 0.5f
+                    val cy = (corners[0].y + corners[2].y) * 0.5f
+                    drawCircle(color = gizmoColor, radius = 11f, center = Offset(cx, cy), style = Stroke(width = 2.2f))
+                    drawLine(color = gizmoColor, start = Offset(cx - 15f, cy), end = Offset(cx + 15f, cy), strokeWidth = 2.2f)
+                    drawLine(color = gizmoColor, start = Offset(cx, cy - 15f), end = Offset(cx, cy + 15f), strokeWidth = 2.2f)
                 }
-                val ax = (cx - boxW / 2f) + boxW * liveTransform.anchorX
-                val ay = (cy - boxH / 2f) + boxH * liveTransform.anchorY
-                drawCircle(color = gizmoColor, radius = 12f, center = Offset(ax, ay), style = Stroke(width = 2.5f))
-                drawLine(color = gizmoColor, start = Offset(ax - 16f, ay), end = Offset(ax + 16f, ay), strokeWidth = 2.5f)
-                drawLine(color = gizmoColor, start = Offset(ax, ay - 16f), end = Offset(ax, ay + 16f), strokeWidth = 2.5f)
+                // In Camera mode also highlight the fixed output frame [0..cw, 0..ch] clearly
+                if (isCamera) {
+                    val frameCorners = listOf(
+                        applyViewMatrix(viewM, 0f, 0f),
+                        applyViewMatrix(viewM, cw, 0f),
+                        applyViewMatrix(viewM, cw, ch),
+                        applyViewMatrix(viewM, 0f, ch),
+                    )
+                    val framePath = Path().apply {
+                        moveTo(frameCorners[0].x, frameCorners[0].y)
+                        lineTo(frameCorners[1].x, frameCorners[1].y)
+                        lineTo(frameCorners[2].x, frameCorners[2].y)
+                        lineTo(frameCorners[3].x, frameCorners[3].y)
+                        close()
+                    }
+                    drawPath(path = framePath, color = Color.White.copy(alpha = 0.85f), style = Stroke(width = 2f))
+                }
             }
         }
 
@@ -2849,6 +3060,32 @@ private fun BoxScope.StageKeyTransformOverlay(
                 }
 
                 Box(Modifier.width(1.dp).height(14.dp).background(DreamsEdge))
+
+                if (isCamera) {
+                    val zoomPct = (100f / liveTransform.scaleX.coerceIn(0.05f, 16f)).roundToInt()
+                    Text(
+                        text = "$zoomPct%",
+                        color = CameraSky,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                    Text(
+                        text = "Draw 1:1",
+                        color = DreamsInk,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(DreamsPillBg)
+                            .clickable {
+                                vm.setCameraEnabled(false)
+                                vm.stageGizmoActive = false
+                                vm.dreamsMode = DreamsWorkMode.DRAW_PAINT
+                            }
+                            .padding(horizontal = 8.dp, vertical = 4.dp),
+                    )
+                }
 
                 // Reset current gizmo property
                 Text(

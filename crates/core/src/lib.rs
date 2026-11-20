@@ -1257,16 +1257,40 @@ impl State {
         }
     }
 
-    /// Inverse of the active layer's timeline display transform (`CanvasSpace -> LayerSpace`),
-    /// so strokes and fills land directly under the stylus even when Camera, Perform, or Move
-    /// keyframes transform the active clip or track.
-    pub(crate) fn active_layer_inv_transform(&self) -> procraft_engine::geom::Affine {
+    /// Active layer's timeline display transform (`LayerSpace -> CanvasSpace`), combining clip,
+    /// track, and global Camera Track transforms at the current playhead.
+    pub(crate) fn active_layer_transform(&self) -> procraft_engine::geom::Affine {
         if self.pad_strokes.is_some() {
             return procraft_engine::geom::Affine::IDENTITY;
         }
         let Some(tl) = self.doc.timeline.as_ref() else { return procraft_engine::geom::Affine::IDENTITY };
-        let t = tl.layer_transform(&self.doc, self.doc.current());
-        t.inverse().unwrap_or(procraft_engine::geom::Affine::IDENTITY)
+        tl.layer_transform(&self.doc, self.doc.current())
+    }
+
+    /// True when the active layer has a non-identity Camera, Perform, or Move display transform.
+    pub(crate) fn active_layer_is_transformed(&self) -> bool {
+        let t = self.active_layer_transform();
+        (t.a - 1.0).abs() >= 1e-4
+            || t.b.abs() >= 1e-4
+            || t.c.abs() >= 1e-4
+            || (t.d - 1.0).abs() >= 1e-4
+            || t.e.abs() >= 1e-4
+            || t.f.abs() >= 1e-4
+    }
+
+    /// Inverse of the active layer's timeline display transform (`CanvasSpace -> LayerSpace`),
+    /// so strokes, fills, selections, and QuickShapes land directly under the stylus even when
+    /// Camera, Perform, or Move keyframes transform the active clip or track.
+    pub(crate) fn active_layer_inv_transform(&self) -> procraft_engine::geom::Affine {
+        self.active_layer_transform().inverse().unwrap_or(procraft_engine::geom::Affine::IDENTITY)
+    }
+
+    /// Maps window point (`x`, `y`) through the viewport and inverse timeline Camera/Perform
+    /// transform into active-layer pixel coordinates.
+    pub(crate) fn window_to_layer(&self, x: f32, y: f32) -> Option<Vec2> {
+        let canvas_pt = self.view?.screen_to_canvas(Vec2::new(x, y))?;
+        let p = self.active_layer_inv_transform().apply(canvas_pt);
+        p.is_finite().then_some(p)
     }
 
     /// Samples in active-layer pixels (canvas pixels mapped through the inverse of any active
@@ -2200,7 +2224,7 @@ impl CanvasSession {
                 .scaled(st.brush_scale() * layer_inv_scale)
                 .with_input(st.input.clone())
                 .on_view_turned(st.view.map_or(0.0, |v| v.rotation()) + layer_rot)
-                .seen_at(st.view.map_or(1.0, |v| v.zoom()) / st.display_scale);
+                .seen_at((st.view.map_or(1.0, |v| v.zoom()) / layer_inv_scale) / st.display_scale);
             if let Some(zoom) = whole_pixels {
                 builder = builder.read_in_whole_pixels(zoom);
             }

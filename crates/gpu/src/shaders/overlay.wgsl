@@ -18,6 +18,8 @@ struct OverlayUniform {
     // the coarsest mip level the shape is read from, as for the stamps
     shape_lod_cap: f32,
     _p1: u32,
+    // layer pixel bounds (width, height, 0, 0) so predicted tails stay clipped to the layer texture
+    bounds: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> ou: OverlayUniform;
@@ -44,6 +46,8 @@ struct Out {
     @location(2) alpha: f32,
     // how much of its quad the stamp itself is across each way, mirrored as the stamp says
     @location(3) fill: vec2<f32>,
+    // position in active layer pixels for exact bounds clipping
+    @location(4) layer_pos: vec2<f32>,
 }
 
 @vertex
@@ -68,6 +72,7 @@ fn vs_overlay(@builtin(vertex_index) vi: u32, inst: StampIn) -> Out {
     o.radius = rs;
     o.alpha = inst.alpha;
     o.fill = inst.flip * half / (half + QUAD_REACH);
+    o.layer_pos = p;
     return o;
 }
 
@@ -79,6 +84,11 @@ fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_overlay(i: Out) -> @location(0) vec4<f32> {
+    if (ou.bounds.x > 0.0 && ou.bounds.y > 0.0) {
+        if (i.layer_pos.x < 0.0 || i.layer_pos.y < 0.0 || i.layer_pos.x > ou.bounds.x || i.layer_pos.y > ou.bounds.y) {
+            return vec4<f32>(0.0);
+        }
+    }
     let r = i.radius;
     let zoom = max(ou.m1.z, 1e-3);
     var a = 0.0;

@@ -244,7 +244,7 @@ impl State {
         let g = &seen;
         let look = g.look();
         let dpi = self.dpi();
-        let to_screen = self.view.map_or(Affine::scale(1.0), |v| v.to_screen());
+        let to_screen = self.active_layer_transform().then(self.view.map_or(Affine::scale(1.0), |v| v.to_screen()));
         let point = |p: Vec2| {
             let w = to_screen.apply(p);
             [w.x, w.y]
@@ -283,7 +283,7 @@ impl State {
     }
 
     fn to_canvas_point(&self, x: f32, y: f32) -> Option<Vec2> {
-        self.view?.screen_to_canvas(Vec2::new(x, y)).filter(|p| p.is_finite())
+        self.window_to_layer(x, y)
     }
 }
 

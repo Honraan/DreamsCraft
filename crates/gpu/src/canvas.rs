@@ -102,6 +102,7 @@ struct OverlayUniform {
     srgb: u32,
     shape_lod_cap: f32,
     _pad: u32,
+    bounds: [f32; 4],
 }
 /// The most painting sent to the GPU as one piece of work, by [`stamp_work`]. A driver stops work
 /// that runs too long and takes the device, and all it holds, with it: an Adreno 750 did at under
@@ -10127,9 +10128,11 @@ impl Canvas {
         }
 
         // the selection: bands over what is not selected, or what is selected tinted or covered
-        if let (Some(look), Some(selection), Some(inverse)) =
-            (target.selection, &self.selection, unit_to_canvas.then(target.to_screen).inverse())
-        {
+        if let (Some(look), Some(selection), Some(inverse)) = (
+            target.selection,
+            &self.selection,
+            unit_to_canvas.then(active_layer_xform).then(target.to_screen).inverse(),
+        ) {
             let multiply = matches!(look, SelectionLook::Tint(_));
             let pipeline = selection_pipelines.entry((target.format, multiply)).or_insert_with(|| {
                 device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -10229,6 +10232,7 @@ impl Canvas {
                 srgb: u32::from(srgb),
                 shape_lod_cap: style.shape_lod_cap,
                 _pad: 0,
+                bounds: [self.width as f32, self.height as f32, 0.0, 0.0],
             });
             let size = size_of::<StampInstance>() as u64;
             pass.set_pipeline(overlay_pipeline);

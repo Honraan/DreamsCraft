@@ -2668,31 +2668,55 @@ impl Timeline {
         if scene.items.iter().any(|item| item.is_onion && item.layer == layer) {
             return (Affine::IDENTITY, 0, true);
         }
+        let fx_pad = |filter: LiveFilterState, effects: TrackEffects| -> i32 {
+            let f = filter.repaired();
+            let e = effects.repaired();
+            let mut pad = f.gaussian_blur.ceil() as i32;
+            if f.sharpen > 0.01 {
+                pad = pad.max(2);
+            }
+            if e.outline_enabled {
+                pad = pad.max(e.outline_width.ceil() as i32);
+            }
+            if e.glow_enabled {
+                pad = pad.max(e.glow_radius.ceil() as i32);
+            }
+            if e.shadow_enabled {
+                let sreach = e.shadow_blur.ceil() as i32
+                    + e.shadow_offset[0].abs().ceil().max(e.shadow_offset[1].abs().ceil()) as i32;
+                pad = pad.max(sreach);
+            }
+            pad
+        };
         let mut cursor = Some(layer);
         let mut guard = 0usize;
         while let Some(lid) = cursor {
-            if let Some(item) = scene.items.iter().rev().find(|item| !item.is_onion && item.layer == lid) {
+            if let Some((idx, item)) =
+                scene.items.iter().enumerate().rev().find(|(_, item)| !item.is_onion && item.layer == lid)
+            {
                 if !item.deform.is_identity() {
                     return (item.transform, 0, true);
                 }
-                let f = item.filter.repaired();
-                let e = item.effects.repaired();
-                let mut pad = f.gaussian_blur.ceil() as i32;
-                if f.sharpen > 0.01 {
-                    pad = pad.max(2);
+                let mut pad = fx_pad(item.filter, item.effects);
+                // Any non-onion item above clipped to this track depends on its alpha silhouette.
+                for above in scene.items.get(idx + 1..).unwrap_or_default() {
+                    if above.is_onion {
+                        continue;
+                    }
+                    if above.clip_to_below {
+                        if !above.deform.is_identity() {
+                            return (item.transform, 0, true);
+                        }
+                        pad = pad.max(fx_pad(above.filter, above.effects));
+                    } else if above.track != item.track {
+                        break;
+                    }
                 }
-                if e.outline_enabled {
-                    pad = pad.max(e.outline_width.ceil() as i32);
-                }
-                if e.glow_enabled {
-                    pad = pad.max(e.glow_radius.ceil() as i32);
-                }
-                if e.shadow_enabled {
-                    let sreach = e.shadow_blur.ceil() as i32
-                        + e.shadow_offset[0].abs().ceil().max(e.shadow_offset[1].abs().ceil()) as i32;
-                    pad = pad.max(sreach);
-                }
-                return (item.transform, pad.saturating_add(2), false);
+                // Scale bilinear sampling + AA margin with the camera/clip magnification so zoomed-in
+                // camera strokes never leave stale dirty-rect fringes.
+                let sf = item.transform.scale_factor();
+                let scale_pad = if sf.is_finite() { (sf.ceil() as i32).clamp(1, 32).saturating_mul(2) } else { 4 };
+                return (item.transform, pad.saturating_add(scale_pad).saturating_add(2), false);
             }
             cursor = doc.layer(lid).and_then(|l| l.parent);
             guard += 1;
@@ -2700,7 +2724,7 @@ impl Timeline {
                 break;
             }
         }
-        (Affine::IDENTITY, 2, false)
+        (Affine::IDENTITY, 4, false)
     }
 
     fn track_or_ancestor_is_solo(&self, track_id: TrackId) -> bool {

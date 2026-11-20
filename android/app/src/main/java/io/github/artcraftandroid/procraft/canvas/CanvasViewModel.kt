@@ -1763,15 +1763,21 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         wideColorWindow = s.showsWideColour()
     }
 
-    /** What fitting the canvas keeps clear of: the top bar and the sidebar, with Fit Canvas Inside Interface. */
+    /** What fitting the canvas keeps clear of: the top bar, sidebar, and active DreamsCraft timeline dock. */
     fun applyFitInsets() {
         val s = session ?: return
-        if (!fitInside) {
+        val bottom = if (timeline != null) lastStageBottomInsetPx.coerceAtLeast(0f) else 0f
+        if (!fitInside && bottom <= 0f) {
             s.setFitInsets(0f, 0f, 0f, 0f)
             return
         }
-        val side = if (showSideBar) (io.github.artcraftandroid.procraft.ui.Pc.sideBarShown.value + io.github.artcraftandroid.procraft.ui.Pc.PopoverGap.value) * density else 0f
-        s.setFitInsets(if (rightHanded) 0f else side, io.github.artcraftandroid.procraft.ui.Pc.barShown.value * density, if (rightHanded) side else 0f, 0f)
+        val top = io.github.artcraftandroid.procraft.ui.Pc.barShown.value * density
+        val side = if (fitInside && showSideBar) {
+            (io.github.artcraftandroid.procraft.ui.Pc.sideBarShown.value + io.github.artcraftandroid.procraft.ui.Pc.PopoverGap.value) * density
+        } else {
+            0f
+        }
+        s.setFitInsets(if (rightHanded) 0f else side, top, if (rightHanded) side else 0f, bottom)
     }
 
     /** A new artwork just started: without time-lapse if it is turned off. */
@@ -8367,12 +8373,11 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
      * area above the multi-track timeline (or expands to full screen in Flipbook mode).
      */
     fun updateStageBottomInset(bottomPx: Float) {
-        val s = session ?: return
+        if (session == null) return
         val clamped = bottomPx.coerceAtLeast(0f)
         if (abs(clamped - lastStageBottomInsetPx) < 1f) return
         lastStageBottomInsetPx = clamped
-        val topPx = io.github.artcraftandroid.procraft.ui.Pc.barShown.value * density
-        s.setFitInsets(0f, topPx, 0f, clamped)
+        applyFitInsets()
     }
 
     fun changeAnimationAssist(on: Boolean) {

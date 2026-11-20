@@ -120,9 +120,15 @@ struct StrokePixel {
 }
 
 // the stroke at a pixel: its build-up, its edges, the paper grain fixed to the canvas, its
-// threshold and its opacity
-fn stroke_pixel(p: vec2<i32>) -> StrokePixel {
+// threshold and its opacity. When `use_bilinear` is true (Camera/Perform transform active),
+// samples `stroke_tex` and `second_tex` with hardware bilinear filtering at subpixel `sf`
+// to match `load_layer_at_f` cleanly with zero jaggedness or commit jump.
+fn stroke_pixel_ex(p: vec2<i32>, sf: vec2<f32>, use_bilinear: bool) -> StrokePixel {
     var s = textureLoad(stroke_tex, p, 0);
+    if (use_bilinear) {
+        let sdims = vec2<f32>(textureDimensions(stroke_tex));
+        s = textureSampleLevel(stroke_tex, layer_smp, sf / sdims, 0.0);
+    }
     // what the stamps laid, before the edges, grain and second change it
     let laid = s.a;
     if (lu.wet < 0.0 && s.a > 0.0) {
@@ -139,8 +145,9 @@ fn stroke_pixel(p: vec2<i32>) -> StrokePixel {
         s = s * mix(1.0, pooled_over(s.a), lu.wet);
     }
     let built = s.a;
+    let sample_at = select(vec2<f32>(p) + 0.5, sf, use_bilinear);
     if (lu.grain >= 0) {
-        let at = (vec2<f32>(p) + 0.5) / lu.scaled.x + lu.scaled.yz;
+        let at = sample_at / lu.scaled.x + lu.scaled.yz;
         let gc = cos(lu.grain_rotation);
         let gs = sin(lu.grain_rotation);
         let uv = vec2<f32>(at.x * gc - at.y * gs, at.x * gs + at.y * gc) / lu.grain_scale;
@@ -166,13 +173,17 @@ fn stroke_pixel(p: vec2<i32>) -> StrokePixel {
     }
     // the paper, fixed to the canvas, whatever the brush: its hollows take a share of the paint
     if (lu.paper.x > 0.0) {
-        let at = (vec2<f32>(p) + 0.5) / lu.scaled.x + lu.scaled.yz;
+        let at = sample_at / lu.scaled.x + lu.scaled.yz;
         s = s * (1.0 - lu.paper.x * (1.0 - paper_height(at)));
     }
     // a dual brush's second: its coverage (cut at its threshold) combined with the first's by
     // the dual mode, or by Normal showing where the first doesn't
     if (lu.dual != 0u) {
-        let t = textureLoad(second_tex, p, 0);
+        var t = textureLoad(second_tex, p, 0);
+        if (use_bilinear) {
+            let ddims = vec2<f32>(textureDimensions(second_tex));
+            t = textureSampleLevel(second_tex, layer_smp, sf / ddims, 0.0);
+        }
         var b = t.a;
         if (lu.dual_threshold >= 0.0) {
             b = select(0.0, 1.0, b > lu.dual_threshold);
@@ -206,6 +217,10 @@ fn stroke_pixel(p: vec2<i32>) -> StrokePixel {
     return StrokePixel(s * lu.stroke_opacity, burn);
 }
 
+fn stroke_pixel(p: vec2<i32>) -> StrokePixel {
+    return stroke_pixel_ex(p, vec2<f32>(p) + 0.5, false);
+}
+
 fn stroke_at(p: vec2<i32>) -> vec4<f32> {
     return stroke_pixel(p).s;
 }
@@ -221,7 +236,7 @@ fn burnt(under: vec4<f32>, r: vec4<f32>, w: f32) -> vec4<f32> {
 }
 
 // a layer with the stroke in progress on it applied
-fn with_stroke(c0: vec4<f32>, p: vec2<i32>) -> vec4<f32> {
+fn with_stroke_ex(c0: vec4<f32>, p: vec2<i32>, sf: vec2<f32>, use_bilinear: bool) -> vec4<f32> {
     var c = c0;
     if (lu.stroke_mode == 4u) {
         // where it reaches its alpha is marked by 1, so that clear can be laid down as well
@@ -234,7 +249,7 @@ fn with_stroke(c0: vec4<f32>, p: vec2<i32>) -> vec4<f32> {
         return select(c0, vec4<f32>(t.rgb, 2.0 * t.a - 1.0), t.a >= 0.25);
     }
     if (lu.stroke_mode != 0u) {
-        let px = stroke_pixel(p);
+        let px = stroke_pixel_ex(p, sf, use_bilinear);
         let s = px.s;
         // where the stroke left nothing (no paint, no burnt edge) the layer is as it was
         if (s.a <= 0.0 && px.burn <= 0.0) {
@@ -250,6 +265,10 @@ fn with_stroke(c0: vec4<f32>, p: vec2<i32>) -> vec4<f32> {
         }
     }
     return c;
+}
+
+fn with_stroke(c0: vec4<f32>, p: vec2<i32>) -> vec4<f32> {
+    return with_stroke_ex(c0, p, vec2<f32>(p) + 0.5, false);
 }
 
 fn load_layer_at_f(tex: texture_2d<f32>, pf: vec2<f32>) -> vec4<f32> {
@@ -451,19 +470,26 @@ fn layer_color(p: vec2<i32>) -> vec4<f32> {
     }
     // the stroke goes into the layer, or into its mask: one place for it (its blend written once)
     let into_mask = lu.stroke_on_mask > 0.5;
+    let transformed = lu.xform1.z > 0.5;
+    var stroke_sf = vec2<f32>(p) + 0.5;
     var stroke_p = p;
-    if (lu.xform1.z > 0.5) {
+    if (transformed) {
         let pt = vec2<f32>(p) + 0.5;
-        let s = vec2<f32>(
+        stroke_sf = vec2<f32>(
             lu.xform0.x * pt.x + lu.xform0.z * pt.y + lu.xform1.x,
             lu.xform0.y * pt.x + lu.xform0.w * pt.y + lu.xform1.y,
         );
-        stroke_p = vec2<i32>(floor(s));
+        stroke_p = vec2<i32>(floor(stroke_sf));
     }
     let dims = vec2<i32>(textureDimensions(layer_tex));
+    let fdims = vec2<f32>(dims);
     var stroked = select(c, m, into_mask);
-    if (stroke_p.x >= 0 && stroke_p.y >= 0 && stroke_p.x < dims.x && stroke_p.y < dims.y) {
-        stroked = with_stroke(stroked, stroke_p);
+    let inside_id = stroke_p.x >= 0 && stroke_p.y >= 0 && stroke_p.x < dims.x && stroke_p.y < dims.y;
+    let inside_xf = stroke_sf.x >= 0.0 && stroke_sf.y >= 0.0 && stroke_sf.x <= fdims.x && stroke_sf.y <= fdims.y;
+    let inside_stroke = select(inside_id, inside_xf, transformed);
+    if (inside_stroke) {
+        let safe_p = clamp(stroke_p, vec2<i32>(0), dims - 1);
+        stroked = with_stroke_ex(stroked, safe_p, stroke_sf, transformed);
     }
     if (into_mask) {
         m = stroked;

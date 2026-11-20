@@ -412,7 +412,7 @@ impl State {
     fn shape_info(&self) -> Option<QuickShapeInfo> {
         let edit = self.shape.as_ref()?;
         let view = self.view?;
-        let to_screen = view.to_screen();
+        let to_screen = self.active_layer_transform().then(view.to_screen());
         Some(QuickShapeInfo {
             kind: edit.shape.kind.into(),
             choices: edit.choices.iter().map(|&k| k.into()).collect(),
@@ -729,7 +729,8 @@ impl CanvasSession {
         let canvas = st.canvas.as_mut()?;
         canvas.undo();
         canvas.begin_stroke(last.layer, last.style);
-        let scale = st.brush_scale();
+        let layer_inv_scale = st.active_layer_inv_transform().scale_factor().clamp(0.05, 20.0);
+        let scale = st.brush_scale() * layer_inv_scale;
         let stroke = last.laid_again(last.samples.clone());
         let along = StrokeAlong::of(&last.samples, last.pace);
         st.stroke =
@@ -848,7 +849,7 @@ impl CanvasSession {
     pub fn quickshape_move_handle(&self, index: u32, x: f32, y: f32) -> Option<QuickShapeInfo> {
         let mut guard = self.shared.lock();
         let st = &mut *guard;
-        let to = st.view?.screen_to_canvas(Vec2::new(x, y))?;
+        let to = st.window_to_layer(x, y)?;
         let edit = st.shape.as_mut()?;
         edit.held = None;
         let index = index as usize;
@@ -928,8 +929,9 @@ impl CanvasSession {
     pub fn quickshape_near_edge(&self, x: f32, y: f32, reach: f32) -> bool {
         let st = self.shared.lock();
         let (Some(edit), Some(view)) = (st.shape.as_ref(), st.view) else { return false };
-        let Some(p) = view.screen_to_canvas(Vec2::new(x, y)) else { return false };
-        edit.shape.turns_from_edge() && edit.shape.edge_distance(p) * view.zoom() <= reach
+        let Some(p) = st.window_to_layer(x, y) else { return false };
+        let scale = view.zoom() * st.active_layer_transform().scale_factor().max(1e-3);
+        edit.shape.turns_from_edge() && edit.shape.edge_distance(p) * scale <= reach
     }
 
     /// A drag on the edited shape's outline, from window point (`x`, `y`) (`begin`) or on to it:
@@ -937,7 +939,7 @@ impl CanvasSession {
     pub fn quickshape_pin(&self, x: f32, y: f32, begin: bool) -> Option<QuickShapeInfo> {
         let mut guard = self.shared.lock();
         let st = &mut *guard;
-        let at = st.view?.screen_to_canvas(Vec2::new(x, y))?;
+        let at = st.window_to_layer(x, y)?;
         let edit = st.shape.as_mut()?;
         if begin {
             edit.held = Some(Held { snapped: edit.shape.clone(), from: at, at, finger: false });
@@ -958,8 +960,7 @@ impl CanvasSession {
     pub fn quickshape_move(&self, fx: f32, fy: f32, tx: f32, ty: f32) -> Option<QuickShapeInfo> {
         let mut guard = self.shared.lock();
         let st = &mut *guard;
-        let view = st.view?;
-        let by = view.screen_to_canvas(Vec2::new(tx, ty))? - view.screen_to_canvas(Vec2::new(fx, fy))?;
+        let by = st.window_to_layer(tx, ty)? - st.window_to_layer(fx, fy)?;
         let edit = st.shape.as_mut()?;
         edit.held = None;
         edit.shape = edit.shape.translated(by);
