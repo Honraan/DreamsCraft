@@ -3212,8 +3212,8 @@ private fun BoxScope.StageKeyTransformOverlay(
                         Row(
                             modifier = Modifier
                                 .clip(RoundedCornerShape(8.dp))
-                                .background(DreamsAccent.copy(alpha = 0.22f))
-                                .border(1.dp, DreamsAccent.copy(alpha = 0.65f), RoundedCornerShape(8.dp))
+                                .background(Pc.Accent.copy(alpha = 0.22f))
+                                .border(1.dp, Pc.Accent.copy(alpha = 0.65f), RoundedCornerShape(8.dp))
                                 .clickable {
                                     view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
                                     vm.replayLastPerform()
