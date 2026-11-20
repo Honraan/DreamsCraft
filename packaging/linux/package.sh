@@ -33,9 +33,9 @@ case "$ARCH" in
   aarch64 | arm64) ARCH=aarch64; DEB_ARCH=arm64 ;;
   *) echo "unsupported architecture $ARCH" >&2; exit 2 ;;
 esac
-BASENAME="procraft-$VERSION-linux-$ARCH"
+BASENAME="dreamscraft-$VERSION-linux-$ARCH"
 has() { case " $FORMATS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
-echo "==> ProCraft $VERSION for Linux $ARCH ($FORMATS)"
+echo "==> DreamsCraft $VERSION for Linux $ARCH ($FORMATS)"
 
 if [ "$SKIP_BUILD" = 0 ]; then
   (cd "$ROOT" && cargo build --release --locked -p procraft-desktop)
@@ -45,16 +45,16 @@ fi
 WORK="$TARGET_DIR/linux-package"
 STAGE="$WORK/root"
 rm -rf "$WORK"
-install -Dm755 "$TARGET_DIR/release/procraft" "$STAGE/usr/bin/procraft"
-strip "$STAGE/usr/bin/procraft" 2>/dev/null || true
-install -Dm644 "$HERE/procraft.desktop" "$STAGE/usr/share/applications/procraft.desktop"
+install -Dm755 "$TARGET_DIR/release/procraft" "$STAGE/usr/bin/dreamscraft"
+strip "$STAGE/usr/bin/dreamscraft" 2>/dev/null || true
+install -Dm644 "$HERE/procraft.desktop" "$STAGE/usr/share/applications/dreamscraft.desktop"
 mkdir -p "$STAGE/usr/share/icons"
 cp -R "$ROOT/assets/app-icon/hicolor" "$STAGE/usr/share/icons/"
 for f in LICENSE-MIT LICENSE-APACHE NOTICE ATTRIBUTION.md; do
-  install -Dm644 "$ROOT/$f" "$STAGE/usr/share/doc/procraft/$f"
+  install -Dm644 "$ROOT/$f" "$STAGE/usr/share/doc/dreamscraft/$f"
 done
 if command -v desktop-file-validate >/dev/null; then
-  desktop-file-validate "$STAGE/usr/share/applications/procraft.desktop"
+  desktop-file-validate "$STAGE/usr/share/applications/dreamscraft.desktop"
 fi
 
 # ---- .tar.gz -------------------------------------------------------------------------------------
@@ -76,13 +76,13 @@ fi
 
 # ---- AppImage ------------------------------------------------------------------------------------
 if has appimage; then
-  APPDIR="$WORK/ProCraft.AppDir"
+  APPDIR="$WORK/DreamsCraft.AppDir"
   cp -R "$STAGE" "$APPDIR"
   rm -rf "$APPDIR/usr/share/doc"
   install -Dm755 "$HERE/AppRun" "$APPDIR/AppRun"
-  cp "$HERE/procraft.desktop" "$APPDIR/procraft.desktop"
-  cp "$ROOT/assets/app-icon/hicolor/256x256/apps/procraft.png" "$APPDIR/procraft.png"
-  ln -s procraft.png "$APPDIR/.DirIcon"
+  cp "$HERE/procraft.desktop" "$APPDIR/dreamscraft.desktop"
+  cp "$ROOT/assets/app-icon/hicolor/256x256/apps/dreamscraft.png" "$APPDIR/dreamscraft.png"
+  ln -s dreamscraft.png "$APPDIR/.DirIcon"
   TOOL="${APPIMAGETOOL:-$(command -v appimagetool || true)}"
   if [ -z "$TOOL" ]; then
     TOOL="$TARGET_DIR/appimagetool-$ARCH.AppImage"

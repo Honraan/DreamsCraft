@@ -87,20 +87,20 @@ impl Format {
 pub fn app_dir() -> PathBuf {
     let home = || std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
     if cfg!(windows) {
-        std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(home).join("ProCraft")
+        std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(home).join("DreamsCraft")
     } else if cfg!(target_os = "macos") {
-        home().join("Library/Application Support/ProCraft")
+        home().join("Library/Application Support/DreamsCraft")
     } else {
         std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home().join(".local/share"))
-            .join("procraft")
+            .join("dreamscraft")
     }
 }
 
 /// Shows a passing message with an OK button.
 pub fn say(text: &str) {
-    message().set_level(MessageLevel::Info).set_title("ProCraft").set_description(text).show();
+    message().set_level(MessageLevel::Info).set_title("DreamsCraft").set_description(text).show();
 }
 
 /// Whether the file at `path` holds brushes, by its name (a zip by what it holds): ours (a brush,

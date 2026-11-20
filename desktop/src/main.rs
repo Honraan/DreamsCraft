@@ -427,8 +427,8 @@ impl ApplicationHandler for App {
         let attributes = {
             use winit::platform::wayland::WindowAttributesExtWayland;
             use winit::platform::x11::WindowAttributesExtX11;
-            let attributes = WindowAttributesExtWayland::with_name(attributes, "procraft", "procraft");
-            WindowAttributesExtX11::with_name(attributes, "procraft", "ProCraft")
+            let attributes = WindowAttributesExtWayland::with_name(attributes, "dreamscraft", "dreamscraft");
+            WindowAttributesExtX11::with_name(attributes, "dreamscraft", "DreamsCraft")
         };
         let window = match event_loop.create_window(attributes) {
             Ok(w) => Arc::new(w),

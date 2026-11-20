@@ -1,11 +1,11 @@
 [Desktop Entry]
 Type=Application
-Name=ProCraft
-GenericName=Painting
-Comment=Paint, draw and sketch
-Exec=procraft %F
-Icon=procraft
+Name=DreamsCraft
+GenericName=2D Animation Studio
+Comment=2D animation, timeline, painting and motion studio
+Exec=dreamscraft %F
+Icon=dreamscraft
 Terminal=false
-Categories=Graphics;2DGraphics;RasterGraphics;
-Keywords=paint;draw;sketch;brush;art;
-StartupWMClass=ProCraft
+Categories=Graphics;2DGraphics;RasterGraphics;AudioVideo;
+Keywords=animation;paint;draw;timeline;motion;dreams;
+StartupWMClass=DreamsCraft

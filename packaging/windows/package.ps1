@@ -55,7 +55,7 @@ $TargetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Pa
 # WIX_EXE, not WIX: Windows runners set WIX to an old WiX 3's folder
 $Wix = if ($env:WIX_EXE) { $env:WIX_EXE } else { 'wix' }
 New-Item -ItemType Directory -Force -Path $Dist | Out-Null
-Write-Output "ProCraft $Version for Windows $Arch"
+Write-Output "DreamsCraft $Version for Windows $Arch"
 
 if (-not $SkipBuild) {
   # the C runtime linked in; only for this target, so build scripts and proc-macros are as ever
@@ -74,12 +74,12 @@ if ($subsystem -ne 2) { throw "procraft.exe has PE subsystem $subsystem, not 2 (
 if ([System.Text.Encoding]::ASCII.GetString($bytes).Contains('VCRUNTIME140.dll')) {
   throw 'procraft.exe needs VCRUNTIME140.dll: the C runtime should be linked in (+crt-static)'
 }
-Write-Output "ok procraft.exe: $Arch, a window, no Visual C++ runtime needed"
+Write-Output "ok DreamsCraft.exe: $Arch, a window, no Visual C++ runtime needed"
 
 $Stage = Join-Path $TargetDir 'windows-package\stage'
 Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $Stage | Out-Null
-Copy-Item $Exe (Join-Path $Stage 'ProCraft.exe')
+Copy-Item $Exe (Join-Path $Stage 'DreamsCraft.exe')
 foreach ($f in 'LICENSE-MIT', 'LICENSE-APACHE', 'NOTICE', 'ATTRIBUTION.md') { Copy-Item (Join-Path $Root $f) $Stage }
 
 # ---- DXC ----------------------------------------------------------------------------------------
@@ -131,15 +131,15 @@ try {
 } finally {
   $dxcArchive.Dispose()
 }
-Write-Output "ok DXC $DxcRelease ($Arch): dxcompiler.dll and dxil.dll beside ProCraft.exe"
+Write-Output "ok DXC $DxcRelease ($Arch): dxcompiler.dll and dxil.dll beside DreamsCraft.exe"
 
 # ---- MSI ----------------------------------------------------------------------------------------
-$Msi = Join-Path $Dist "procraft-$Version-windows-$Arch.msi"
+$Msi = Join-Path $Dist "dreamscraft-$Version-windows-$Arch.msi"
 Invoke-Native 'wix build' {
   & $Wix build (Join-Path $PSScriptRoot 'procraft.wxs') -arch $Arch `
     -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext -culture en-US `
     -d "Version=$MsiVersion" -d "DisplayVersion=$Version" -d "BinDir=$Stage" `
-    -d "IconPath=$(Join-Path $Root 'assets\app-icon\procraft.ico')" -o $Msi
+    -d "IconPath=$(Join-Path $Root 'assets\app-icon\dreamscraft.ico')" -o $Msi
 }
 Invoke-Native 'wix msi validate' {
   & $Wix msi validate $Msi -intermediateFolder (Join-Path $TargetDir 'windows-package\msi-validation')
@@ -148,7 +148,7 @@ Invoke-Native 'wix msi validate' {
 Remove-Item -Force -ErrorAction SilentlyContinue ([IO.Path]::ChangeExtension($Msi, '.wixpdb'))
 
 # ---- portable zip -------------------------------------------------------------------------------
-$Name = "procraft-$Version-windows-$Arch-portable"
+$Name = "dreamscraft-$Version-windows-$Arch-portable"
 $Portable = Join-Path $TargetDir "windows-package\$Name"
 Remove-Item -Recurse -Force $Portable -ErrorAction SilentlyContinue
 Copy-Item -Recurse $Stage $Portable

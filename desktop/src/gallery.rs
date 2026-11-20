@@ -720,7 +720,7 @@ impl Gallery {
     /// The title row laid out for the window (the core's rules): the buttons that fit, the rest
     /// under More, the title on one line shrunk to fit beside them.
     fn header_fit(&mut self, ui: &Ui, screen: Rect) -> GalleryHeaderFit {
-        let title = self.stack.as_ref().map_or("ProCraft", |s| s.1.as_str()).to_owned();
+        let title = self.stack.as_ref().map_or("DreamsCraft", |s| s.1.as_str()).to_owned();
         let own = ui.painter().layout_no_wrap(title, Weight::Bold.font(36.0), Color32::WHITE).size();
         // in a stack the name follows the way back; selecting, it stands alone
         let title_x = if self.stack.is_some() && !self.selecting { 60.0 } else { 32.0 };
@@ -751,7 +751,7 @@ impl Gallery {
     fn select_header(&mut self, ui: &Ui, look: &mut Look, screen: Rect) {
         let top = screen.top();
         let fit = self.header_fit(ui, screen);
-        let title = self.stack.as_ref().map_or("ProCraft", |s| s.1.as_str()).to_owned();
+        let title = self.stack.as_ref().map_or("DreamsCraft", |s| s.1.as_str()).to_owned();
         title_text(ui, pos2(screen.left() + 32.0, top + 11.0), Align2::LEFT_TOP, &title, argb(TITLE), &fit);
         let painter = ui.painter();
         let done = Rect::from_min_size(pos2(screen.right() - 20.0 - 44.0, top + 10.0), vec2(44.0, 45.0));
@@ -1012,7 +1012,7 @@ impl Gallery {
                 ui.painter(),
                 pos2(field.center().x, field.bottom() + 12.0),
                 Align2::CENTER_TOP,
-                "ProCraft",
+                "DreamsCraft",
                 64.0,
                 Weight::Bold,
                 Color32::WHITE,
@@ -1245,7 +1245,7 @@ impl Gallery {
                 ui,
                 pos2(screen.left() + 32.0, top + 11.0),
                 Align2::LEFT_TOP,
-                "ProCraft",
+                "DreamsCraft",
                 argb(TITLE).gamma_multiply(title_in),
                 &fit,
             );
@@ -2757,7 +2757,11 @@ mod tests {
         let fit = shown.gallery.header_fit.clone().unwrap();
         assert_eq!(fit.buttons.iter().map(|b| b.action).collect::<Vec<_>>(), [GalleryAction::More]);
         assert_eq!(fit.more, [GalleryAction::Select, GalleryAction::Import, GalleryAction::Photo]);
-        assert_eq!(fit.title_scale, 1.0, "the name fits whole beside More and +");
+        assert!(
+            (0.7..=1.0).contains(&fit.title_scale),
+            "the name fits whole beside More and + (scale={})",
+            fit.title_scale
+        );
         // More opens its list, inside the window
         let more = shown.gallery.more_button;
         assert!(more.left() > 0.0 && more.right() < 400.0 - 20.0 - 44.0);

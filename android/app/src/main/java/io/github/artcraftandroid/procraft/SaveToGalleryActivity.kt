@@ -125,7 +125,7 @@ class SaveToGalleryActivity : ComponentActivity() {
     companion object {
         private const val EXTRA_PATHS = "paths"
         private const val EXTRA_MIME = "mime"
-        private const val FOLDER = "ProCraft"
+        private const val FOLDER = "DreamsCraft"
 
         @Suppress("DEPRECATION")
         private fun sharedFolder(video: Boolean) = if (video) Environment.DIRECTORY_MOVIES else Environment.DIRECTORY_PICTURES

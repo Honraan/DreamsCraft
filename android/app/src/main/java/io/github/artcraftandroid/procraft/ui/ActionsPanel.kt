@@ -329,7 +329,7 @@ fun ActionsPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier)
         )
         else -> listOf(
             listOf(
-                Act("About ProCraft") { dialog = "ProCraft" to "Version ${versionName(context)}" },
+                Act("About DreamsCraft") { dialog = "DreamsCraft" to "Version ${versionName(context)}" },
                 Act("Licences") { dialog = "Licences" to licences(context) },
             ),
             listOf(
@@ -989,8 +989,8 @@ fun WrongBuildAlert(vm: CanvasViewModel) {
         Unit.takeIf { vm.wrongBuildNotice },
         title = { "Use the 64-bit version" },
         message = {
-            "This is ProCraft's 32-bit version, for older tablets. This tablet runs the 64-bit one, which newer " +
-                "Android expects: install the file ending in arm64.apk over this one, and your artworks stay."
+            "This is DreamsCraft's 32-bit version, for older tablets. This tablet runs the 64-bit one, which newer " +
+                "Android expects: install the file ending in arm64.apk over this one, and your animations stay."
         },
         action = "Releases",
         cancel = "Later",
@@ -1009,7 +1009,7 @@ fun WrongBuildAlert(vm: CanvasViewModel) {
 }
 
 /** Where each release's files are. */
-private const val RELEASES_PAGE = "https://github.com/artcraft-android/procraft/releases/latest"
+private const val RELEASES_PAGE = "https://github.com/Honraan/DreamsCraft/releases/latest"
 
 /** Choices as rows of a rounded group, the chosen one a full blue row. */
 @Composable
