@@ -1,11 +1,20 @@
 package io.github.artcraftandroid.procraft.ui
 
+import androidx.compose.ui.geometry.Offset
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class TimelineUiTest {
+    @Test
+    fun performDragUsesClipCoordinatesWithZoomAndRotation() {
+        val delta = stageDeltaToContent(Offset(-6f, 12f), listOf(0f, 3f, -2f, 0f, 300f, 240f))
+        assertEquals(4f, delta.x, 0.001f)
+        assertEquals(3f, delta.y, 0.001f)
+        assertEquals(Offset.Zero, stageDeltaToContent(Offset(10f, 20f), listOf(0f, 0f, 0f, 0f)))
+    }
+
     @Test
     fun formatTimecodeFormatsMinutesSecondsAndFrames() {
         assertEquals("00:00:00", formatTimecode(0, 12))

@@ -1776,12 +1776,9 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     /** What fitting the canvas keeps clear of: the top bar and the sidebar, with Fit Canvas Inside Interface. */
     fun applyFitInsets() {
         val s = session ?: return
-        if (!fitInside) {
-            s.setFitInsets(0f, 0f, 0f, 0f)
-            return
-        }
-        val side = if (showSideBar) (io.github.artcraftandroid.procraft.ui.Pc.sideBarShown.value + io.github.artcraftandroid.procraft.ui.Pc.PopoverGap.value) * density else 0f
-        s.setFitInsets(if (rightHanded) 0f else side, io.github.artcraftandroid.procraft.ui.Pc.barShown.value * density, if (rightHanded) side else 0f, 0f)
+        val top = if (fitInside || stageBottomInsetPx > 0f) io.github.artcraftandroid.procraft.ui.Pc.barShown.value * density else 0f
+        val side = if (fitInside && showSideBar) (io.github.artcraftandroid.procraft.ui.Pc.sideBarShown.value + io.github.artcraftandroid.procraft.ui.Pc.PopoverGap.value) * density else 0f
+        s.setFitInsets(if (rightHanded) 0f else side, top, if (rightHanded) side else 0f, stageBottomInsetPx)
     }
 
     /** A new artwork just started: without time-lapse if it is turned off. */
@@ -3203,6 +3200,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         }
         if (!brushesLoaded) loadBrushes(s)
         s.useColourHistory(colourHistory)
+        windowSize = Offset.Zero
         session = s
         val model = s.modelInfo()
         modelOpen = model != null
@@ -3232,6 +3230,10 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         addPendingBrushes()
         pushSecondary()
         artworkDir = dir
+        stageBottomInsetPx = 0f
+        stageGizmoActive = false
+        stageGizmoMode = StageGizmoSubMode.MOVE_SCALE
+        dreamsMode = DreamsWorkMode.DRAW_PAINT
         selectedClipIds = emptySet()
         selectedKeyframes = emptySet()
         selectedTrackIds = emptySet()
@@ -8427,19 +8429,24 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     private var lastAudioScrubMs = 0L
     private val recordedPerformDeforms = mutableListOf<io.github.artcraftandroid.procraft.core.PerformDeformSampleInfo>()
 
-    private var lastStageBottomInsetPx = -1f
+    private var stageBottomInsetPx = 0f
 
-    /**
-     * Adjusts the bottom fit inset of the Stage so the canvas centers in the visible upper Stage
-     * area above the multi-track timeline (or expands to full screen in Flipbook mode).
-     */
+    val stageControlsActive: Boolean
+        get() = timeline?.flipbookOpen == false && !barsHidden &&
+            (dreamsMode == DreamsWorkMode.PERFORM || stageGizmoActive)
+
+    /** A dock layout change fits the viewport once, independently of content animation. */
     fun updateStageBottomInset(bottomPx: Float) {
         val s = session ?: return
         val clamped = bottomPx.coerceAtLeast(0f)
-        if (abs(clamped - lastStageBottomInsetPx) < 1f) return
-        lastStageBottomInsetPx = clamped
-        val topPx = io.github.artcraftandroid.procraft.ui.Pc.barShown.value * density
-        s.setFitInsets(0f, topPx, 0f, clamped)
+        if (abs(clamped - stageBottomInsetPx) < 1f) return
+        stageBottomInsetPx = clamped
+        applyFitInsets()
+        // The native surface uses these insets for its first fit if it has not attached yet.
+        if (windowSize != Offset.Zero) {
+            s.fitView()
+            refreshView()
+        }
     }
 
     fun changeAnimationAssist(on: Boolean) {
@@ -8511,6 +8518,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     // ---- Multi-Track Timeline Actions ----
 
     fun setTimelinePlayhead(frame: Int) {
+        if (performRecording) finishPerformRecording()
         val s = session ?: return
         val clamped = frame.coerceAtLeast(0)
         s.timelineSetPlayhead(clamped.toUInt())
@@ -8533,6 +8541,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun stepTimelineFrame(delta: Int) {
+        if (performRecording) finishPerformRecording()
         stopPlaying()
         val s = session ?: return
         s.timelineStepFrame(delta)
@@ -8569,7 +8578,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                     requestedVideoFrame = null
                     decodeTimelineVideo(s, media, target) {
                         session === s && !exportingTimelineMedia &&
-                            (requestedVideoFrame == null || playingFrame != null)
+                            (requestedVideoFrame == null || playingFrame != null || performRecording)
                     }
                 }
             } finally {
@@ -8642,8 +8651,13 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun setFlipbookMode(open: Boolean) {
+        if (performRecording) finishPerformRecording()
         stopPlaying()
         val s = session ?: return
+        if (open) {
+            dreamsMode = DreamsWorkMode.DRAW_PAINT
+            stageGizmoActive = false
+        }
         s.timelineSetFlipbook(open)
         timeline = s.timelineState()
     }
@@ -8716,6 +8730,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun selectTimelineClip(clipId: ULong) {
+        if (performRecording) finishPerformRecording()
         val s = session ?: return
         s.timelineSelectClip(clipId)
         refresh()
@@ -8833,74 +8848,81 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         return raw.map { it.transform.x to it.transform.y } to filtered.map { it.transform.x to it.transform.y }
     }
 
-    fun beginPerformRecording() {
-        val s = session ?: return
-        val tl = timeline ?: return
-        val target = tl.tracks.asSequence().flatMap { it.clips.asSequence() }
-            .firstOrNull { it.id == tl.activeClipId } ?: return
-        val clipEnd = target.startFrame + target.durationFrames - 1u
-        val start = maxOf(target.startFrame, tl.workArea?.start ?: target.startFrame)
-        val end = minOf(clipEnd, tl.workArea?.end ?: clipEnd)
-        if (start > end) {
-            message = "The work area does not overlap this clip"
-            return
+    private var performFrame = 0u
+
+    fun beginPerformRecording(): Boolean {
+        if (performRecording) return false
+        val s = session ?: return false
+        val tl = timeline ?: return false
+        val target = tl.activeClipId ?: return false
+        val range = s.timelinePerformRange(target) ?: run {
+            message = "Select an unlocked clip that overlaps the work area"
+            return false
         }
         stopPlaying()
         showPerformComparison = false
-        performTarget = target.id
+        performTarget = target
         recordedPerformSamples.clear()
         recordedPerformDeforms.clear()
         lastPerformCommitRev = null
-        val initial = tl.playhead.takeIf { it in start..end } ?: start
-        setTimelinePlayhead(initial.toInt())
-        val initialTransform = timeline?.activeEvaluatedTransform ?: return
+        performSamplesCount = 0
+        val initial = tl.playhead.takeIf { it in range.start..range.end } ?: range.start
+        performFrame = initial
         s.timelineBeginPerform()
+        s.timelineSetPlayhead(initial)
+        timeline = s.timelineState()
         performRecording = true
-        recordedPerformSamples.add(io.github.artcraftandroid.procraft.core.PerformSampleInfo(initial, initialTransform))
-        performSamplesCount = 1
+        syncVideoClipsAt(initial.toInt())
 
         val fps = tl.fps.toInt().coerceIn(1, 60)
         val epoch = android.os.SystemClock.elapsedRealtimeNanos()
         performPlayJob?.cancel()
         performPlayJob = viewModelScope.launch {
-            var frame = initial
-            while (performRecording && session === s) {
-                val tick = (frame - initial + 1u).toLong()
+            while (performRecording && session === s && performFrame < range.end) {
+                val tick = (performFrame - initial + 1u).toLong()
                 val wait = epoch + tick * 1_000_000_000L / fps - android.os.SystemClock.elapsedRealtimeNanos()
                 if (wait > 0) kotlinx.coroutines.delay((wait + 999_999L) / 1_000_000L)
-                if (frame == end) {
-                    finishPerformRecording()
-                    break
-                }
-                frame += 1u
-                setTimelinePlayhead(frame.toInt())
+                performFrame += 1u
+                // Carry the current pose into elapsed frames, even when the pointer is still.
+                val deformation = recordedPerformDeforms.lastOrNull()
+                if (deformation != null) recordPerformDeform(deformation.deform)
+                else recordedPerformSamples.lastOrNull()?.let { recordPerformTransform(it.transform) }
+                s.timelineSetPlayhead(performFrame)
+                timeline = s.timelineState()
+                syncVideoClipsAt(performFrame.toInt())
             }
+            // Keep the take at its last frame until this gesture lifts.
         }
+        return true
     }
 
     fun recordPerformTransform(transform: io.github.artcraftandroid.procraft.core.TimelineTransformInfo) {
+        if (!performRecording) return
         val s = session ?: return
-        val tl = timeline ?: return
         val cid = performTarget ?: return
-        val frame = tl.playhead
-        recordedPerformSamples.add(
-            io.github.artcraftandroid.procraft.core.PerformSampleInfo(frame, transform),
-        )
+        if (!s.timelinePreviewPerformTransform(cid, performFrame, transform)) return
+        val sample = io.github.artcraftandroid.procraft.core.PerformSampleInfo(performFrame, transform)
+        if (recordedPerformSamples.lastOrNull()?.frame == performFrame) {
+            recordedPerformSamples[recordedPerformSamples.lastIndex] = sample
+        } else {
+            recordedPerformSamples.add(sample)
+        }
         performSamplesCount = recordedPerformSamples.size
-        s.timelinePreviewPerformTransform(cid, frame, transform)
         canUndo = true
     }
 
     fun recordPerformDeform(deform: io.github.artcraftandroid.procraft.core.TimelineDeformInfo) {
+        if (!performRecording) return
         val s = session ?: return
-        val tl = timeline ?: return
         val cid = performTarget ?: return
-        val frame = tl.playhead
-        recordedPerformDeforms.add(
-            io.github.artcraftandroid.procraft.core.PerformDeformSampleInfo(frame, deform),
-        )
+        if (!s.timelinePreviewPerformDeform(cid, performFrame, deform)) return
+        val sample = io.github.artcraftandroid.procraft.core.PerformDeformSampleInfo(performFrame, deform)
+        if (recordedPerformDeforms.lastOrNull()?.frame == performFrame) {
+            recordedPerformDeforms[recordedPerformDeforms.lastIndex] = sample
+        } else {
+            recordedPerformDeforms.add(sample)
+        }
         performSamplesCount = recordedPerformDeforms.size
-        s.timelinePreviewPerformDeform(cid, frame, deform)
         canUndo = true
     }
 
@@ -8916,6 +8938,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         showPerformComparison = false
         session?.timelineCancelPerform()
         refresh()
+        timeline?.let { syncVideoClipsAt(it.playhead.toInt()) }
     }
 
     fun finishPerformRecording() {
@@ -8953,6 +8976,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         if (!performRecording && cid != null && timeline?.activeClipId == cid && lastPerformCommitRev == s.info().revision &&
             (recordedPerformDeforms.isNotEmpty() || recordedPerformSamples.isNotEmpty())
         ) {
+            val previewFrame = timeline?.playhead
             // If the user is adjusting Motion Filtering right after a Perform take, replace that
             // single Perform undo step instead of stacking duplicate Perform steps!
             s.undo()
@@ -8961,6 +8985,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             } else {
                 s.timelineCommitPerform(cid, recordedPerformSamples.toList(), clamped)
             }
+            if (previewFrame != null) s.timelineSetPlayhead(previewFrame)
             lastPerformCommitRev = s.info().revision
         }
         refresh()
@@ -9473,6 +9498,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     fun togglePlaying() = if (playingFrame != null) stopPlaying() else play()
 
     private fun play() {
+        if (performRecording) finishPerformRecording()
         val s = session ?: return
         val tl = timeline
         if (tl != null) {

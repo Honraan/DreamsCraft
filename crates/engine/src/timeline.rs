@@ -2142,6 +2142,48 @@ impl Timeline {
         Some((new_layer, true))
     }
 
+    /// Where a take can record. A single drawing can be held through free space on its track.
+    pub fn perform_range(&self, clip_id: ClipId) -> Option<WorkArea> {
+        let track = self.track(self.track_of_clip(clip_id)?)?;
+        let clip = self.clip(clip_id)?;
+        if track.locked || !track.visible || matches!(clip.kind, ClipKind::Audio { .. }) {
+            return None;
+        }
+        let mut end = clip.end_frame().min(self.duration_frames);
+        if matches!(&clip.kind, ClipKind::Cel { cels } if cels.len() == 1) {
+            let next = track
+                .clips
+                .iter()
+                .filter(|other| other.id != clip_id && other.start_frame > clip.start_frame)
+                .map(|other| other.start_frame)
+                .min()
+                .unwrap_or(self.duration_frames);
+            end = end.max(next.min(self.duration_frames).min(clip.start_frame.saturating_add(601)));
+        }
+        let mut start = clip.start_frame;
+        let mut end = end.checked_sub(1)?;
+        if let Some(work_area) = self.work_area {
+            start = start.max(work_area.start);
+            end = end.min(work_area.end);
+        }
+        (start <= end).then_some(WorkArea { start, end })
+    }
+
+    /// Holds a single drawing through the recorded frame. The undo snapshot belongs to the take.
+    pub fn extend_perform_exposure(&mut self, clip_id: ClipId, frame: u32) {
+        if !self.perform_range(clip_id).is_some_and(|range| (range.start..=range.end).contains(&frame)) {
+            return;
+        }
+        if let Some(clip) = self.clip_mut(clip_id)
+            && frame >= clip.end_frame()
+            && let ClipKind::Cel { cels } = &mut clip.kind
+            && let [cel] = cels.as_mut_slice()
+        {
+            cel.hold = frame - clip.start_frame;
+            clip.sync_duration();
+        }
+    }
+
     /// Moves `clip_id` to `new_start_frame` (and optionally to `target_track`), shifting its
     /// keyframes by the same frame delta.
     pub fn move_clip(&mut self, clip_id: ClipId, new_start_frame: u32, target_track: Option<TrackId>) -> bool {
@@ -2464,6 +2506,16 @@ impl Timeline {
         acc
     }
 
+    /// Transforms a clip's position channel into stage pixels, before applying the view.
+    pub fn clip_stage_affine(&self, track_id: TrackId, frame: f32, width: u32, height: u32) -> Affine {
+        let track = self.evaluate_track_affine(track_id, frame, width, height);
+        if !self.camera_enabled {
+            return track;
+        }
+        let camera = self.camera.evaluate_transform(frame).to_affine(width, height);
+        track.then(camera.inverse().unwrap_or(Affine::IDENTITY))
+    }
+
     /// Evaluates the combined hierarchical opacity of `track_id` at `frame`.
     pub fn evaluate_track_opacity(&self, track_id: TrackId, frame: f32) -> f32 {
         let mut opacity = 1.0_f32;
@@ -2560,15 +2612,28 @@ impl Timeline {
                 let clip_filter = track_filter.combine(clip.keyframes.evaluate_filter(frame)).combine(scene_cam_filter);
                 let clip_deform = clip.keyframes.evaluate_deform(frame);
 
-                // 0. Perform Motion Ghost (Onion Skin of the first frame following the Perform motion!)
-                // Shown whenever `!playing && clip.perform_onion_guide` so the artist can trace and
-                // animate frame-by-frame right on top of the Perform trajectory.
+                // Older takes can have motion keys beyond the exposure of their first drawing.
+                // Keep that guide usable through the original take, including when the tracing
+                // drawing lives in a separate clip.
+                let guide_in_range = clip.contains_frame(frame_u32)
+                    || (frame_u32 >= clip.start_frame
+                        && clip
+                            .keyframes
+                            .transform
+                            .last()
+                            .map(|k| k.frame)
+                            .into_iter()
+                            .chain(clip.keyframes.deform.last().map(|k| k.frame))
+                            .any(|end| frame_u32 <= end));
+                let mut shown_guide = None;
                 if !playing
                     && clip.perform_onion_guide
+                    && guide_in_range
                     && let Some(guide_layer) = clip.perform_guide_layer.or_else(|| clip.first_layer())
                 {
                     let guide_alpha = (clip.perform_guide_opacity.clamp(0.0, 1.0) * clip_base_opacity).clamp(0.0, 1.0);
                     if guide_alpha > 1e-4 {
+                        shown_guide = Some(guide_layer);
                         let [r, g, b] = clip.perform_guide_color;
                         items.push(EvaluatedLayer {
                             layer: guide_layer,
@@ -2689,7 +2754,14 @@ impl Timeline {
                         let effective_blend = if clip.blend != BlendMode::Normal { clip.blend } else { track.blend };
                         match &clip.kind {
                             ClipKind::Cel { .. } => {
-                                if let Some((cel_idx, cel, _)) = clip.cel_at(frame_u32) {
+                                if let Some((cel_idx, cel, offset)) = clip.cel_at(frame_u32)
+                                    && !(self.flipbook_open
+                                        && self.auto_split_cel_on_draw
+                                        && self.active_clip == Some(clip.id)
+                                        && cel_idx == 0
+                                        && offset > 0
+                                        && shown_guide == Some(cel.layer))
+                                {
                                     // If Perform Motion Ghost is active and the artist has drawn a
                                     // dedicated frame-by-frame cel (`cel_idx > 0`), keep the drawn
                                     // cel in stage space so it doesn't double-transform on top of the

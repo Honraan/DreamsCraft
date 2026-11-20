@@ -6814,6 +6814,59 @@ fn dreamscraft_v2_auto_draw_perform_ghost_track_effects_audio_filters_warp_and_c
 }
 
 #[test]
+fn dreamscraft_perform_holds_a_single_drawing_for_flipbook_tracing() {
+    let Some(s) = session(32, 32) else { return };
+    s.enable_animation_for_new_artwork();
+    let clip_id = s.timeline_state().unwrap().active_clip_id.unwrap();
+    s.timeline_set_work_area(Some(crate::TimelineWorkAreaInfo { start: 0, end: 12 }));
+    assert_eq!(s.timeline_perform_range(clip_id).unwrap().end, 12);
+    assert!(s.timeline_set_perform_onion_guide(clip_id, true, true, 0.55, vec![0.1, 0.9, 1.0]));
+    let view = s.view_matrix();
+    let samples = [(0, 0.0), (8, 10.0)].map(|(frame, x)| crate::PerformSampleInfo {
+        frame,
+        transform: crate::TimelineTransformInfo { x, ..crate::TimelineTransformInfo::default() },
+    });
+    s.timeline_begin_perform();
+    for sample in &samples {
+        assert!(s.timeline_preview_perform_transform(clip_id, sample.frame, sample.transform.clone()));
+        s.timeline_set_playhead(sample.frame);
+    }
+    assert_eq!(s.timeline_commit_perform(clip_id, samples.to_vec(), 0.0), 2);
+    let exposure = || s.timeline_state().unwrap().tracks[0].clips[0].duration_frames;
+    assert_eq!(exposure(), 9);
+    assert_eq!(s.view_matrix(), view);
+    assert_eq!(s.undo().as_deref(), Some("perform motion"));
+    assert_eq!(exposure(), 1);
+    assert_eq!(s.redo().as_deref(), Some("perform motion"));
+    assert_eq!(exposure(), 9);
+
+    s.timeline_set_flipbook(true);
+    {
+        let st = s.shared.lock();
+        let tl = st.doc.timeline.as_ref().unwrap();
+        let items = tl.evaluate(&st.doc, 8.0, false).items;
+        assert_eq!(items.len(), 1);
+        assert!(items[0].is_perform_guide);
+        assert_eq!(items[0].transform.e, 10.0);
+        let items = tl.evaluate(&st.doc, 8.0, true).items;
+        assert_eq!(items.len(), 1);
+        assert!(!items[0].is_perform_guide);
+        assert_eq!(items[0].transform.e, 10.0);
+        assert!(tl.evaluate(&st.doc, 9.0, false).items.iter().all(|item| !item.is_perform_guide));
+    }
+    s.timeline_set_playhead(8);
+    s.stroke_begin(PointerKind::Finger, vec![sample(16.0, 16.0, 0.0)]);
+    s.stroke_end(vec![]);
+    let st = s.shared.lock();
+    let tl = st.doc.timeline.as_ref().unwrap();
+    let items = tl.evaluate(&st.doc, 8.0, false).items;
+    assert_eq!(items.len(), 2);
+    assert!(items[0].is_perform_guide);
+    assert_eq!(items[0].transform.e, 10.0);
+    assert_eq!(items[1].transform.e, 0.0);
+}
+
+#[test]
 fn dreamscraft_v2_1_perform_and_timeline_undo_redo_are_atomic() {
     let Some(s) = session(40, 40) else { return };
     s.enable_animation_for_new_artwork();

@@ -345,8 +345,9 @@ class CanvasSurfaceView(context: Context, private val vm: CanvasViewModel) : Sur
                 skipping = true
                 return true
             }
-            // a mouse's other buttons do nothing on the canvas: only its primary button paints
-            skipping = kindOf(e, 0) == PointerKind.MOUSE && !mousePressPaints(e.buttonState)
+            // Stage controls handle their own gestures in Compose. Only the primary mouse button paints.
+            skipping = vm.stageControlsActive ||
+                (kindOf(e, 0) == PointerKind.MOUSE && !mousePressPaints(e.buttonState))
             if (skipping) return true
             // a touch on the canvas closes an adjustment's menu, its Layer / Pencil choice and liquify's popups
             closedAdjustMenu = vm.adjustMenuAt != null

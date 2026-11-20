@@ -18,10 +18,13 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateCentroid
+import androidx.compose.foundation.gestures.calculateCentroidSize
+import androidx.compose.foundation.gestures.calculateRotation
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.gestures.draggable
 import androidx.compose.foundation.gestures.rememberDraggableState
 import androidx.compose.foundation.horizontalScroll
@@ -64,9 +67,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.geometry.isSpecified
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
@@ -75,6 +79,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
@@ -388,6 +393,7 @@ private fun Modifier.multiFingerUndoRedo(
             var maxPointers = 1
             var maxTravel = 0f
             var endMs = startMs
+            var dragged = false
             do {
                 val event = awaitPointerEvent(PointerEventPass.Initial)
                 val pressed = event.changes.filter { it.pressed }
@@ -398,8 +404,11 @@ private fun Modifier.multiFingerUndoRedo(
                     val travel = hypot(c.position.x - origin.x, c.position.y - origin.y)
                     if (travel > maxTravel) maxTravel = travel
                 }
+                val handled = awaitPointerEvent(PointerEventPass.Final)
+                dragged = dragged || handled.changes.any { it.isConsumed && it.position != it.previousPosition }
             } while (event.changes.any { it.pressed })
 
+            if (dragged) return@awaitEachGesture
             when (classifyMultiFingerTap(maxPointers, maxTravel, endMs - startMs)) {
                 MultiFingerTapAction.UNDO -> {
                     view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
@@ -497,24 +506,22 @@ fun BoxScope.DreamsWorkspaceOverlay(
     val density = LocalDensity.current
     val view = LocalView.current
     val totalHeightPx = with(density) { windowHeight.toPx() }
-    val timelineHeightDp = (windowHeight * vm.timelineSplitRatio).coerceIn(140.dp, windowHeight * 0.70f)
+    val maxTimelineHeight = windowHeight * 0.70f
+    val timelineHeightDp = (windowHeight * vm.timelineSplitRatio).coerceIn(minOf(140.dp, maxTimelineHeight), maxTimelineHeight)
+    var flipbookToolbarHeightPx by remember { mutableIntStateOf(0) }
     val dockBottomPx = with(density) {
-        if (tl.flipbookOpen) 126.dp.toPx() else (timelineHeightDp + CenterBarHeight).toPx()
+        if (tl.flipbookOpen) 126.dp.toPx() + flipbookToolbarHeightPx
+        else (timelineHeightDp + CenterBarHeight).toPx()
     }
 
-    LaunchedEffect(dockBottomPx, tl.flipbookOpen) {
+    LaunchedEffect(vm.session, dockBottomPx) {
         vm.updateStageBottomInset(dockBottomPx)
     }
 
-    // 1. Stage Backstage Frame & Interactive Keyframe / Warp / Distort / Camera / Live Perform Gizmo
-    val stageHeightDp = if (tl.flipbookOpen) windowHeight else (windowHeight - timelineHeightDp - CenterBarHeight)
-    if (vm.dreamsMode == DreamsWorkMode.PERFORM || vm.stageGizmoActive || vm.stageGizmoMode == StageGizmoSubMode.CAMERA) {
-        StageKeyTransformOverlay(
-            vm = vm,
-            tl = tl,
-            stageWidth = windowWidth,
-            stageHeight = stageHeightDp.coerceAtLeast(120.dp),
-        )
+    val stageTop = Pc.barShown
+    val stageHeight = (windowHeight - timelineHeightDp - CenterBarHeight - stageTop).coerceAtLeast(0.dp)
+    if (vm.stageControlsActive && stageHeight > 0.dp) {
+        StageKeyTransformOverlay(vm, tl, windowWidth, stageTop, stageHeight)
     }
 
     // 2. Flipbook Mode vs Full Multi-Track Split View
@@ -527,6 +534,7 @@ fun BoxScope.DreamsWorkspaceOverlay(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .padding(bottom = 126.dp)
+                    .onSizeChanged { flipbookToolbarHeightPx = it.height }
                     .horizontalScroll(rememberScrollState())
                     .clip(RoundedCornerShape(20.dp))
                     .background(DreamsBarFill.copy(alpha = 0.95f))
@@ -542,6 +550,24 @@ fun BoxScope.DreamsWorkspaceOverlay(
                     fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.clickable { vm.setFlipbookMode(false) },
                 )
+                if (activeClip != null) {
+                    Box(Modifier.width(1.dp).height(14.dp).background(DreamsEdge))
+                    Text(
+                        text = if (activeClip.performOnionGuide) "👻 Ghost: ON" else "👻 Ghost",
+                        color = if (activeClip.performOnionGuide) OpacityCyan else DreamsDimInk,
+                        fontSize = 13.sp,
+                        fontWeight = if (activeClip.performOnionGuide) FontWeight.Bold else FontWeight.Medium,
+                        modifier = Modifier.clickable {
+                            vm.setPerformOnionGuide(
+                                clipId = activeClip.id,
+                                enabled = !activeClip.performOnionGuide,
+                                isolateFirstFrame = true,
+                                opacity = activeClip.performGuideOpacity.coerceIn(0.15f, 0.9f),
+                                colorRgb = activeClip.performGuideColor.ifEmpty { listOf(0.15f, 0.85f, 1.0f) },
+                            )
+                        },
+                    )
+                }
                 Box(Modifier.width(1.dp).height(14.dp).background(DreamsEdge))
                 Text(
                     text = "↶",
@@ -578,22 +604,6 @@ fun BoxScope.DreamsWorkspaceOverlay(
                     },
                 )
                 if (activeClip != null) {
-                    Box(Modifier.width(1.dp).height(14.dp).background(DreamsEdge))
-                    Text(
-                        text = if (activeClip.performOnionGuide) "👻 Ghost: ON" else "👻 Ghost",
-                        color = if (activeClip.performOnionGuide) OpacityCyan else DreamsDimInk,
-                        fontSize = 13.sp,
-                        fontWeight = if (activeClip.performOnionGuide) FontWeight.Bold else FontWeight.Medium,
-                        modifier = Modifier.clickable {
-                            vm.setPerformOnionGuide(
-                                clipId = activeClip.id,
-                                enabled = !activeClip.performOnionGuide,
-                                isolateFirstFrame = true,
-                                opacity = activeClip.performGuideOpacity.coerceIn(0.15f, 0.9f),
-                                colorRgb = activeClip.performGuideColor.ifEmpty { listOf(0.15f, 0.85f, 1.0f) },
-                            )
-                        },
-                    )
                     if (activeClip.kind == TimelineClipKind.CEL && activeClip.cels.isNotEmpty()) {
                         val relFrame = (tl.playhead.toInt() - activeClip.startFrame.toInt()).coerceAtLeast(0)
                         var cursor = 0
@@ -2208,6 +2218,29 @@ private fun KeyframeDiamond(
     }
 }
 
+internal fun stageDeltaToContent(delta: Offset, matrix: List<Float>): Offset {
+    if (matrix.size < 4) return Offset.Zero
+    val (a, b, c, d) = matrix
+    val determinant = a * d - b * c
+    if (!determinant.isFinite() || abs(determinant) < 1e-9f) return Offset.Zero
+    return Offset((d * delta.x - c * delta.y) / determinant, (a * delta.y - b * delta.x) / determinant)
+}
+
+private fun stageContentPoint(point: Offset, matrix: List<Float>, stageTop: Float): Offset =
+    Offset(
+        matrix[0] * point.x + matrix[2] * point.y + matrix[4],
+        matrix[1] * point.x + matrix[3] * point.y + matrix[5] - stageTop,
+    )
+
+private fun TimelineTransformInfo.stagePoint(point: Offset, canvas: Size): Offset {
+    val pivot = Offset(anchorX * canvas.width, anchorY * canvas.height)
+    val x = (point.x - pivot.x) * scaleX
+    val y = (point.y - pivot.y) * scaleY
+    val cos = kotlin.math.cos(rotation)
+    val sin = kotlin.math.sin(rotation)
+    return pivot + Offset(x * cos - y * sin + this.x, x * sin + y * cos + this.y)
+}
+
 /**
  * Interactive **Stage Keyframe, Warp/Distort, Camera & Live Perform Gizmo** rendered over the upper Stage:
  * - **Move & Scale**: 1-finger pan, 2-finger scale/rotate, Anchor Point pivot, and Motion Path curve.
@@ -2221,6 +2254,7 @@ private fun BoxScope.StageKeyTransformOverlay(
     vm: CanvasViewModel,
     tl: TimelineState,
     stageWidth: Dp,
+    stageTop: Dp,
     stageHeight: Dp,
 ) {
     val activeClip = remember(tl) { activeClipOf(tl) }
@@ -2232,9 +2266,18 @@ private fun BoxScope.StageKeyTransformOverlay(
 
     val view = LocalView.current
     val currentPlayhead by rememberUpdatedState(tl.playhead.toInt())
+    val stageTopPx = with(LocalDensity.current) { stageTop.toPx() }
+    val viewMatrix = vm.viewMatrix
+    val editMatrix by rememberUpdatedState(
+        remember(vm.session, activeClipId, isCamera, viewMatrix, tl.playhead, tl.cameraEnabled, tl.cameraTransform) {
+            if (isCamera || activeClipId == null) viewMatrix
+            else vm.session?.timelineStageEditMatrix(activeClipId) ?: viewMatrix
+        },
+    )
+    val canvasSize = vm.canvasSize().let { (w, h) -> Size(w.coerceAtLeast(1).toFloat(), h.coerceAtLeast(1).toFloat()) }
+    fun project(point: Offset): Offset = stageContentPoint(point, editMatrix, stageTopPx)
     val baseTransform = if (isCamera) tl.cameraTransform else tl.activeEvaluatedTransform
     var isInteracting by remember { mutableStateOf(false) }
-    var didMutateTransform by remember { mutableStateOf(false) }
     var liveTransform by remember(activeClipId, isCamera) {
         mutableStateOf(baseTransform)
     }
@@ -2284,8 +2327,10 @@ private fun BoxScope.StageKeyTransformOverlay(
     Box(
         modifier = Modifier
             .align(Alignment.TopCenter)
+            .offset(y = stageTop)
             .width(stageWidth)
             .height(stageHeight)
+            .clipToBounds()
             // Procreate-style 2-finger tap = Undo, 3-finger tap = Redo right over Perform & Stage Gizmo
             .multiFingerUndoRedo(
                 onUndo = { vm.undo() },
@@ -2294,98 +2339,108 @@ private fun BoxScope.StageKeyTransformOverlay(
             // Move & Scale / Camera multi-touch gestures
             .then(
                 if (!isWarp && !isDistort) {
-                    Modifier
-                        .pointerInput(activeClipId, isCamera, vm.dreamsMode) {
-                            detectTransformGestures { _, pan, zoom, rotationDeg ->
-                                val hasDelta = pan != Offset.Zero || abs(zoom - 1f) > 0.0005f || abs(rotationDeg) > 0.01f
-                                if (!hasDelta) return@detectTransformGestures
-                                isInteracting = true
-                                didMutateTransform = true
-                                if (vm.dreamsMode == DreamsWorkMode.PERFORM && !vm.performRecording) {
-                                    vm.beginPerformRecording()
-                                }
-                                val rotRad = (rotationDeg * Math.PI / 180.0).toFloat()
-                                val updated = TimelineTransformInfo(
-                                    x = liveTransform.x + pan.x,
-                                    y = liveTransform.y + pan.y,
-                                    scaleX = (liveTransform.scaleX * zoom).coerceIn(0.05f, 16f),
-                                    scaleY = (liveTransform.scaleY * zoom).coerceIn(0.05f, 16f),
-                                    rotation = liveTransform.rotation + rotRad,
-                                    anchorX = liveTransform.anchorX,
-                                    anchorY = liveTransform.anchorY,
-                                )
-                                liveTransform = updated
-                                when {
-                                    isCamera -> vm.setCameraTransformKeyframe(currentPlayhead, updated, done = false)
-                                    vm.dreamsMode == DreamsWorkMode.PERFORM -> vm.recordPerformTransform(updated)
-                                    activeClipId != null -> vm.setClipTransformKeyframe(activeClipId, currentPlayhead, updated, done = false)
-                                }
-                            }
-                        }
-                        .pointerInput(activeClipId, isCamera, vm.dreamsMode) {
-                            awaitEachGesture {
-                                awaitFirstDown(requireUnconsumed = false)
-                                do {
+                    Modifier.pointerInput(activeClipId, isCamera, vm.dreamsMode) {
+                        awaitEachGesture {
+                            awaitFirstDown()
+                            val isPerform = vm.dreamsMode == DreamsWorkMode.PERFORM && !isCamera
+                            var travel = Offset.Zero
+                            var zoomTravel = 1f
+                            var turnTravel = 0f
+                            var started = false
+                            var completed = false
+                            try {
+                                while (true) {
                                     val event = awaitPointerEvent()
-                                } while (event.changes.any { it.pressed })
-                                val mutated = didMutateTransform
-                                isInteracting = false
-                                didMutateTransform = false
-                                when {
-                                    vm.dreamsMode == DreamsWorkMode.PERFORM && vm.performRecording -> vm.finishPerformRecording()
-                                    mutated && isCamera -> vm.setCameraTransformKeyframe(currentPlayhead, liveTransform, done = true)
-                                    mutated && vm.stageGizmoActive && activeClipId != null -> vm.setClipTransformKeyframe(activeClipId, currentPlayhead, liveTransform, done = true)
+                                    if (event.changes.any { it.isConsumed }) break
+                                    if (event.changes.none { it.pressed }) {
+                                        completed = true
+                                        break
+                                    }
+                                    val from = event.calculateCentroid(useCurrent = false)
+                                    val to = event.calculateCentroid()
+                                    if (!from.isSpecified || !to.isSpecified) continue
+                                    fun inside(p: Offset) = Offset(p.x.coerceIn(0f, size.width.toFloat()), p.y.coerceIn(0f, size.height.toFloat()))
+                                    val pan = inside(to) - inside(from)
+                                    val zoom = event.calculateZoom()
+                                    val turn = event.calculateRotation()
+                                    if (!started) {
+                                        travel += pan
+                                        zoomTravel *= zoom
+                                        turnTravel += turn
+                                        val radius = event.calculateCentroidSize(useCurrent = false)
+                                        val slop = viewConfiguration.touchSlop
+                                        if (travel.getDistance() <= slop &&
+                                            abs(1f - zoomTravel) * radius <= slop &&
+                                            abs(turnTravel * Math.PI.toFloat() / 180f) * radius <= slop
+                                        ) continue
+                                        if (isPerform) {
+                                            if (!vm.beginPerformRecording()) break
+                                            liveTransform = vm.timeline?.activeEvaluatedTransform ?: liveTransform
+                                        }
+                                        isInteracting = true
+                                        started = true
+                                    }
+                                    val delta = stageDeltaToContent(pan, editMatrix)
+                                    val updated = liveTransform.copy(
+                                        x = liveTransform.x + delta.x,
+                                        y = liveTransform.y + delta.y,
+                                        scaleX = (liveTransform.scaleX * zoom).coerceIn(0.05f, 16f),
+                                        scaleY = (liveTransform.scaleY * zoom).coerceIn(0.05f, 16f),
+                                        rotation = liveTransform.rotation + turn * Math.PI.toFloat() / 180f,
+                                    )
+                                    liveTransform = updated
+                                    when {
+                                        isPerform -> vm.recordPerformTransform(updated)
+                                        isCamera -> vm.setCameraTransformKeyframe(currentPlayhead, updated, done = false)
+                                        activeClipId != null -> vm.setClipTransformKeyframe(activeClipId, currentPlayhead, updated, done = false)
+                                    }
+                                    event.changes.filter { it.position != it.previousPosition }.forEach { it.consume() }
                                 }
+                            } finally {
+                                if (started) {
+                                    when {
+                                        isPerform && vm.performRecording -> {
+                                            if (completed) vm.finishPerformRecording() else vm.cancelPerformRecording()
+                                        }
+                                        !isPerform && isCamera -> vm.setCameraTransformKeyframe(currentPlayhead, liveTransform, done = true)
+                                        !isPerform && activeClipId != null -> vm.setClipTransformKeyframe(activeClipId, currentPlayhead, liveTransform, done = true)
+                                    }
+                                }
+                                isInteracting = false
                             }
                         }
+                    }
                 } else {
                     // Distort (4 corners) or Warp (4x4 16 nodes) drag interaction (+ Perform Warp!)
                     Modifier.pointerInput(activeClipId, isWarp, isDistort, vm.dreamsMode) {
                         detectDragGestures(
                             onDragStart = { pos ->
-                                val bx = size.width * 0.25f
-                                val by = size.height * 0.22f
-                                val bw = size.width * 0.50f
-                                val bh = size.height * 0.56f
-                                var bestIdx = -1
-                                var bestDist = 72f
-                                if (isDistort) {
-                                    for (i in 0..3) {
-                                        val hx = bx + distortCorners[i].first * bw
-                                        val hy = by + distortCorners[i].second * bh
-                                        val d = hypot(pos.x - hx, pos.y - hy)
-                                        if (d < bestDist) {
-                                            bestDist = d
-                                            bestIdx = i
-                                        }
+                                val points = if (isDistort) distortCorners else warpPoints.chunked(2).map { it[0] to it[1] }
+                                fun handle(point: Pair<Float, Float>): Offset =
+                                    project(liveTransform.stagePoint(Offset(point.first * canvasSize.width, point.second * canvasSize.height), canvasSize))
+                                val closest = points.indices.minByOrNull { (pos - handle(points[it])).getDistance() }
+                                val found = closest?.takeIf { (pos - handle(points[it])).getDistance() <= 40.dp.toPx() }
+                                if (found != null && (vm.dreamsMode != DreamsWorkMode.PERFORM || vm.beginPerformRecording())) {
+                                    if (vm.performRecording) {
+                                        val deform = vm.timeline?.activeEvaluatedDeform
+                                        warpPoints = deform?.warpMesh?.takeIf { it.size == 32 } ?: defaultIdentityDeformPoints()
+                                        distortCorners = deform?.distortCorners?.takeIf { it.size == 8 }?.chunked(2)
+                                            ?.map { it[0] to it[1] } ?: listOf(0f to 0f, 1f to 0f, 1f to 1f, 0f to 1f)
+                                        liveTransform = vm.timeline?.activeEvaluatedTransform ?: liveTransform
                                     }
-                                } else {
-                                    for (i in 0 until 16) {
-                                        val hx = bx + warpPoints[i * 2] * bw
-                                        val hy = by + warpPoints[i * 2 + 1] * bh
-                                        val d = hypot(pos.x - hx, pos.y - hy)
-                                        if (d < bestDist) {
-                                            bestDist = d
-                                            bestIdx = i
-                                        }
-                                    }
-                                }
-                                activeDeformHandle = bestIdx
-                                if (bestIdx >= 0) {
+                                    activeDeformHandle = found
                                     isInteracting = true
-                                    if (vm.dreamsMode == DreamsWorkMode.PERFORM && !vm.performRecording) {
-                                        vm.beginPerformRecording()
-                                    }
                                 }
                             },
                             onDrag = { change, drag ->
                                 val idx = activeDeformHandle
                                 if (idx < 0 || activeClipId == null) return@detectDragGestures
                                 change.consume()
-                                val bw = (size.width * 0.50f).coerceAtLeast(1f)
-                                val bh = (size.height * 0.56f).coerceAtLeast(1f)
-                                val du = drag.x / bw
-                                val dv = drag.y / bh
+                                val delta = stageDeltaToContent(drag, editMatrix)
+                                val cos = kotlin.math.cos(liveTransform.rotation)
+                                val sin = kotlin.math.sin(liveTransform.rotation)
+                                val du = (delta.x * cos + delta.y * sin) / (liveTransform.scaleX * canvasSize.width)
+                                val dv = (delta.y * cos - delta.x * sin) / (liveTransform.scaleY * canvasSize.height)
                                 val info = if (isDistort) {
                                     val next = distortCorners.toMutableList()
                                     val cur = next[idx]
@@ -2413,8 +2468,8 @@ private fun BoxScope.StageKeyTransformOverlay(
                             },
                             onDragEnd = {
                                 if (activeDeformHandle >= 0 && activeClipId != null) {
-                                    if (vm.dreamsMode == DreamsWorkMode.PERFORM && vm.performRecording) {
-                                        vm.finishPerformRecording()
+                                    if (vm.dreamsMode == DreamsWorkMode.PERFORM) {
+                                        if (vm.performRecording) vm.finishPerformRecording()
                                     } else {
                                         val info = if (isDistort) {
                                             TimelineDeformInfo(
@@ -2447,12 +2502,15 @@ private fun BoxScope.StageKeyTransformOverlay(
     ) {
         // Visual Stage Gizmo Canvas (Move & Scale + Motion Path, Distort 4-pin, Warp 4x4 Mesh, or Camera Viewport)
         Canvas(modifier = Modifier.fillMaxSize()) {
+            val pivot = Offset(liveTransform.anchorX * canvasSize.width, liveTransform.anchorY * canvasSize.height)
+            fun projectOffset(x: Float, y: Float): Offset = project(pivot + Offset(x, y))
+            fun projectShape(u: Float, v: Float): Offset =
+                project(liveTransform.stagePoint(Offset(u * canvasSize.width, v * canvasSize.height), canvasSize))
             comparison?.let { (raw, smooth) ->
                 fun drawTake(points: List<Pair<Float, Float>>, ink: Color) {
                     for ((from, to) in points.zipWithNext()) {
                         drawLine(
-                            ink, Offset(size.width * 0.5f + from.first * 0.25f, size.height * 0.5f + from.second * 0.25f),
-                            Offset(size.width * 0.5f + to.first * 0.25f, size.height * 0.5f + to.second * 0.25f),
+                            ink, projectOffset(from.first, from.second), projectOffset(to.first, to.second),
                             strokeWidth = 2.dp.toPx(),
                         )
                     }
@@ -2466,8 +2524,7 @@ private fun BoxScope.StageKeyTransformOverlay(
                 val motionPath = Path()
                 pathKeyframes.forEachIndexed { i, kf ->
                     val t = kf.transform ?: return@forEachIndexed
-                    val px = size.width * 0.5f + t.x * 0.25f
-                    val py = size.height * 0.5f + t.y * 0.25f
+                    val (px, py) = projectOffset(t.x, t.y)
                     if (i == 0) motionPath.moveTo(px, py) else motionPath.lineTo(px, py)
                     drawCircle(color = gizmoColor.copy(alpha = 0.85f), radius = 4.5f, center = Offset(px, py))
                 }
@@ -2479,14 +2536,10 @@ private fun BoxScope.StageKeyTransformOverlay(
             }
 
             if (isDistort || isWarp) {
-                val bx = size.width * 0.25f
-                val by = size.height * 0.22f
-                val bw = size.width * 0.50f
-                val bh = size.height * 0.56f
                 val mesh = if (isDistort) distortCornersToDeformPoints(distortCorners) else warpPoints
                 fun pt(row: Int, col: Int): Offset {
                     val idx = (row * 4 + col) * 2
-                    return Offset(bx + mesh[idx] * bw, by + mesh[idx + 1] * bh)
+                    return projectShape(mesh[idx], mesh[idx + 1])
                 }
                 // Draw 4x4 grid lines
                 for (r in 0..3) {
@@ -2502,45 +2555,30 @@ private fun BoxScope.StageKeyTransformOverlay(
                 // Draw draggable handles
                 if (isDistort) {
                     for ((i, c) in distortCorners.withIndex()) {
-                        val o = Offset(bx + c.first * bw, by + c.second * bh)
+                        val o = projectShape(c.first, c.second)
                         drawCircle(Color.White, radius = if (i == activeDeformHandle) 12f else 9f, center = o)
                         drawCircle(gizmoColor, radius = if (i == activeDeformHandle) 9f else 6.5f, center = o)
                     }
                 } else {
                     for (i in 0 until 16) {
-                        val o = Offset(bx + warpPoints[i * 2] * bw, by + warpPoints[i * 2 + 1] * bh)
+                        val o = projectShape(warpPoints[i * 2], warpPoints[i * 2 + 1])
                         drawCircle(Color.White, radius = if (i == activeDeformHandle) 10f else 7f, center = o)
                         drawCircle(gizmoColor, radius = if (i == activeDeformHandle) 7.5f else 5f, center = o)
                     }
                 }
             } else {
-                val cx = size.width * 0.5f + liveTransform.x * 0.25f
-                val cy = size.height * 0.5f + liveTransform.y * 0.25f
-                val boxW = (size.width * (if (isCamera) 0.60f else 0.42f) * liveTransform.scaleX).coerceIn(40f, size.width * 0.92f)
-                val boxH = (size.height * (if (isCamera) 0.58f else 0.42f) * liveTransform.scaleY).coerceIn(40f, size.height * 0.92f)
-
-                drawRoundRect(
-                    color = gizmoColor,
-                    topLeft = Offset(cx - boxW / 2f, cy - boxH / 2f),
-                    size = Size(boxW, boxH),
-                    cornerRadius = CornerRadius(if (isCamera) 2f else 8f, if (isCamera) 2f else 8f),
-                    style = Stroke(
-                        width = 3f,
-                        pathEffect = if (isCamera) PathEffect.dashPathEffect(floatArrayOf(12f, 6f)) else null,
-                    ),
-                )
-                val corners = listOf(
-                    Offset(cx - boxW / 2f, cy - boxH / 2f),
-                    Offset(cx + boxW / 2f, cy - boxH / 2f),
-                    Offset(cx + boxW / 2f, cy + boxH / 2f),
-                    Offset(cx - boxW / 2f, cy + boxH / 2f),
-                )
-                for (c in corners) {
-                    drawCircle(color = Color.White, radius = 8f, center = c)
-                    drawCircle(color = gizmoColor, radius = 6f, center = c)
+                // Show the animated clip's pivot. Keep the drawing area itself fixed.
+                val anchor = projectOffset(liveTransform.x, liveTransform.y)
+                if (isCamera) {
+                    val border = Path().apply {
+                        val corners = listOf(projectShape(0f, 0f), projectShape(1f, 0f), projectShape(1f, 1f), projectShape(0f, 1f))
+                        moveTo(corners[0].x, corners[0].y)
+                        corners.drop(1).forEach { lineTo(it.x, it.y) }
+                        close()
+                    }
+                    drawPath(border, gizmoColor, style = Stroke(3f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(12f, 6f))))
                 }
-                val ax = (cx - boxW / 2f) + boxW * liveTransform.anchorX
-                val ay = (cy - boxH / 2f) + boxH * liveTransform.anchorY
+                val (ax, ay) = anchor
                 drawCircle(color = gizmoColor, radius = 12f, center = Offset(ax, ay), style = Stroke(width = 2.5f))
                 drawLine(color = gizmoColor, start = Offset(ax - 16f, ay), end = Offset(ax + 16f, ay), strokeWidth = 2.5f)
                 drawLine(color = gizmoColor, start = Offset(ax, ay - 16f), end = Offset(ax, ay + 16f), strokeWidth = 2.5f)
@@ -2551,7 +2589,7 @@ private fun BoxScope.StageKeyTransformOverlay(
         Column(
             modifier = Modifier
                 .align(Alignment.TopCenter)
-                .padding(top = Pc.barShown + 8.dp),
+                .padding(top = 6.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
@@ -2581,8 +2619,12 @@ private fun BoxScope.StageKeyTransformOverlay(
                             .clip(RoundedCornerShape(8.dp))
                             .background(if (chosen) gizmoColor else Color.Transparent)
                             .clickable {
+                                if (vm.performRecording) vm.finishPerformRecording()
                                 vm.stageGizmoMode = sub
-                                if (sub == StageGizmoSubMode.CAMERA) vm.setCameraEnabled(true)
+                                if (sub == StageGizmoSubMode.CAMERA) {
+                                    vm.dreamsMode = DreamsWorkMode.TIMELINE
+                                    vm.setCameraEnabled(true)
+                                }
                             }
                             .padding(horizontal = 8.dp, vertical = 3.dp),
                     )
@@ -2656,21 +2698,8 @@ private fun BoxScope.StageKeyTransformOverlay(
                             }
                             .padding(horizontal = 7.dp, vertical = 3.dp),
                     )
-                    if (vm.canComparePerform) {
-                        ModeChip(if (vm.showPerformComparison) "Close comparison" else "Compare take", vm.showPerformComparison, OpacityCyan) {
-                            if (!vm.showPerformComparison) vm.performCompareFiltering = tl.motionFiltering
-                            vm.showPerformComparison = !vm.showPerformComparison
-                        }
-                    }
-                    if (vm.showPerformComparison) {
-                        Text("Raw", color = PerformRed, fontSize = 11.sp)
-                        Text("Smoothed", color = OpacityCyan, fontSize = 11.sp)
-                        ModeChip("Apply", false, OpacityCyan) {
-                            vm.updatePerformMotionFiltering(vm.performCompareFiltering)
-                            vm.showPerformComparison = false
-                        }
-                    }
-                    val filtering = if (vm.showPerformComparison) vm.performCompareFiltering else tl.motionFiltering
+                    val comparing = vm.canComparePerform && vm.showPerformComparison
+                    val filtering = if (comparing) vm.performCompareFiltering else tl.motionFiltering
                     val filterPct = (filtering * 100).roundToInt()
                     Text(
                         text = "Filter: $filterPct%",
@@ -2686,7 +2715,7 @@ private fun BoxScope.StageKeyTransformOverlay(
                                     filtering < 0.85f -> 1.0f
                                     else -> 0.0f
                                 }
-                                if (vm.showPerformComparison) vm.performCompareFiltering = next
+                                if (comparing) vm.performCompareFiltering = next
                                 else vm.updatePerformMotionFiltering(next)
                             }
                             .padding(horizontal = 7.dp, vertical = 3.dp),
@@ -2694,7 +2723,7 @@ private fun BoxScope.StageKeyTransformOverlay(
                     // DreamsCraft v2.0 Pilar 2: Perform Motion Ghost (Onion Skin of 1st frame along Perform motion)
                     val ghostOn = activeClip.performOnionGuide
                     Text(
-                        text = if (ghostOn) "👻 Ghost 1st Frame: ON (${(activeClip.performGuideOpacity * 100).roundToInt()}%)" else "👻 Ghost 1st Frame: OFF",
+                        text = if (ghostOn) "Ghost on" else "Ghost off",
                         color = if (ghostOn) Color.Black else OpacityCyan,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
@@ -2712,6 +2741,22 @@ private fun BoxScope.StageKeyTransformOverlay(
                             }
                             .padding(horizontal = 8.dp, vertical = 3.dp),
                     )
+                }
+                if (vm.canComparePerform) {
+                    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                        ModeChip(if (vm.showPerformComparison) "Close comparison" else "Compare take", vm.showPerformComparison, OpacityCyan) {
+                            if (!vm.showPerformComparison) vm.performCompareFiltering = tl.motionFiltering
+                            vm.showPerformComparison = !vm.showPerformComparison
+                        }
+                        if (vm.showPerformComparison) {
+                            Text("Raw", color = PerformRed, fontSize = 11.sp)
+                            Text("Smoothed", color = OpacityCyan, fontSize = 11.sp)
+                            ModeChip("Apply", false, OpacityCyan) {
+                                vm.updatePerformMotionFiltering(vm.performCompareFiltering)
+                                vm.showPerformComparison = false
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -1949,6 +1949,30 @@ impl CanvasSession {
         .is_some()
     }
 
+    /// The available time range for a Perform take on the selected content.
+    pub fn timeline_perform_range(&self, clip_id: u64) -> Option<TimelineWorkAreaInfo> {
+        let st = self.shared.lock();
+        let range = st.doc.timeline.as_ref()?.perform_range(ClipId(clip_id))?;
+        Some(TimelineWorkAreaInfo { start: range.start, end: range.end })
+    }
+
+    /// The clip's editable translation coordinates mapped to window pixels.
+    pub fn timeline_stage_edit_matrix(&self, clip_id: u64) -> Vec<f32> {
+        use procraft_engine::geom::Affine;
+        let st = self.shared.lock();
+        let view = st.view.map_or(Affine::IDENTITY, |view| view.to_screen());
+        let m = st
+            .doc
+            .timeline
+            .as_ref()
+            .and_then(|tl| {
+                let track_id = tl.track_of_clip(ClipId(clip_id))?;
+                Some(tl.clip_stage_affine(track_id, tl.playhead as f32, st.doc.width(), st.doc.height()).then(view))
+            })
+            .unwrap_or(view);
+        vec![m.a, m.b, m.c, m.d, m.e, m.f]
+    }
+
     /// Starts a live Perform recording session: flushes any pending edit and captures a single
     /// pre-Perform document snapshot so all live preview updates collapse into 1 atomic undo step.
     pub fn timeline_begin_perform(&self) {
@@ -1976,11 +2000,12 @@ impl CanvasSession {
             st.pending_doc = Some(st.doc.clone());
             st.pending_name = Some("perform motion".to_owned());
         }
-        let tl = st.doc.ensure_timeline();
+        let Some(tl) = st.doc.timeline.as_mut() else { return false };
         let cid = ClipId(clip_id);
         if tl.track_of_clip(cid).and_then(|t| tl.track(t)).is_some_and(|t| t.locked) {
             return false;
         }
+        tl.extend_perform_exposure(cid, frame);
         let Some(clip) = tl.clip_mut(cid) else { return false };
         clip.keyframes.set_transform(frame, t2d, None);
         if let Some(canvas) = st.canvas.as_mut() {
@@ -2002,11 +2027,12 @@ impl CanvasSession {
             st.pending_doc = Some(st.doc.clone());
             st.pending_name = Some("perform warp".to_owned());
         }
-        let tl = st.doc.ensure_timeline();
+        let Some(tl) = st.doc.timeline.as_mut() else { return false };
         let cid = ClipId(clip_id);
         if tl.track_of_clip(cid).and_then(|t| tl.track(t)).is_some_and(|t| t.locked) {
             return false;
         }
+        tl.extend_perform_exposure(cid, frame);
         let Some(clip) = tl.clip_mut(cid) else { return false };
         clip.keyframes.set_deform(frame, def, None);
         if let Some(canvas) = st.canvas.as_mut() {
@@ -2085,6 +2111,7 @@ impl CanvasSession {
             st.doc = before;
             return 0;
         }
+        tl.extend_perform_exposure(cid, last_frame);
         let Some(clip) = tl.clip_mut(cid) else {
             st.doc = before;
             return 0;
@@ -2510,6 +2537,7 @@ impl CanvasSession {
             st.doc = before;
             return 0;
         }
+        tl.extend_perform_exposure(cid, last_frame);
         let Some(clip) = tl.clip_mut(cid) else {
             st.doc = before;
             return 0;
