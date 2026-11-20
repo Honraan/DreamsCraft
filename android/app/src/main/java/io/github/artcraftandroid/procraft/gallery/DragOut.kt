@@ -89,6 +89,13 @@ class DragProvider : ContentProvider() {
  * of the gallery's still [CanvasViewModel.SHARE_FORMATS]).
  */
 fun exportArtwork(dir: File, format: String, out: File, pdfQuality: Int = 100): Boolean = runCatching {
+    if (format == CanvasViewModel.OWN_LABEL) {
+        val media = io.github.artcraftandroid.procraft.core.artworkTimelineMedia(dir.path)
+        if (media != null) {
+            ArtworkFile.write(dir, out, media)
+            return@runCatching true
+        }
+    }
     CanvasSession.open(dir.path).use { s ->
         if (!s.prepareOffscreen()) return@runCatching false
         when (format) {

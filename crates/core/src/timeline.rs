@@ -436,6 +436,8 @@ pub struct TimelineState {
     pub camera_filter_keyframes: Vec<TimelineKeyframeInfo>,
     /// True if at least one AudioClip is present on the timeline.
     pub has_audio: bool,
+    pub dialogue_markers: Vec<TimelineDialogueMarker>,
+    pub flipbook_groups: Vec<u64>,
 }
 
 /// A live-recorded motion sample during Perform mode.
@@ -450,6 +452,68 @@ pub struct PerformSampleInfo {
 pub struct PerformDeformSampleInfo {
     pub frame: u32,
     pub deform: TimelineDeformInfo,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct TimelineDialogueMarker {
+    pub frame: u32,
+    pub label: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum TimelineKeyframeChannel {
+    Transform,
+    Opacity,
+    Filter,
+    Deform,
+    Volume,
+    Pan,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct TimelineKeyframeAddress {
+    pub clip_id: u64,
+    pub frame: u32,
+    pub channel: TimelineKeyframeChannel,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct TimelineCopiedKeyframe {
+    pub address: TimelineKeyframeAddress,
+    pub value: TimelineKeyframeInfo,
+}
+
+#[derive(Clone, Copy, Debug, uniffi::Enum)]
+pub enum TimelineClipBatch {
+    Move,
+    TrimStart,
+    TrimEnd,
+}
+
+#[derive(Clone, Copy, Debug, uniffi::Enum)]
+pub enum FlipbookBatch {
+    Exposure,
+    Reverse,
+    Duplicate,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct TimelineVideoRequest {
+    pub clip_id: u64,
+    pub file: String,
+    pub time_us: u64,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct TimelineVideoPixels {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+#[uniffi::export(with_foreign)]
+pub trait TimelineMediaProvider: Send + Sync {
+    fn video_frame(&self, request: TimelineVideoRequest) -> Option<TimelineVideoPixels>;
 }
 
 fn map_transform_kfs(kfs: &[Keyframe<Transform2D>]) -> Vec<TimelineKeyframeInfo> {
@@ -549,17 +613,23 @@ fn snapshot_clip(tl: &Timeline, track_id: TrackId, clip: &Clip, playhead: u32) -
         }
         ClipKind::Layer { layer } => (TimelineClipKind::Layer, layer.0, Vec::new()),
         ClipKind::Group { members } => (TimelineClipKind::Group, members.first().map_or(0, |l| l.0), Vec::new()),
-        ClipKind::Audio { asset_id, .. } => {
+        ClipKind::Audio { asset_id, trim_start_samples, sample_rate, .. } => {
             audio_asset_id = Some(asset_id.0);
-            if let Some(asset) = tl.audio_asset(*asset_id) {
-                // Downsample peaks to at most 128 buckets for crisp, low-overhead UI rendering
-                let total = asset.peaks.len();
-                let step = (total / 128).max(1);
-                for chunk in asset.peaks.chunks(step) {
-                    let lo = chunk.iter().map(|p| p[0]).fold(0.0_f32, f32::min);
-                    let hi = chunk.iter().map(|p| p[1]).fold(0.0_f32, f32::max);
-                    waveform_peaks.push(lo);
-                    waveform_peaks.push(hi);
+            if let Some(asset) = tl.audio_asset(*asset_id).filter(|asset| asset.duration_samples > 0) {
+                let total = asset.peaks.len() as u64;
+                let shown = (u64::from(clip.effective_duration()) * u64::from(*sample_rate))
+                    .div_ceil(u64::from(tl.fps.clamp(1, 60)));
+                let first = trim_start_samples.saturating_mul(total) / asset.duration_samples;
+                let last =
+                    trim_start_samples.saturating_add(shown).saturating_mul(total).div_ceil(asset.duration_samples);
+                let count = (last.saturating_sub(first)).clamp(1, 128);
+                for i in 0..count {
+                    let low = first + (last - first) * i / count;
+                    let high = first + ((last - first) * (i + 1)).div_ceil(count);
+                    let buckets =
+                        asset.peaks.get(low.min(total) as usize..high.min(total) as usize).unwrap_or_default();
+                    waveform_peaks.push(buckets.iter().map(|p| p[0]).fold(0.0_f32, f32::min));
+                    waveform_peaks.push(buckets.iter().map(|p| p[1]).fold(0.0_f32, f32::max));
                 }
             }
             (TimelineClipKind::Audio, 0, Vec::new())
@@ -672,6 +742,12 @@ pub(crate) fn snapshot_timeline(tl: &Timeline) -> TimelineState {
         camera_transform_keyframes: map_transform_kfs(&tl.camera.transform),
         camera_filter_keyframes: map_filter_kfs(&tl.camera.filter),
         has_audio,
+        dialogue_markers: tl
+            .dialogue_markers
+            .iter()
+            .map(|(&frame, label)| TimelineDialogueMarker { frame, label: label.clone() })
+            .collect(),
+        flipbook_groups: tl.flipbook_groups.iter().map(|id| id.0).collect(),
     }
 }
 
@@ -716,6 +792,181 @@ pub(crate) fn sync_current_layer_to_playhead(doc: &mut Document) {
             layer
         };
         doc.set_current(resolved);
+    }
+}
+
+fn editable_clip(tl: &mut Timeline, id: u64) -> Option<&mut Clip> {
+    let clip = ClipId(id);
+    if tl.track(tl.track_of_clip(clip)?)?.locked {
+        return None;
+    }
+    tl.clip_mut(clip)
+}
+
+fn remove_timeline_keyframe(tl: &mut Timeline, address: &TimelineKeyframeAddress) -> bool {
+    let Some(clip) = editable_clip(tl, address.clip_id) else { return false };
+    let keys = &mut clip.keyframes;
+    let frame = address.frame;
+    match address.channel {
+        TimelineKeyframeChannel::Transform => keys.remove_transform(frame),
+        TimelineKeyframeChannel::Opacity => keys.remove_opacity(frame),
+        TimelineKeyframeChannel::Filter => keys.remove_filter(frame),
+        TimelineKeyframeChannel::Deform => keys.remove_deform(frame),
+        TimelineKeyframeChannel::Volume => keys.remove_volume(frame),
+        TimelineKeyframeChannel::Pan => keys.remove_pan(frame),
+    }
+}
+
+fn write_timeline_keyframe(
+    clip: &mut Clip,
+    channel: TimelineKeyframeChannel,
+    frame: u32,
+    value: TimelineKeyframeInfo,
+) -> bool {
+    let ease = Some(Easing::from(&value.easing));
+    let keys = &mut clip.keyframes;
+    match channel {
+        TimelineKeyframeChannel::Transform => {
+            value.transform.map(|v| keys.set_transform(frame, Transform2D::from(&v), ease))
+        }
+        TimelineKeyframeChannel::Opacity => value.opacity.map(|v| keys.set_opacity(frame, v, ease)),
+        TimelineKeyframeChannel::Filter => {
+            value.filter.map(|v| keys.set_filter(frame, LiveFilterState::from(&v), ease))
+        }
+        TimelineKeyframeChannel::Deform => value.deform.map(|v| keys.set_deform(frame, Deform2D::from(&v), ease)),
+        TimelineKeyframeChannel::Volume => value.scalar.map(|v| keys.set_volume(frame, v, ease)),
+        TimelineKeyframeChannel::Pan => value.scalar.map(|v| keys.set_pan(frame, v, ease)),
+    }
+    .is_some()
+}
+
+/// Duplicates the whole layer unit, including its masks and any sublayers.
+fn copy_timeline_layer(doc: &mut Document, layer: LayerId, pairs: &mut Vec<(LayerId, LayerId)>) -> Option<LayerId> {
+    let count =
+        doc.layer_ids().filter(|&id| id == layer || doc.is_inside(id, layer) || doc.mask_of(layer) == Some(id)).count();
+    if !doc.has_room(count) {
+        return None;
+    }
+    let (copy, copied) = doc.duplicate(layer)?;
+    pairs.extend(copied);
+    Some(copy)
+}
+
+impl CanvasSession {
+    fn paste_timeline_clips(&self, ids: &[u64], at: Option<u32>) -> Option<Vec<u64>> {
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        st.finish_stroke();
+        st.settle();
+        let mut changed = st.doc.clone();
+        let tl = changed.ensure_timeline();
+        let ids: std::collections::BTreeSet<_> = ids.iter().copied().map(ClipId).collect();
+        let sources: Vec<_> =
+            ids.into_iter().map(|cid| Some((tl.track_of_clip(cid)?, tl.clip(cid)?.clone()))).collect::<Option<_>>()?;
+        let origin = sources.iter().map(|(_, clip)| clip.start_frame).min()?;
+        let mut pairs = Vec::new();
+        let mut result = Vec::new();
+        for (track, mut clip) in sources {
+            let start = match at {
+                Some(at) => at.checked_add(clip.start_frame - origin)?,
+                None => clip.end_frame(),
+            };
+            let mut copied = std::collections::HashMap::new();
+            let mut map = |layer: &mut LayerId| -> Option<()> {
+                if let Some(&id) = copied.get(layer) {
+                    *layer = id;
+                } else {
+                    let id = copy_timeline_layer(&mut changed, *layer, &mut pairs)?;
+                    copied.insert(*layer, id);
+                    *layer = id;
+                }
+                Some(())
+            };
+            match &mut clip.kind {
+                ClipKind::Cel { cels } => {
+                    for cel in cels {
+                        map(&mut cel.layer)?;
+                    }
+                }
+                ClipKind::Layer { layer } | ClipKind::Text { layer } | ClipKind::Video { layer, .. } => map(layer)?,
+                ClipKind::Group { members } => {
+                    for layer in members {
+                        map(layer)?;
+                    }
+                }
+                ClipKind::Audio { .. } => {}
+            }
+            if let Some(layer) = &mut clip.perform_guide_layer {
+                map(layer)?;
+            }
+            result.push(changed.timeline.as_mut()?.place_clip_copy(track, clip, start)?.0);
+        }
+        sync_current_layer_to_playhead(&mut changed);
+        let before = std::mem::replace(&mut st.doc, changed);
+        if let Some(canvas) = st.canvas.as_mut() {
+            canvas.name_next_step("paste clips");
+            canvas.duplicate_layers(pairs, before);
+        }
+        st.revision += 1;
+        self.shared.frame(st);
+        Some(result)
+    }
+
+    fn edit_flipbook(&self, id: ClipId, indices: &[u32], mode: FlipbookBatch, exposure: u32) -> Option<()> {
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        st.finish_stroke();
+        st.settle();
+        let mut changed = st.doc.clone();
+        let source = editable_clip(changed.timeline.as_mut()?, id.0)?;
+        let ClipKind::Cel { cels } = &source.kind else { return None };
+        let indices: std::collections::BTreeSet<_> = indices.iter().map(|&i| i as usize).collect();
+        if indices.is_empty() {
+            return None;
+        }
+        let picked: Vec<_> = indices.iter().map(|&i| cels.get(i).copied()).collect::<Option<_>>()?;
+        let mut cels = cels.clone();
+        let mut pairs = Vec::new();
+        match mode {
+            FlipbookBatch::Exposure => {
+                for &index in &indices {
+                    cels.get_mut(index)?.hold = exposure.clamp(1, 601) - 1;
+                }
+            }
+            FlipbookBatch::Reverse => {
+                for (&index, cel) in indices.iter().zip(picked.into_iter().rev()) {
+                    *cels.get_mut(index)? = cel;
+                }
+            }
+            FlipbookBatch::Duplicate => {
+                let after = indices.last().copied()? + 1;
+                let copies: Vec<_> = picked
+                    .into_iter()
+                    .map(|cel| {
+                        Some(Cel { layer: copy_timeline_layer(&mut changed, cel.layer, &mut pairs)?, hold: cel.hold })
+                    })
+                    .collect::<Option<_>>()?;
+                cels.splice(after..after, copies);
+            }
+        }
+        let tl = changed.timeline.as_mut()?;
+        let clip = tl.clip_mut(id)?;
+        clip.kind = ClipKind::Cel { cels };
+        clip.sync_duration();
+        let end = clip.end_frame();
+        if end > procraft_engine::timeline::MAX_TIMELINE_DURATION {
+            return None;
+        }
+        tl.duration_frames = tl.duration_frames.max(end);
+        sync_current_layer_to_playhead(&mut changed);
+        let before = std::mem::replace(&mut st.doc, changed);
+        if let Some(canvas) = st.canvas.as_mut() {
+            canvas.name_next_step("edit Flipbook frames");
+            canvas.duplicate_layers(pairs, before);
+        }
+        st.revision += 1;
+        self.shared.frame(st);
+        Some(())
     }
 }
 
@@ -766,7 +1017,10 @@ impl CanvasSession {
     pub fn timeline_set_playhead(&self, frame: u32) {
         let mut guard = self.shared.lock();
         let st = &mut *guard;
-        let tl = st.doc.ensure_timeline();
+        if st.doc.timeline.is_none() {
+            st.doc.ensure_timeline();
+        }
+        let Some(tl) = st.doc.timeline.as_mut() else { return };
         let clamped = frame.min(tl.duration_frames.saturating_sub(1));
         if tl.playhead != clamped {
             tl.playhead = clamped;
@@ -1193,108 +1447,80 @@ impl CanvasSession {
     /// Splits `clip_id` at the current timeline playhead as an undo step, returning the new clip id.
     pub fn timeline_split_clip_at_playhead(&self, clip_id: u64) -> Option<u64> {
         self.change("split clip", |d| {
+            let cid = ClipId(clip_id);
+            let is_video = d
+                .timeline
+                .as_ref()
+                .and_then(|tl| tl.clip(cid))
+                .is_some_and(|clip| matches!(clip.kind, ClipKind::Video { .. }));
+            if is_video && !d.has_room(1) {
+                return None;
+            }
             let tl = d.ensure_timeline();
-            let at = tl.playhead;
-            tl.split_clip(ClipId(clip_id), at).map(|c| c.0)
+            let right = tl.split_clip(cid, tl.playhead)?;
+            if is_video {
+                let new_layer = d.add_layer();
+                if let Some(ClipKind::Video { layer, .. }) =
+                    d.ensure_timeline().clip_mut(right).map(|clip| &mut clip.kind)
+                {
+                    *layer = new_layer;
+                }
+            }
+            sync_current_layer_to_playhead(d);
+            Some(right.0)
         })
     }
 
-    /// Duplicates `clip_id` (and its underlying layer(s) on the GPU) right after `clip_id` as an
-    /// undo step, returning the new clip id.
+    /// Duplicates one clip immediately after its current end.
     pub fn timeline_duplicate_clip(&self, clip_id: u64) -> Option<u64> {
-        let mut guard = self.shared.lock();
-        let st = &mut *guard;
-        st.finish_stroke();
-        st.settle();
-        let cid = ClipId(clip_id);
-        let (track_id, clip) = {
-            let tl = st.doc.ensure_timeline();
-            let tid = tl.track_of_clip(cid)?;
-            if tl.track(tid).is_some_and(|t| t.locked) {
-                return None;
-            }
-            (tid, tl.clip(cid)?.clone())
-        };
-        let layers_needed = clip.referenced_layers().len();
-        if !st.doc.has_room(layers_needed) {
-            return None;
-        }
-        let before = st.doc.clone();
-        let mut pairs = Vec::new();
-        let mut map_layer = |doc: &mut Document, old: LayerId| -> LayerId {
-            if let Some((new_id, copy_pairs)) = doc.duplicate(old) {
-                pairs.extend(copy_pairs);
-                new_id
-            } else {
-                old
-            }
-        };
-        let new_kind = match &clip.kind {
-            ClipKind::Cel { cels } => {
-                let new_cels: Vec<Cel> =
-                    cels.iter().map(|c| Cel { layer: map_layer(&mut st.doc, c.layer), hold: c.hold }).collect();
-                ClipKind::Cel { cels: new_cels }
-            }
-            ClipKind::Layer { layer } => ClipKind::Layer { layer: map_layer(&mut st.doc, *layer) },
-            ClipKind::Text { layer } => ClipKind::Text { layer: map_layer(&mut st.doc, *layer) },
-            ClipKind::Video { video_id, layer, source_fps, trim_in_frames, frame_count } => ClipKind::Video {
-                video_id: *video_id,
-                layer: map_layer(&mut st.doc, *layer),
-                source_fps: *source_fps,
-                trim_in_frames: *trim_in_frames,
-                frame_count: *frame_count,
-            },
-            ClipKind::Group { members } => {
-                let new_members: Vec<LayerId> = members.iter().map(|&m| map_layer(&mut st.doc, m)).collect();
-                ClipKind::Group { members: new_members }
-            }
-            ClipKind::Audio { asset_id, trim_start_samples, sample_rate, channels } => ClipKind::Audio {
-                asset_id: *asset_id,
-                trim_start_samples: *trim_start_samples,
-                sample_rate: *sample_rate,
-                channels: *channels,
-            },
-        };
-        let new_start = clip.end_frame();
-        let delta = i64::from(new_start) - i64::from(clip.start_frame);
-        let mut new_kf = clip.keyframes.clone();
-        new_kf.shift(delta);
+        self.paste_timeline_clips(&[clip_id], None)?.into_iter().next()
+    }
 
-        let tl = st.doc.ensure_timeline();
-        let new_clip_id = ClipId(tl.tracks.iter().flat_map(|t| &t.clips).map(|c| c.id.0).max().unwrap_or(0) + 100);
-        let mut new_clip = Clip {
-            id: new_clip_id,
-            name: format!("{} Copy", clip.name),
-            start_frame: new_start,
-            duration_frames: clip.effective_duration(),
-            blend: clip.blend,
-            opacity: clip.opacity,
-            kind: new_kind,
-            keyframes: new_kf,
-            perform_onion_guide: clip.perform_onion_guide,
-            perform_guide_layer: clip.perform_guide_layer,
-            perform_guide_opacity: clip.perform_guide_opacity,
-            perform_guide_color: clip.perform_guide_color,
-        };
-        new_clip.sync_duration();
-        let end = new_clip.end_frame();
-        if let Some(track) = tl.track_mut(track_id) {
-            track.clips.push(new_clip);
-            track.clips.sort_by_key(|c| c.start_frame);
-        }
-        tl.duration_frames = tl.duration_frames.max(end);
-        tl.active_clip = Some(new_clip_id);
-        tl.playhead = new_start;
-        st.doc.repair_timeline();
-        sync_current_layer_to_playhead(&mut st.doc);
+    /// Copies the clips and their drawing layers in one step, preserving their relative positions.
+    pub fn timeline_paste_clips(&self, ids: Vec<u64>, frame: u32) -> Vec<u64> {
+        self.paste_timeline_clips(&ids, Some(frame)).unwrap_or_default()
+    }
 
-        if let Some(canvas) = st.canvas.as_mut() {
-            canvas.name_next_step("duplicate clip");
-            canvas.duplicate_layers(pairs, before);
-        }
-        st.revision += 1;
-        self.shared.frame(st);
-        Some(new_clip_id.0)
+    /// Moves or trims the selected clips as one change.
+    pub fn timeline_edit_clips(&self, ids: Vec<u64>, edit: TimelineClipBatch, frame: u32) -> bool {
+        self.change("edit selected clips", |doc| {
+            let mut changed = doc.clone();
+            let tl = changed.ensure_timeline();
+            let ids: std::collections::BTreeSet<_> = ids.into_iter().map(ClipId).collect();
+            let starts: Vec<_> = ids
+                .iter()
+                .map(|id| {
+                    let track = tl.track(tl.track_of_clip(*id)?)?;
+                    (!track.locked).then(|| tl.clip(*id).map(|clip| (*id, clip.start_frame))).flatten()
+                })
+                .collect::<Option<_>>()?;
+            let origin = starts.iter().map(|(_, start)| *start).min()?;
+            let mut removed = Vec::new();
+            for (id, start) in starts {
+                match edit {
+                    TimelineClipBatch::Move => {
+                        let target = frame.checked_add(start - origin)?;
+                        let end = target.checked_add(tl.clip(id)?.effective_duration())?;
+                        if end > procraft_engine::timeline::MAX_TIMELINE_DURATION || !tl.move_clip(id, target, None) {
+                            return None;
+                        }
+                    }
+                    TimelineClipBatch::TrimStart | TimelineClipBatch::TrimEnd => {
+                        removed.extend(tl.trim_clip(id, frame, matches!(edit, TimelineClipBatch::TrimStart))?);
+                    }
+                }
+            }
+            let managed = tl.managed_layers();
+            for layer in removed {
+                if !managed.contains(&layer) {
+                    changed.delete_layer(layer);
+                }
+            }
+            sync_current_layer_to_playhead(&mut changed);
+            *doc = changed;
+            Some(())
+        })
+        .is_some()
     }
 
     /// Deletes `clip_id` as an undo step.
@@ -1449,6 +1675,127 @@ impl CanvasSession {
             }
             true
         })
+    }
+
+    pub fn timeline_edit_flipbook(&self, clip_id: u64, indices: Vec<u32>, mode: FlipbookBatch, exposure: u32) -> bool {
+        self.edit_flipbook(ClipId(clip_id), &indices, mode, exposure).is_some()
+    }
+
+    pub fn timeline_add_flipbook_track(&self, clip_id: u64) -> Option<u64> {
+        self.change("add Flipbook track", |doc| {
+            if !doc.has_room(1) {
+                return None;
+            }
+            let mut changed = doc.clone();
+            let layer = changed.add_layer();
+            let clip = changed.ensure_timeline().add_flipbook_track(ClipId(clip_id), layer)?;
+            sync_current_layer_to_playhead(&mut changed);
+            *doc = changed;
+            Some(clip.0)
+        })
+    }
+
+    pub fn timeline_set_dialogue_marker(&self, frame: u32, label: Option<String>) -> bool {
+        self.change("dialogue marker", |doc| {
+            let tl = doc.timeline.as_mut()?;
+            if frame >= tl.duration_frames {
+                return None;
+            }
+            match label {
+                Some(label) => {
+                    let name: String = label.trim().chars().take(48).collect();
+                    tl.dialogue_markers.insert(frame, name);
+                }
+                None => {
+                    tl.dialogue_markers.remove(&frame)?;
+                }
+            }
+            Some(())
+        })
+        .is_some()
+    }
+
+    pub fn timeline_copy_keyframes(&self, addresses: Vec<TimelineKeyframeAddress>) -> Vec<TimelineCopiedKeyframe> {
+        let st = self.shared.lock();
+        let Some(tl) = st.doc.timeline.as_ref() else { return Vec::new() };
+        addresses
+            .into_iter()
+            .filter_map(|address| {
+                let clip = tl.clip(ClipId(address.clip_id))?;
+                if !clip.contains_frame(address.frame) {
+                    return None;
+                }
+                let keys = &clip.keyframes;
+                let values = match address.channel {
+                    TimelineKeyframeChannel::Transform => map_transform_kfs(&keys.transform),
+                    TimelineKeyframeChannel::Opacity => map_opacity_kfs(&keys.opacity),
+                    TimelineKeyframeChannel::Filter => map_filter_kfs(&keys.filter),
+                    TimelineKeyframeChannel::Deform => map_deform_kfs(&keys.deform),
+                    TimelineKeyframeChannel::Volume => map_scalar_kfs(&keys.volume),
+                    TimelineKeyframeChannel::Pan => map_scalar_kfs(&keys.pan),
+                };
+                let value = values.into_iter().find(|value| value.frame == address.frame)?;
+                Some(TimelineCopiedKeyframe { address, value })
+            })
+            .collect()
+    }
+
+    pub fn timeline_paste_keyframes(
+        &self,
+        keys: Vec<TimelineCopiedKeyframe>,
+        frame: u32,
+        target: Option<u64>,
+        move_original: bool,
+    ) -> bool {
+        self.change("edit selected keyframes", |doc| {
+            let mut changed = doc.clone();
+            let tl = changed.timeline.as_mut()?;
+            let origin = keys.iter().map(|key| key.address.frame).min()?;
+            if move_original {
+                for key in &keys {
+                    if !remove_timeline_keyframe(tl, &key.address) {
+                        return None;
+                    }
+                }
+            }
+            for key in keys {
+                let mut address = key.address;
+                address.clip_id = target.unwrap_or(address.clip_id);
+                address.frame = frame.checked_add(address.frame - origin)?;
+                let clip = editable_clip(tl, address.clip_id)?;
+                if !clip.contains_frame(address.frame)
+                    || !write_timeline_keyframe(clip, address.channel, address.frame, key.value)
+                {
+                    return None;
+                }
+            }
+            *doc = changed;
+            Some(())
+        })
+        .is_some()
+    }
+
+    pub fn timeline_set_keyframe_easing(&self, address: TimelineKeyframeAddress, easing: TimelineEasingInfo) -> bool {
+        self.change("keyframe easing", |doc| {
+            let keys = &mut editable_clip(doc.timeline.as_mut()?, address.clip_id)?.keyframes;
+            let e = Easing::from(&easing);
+            let f = address.frame;
+            match address.channel {
+                TimelineKeyframeChannel::Transform => keys.set_transform_easing(f, e),
+                TimelineKeyframeChannel::Opacity => keys.set_opacity_easing(f, e),
+                TimelineKeyframeChannel::Filter => keys.set_filter_easing(f, e),
+                TimelineKeyframeChannel::Deform => keys.set_deform_easing(f, e),
+                TimelineKeyframeChannel::Volume => keys.set_volume_easing(f, e),
+                TimelineKeyframeChannel::Pan => keys.set_pan_easing(f, e),
+            }
+            .then_some(())
+        })
+        .is_some()
+    }
+
+    pub fn timeline_remove_keyframe(&self, address: TimelineKeyframeAddress) -> bool {
+        self.change("delete keyframe", |doc| remove_timeline_keyframe(doc.timeline.as_mut()?, &address).then_some(()))
+            .is_some()
     }
 
     /// Sets or updates a non-destructive `Move` (`Transform2D`) keyframe on `clip_id` at `frame`,
@@ -1688,6 +2035,17 @@ impl CanvasSession {
         true
     }
 
+    pub fn timeline_perform_curve(&self, samples: Vec<PerformSampleInfo>, filtering: f32) -> Vec<PerformSampleInfo> {
+        let samples: Vec<_> = samples
+            .into_iter()
+            .map(|s| MotionSample { frame: s.frame, transform: Transform2D::from(&s.transform) })
+            .collect();
+        simplify_motion_samples(&samples, filtering)
+            .into_iter()
+            .map(|k| PerformSampleInfo { frame: k.frame, transform: TimelineTransformInfo::from(k.value) })
+            .collect()
+    }
+
     /// Commits a live Perform motion recording on `clip_id`: restores pre-Perform keyframes from
     /// the session snapshot, simplifies `samples` with `filtering` (`0.0..=1.0`, RDP), and pushes
     /// **exactly one** atomic undo step (`"perform motion"`).
@@ -1896,11 +2254,11 @@ impl CanvasSession {
                 },
                 ClipKind::Layer { layer } => ClipKind::Layer { layer: map_layer(&mut st.doc, *layer) },
                 ClipKind::Text { layer } => ClipKind::Text { layer: map_layer(&mut st.doc, *layer) },
-                ClipKind::Video { video_id, layer, source_fps, trim_in_frames, frame_count } => ClipKind::Video {
+                ClipKind::Video { video_id, layer, source_fps, trim_start_us, frame_count } => ClipKind::Video {
                     video_id: *video_id,
                     layer: map_layer(&mut st.doc, *layer),
                     source_fps: *source_fps,
-                    trim_in_frames: *trim_in_frames,
+                    trim_start_us: *trim_start_us,
                     frame_count: *frame_count,
                 },
                 ClipKind::Group { members } => {
@@ -2241,6 +2599,55 @@ impl CanvasSession {
         };
         let floats = tl.mix_audio_range(start_frame, end_frame, sample_rate);
         float_pcm_to_i16(&floats)
+    }
+
+    /// Creates the track, clip, and source reference as one undo step.
+    pub fn timeline_import_video(
+        &self,
+        name: String,
+        start_frame: u32,
+        duration_frames: u32,
+        source_fps: f32,
+        frame_count: u32,
+        file: String,
+    ) -> Option<u64> {
+        if !Timeline::valid_video_filename(&file) {
+            return None;
+        }
+        self.change("import video", |doc| {
+            if !doc.has_room(1) {
+                return None;
+            }
+            let layer = doc.add_layer();
+            let tl = doc.ensure_timeline();
+            let track = tl.add_track(Some(&name), false);
+            let clip =
+                tl.add_video_clip(track, start_frame, duration_frames, layer, source_fps, frame_count, Some(&name))?;
+            tl.video_files.insert(clip.0, file);
+            Some(clip.0)
+        })
+    }
+
+    /// Video input for an absolute timeline frame, in source microseconds.
+    pub fn timeline_video_requests(&self, frame: u32) -> Vec<TimelineVideoRequest> {
+        let st = self.shared.lock();
+        let Some(tl) = st.doc.timeline.as_ref() else { return Vec::new() };
+        if tl.video_files.is_empty() {
+            return Vec::new();
+        }
+        let scene = tl.evaluate(&st.doc, frame as f32, true);
+        scene
+            .items
+            .iter()
+            .filter_map(|item| {
+                let clip = tl.clip(item.clip)?;
+                let ClipKind::Video { video_id, trim_start_us, .. } = clip.kind else { return None };
+                let file = tl.video_files.get(&video_id)?.clone();
+                let time_us = trim_start_us
+                    .saturating_add(u64::from(frame - clip.start_frame) * 1_000_000 / u64::from(tl.fps.clamp(1, 60)));
+                Some(TimelineVideoRequest { clip_id: clip.id.0, file, time_us })
+            })
+            .collect()
     }
 
     /// Adds a `VideoClip` (for rotoscoping or video compositing) on `track_id` as an undo step.

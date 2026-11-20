@@ -2,7 +2,14 @@
 
 Aplicativo de código aberto para desenhar e animar em 2D em tablets Android, Windows e Linux. O DreamsCraft usa o motor de pintura do [ProCraft](https://github.com/artcraft-android/procraft), com renderização por GPU em Rust e `wgpu` e interface em Kotlin e Jetpack Compose no Android. Desenhe quadro a quadro no Flipbook, organize clipes e áudio em uma linha do tempo multifaixa e grave movimentos em tempo real com o Perform.
 
-## Recursos Principais (v2.0)
+## Novidades da 2.2.0
+
+- **Projeto editável.** Nas opções de compartilhamento, **Editable project** gera um `.procraft` que mantém a timeline e as mídias referenciadas. Abra o arquivo pela importação da galeria.
+- **Timeline.** No modo **Edit**, selecione clipes ou keyframes para mover, copiar e colar em lote. Clipes também podem ser aparados no playhead. Dividir um clipe preserva a interpolação existente. A mesclagem agrupa trilhas que precisam manter seus efeitos separados.
+- **Flipbook e Perform.** O Flipbook tem trilhas de desenho com exposições independentes, duração em lote de 1 a 3 quadros, duplicação e inversão de sequência. O Perform grava dentro do clipe e da área de trabalho e permite comparar trajetórias antes de reaplicar a suavização.
+- **Diálogo e exportação.** O menu do playhead permite marcar sílabas na forma de onda, navegar entre elas e repetir o trecho delimitado. O áudio e o vídeo são salvos com o projeto, e os quadros de vídeo são decodificados pelo tempo da timeline na exportação.
+
+## Recursos principais
 
 - **Timeline Multifaixa + Split View + Modo Flipbook:** Divisão dinâmica entre Palco (*Stage* com *Backstage*) e Timeline multifaixa, barra central arrastável, pinch-zoom horizontal/vertical e modo Flipbook em tela cheia.
 - **Auto-Criação de Frame ao Desenhar (*Draw-to-Create*):** Desenhar em qualquer região vazia da timeline cria/estende automaticamente um frame/cel (e divide *holds* estendidos), com **Undo atômico em 1 passo**.

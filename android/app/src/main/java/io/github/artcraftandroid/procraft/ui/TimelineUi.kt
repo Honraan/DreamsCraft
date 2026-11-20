@@ -41,6 +41,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -85,16 +88,20 @@ import io.github.artcraftandroid.procraft.canvas.CanvasViewModel
 import io.github.artcraftandroid.procraft.canvas.DreamsWorkMode
 import io.github.artcraftandroid.procraft.canvas.StageGizmoSubMode
 import io.github.artcraftandroid.procraft.core.AnimationPlayback
+import io.github.artcraftandroid.procraft.core.FlipbookBatch
+import io.github.artcraftandroid.procraft.core.TimelineClipBatch
+import io.github.artcraftandroid.procraft.core.TimelineKeyframeAddress
+import io.github.artcraftandroid.procraft.core.TimelineKeyframeChannel
+import io.github.artcraftandroid.procraft.core.TimelineKeyframeInfo
+import io.github.artcraftandroid.procraft.core.TimelineTransformInfo
 import io.github.artcraftandroid.procraft.core.TimelineClipInfo
 import io.github.artcraftandroid.procraft.core.TimelineClipKind
 import io.github.artcraftandroid.procraft.core.TimelineDeformInfo
 import io.github.artcraftandroid.procraft.core.TimelineEasingKind
-import io.github.artcraftandroid.procraft.core.TimelineKeyframeInfo
 import io.github.artcraftandroid.procraft.core.TimelineLiveFilterInfo
 import io.github.artcraftandroid.procraft.core.TimelineState
 import io.github.artcraftandroid.procraft.core.TimelineTrackEffectsInfo
 import io.github.artcraftandroid.procraft.core.TimelineTrackInfo
-import io.github.artcraftandroid.procraft.core.TimelineTransformInfo
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
@@ -514,12 +521,13 @@ fun BoxScope.DreamsWorkspaceOverlay(
     if (tl.flipbookOpen) {
         val activeClip = remember(tl) { activeClipOf(tl) }
         Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth()) {
-            AnimationBar(vm)
+            FlipbookFrameStrip(vm, tl, activeClip)
             // Floating Pill above the Flipbook bar: Timeline, Undo/Redo, Onion Skin, Perform Motion Ghost, Cel Sub-Layers, Timecode
             Row(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .padding(bottom = 126.dp)
+                    .horizontalScroll(rememberScrollState())
                     .clip(RoundedCornerShape(20.dp))
                     .background(DreamsBarFill.copy(alpha = 0.95f))
                     .border(1.dp, DreamsEdge, RoundedCornerShape(20.dp))
@@ -690,14 +698,132 @@ fun BoxScope.DreamsWorkspaceOverlay(
             )
         }
     }
-    vm.editingKeyframe?.let { (clipId, frame) ->
-        KeyframeEasingPopover(
-            vm = vm,
-            tl = tl,
-            clipId = clipId,
-            frame = frame.toInt(),
-            bottomOffset = popoverBottom,
-        )
+    if (vm.timelineBatchOpen && vm.dreamsMode == DreamsWorkMode.TIMELINE_EDIT) {
+        TimelineBatchPopover(vm, popoverBottom)
+    }
+    vm.editingKeyframe?.let { address ->
+        KeyframeEasingPopover(vm, tl, address, popoverBottom)
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun FlipbookFrameStrip(vm: CanvasViewModel, tl: TimelineState, clip: TimelineClipInfo?) {
+    val cels = clip?.takeIf { it.kind == TimelineClipKind.CEL }?.cels.orEmpty()
+    var selecting by remember(clip?.id) { mutableStateOf(false) }
+    var selected by remember(clip?.id) { mutableStateOf<Set<UInt>>(emptySet()) }
+    val current = cels.indexOfLast { it.startFrame <= tl.playhead }.coerceAtLeast(0)
+    val frames = rememberLazyListState()
+    LaunchedEffect(clip?.id, current) {
+        if (current in cels.indices && frames.layoutInfo.visibleItemsInfo.none { it.index == current }) {
+            frames.scrollToItem(current)
+        }
+    }
+    Column(Modifier.fillMaxWidth().height(126.dp).background(DreamsSurface).padding(6.dp)) {
+        Row(
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            ModeChip(if (vm.playingFrame == null) "Play" else "Pause", vm.playingFrame != null, Pc.Accent, vm::togglePlaying)
+            if (clip != null && cels.isNotEmpty()) {
+                val activeTrack = tl.tracks.firstOrNull { it.id == clip.trackId }
+                val group = activeTrack?.parentGroup?.takeIf { it in tl.flipbookGroups }
+                if (group != null) {
+                    tl.tracks.filter { it.parentGroup == group }.forEach { track ->
+                        val drawing = track.clips.filter { it.kind == TimelineClipKind.CEL }
+                        val next = drawing.firstOrNull { tl.playhead >= it.startFrame && tl.playhead - it.startFrame < it.durationFrames }
+                            ?: drawing.minByOrNull { abs(it.startFrame.toInt() - tl.playhead.toInt()) }
+                        if (next != null) {
+                            ModeChip(track.name, track.id == clip.trackId, Pc.Accent) {
+                                vm.selectTimelineClip(next.id)
+                                if (tl.playhead < next.startFrame || tl.playhead - next.startFrame >= next.durationFrames) {
+                                    vm.setTimelinePlayhead(next.startFrame.toInt())
+                                }
+                            }
+                        }
+                    }
+                }
+                ModeChip("+ Track", false, Pc.Accent) { vm.addFlipbookTrack(clip.id) }
+                ModeChip("+ Frame", false, Pc.Accent) { vm.addFlipbookFrame(clip.id) }
+                ModeChip("Select", selecting, Pc.Accent) {
+                    selecting = !selecting
+                    if (!selecting) selected = emptySet()
+                }
+            }
+        }
+        if (clip == null || cels.isEmpty()) {
+            Text("Open a drawing clip to edit frames.", color = DreamsDimInk, modifier = Modifier.padding(8.dp))
+        } else {
+            LazyRow(
+                state = frames,
+                modifier = Modifier.fillMaxWidth().weight(1f),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                items(cels, key = { it.index.toInt() }) { cel ->
+                    val focus = cel.index.toInt() == current
+                    val picked = cel.index in selected
+                    Column(
+                        Modifier.size(50.dp, 47.dp).clip(RoundedCornerShape(5.dp))
+                            .background(if (picked) Pc.Accent.copy(alpha = 0.40f) else DreamsClipFill)
+                            .border(1.dp, if (focus) KeyframeGold else DreamsEdge, RoundedCornerShape(5.dp))
+                            .combinedClickable(
+                                onClick = {
+                                    if (selecting) selected = if (picked) selected - cel.index else selected + cel.index
+                                    else vm.setTimelinePlayhead(cel.startFrame.toInt())
+                                },
+                                onLongClick = { selecting = true; selected = selected + cel.index },
+                            ),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        vm.frameThumbnails[cel.layerId]?.let {
+                            Image(it, contentDescription = null, modifier = Modifier.weight(1f).fillMaxWidth(), contentScale = ContentScale.Fit)
+                        }
+                        Text("${cel.index + 1u} · ${cel.durationFrames}f", color = DreamsInk, fontSize = 10.sp)
+                    }
+                }
+            }
+            val targets = selected.ifEmpty { setOf(current.toUInt()) }
+            Row(
+                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Exposure", color = DreamsDimInk, fontSize = 11.sp)
+                for (exposure in 1..3) {
+                    ModeChip("${exposure}f", false, Pc.Accent) { vm.editFlipbook(clip.id, targets, FlipbookBatch.EXPOSURE, exposure) }
+                }
+                ModeChip("Duplicate", false, Pc.Accent) { vm.editFlipbook(clip.id, targets, FlipbookBatch.DUPLICATE) }
+                if (targets.size > 1) {
+                    ModeChip("Reverse", false, Pc.Accent) { vm.editFlipbook(clip.id, targets, FlipbookBatch.REVERSE) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun BoxScope.TimelineBatchPopover(vm: CanvasViewModel, bottom: Dp) {
+    Column(
+        Modifier.align(Alignment.BottomEnd).padding(end = 10.dp, bottom = bottom)
+            .width(220.dp).clip(RoundedCornerShape(14.dp)).background(DreamsBarFill)
+            .border(1.dp, DreamsEdge, RoundedCornerShape(14.dp)).padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        val clips = vm.selectedClipIds.isNotEmpty()
+        val any = clips || vm.selectedKeyframes.isNotEmpty()
+        if (any) {
+            MenuActionRow("Move to playhead") { vm.editTimelineSelection(TimelineClipBatch.MOVE); vm.timelineBatchOpen = false }
+            MenuActionRow("Copy selection") { vm.copyTimelineSelection(); vm.timelineBatchOpen = false }
+        }
+        if (vm.canPasteTimeline) MenuActionRow("Paste at playhead") { vm.pasteTimelineSelection(); vm.timelineBatchOpen = false }
+        if (clips) {
+            MenuActionRow("Trim starts to playhead") { vm.editTimelineSelection(TimelineClipBatch.TRIM_START); vm.timelineBatchOpen = false }
+            MenuActionRow("Trim ends to playhead") { vm.editTimelineSelection(TimelineClipBatch.TRIM_END); vm.timelineBatchOpen = false }
+            MenuActionRow("Delete clips", color = PerformRed) { vm.deleteSelectedClips(); vm.timelineBatchOpen = false }
+        }
+        MenuActionRow("Close") { vm.timelineBatchOpen = false }
     }
 }
 
@@ -991,13 +1117,13 @@ private fun CenterActionBar(
                     onClick = { vm.groupSelectedTracks() },
                 )
             }
-            if (vm.dreamsMode == DreamsWorkMode.TIMELINE_EDIT && vm.selectedClipIds.isNotEmpty()) {
-                ModeChip(
-                    label = "Del (${vm.selectedClipIds.size})",
-                    selected = true,
-                    activeColor = PerformRed,
-                    onClick = { vm.deleteSelectedClips() },
-                )
+            if (vm.dreamsMode == DreamsWorkMode.TIMELINE_EDIT &&
+                (vm.selectedClipIds.isNotEmpty() || vm.selectedKeyframes.isNotEmpty() || vm.canPasteTimeline)
+            ) {
+                val count = vm.selectedClipIds.size + vm.selectedKeyframes.size
+                ModeChip(if (count == 0) "Paste" else "Selected $count", vm.timelineBatchOpen, Pc.Accent) {
+                    vm.timelineBatchOpen = !vm.timelineBatchOpen
+                }
             }
             // + Add Button
             Box(
@@ -1722,8 +1848,11 @@ private fun TrackLaneRow(
                 val isClipSelected = tl.activeClipId == clip.id || vm.selectedClipIds.contains(clip.id)
                 val clipStartDp = zoomDp * clip.startFrame.toInt()
                 val clipWidthDp = (zoomDp * clip.durationFrames.toInt()).coerceAtLeast(18.dp)
-                var dragAccumPx by remember(clip.id, clip.startFrame) { mutableFloatStateOf(0f) }
-                var resizeAccumPx by remember(clip.id, clip.durationFrames) { mutableFloatStateOf(0f) }
+                val currentStart by rememberUpdatedState(clip.startFrame.toInt())
+                val currentDuration by rememberUpdatedState(clip.durationFrames.toInt())
+                val currentSnaps by rememberUpdatedState(snapCandidates)
+                var dragAccumPx by remember(clip.id) { mutableFloatStateOf(0f) }
+                var resizeAccumPx by remember(clip.id) { mutableFloatStateOf(0f) }
                 val clipAccent = when (clip.kind) {
                     TimelineClipKind.AUDIO -> AudioGreen
                     TimelineClipKind.VIDEO -> CameraSky
@@ -1763,23 +1892,24 @@ private fun TrackLaneRow(
                             },
                         )
                         // Dragging the clip body moves its start frame along the track
-                        .pointerInput(clip.id, clip.startFrame, zoomPx) {
+                        .pointerInput(clip.id, zoomPx) {
+                            var dragStart = 0
+                            var target = 0
                             detectHorizontalDragGestures(
-                                onDragStart = { dragAccumPx = 0f },
-                                onHorizontalDrag = { change, dragAmount ->
+                                onDragStart = {
+                                    dragStart = currentStart
+                                    target = dragStart
+                                    dragAccumPx = 0f
+                                },
+                                onHorizontalDrag = { change, amount ->
                                     change.consume()
-                                    dragAccumPx += dragAmount
-                                    val deltaFrames = (dragAccumPx / zoomPx).roundToInt()
-                                    val rawStart = (clip.startFrame.toInt() + deltaFrames).coerceAtLeast(0)
-                                    val snapped = snapClipFrame(rawStart, snapCandidates)
-                                    vm.moveTimelineClip(clip.id, snapped, null, done = false)
+                                    dragAccumPx += amount
+                                    val raw = (dragStart + (dragAccumPx / zoomPx).roundToInt()).coerceAtLeast(0)
+                                    target = snapClipFrame(raw, currentSnaps.filterNot { it == currentStart || it == currentStart + currentDuration })
+                                    vm.moveTimelineClip(clip.id, target, null, done = false)
                                 },
-                                onDragEnd = {
-                                    val deltaFrames = (dragAccumPx / zoomPx).roundToInt()
-                                    val rawStart = (clip.startFrame.toInt() + deltaFrames).coerceAtLeast(0)
-                                    val snapped = snapClipFrame(rawStart, snapCandidates)
-                                    vm.moveTimelineClip(clip.id, snapped, null, done = true)
-                                },
+                                onDragEnd = { vm.moveTimelineClip(clip.id, target, null, done = true) },
+                                onDragCancel = { vm.moveTimelineClip(clip.id, target, null, done = true) },
                             )
                         },
                 ) {
@@ -1828,6 +1958,17 @@ private fun TrackLaneRow(
                                     .align(Alignment.TopStart)
                                     .padding(start = 6.dp, top = 2.dp),
                             )
+                            tl.dialogueMarkers.filter {
+                                it.frame >= clip.startFrame && it.frame < clip.startFrame + clip.durationFrames
+                            }.forEach { marker ->
+                                val x = zoomDp * (marker.frame - clip.startFrame).toInt()
+                                Box(Modifier.offset(x = x).fillMaxHeight().width(1.dp).background(KeyframeGold))
+                                Text(
+                                    marker.label.ifEmpty { "•" }, color = KeyframeGold, fontSize = 10.sp, maxLines = 1,
+                                    modifier = Modifier.align(Alignment.BottomStart).offset(x = x + 2.dp)
+                                        .background(DreamsBarFill).clickable { vm.setTimelinePlayhead(marker.frame.toInt()) },
+                                )
+                            }
                         }
 
                         clip.kind == TimelineClipKind.CEL && clip.cels.isNotEmpty() -> {
@@ -1917,21 +2058,23 @@ private fun TrackLaneRow(
                             .width(12.dp)
                             .fillMaxHeight()
                             .background(clipAccent.copy(alpha = 0.65f))
-                            .pointerInput(clip.id, clip.durationFrames, zoomPx) {
+                            .pointerInput(clip.id, zoomPx) {
+                                var origin = 1
+                                var target = 1
                                 detectHorizontalDragGestures(
-                                    onDragStart = { resizeAccumPx = 0f },
-                                    onHorizontalDrag = { change, dragAmount ->
+                                    onDragStart = {
+                                        origin = currentDuration
+                                        target = origin
+                                        resizeAccumPx = 0f
+                                    },
+                                    onHorizontalDrag = { change, amount ->
                                         change.consume()
-                                        resizeAccumPx += dragAmount
-                                        val deltaFrames = (resizeAccumPx / zoomPx).roundToInt()
-                                        val nextDur = (clip.durationFrames.toInt() + deltaFrames).coerceAtLeast(1)
-                                        vm.resizeTimelineClip(clip.id, nextDur, done = false)
+                                        resizeAccumPx += amount
+                                        target = (origin + (resizeAccumPx / zoomPx).roundToInt()).coerceAtLeast(1)
+                                        vm.resizeTimelineClip(clip.id, target, done = false)
                                     },
-                                    onDragEnd = {
-                                        val deltaFrames = (resizeAccumPx / zoomPx).roundToInt()
-                                        val nextDur = (clip.durationFrames.toInt() + deltaFrames).coerceAtLeast(1)
-                                        vm.resizeTimelineClip(clip.id, nextDur, done = true)
-                                    },
+                                    onDragEnd = { vm.resizeTimelineClip(clip.id, target, done = true) },
+                                    onDragCancel = { vm.resizeTimelineClip(clip.id, target, done = true) },
                                 )
                             },
                     )
@@ -1939,65 +2082,31 @@ private fun TrackLaneRow(
             }
         }
 
-        // Sub-tracks for Move, Opacity, Live Filters, Warp/Distort, and Audio Volume/Pan Keyframes
         if (hasTransform) {
             KeyframeSubTrackLane(zoomDp, KeyframeGold, 0.45f) {
-                for (clip in track.clips) {
-                    for (kf in clip.transformKeyframes) {
-                        KeyframeDiamond(kf.frame.toInt(), zoomDp, KeyframeGold) {
-                            vm.setTimelinePlayhead(kf.frame.toInt())
-                            vm.editingKeyframe = clip.id to kf.frame
-                        }
-                    }
-                }
+                track.clips.forEach { ClipKeyframes(vm, it, it.transformKeyframes, TimelineKeyframeChannel.TRANSFORM, zoomDp, KeyframeGold) }
             }
         }
         if (hasOpacity) {
             KeyframeSubTrackLane(zoomDp, OpacityCyan, 0.65f) {
-                for (clip in track.clips) {
-                    for (kf in clip.opacityKeyframes) {
-                        KeyframeDiamond(kf.frame.toInt(), zoomDp, OpacityCyan) {
-                            vm.setTimelinePlayhead(kf.frame.toInt())
-                            vm.editingKeyframe = clip.id to kf.frame
-                        }
-                    }
-                }
+                track.clips.forEach { ClipKeyframes(vm, it, it.opacityKeyframes, TimelineKeyframeChannel.OPACITY, zoomDp, OpacityCyan) }
             }
         }
         if (hasFilter) {
             KeyframeSubTrackLane(zoomDp, FilterPurple, 0.45f) {
-                for (clip in track.clips) {
-                    for (kf in clip.filterKeyframes) {
-                        KeyframeDiamond(kf.frame.toInt(), zoomDp, FilterPurple) {
-                            vm.setTimelinePlayhead(kf.frame.toInt())
-                            vm.editingKeyframe = clip.id to kf.frame
-                        }
-                    }
-                }
+                track.clips.forEach { ClipKeyframes(vm, it, it.filterKeyframes, TimelineKeyframeChannel.FILTER, zoomDp, FilterPurple) }
             }
         }
         if (hasDeform) {
             KeyframeSubTrackLane(zoomDp, WarpPink, 0.65f) {
-                for (clip in track.clips) {
-                    for (kf in clip.deformKeyframes) {
-                        KeyframeDiamond(kf.frame.toInt(), zoomDp, WarpPink) {
-                            vm.setTimelinePlayhead(kf.frame.toInt())
-                            vm.stageGizmoMode = StageGizmoSubMode.WARP
-                            vm.stageGizmoActive = true
-                        }
-                    }
-                }
+                track.clips.forEach { ClipKeyframes(vm, it, it.deformKeyframes, TimelineKeyframeChannel.DEFORM, zoomDp, WarpPink) }
             }
         }
         if (hasAudio) {
             KeyframeSubTrackLane(zoomDp, AudioGreen, 0.45f) {
-                for (clip in track.clips) {
-                    for (kf in clip.volumeKeyframes) {
-                        KeyframeDiamond(kf.frame.toInt(), zoomDp, AudioGreen) {
-                            vm.setTimelinePlayhead(kf.frame.toInt())
-                            vm.editingKeyframe = clip.id to kf.frame
-                        }
-                    }
+                track.clips.forEach {
+                    ClipKeyframes(vm, it, it.volumeKeyframes, TimelineKeyframeChannel.VOLUME, zoomDp, AudioGreen)
+                    ClipKeyframes(vm, it, it.panKeyframes, TimelineKeyframeChannel.PAN, zoomDp, OpacityCyan)
                 }
             }
         }
@@ -2010,6 +2119,48 @@ private fun TrackLaneRow(
             clip = clip,
             onDismiss = { contextMenuClip = null },
         )
+    }
+}
+
+@Composable
+private fun BoxScope.ClipKeyframes(
+    vm: CanvasViewModel,
+    clip: TimelineClipInfo,
+    allKeys: List<TimelineKeyframeInfo>,
+    channel: TimelineKeyframeChannel,
+    zoom: Dp,
+    color: Color,
+) {
+    val keys = allKeys.filter { it.frame >= clip.startFrame && it.frame - clip.startFrame < clip.durationFrames }
+    if (keys.size >= 2) {
+        Canvas(Modifier.matchParentSize()) {
+            val pitch = zoom.toPx()
+            for ((from, to) in keys.zipWithNext()) {
+                val x = (from.frame.toFloat() + 0.5f) * pitch
+                val w = (to.frame - from.frame).toFloat() * pitch
+                val y = size.height * 0.72f
+                val h = size.height * 0.48f
+                val curve = Path().apply {
+                    moveTo(x, y)
+                    val e = from.easing
+                    when (e.kind) {
+                        TimelineEasingKind.HOLD -> { lineTo(x + w, y); lineTo(x + w, y - h) }
+                        TimelineEasingKind.LINEAR -> lineTo(x + w, y - h)
+                        TimelineEasingKind.EASE_IN -> cubicTo(x + w * 0.42f, y, x + w, y - h, x + w, y - h)
+                        TimelineEasingKind.EASE_OUT -> cubicTo(x, y, x + w * 0.58f, y - h, x + w, y - h)
+                        TimelineEasingKind.EASE_IN_OUT -> cubicTo(x + w * 0.42f, y, x + w * 0.58f, y - h, x + w, y - h)
+                        TimelineEasingKind.CUBIC_BEZIER -> cubicTo(x + w * e.x1, y - h * e.y1, x + w * e.x2, y - h * e.y2, x + w, y - h)
+                    }
+                }
+                drawPath(curve, color.copy(alpha = 0.75f), style = Stroke(1.3.dp.toPx()))
+            }
+        }
+    }
+    for (key in keys) {
+        val address = TimelineKeyframeAddress(clip.id, key.frame, channel)
+        KeyframeDiamond(key.frame.toInt(), zoom, if (address in vm.selectedKeyframes) Color.White else color) {
+            vm.inspectTimelineKey(clip.id, key, channel)
+        }
     }
 }
 
@@ -2122,6 +2273,7 @@ private fun BoxScope.StageKeyTransformOverlay(
     }
     var activeDeformHandle by remember { mutableIntStateOf(-1) }
 
+    val comparison = if (vm.canComparePerform && vm.showPerformComparison) vm.performComparison() else null
     val gizmoColor = when {
         vm.dreamsMode == DreamsWorkMode.PERFORM -> PerformRed
         isCamera -> CameraSky
@@ -2295,6 +2447,19 @@ private fun BoxScope.StageKeyTransformOverlay(
     ) {
         // Visual Stage Gizmo Canvas (Move & Scale + Motion Path, Distort 4-pin, Warp 4x4 Mesh, or Camera Viewport)
         Canvas(modifier = Modifier.fillMaxSize()) {
+            comparison?.let { (raw, smooth) ->
+                fun drawTake(points: List<Pair<Float, Float>>, ink: Color) {
+                    for ((from, to) in points.zipWithNext()) {
+                        drawLine(
+                            ink, Offset(size.width * 0.5f + from.first * 0.25f, size.height * 0.5f + from.second * 0.25f),
+                            Offset(size.width * 0.5f + to.first * 0.25f, size.height * 0.5f + to.second * 0.25f),
+                            strokeWidth = 2.dp.toPx(),
+                        )
+                    }
+                }
+                drawTake(raw, PerformRed)
+                drawTake(smooth, OpacityCyan)
+            }
             // Draw Motion Path across transform keyframes when in Move/Perform/Camera mode
             val pathKeyframes = if (isCamera) tl.cameraTransformKeyframes else activeClip?.transformKeyframes.orEmpty()
             if (!isWarp && !isDistort && pathKeyframes.size >= 2) {
@@ -2491,7 +2656,22 @@ private fun BoxScope.StageKeyTransformOverlay(
                             }
                             .padding(horizontal = 7.dp, vertical = 3.dp),
                     )
-                    val filterPct = (tl.motionFiltering * 100).roundToInt()
+                    if (vm.canComparePerform) {
+                        ModeChip(if (vm.showPerformComparison) "Close comparison" else "Compare take", vm.showPerformComparison, OpacityCyan) {
+                            if (!vm.showPerformComparison) vm.performCompareFiltering = tl.motionFiltering
+                            vm.showPerformComparison = !vm.showPerformComparison
+                        }
+                    }
+                    if (vm.showPerformComparison) {
+                        Text("Raw", color = PerformRed, fontSize = 11.sp)
+                        Text("Smoothed", color = OpacityCyan, fontSize = 11.sp)
+                        ModeChip("Apply", false, OpacityCyan) {
+                            vm.updatePerformMotionFiltering(vm.performCompareFiltering)
+                            vm.showPerformComparison = false
+                        }
+                    }
+                    val filtering = if (vm.showPerformComparison) vm.performCompareFiltering else tl.motionFiltering
+                    val filterPct = (filtering * 100).roundToInt()
                     Text(
                         text = "Filter: $filterPct%",
                         color = DreamsInk,
@@ -2501,12 +2681,13 @@ private fun BoxScope.StageKeyTransformOverlay(
                             .background(DreamsClipFill)
                             .clickable {
                                 val next = when {
-                                    tl.motionFiltering < 0.25f -> 0.35f
-                                    tl.motionFiltering < 0.55f -> 0.70f
-                                    tl.motionFiltering < 0.85f -> 1.0f
+                                    filtering < 0.25f -> 0.35f
+                                    filtering < 0.55f -> 0.70f
+                                    filtering < 0.85f -> 1.0f
                                     else -> 0.0f
                                 }
-                                vm.updatePerformMotionFiltering(next)
+                                if (vm.showPerformComparison) vm.performCompareFiltering = next
+                                else vm.updatePerformMotionFiltering(next)
                             }
                             .padding(horizontal = 7.dp, vertical = 3.dp),
                     )
@@ -2761,6 +2942,7 @@ private fun BoxScope.PlayheadActionPopover(
     tl: TimelineState,
     bottomOffset: Dp,
 ) {
+    var dialogueOpen by remember { mutableStateOf(false) }
     Column(
         modifier = Modifier
             .align(Alignment.BottomCenter)
@@ -2778,6 +2960,21 @@ private fun BoxScope.PlayheadActionPopover(
             fontSize = 13.sp,
             fontWeight = FontWeight.Bold,
         )
+        if (dialogueOpen) {
+            val marker = tl.dialogueMarkers.firstOrNull { it.frame == tl.playhead }
+            var label by remember(tl.playhead, marker) { mutableStateOf(marker?.label.orEmpty()) }
+            TimelineValueField("Syllable or note", label, { label = it.take(48) })
+            MenuActionRow("Save marker") { vm.saveDialogueMarker(label) }
+            if (marker != null) MenuActionRow("Remove marker", color = PerformRed) { vm.saveDialogueMarker(null) }
+            MenuActionRow("Previous marker") { vm.jumpDialogueMarker(false) }
+            MenuActionRow("Next marker") { vm.jumpDialogueMarker(true) }
+            MenuActionRow("Set work area and loop") { vm.playheadActionMenuOpen = false; vm.loopDialogue() }
+            MenuActionRow("Back") { dialogueOpen = false }
+            return@Column
+        }
+        if (tl.hasAudio || tl.dialogueMarkers.isNotEmpty()) {
+            MenuActionRow("Dialogue markers", color = AudioGreen) { dialogueOpen = true }
+        }
         MenuActionRow("Move & Scale (Keyframe)", color = KeyframeGold) {
             vm.playheadActionMenuOpen = false
             tl.activeClipId?.let { cid ->
@@ -3239,57 +3436,89 @@ private fun BoxScope.LiveFilterPopover(
 private fun BoxScope.KeyframeEasingPopover(
     vm: CanvasViewModel,
     tl: TimelineState,
-    clipId: ULong,
-    frame: Int,
+    address: TimelineKeyframeAddress,
     bottomOffset: Dp,
 ) {
+    val clip = tl.tracks.asSequence().flatMap { it.clips.asSequence() }.firstOrNull { it.id == address.clipId } ?: return
+    val keys = when (address.channel) {
+        TimelineKeyframeChannel.TRANSFORM -> clip.transformKeyframes
+        TimelineKeyframeChannel.OPACITY -> clip.opacityKeyframes
+        TimelineKeyframeChannel.FILTER -> clip.filterKeyframes
+        TimelineKeyframeChannel.DEFORM -> clip.deformKeyframes
+        TimelineKeyframeChannel.VOLUME -> clip.volumeKeyframes
+        TimelineKeyframeChannel.PAN -> clip.panKeyframes
+    }
+    val key = keys.firstOrNull { it.frame == address.frame } ?: return
     Column(
-        modifier = Modifier
-            .align(Alignment.BottomCenter)
-            .padding(bottom = bottomOffset)
-            .width(270.dp)
-            .clip(RoundedCornerShape(18.dp))
-            .background(DreamsBarFill)
-            .border(1.dp, KeyframeGold, RoundedCornerShape(18.dp))
-            .padding(14.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+        Modifier.align(Alignment.BottomCenter).padding(bottom = bottomOffset).width(290.dp)
+            .heightIn(max = 300.dp).clip(RoundedCornerShape(18.dp)).background(DreamsBarFill)
+            .border(1.dp, KeyframeGold, RoundedCornerShape(18.dp)).verticalScroll(rememberScrollState()).padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text("Keyframe @ F${frame + 1}", color = KeyframeGold, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-            Text(
-                text = "Close",
-                color = DreamsDimInk,
-                fontSize = 12.sp,
-                modifier = Modifier.clickable { vm.editingKeyframe = null },
-            )
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text("Keyframe · F${address.frame + 1u}", color = KeyframeGold, fontSize = 14.sp)
+            Text("Close", color = DreamsDimInk, modifier = Modifier.clickable { vm.editingKeyframe = null })
         }
-        Text("Set Easing Curve", color = DreamsDimInk, fontSize = 12.sp)
-        val easings = listOf(
-            TimelineEasingKind.EASE_IN_OUT to "Ease In & Out (Smooth)",
-            TimelineEasingKind.LINEAR to "Linear",
-            TimelineEasingKind.EASE_IN to "Ease In",
-            TimelineEasingKind.EASE_OUT to "Ease Out",
-            TimelineEasingKind.HOLD to "Hold (Step / Constant)",
-        )
-        for ((kind, label) in easings) {
-            MenuActionRow(label) {
-                vm.setClipTransformEasing(clipId, frame, kind)
-                vm.setClipOpacityEasing(clipId, frame, kind)
-                vm.setClipFilterEasing(clipId, frame, kind)
-                vm.editingKeyframe = null
+        key.transform?.let { transform ->
+            TransformKeyframeValues(address, transform) { edited ->
+                vm.setClipTransformKeyframe(address.clipId, address.frame.toInt(), edited, done = true)
             }
         }
-        MenuActionRow("Delete Keyframe", color = PerformRed) {
-            vm.deleteClipTransformKeyframe(clipId, frame)
-            vm.deleteClipOpacityKeyframe(clipId, frame)
-            vm.deleteClipFilterKeyframe(clipId, frame)
-            vm.deleteClipDeformKeyframe(clipId, frame)
-            vm.editingKeyframe = null
+        val easings = listOf(
+            TimelineEasingKind.LINEAR to "Linear",
+            TimelineEasingKind.EASE_IN to "Ease in",
+            TimelineEasingKind.EASE_OUT to "Ease out",
+            TimelineEasingKind.EASE_IN_OUT to "Ease in and out",
+            TimelineEasingKind.HOLD to "Hold",
+        )
+        for ((kind, label) in easings) {
+            MenuActionRow(label, color = if (key.easing.kind == kind) KeyframeGold else DreamsInk) {
+                vm.changeTimelineKeyEasing(address, kind)
+            }
         }
+        MenuActionRow("Delete keyframe", color = PerformRed) { vm.deleteTimelineKey(address) }
+    }
+}
+
+@Composable
+private fun TransformKeyframeValues(
+    address: TimelineKeyframeAddress,
+    transform: TimelineTransformInfo,
+    apply: (TimelineTransformInfo) -> Unit,
+) {
+    val degrees = Math.toDegrees(transform.rotation.toDouble()).toFloat()
+    var x by remember(address, transform) { mutableStateOf(transform.x.toString()) }
+    var y by remember(address, transform) { mutableStateOf(transform.y.toString()) }
+    var sx by remember(address, transform) { mutableStateOf(transform.scaleX.toString()) }
+    var sy by remember(address, transform) { mutableStateOf(transform.scaleY.toString()) }
+    var rotation by remember(address, transform) { mutableStateOf(degrees.toString()) }
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        TimelineValueField("Position X", x, { x = it }, Modifier.weight(1f))
+        TimelineValueField("Position Y", y, { y = it }, Modifier.weight(1f))
+    }
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        TimelineValueField("Scale X", sx, { sx = it }, Modifier.weight(1f))
+        TimelineValueField("Scale Y", sy, { sy = it }, Modifier.weight(1f))
+        TimelineValueField("Rotation °", rotation, { rotation = it }, Modifier.weight(1f))
+    }
+    MenuActionRow("Apply transform") {
+        fun number(text: String, fallback: Float) = text.toFloatOrNull()?.takeIf { it.isFinite() } ?: fallback
+        apply(transform.copy(
+            x = number(x, transform.x), y = number(y, transform.y),
+            scaleX = number(sx, transform.scaleX), scaleY = number(sy, transform.scaleY),
+            rotation = Math.toRadians(number(rotation, degrees).toDouble()).toFloat(),
+        ))
+    }
+}
+
+@Composable
+private fun TimelineValueField(label: String, value: String, change: (String) -> Unit, modifier: Modifier = Modifier) {
+    Column(modifier) {
+        Text(label, color = DreamsDimInk, fontSize = 10.sp)
+        BasicTextField(
+            value, change, modifier = Modifier.fillMaxWidth().background(DreamsClipFill).padding(6.dp),
+            textStyle = TextStyle(color = DreamsInk, fontSize = 12.sp), singleLine = true,
+        )
     }
 }
 

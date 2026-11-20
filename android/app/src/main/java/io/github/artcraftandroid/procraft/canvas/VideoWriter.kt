@@ -323,10 +323,9 @@ object VideoWriter {
             videoOnly.delete()
             return true
         }
-        // Fallback: keep video-only MP4 if AAC muxing failed
-        videoOnly.copyTo(out, overwrite = true)
         videoOnly.delete()
-        return true
+        out.delete()
+        return false
     }
 
     /** Encodes [pcmStereo] (interleaved 16-bit stereo at [sampleRate] Hz) to AAC and muxes it with [videoMp4] into [out]. */

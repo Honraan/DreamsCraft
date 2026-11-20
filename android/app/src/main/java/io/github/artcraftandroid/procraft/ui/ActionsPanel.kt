@@ -266,7 +266,7 @@ fun ActionsPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier)
             listOfNotNull(
                 Heading("Share Image"),
                 // ours first, then the same package named for the other app
-                Act(CanvasViewModel.OWN_LABEL) { sharePackage(CanvasViewModel.OWN_EXTENSION) },
+                Act(if (vm.timeline != null) "Editable project" else CanvasViewModel.OWN_LABEL) { sharePackage(CanvasViewModel.OWN_EXTENSION) },
                 Act(CanvasViewModel.PACKAGE_LABEL) { sharePackage(CanvasViewModel.PACKAGE_EXTENSION) },
                 Act("PSD") { share(CanvasViewModel.Export.PSD) },
                 Act("PDF") { pdfAsking = CanvasViewModel.Export.PDF },

@@ -6597,6 +6597,100 @@ fn multitrack_timeline_tracks_clips_keyframes_perform_and_png_sequence_export() 
 }
 
 #[test]
+fn dreamscraft_22_saved_artwork_recovers_audio_video_and_dialogue() {
+    let dir = std::env::temp_dir().join(format!("dreamscraft22-{}", std::process::id()));
+    let path = dir.to_string_lossy().into_owned();
+    let s = CanvasSession::new(32, 32);
+    s.enable_animation_for_new_artwork();
+    s.timeline_set_fps(24);
+    let audio = s.timeline_import_audio_pcm("Dialogue".into(), 8_000, 1, vec![8000; 8_000], 20).unwrap();
+    let before = s.timeline_mix_audio_pcm(20, 21, 8_000);
+    assert!(before.iter().any(|&sample| sample != 0));
+    assert!(s.timeline_set_dialogue_marker(20, Some("ma".into())));
+    let source = "video-00000000000000000000000000000001.media";
+    let video = s.timeline_import_video("Reference".into(), 20, 40, 30.0, 50, source.into()).unwrap();
+    s.timeline_set_playhead(32);
+    let split = s.timeline_split_clip_at_playhead(video).unwrap();
+    assert_ne!(video, split);
+    s.timeline_set_work_area(Some(crate::TimelineWorkAreaInfo { start: 32, end: 36 }));
+    s.save(path.clone()).unwrap();
+
+    let opened = CanvasSession::open(path.clone()).unwrap();
+    assert_eq!(opened.timeline_mix_audio_pcm(20, 21, 8_000), before);
+    let state = opened.timeline_state().unwrap();
+    assert_eq!(state.dialogue_markers[0].label, "ma");
+    assert_eq!(state.tracks.iter().flat_map(|t| &t.clips).find(|c| c.id == audio).unwrap().start_frame, 20);
+    assert_eq!(opened.timeline_play_order(), vec![32, 33, 34, 35, 36]);
+    let requests = opened.timeline_video_requests(32);
+    assert_eq!(requests[0].clip_id, split);
+    assert_eq!(requests[0].file, source);
+    assert_eq!(requests[0].time_us, 500_000);
+    let assets = crate::project::artwork_timeline_media(path).unwrap();
+    assert_eq!(assets.len(), 2);
+    assert!(assets.iter().any(|name| name == source));
+    assert!(assets.iter().any(|name| name.ends_with(".pcm") && dir.join("media").join(name).is_file()));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn dreamscraft_22_batch_retime_and_flipbook_operations_keep_undo_atomic() {
+    let Some(s) = session(32, 32) else { return };
+    s.enable_animation_for_new_artwork();
+    let tl = s.timeline_state().unwrap();
+    let track = tl.active_track_id.unwrap();
+    let clip = tl.active_clip_id.unwrap();
+    s.timeline_add_cel(clip).unwrap();
+    s.timeline_add_cel(clip).unwrap();
+    assert!(s.timeline_edit_flipbook(clip, vec![0, 1], crate::timeline::FlipbookBatch::Exposure, 2));
+    let cels = || {
+        s.timeline_state().unwrap().tracks.iter().flat_map(|t| &t.clips).find(|c| c.id == clip).unwrap().cels.clone()
+    };
+    let held = cels();
+    assert_eq!(held[0].duration_frames, 2);
+    assert_eq!(held[1].duration_frames, 2);
+    assert!(s.timeline_edit_flipbook(clip, vec![0, 1], crate::timeline::FlipbookBatch::Reverse, 1));
+    assert_eq!(cels()[0].layer_id, held[1].layer_id);
+    assert!(s.timeline_edit_flipbook(clip, vec![0, 1], crate::timeline::FlipbookBatch::Duplicate, 1));
+    assert_eq!(cels().len(), 5);
+    assert!(s.undo().is_some());
+    assert_eq!(cels().len(), 3);
+    let child = s.timeline_add_flipbook_track(clip).unwrap();
+    assert_ne!(child, clip);
+    assert_eq!(s.timeline_state().unwrap().flipbook_groups.len(), 1);
+    let a = s.timeline_add_layer_clip(track, 10, 5);
+    let b = s.timeline_add_layer_clip(track, 30, 5);
+    assert!(s.timeline_edit_clips(vec![a, b], crate::timeline::TimelineClipBatch::Move, 40));
+    let copies = s.timeline_paste_clips(vec![a, b], 80);
+    assert_eq!(copies.len(), 2);
+    let state = s.timeline_state().unwrap();
+    let starts: Vec<u32> =
+        state.tracks.iter().flat_map(|t| &t.clips).filter(|c| copies.contains(&c.id)).map(|c| c.start_frame).collect();
+    assert_eq!(starts, vec![80, 100]);
+}
+
+#[test]
+fn dreamscraft_22_keyframe_selection_moves_only_its_channels() {
+    use crate::timeline::{TimelineKeyframeAddress, TimelineKeyframeChannel};
+    let s = CanvasSession::new(32, 32);
+    s.enable_animation_for_new_artwork();
+    let state = s.timeline_state().unwrap();
+    let clip = s.timeline_add_layer_clip(state.active_track_id.unwrap(), 6, 20);
+    assert!(s.timeline_set_transform_keyframe(clip, 8, crate::TimelineTransformInfo::default(), true));
+    assert!(s.timeline_set_opacity_keyframe(clip, 8, 0.5, true));
+    assert!(s.timeline_set_opacity_keyframe(clip, 12, 0.7, true));
+    let address = TimelineKeyframeAddress { clip_id: clip, frame: 8, channel: TimelineKeyframeChannel::Opacity };
+    let saved = s.timeline_copy_keyframes(vec![address.clone()]);
+    assert_eq!(saved[0].value.opacity, Some(0.5));
+    assert!(!s.timeline_paste_keyframes(saved.clone(), 30, None, true));
+    assert_eq!(s.timeline_copy_keyframes(vec![address]).len(), 1);
+    assert!(s.timeline_paste_keyframes(saved, 10, None, true));
+    let state = s.timeline_state().unwrap();
+    let clip = state.tracks.iter().flat_map(|t| &t.clips).find(|c| c.id == clip).unwrap();
+    assert_eq!(clip.transform_keyframes[0].frame, 8);
+    assert_eq!(clip.opacity_keyframes.iter().map(|key| key.frame).collect::<Vec<_>>(), vec![10, 12]);
+}
+
+#[test]
 fn dreamscraft_v2_auto_draw_perform_ghost_track_effects_audio_filters_warp_and_camera() {
     let Some(s) = session(40, 40) else { return };
     s.enable_animation_for_new_artwork();

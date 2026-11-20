@@ -80,7 +80,17 @@ import io.github.artcraftandroid.procraft.gallery.Palette
 import io.github.artcraftandroid.procraft.core.blendModes
 import io.github.artcraftandroid.procraft.core.brushBlendModes
 import io.github.artcraftandroid.procraft.core.grainBlendModes
+import io.github.artcraftandroid.procraft.core.FlipbookBatch
+import io.github.artcraftandroid.procraft.core.TimelineClipBatch
+import io.github.artcraftandroid.procraft.core.TimelineCopiedKeyframe
+import io.github.artcraftandroid.procraft.core.TimelineKeyframeAddress
+import io.github.artcraftandroid.procraft.core.TimelineKeyframeChannel
+import io.github.artcraftandroid.procraft.core.TimelineKeyframeInfo
+import io.github.artcraftandroid.procraft.core.TimelineEasingInfo
+import io.github.artcraftandroid.procraft.core.TimelineEasingKind
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlin.math.abs
@@ -2584,7 +2594,16 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             runCatching {
                 val base = io.github.artcraftandroid.procraft.core.exportFileName(s.name(), true)
                 val out = File(File(getApplication<Application>().cacheDir, "exports").apply { mkdirs() }, "$base.$extension")
-                s.exportPackage(out.path, System.nanoTime().toULong(), timeLapse?.forPackage())
+                val project = artworkDir?.takeIf { extension == OWN_EXTENSION && s.timelineState() != null }
+                if (project != null) {
+                    timeLapse?.forPackage()
+                    s.save(project.path)
+                    val media = io.github.artcraftandroid.procraft.core.artworkTimelineMedia(project.path)
+                    if (media != null) io.github.artcraftandroid.procraft.gallery.ArtworkFile.write(project, out, media)
+                    else s.exportPackage(out.path, System.nanoTime().toULong(), timeLapse?.forPackage())
+                } else {
+                    s.exportPackage(out.path, System.nanoTime().toULong(), timeLapse?.forPackage())
+                }
                 out
             }.onFailure { AppLog.e("ProCraft", "exporting a package", it) }.getOrNull()
         }
@@ -2659,7 +2678,10 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 else -> null
             }
         } ?: false
-        if (failed && session === s) message = "This device's graphics can't draw the canvas."
+        if (session === s) {
+            if (failed) message = "This device's graphics can't draw the canvas."
+            else timeline?.let { syncVideoClipsAt(it.playhead.toInt()) }
+        }
     }
 
     /**
@@ -2894,6 +2916,11 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         // a plugin's panel goes with the artwork it was open over
         closePluginPanel()
         val lapse = timeLapse
+        if (performRecording) cancelPerformRecording()
+        stopPlaying()
+        requestedVideoFrame = null
+        videoPreviewJob?.cancel()
+        videoPreviewJob = null
         session = null
         wideColorWindow = false
         artworkDir = null
@@ -3205,6 +3232,14 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         addPendingBrushes()
         pushSecondary()
         artworkDir = dir
+        selectedClipIds = emptySet()
+        selectedKeyframes = emptySet()
+        selectedTrackIds = emptySet()
+        copiedTimelineClips = emptyList()
+        copiedTimelineKeys = emptyList()
+        timelineBatchOpen = false
+        performTarget = null
+        showPerformComparison = false
         applyFitInsets()
         attachProjection()
         activeSince = android.os.SystemClock.elapsedRealtime()
@@ -6665,6 +6700,10 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     /** Frame [index] fitted to [side] pixels, without the background if [transparent]. */
     fun animationFrame(index: Int, side: Int, transparent: Boolean): Bitmap? {
         val t = session?.animationFrame(index.toUInt(), transparent, side.coerceAtLeast(1).toUInt()) ?: return null
+        return animationBitmap(t)
+    }
+
+    private fun animationBitmap(t: io.github.artcraftandroid.procraft.core.ThumbnailImage): Bitmap {
         val w = t.width.toInt()
         val h = t.height.toInt()
         val argb = IntArray(w * h) { i ->
@@ -6679,6 +6718,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     /** One animation export at a time: they write the same file. */
     private val animationExports = Mutex()
+    @Volatile private var exportingTimelineMedia = false
 
     /** The artwork's own frame rate, which an animated export starts at: the Timeline's or Animation Assist's, else 15. */
     fun artworkFps(): Float = (session?.timelineState()?.fps?.toInt() ?: session?.animationSettings()?.fps?.toInt() ?: ANIMATION_FPS).toFloat()
@@ -6697,45 +6737,60 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         cancelled: () -> Boolean = { false },
     ): File? {
         val s = session ?: return null
+        val project = artworkDir
+        stopPlaying()
+        videoPreviewJob?.cancel()
         return animationExports.withLock { withContext(Dispatchers.IO) {
             val dir = File(getApplication<Application>().cacheDir, "exports").apply { mkdirs() }
             val base = io.github.artcraftandroid.procraft.core.exportFileName(s.name(), false)
             val file = File(dir, "$base.${format.extension}")
             val side = if (webReady) WEB_READY_SIDE else 0
+            val (cw, ch) = canvasSize()
+            val media = project?.let { ProjectVideoFrames(it, cw, ch) }
+            exportingTimelineMedia = true
             try {
                 when (format) {
-                    Animated.GIF -> s.exportGif(file.path, side.toUInt(), fps, dither, perFramePalette, transparent)
-                    Animated.PNG -> s.exportApng(file.path, side.toUInt(), fps, transparent)
+                    Animated.GIF -> s.exportGifWithMedia(file.path, side.toUInt(), fps, dither, perFramePalette, transparent, media)
+                    Animated.PNG -> s.exportApngWithMedia(file.path, side.toUInt(), fps, transparent, media)
                     Animated.MP4, Animated.HEVC -> {
                         val mime = if (format == Animated.HEVC) android.media.MediaFormat.MIMETYPE_VIDEO_HEVC else android.media.MediaFormat.MIMETYPE_VIDEO_AVC
-                        val (cw, ch) = canvasSize()
                         val (w, h) = VideoWriter.fit(cw, ch, if (webReady) WEB_READY_SIDE else MAX_VIDEO_SIDE, mime) ?: return@withContext null
                         val frame = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
                         val paint = android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG)
                         val ok = try {
-                            val order = s.animationPlayOrder()
-                            val tlSnapshot = s.timelineState()
-                            val audioPcm: ShortArray? = if (tlSnapshot?.hasAudio == true && order.isNotEmpty()) {
-                                val startF = order.minOrNull() ?: 0u
-                                val endF = order.maxOrNull() ?: startF
-                                val mixed = s.timelineMixAudioPcm(startF, endF, TimelineAudioPlayer.SAMPLE_RATE.toUInt())
-                                if (mixed.isNotEmpty()) ShortArray(mixed.size) { idx -> mixed[idx] } else null
-                            } else {
-                                null
+                            val timelineFrames = s.timelinePlayOrder()
+                            val tlSnapshot = if (timelineFrames.isNotEmpty()) s.timelineState() else null
+                            val legacyFrames = if (tlSnapshot == null) s.animationPlayOrder() else emptyList()
+                            val timelineFps = tlSnapshot?.fps?.toDouble()?.coerceAtLeast(1.0) ?: 1.0
+                            val outputFps = io.github.artcraftandroid.procraft.core.frameRate(fps).let {
+                                it.frames.toDouble() / it.seconds.toDouble()
                             }
+                            val count = if (tlSnapshot == null) legacyFrames.size
+                                else (timelineFrames.size * outputFps / timelineFps).roundToInt().coerceAtLeast(1)
+                            val audioPcm = if (tlSnapshot?.hasAudio == true && timelineFrames.isNotEmpty()) {
+                                val mixed = s.timelineMixAudioPcm(
+                                    timelineFrames.first(), timelineFrames.last(), TimelineAudioPlayer.SAMPLE_RATE.toUInt(),
+                                )
+                                mixed.takeIf { it.isNotEmpty() }?.toShortArray()
+                            } else null
                             VideoWriter.writeWithAudio(
                                 out = file,
                                 width = w,
                                 height = h,
                                 fps = fps,
-                                count = order.size,
+                                count = count,
                                 mime = mime,
                                 audioPcmStereo = audioPcm,
                                 audioSampleRate = TimelineAudioPlayer.SAMPLE_RATE,
                             ) { i, pixels ->
                                 if (cancelled()) return@writeWithAudio false
-                                videoDone = i.toFloat() / order.size
-                                val picture = animationFrame(order[i].toInt(), maxOf(w, h), false) ?: return@writeWithAudio false
+                                videoDone = i.toFloat() / count
+                                val pixelsAtFrame = if (tlSnapshot != null) {
+                                    val index = (i * timelineFps / outputFps).toInt().coerceAtMost(timelineFrames.lastIndex)
+                                    s.timelineAnimationFrame(timelineFrames[index], false, maxOf(w, h).toUInt(), media)
+                                } else s.animationFrame(legacyFrames[i], false, maxOf(w, h).toUInt())
+                                val picture = pixelsAtFrame?.let(::animationBitmap) ?: return@writeWithAudio false
+                                frame.eraseColor(android.graphics.Color.BLACK)
                                 android.graphics.Canvas(frame).drawBitmap(picture, null, android.graphics.Rect(0, 0, w, h), paint)
                                 picture.recycle()
                                 frame.getPixels(pixels, 0, w, 0, 0, w, h)
@@ -6751,8 +6806,13 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             } catch (e: MobileException) {
                 AppLog.e(TAG, "exporting an animation", e)
                 null
+            } finally {
+                media?.close()
+                exportingTimelineMedia = false
             }
-        } }
+        } }.also {
+            if (session === s) timeline?.let { state -> syncVideoClipsAt(state.playhead.toInt()) }
+        }
     }
 
     /** [exportAnimation] with the export card (as every export has), how far it has come shown; Cancel stops a video. */
@@ -8344,7 +8404,13 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     var movieSettingsOpen by mutableStateOf(false)
     var playheadActionMenuOpen by mutableStateOf(false)
     var addTrackMenuOpen by mutableStateOf(false)
-    var editingKeyframe by mutableStateOf<Pair<ULong, UInt>?>(null)
+    var editingKeyframe by mutableStateOf<TimelineKeyframeAddress?>(null)
+    var selectedKeyframes by mutableStateOf<Set<TimelineKeyframeAddress>>(emptySet())
+        private set
+    var timelineBatchOpen by mutableStateOf(false)
+    private var copiedTimelineClips by mutableStateOf<List<ULong>>(emptyList())
+    private var copiedTimelineKeys by mutableStateOf<List<TimelineCopiedKeyframe>>(emptyList())
+    val canPasteTimeline: Boolean get() = copiedTimelineClips.isNotEmpty() || copiedTimelineKeys.isNotEmpty()
 
     /** Track ID whose Track Options & Layer Effects popover is currently open (null = closed). */
     var trackOptionsTrackId by mutableStateOf<ULong?>(null)
@@ -8356,7 +8422,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     var audioScrubbingEnabled by mutableStateOf(true)
 
     private val audioPlayer = TimelineAudioPlayer()
-    private val videoClipSources = mutableMapOf<ULong, android.net.Uri>()
+    private var videoPreviewJob: Job? = null
+    private var requestedVideoFrame: Int? = null
     private var lastAudioScrubMs = 0L
     private val recordedPerformDeforms = mutableListOf<io.github.artcraftandroid.procraft.core.PerformDeformSampleInfo>()
 
@@ -8462,7 +8529,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
         }
-        syncVideoClipsAt(clamped)
+        tl?.let { syncVideoClipsAt(it.playhead.toInt()) }
     }
 
     fun stepTimelineFrame(delta: Int) {
@@ -8485,25 +8552,46 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun syncVideoClipsAt(frame: Int) {
-        if (videoClipSources.isEmpty()) return
+        if (exportingTimelineMedia || timeline?.tracks?.any { track ->
+                track.clips.any { it.kind == io.github.artcraftandroid.procraft.core.TimelineClipKind.VIDEO }
+            } != true
+        ) return
         val s = session ?: return
-        val tl = timeline ?: return
-        val fps = tl.fps.toFloat().coerceAtLeast(1f)
+        val project = artworkDir ?: return
+        requestedVideoFrame = frame
+        if (videoPreviewJob?.isActive == true) return
         val (cw, ch) = canvasSize()
-        for (track in tl.tracks) {
-            for (clip in track.clips) {
-                if (clip.kind != io.github.artcraftandroid.procraft.core.TimelineClipKind.VIDEO) continue
-                val start = clip.startFrame.toInt()
-                val end = start + clip.durationFrames.toInt()
-                if (frame < start || frame >= end) continue
-                val uri = videoClipSources[clip.id] ?: continue
-                val timeUs = (((frame - start).toDouble() / fps) * 1_000_000.0).toLong().coerceAtLeast(0L)
-                val ctx = getApplication<Application>()
-                viewModelScope.launch(Dispatchers.IO) {
-                    val decoded = VideoDecoder.decodeFrameAt(ctx, uri, timeUs, cw, ch) ?: return@launch
-                    s.timelineSupplyVideoFrame(clip.id, decoded.width.toUInt(), decoded.height.toUInt(), decoded.rgba)
+        videoPreviewJob = viewModelScope.launch {
+            val media = ProjectVideoFrames(project, cw, ch)
+            try {
+                while (session === s && !exportingTimelineMedia) {
+                    val target = requestedVideoFrame ?: break
+                    requestedVideoFrame = null
+                    decodeTimelineVideo(s, media, target) {
+                        session === s && !exportingTimelineMedia &&
+                            (requestedVideoFrame == null || playingFrame != null)
+                    }
                 }
+            } finally {
+                withContext(NonCancellable + Dispatchers.IO) { media.close() }
             }
+        }
+    }
+
+    private suspend fun decodeTimelineVideo(
+        s: CanvasSession,
+        media: ProjectVideoFrames,
+        frame: Int,
+        current: () -> Boolean,
+    ) {
+        val decoded = withContext(Dispatchers.IO) {
+            s.timelineVideoRequests(frame.toUInt()).mapNotNull { request ->
+                media.videoFrame(request)?.let { request.clipId to it }
+            }
+        }
+        if (!current()) return
+        for ((id, pixels) in decoded) {
+            s.timelineSupplyVideoFrame(id, pixels.width, pixels.height, pixels.rgba)
         }
     }
 
@@ -8584,6 +8672,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun toggleClipMultiSelection(clipId: ULong) {
+        selectedKeyframes = emptySet()
         selectedClipIds = if (selectedClipIds.contains(clipId)) {
             selectedClipIds - clipId
         } else {
@@ -8630,6 +8719,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         val s = session ?: return
         s.timelineSelectClip(clipId)
         refresh()
+        timeline?.let { syncVideoClipsAt(it.playhead.toInt()) }
     }
 
     fun addCelClipToActiveTrack() {
@@ -8653,7 +8743,10 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         val s = session ?: return
         s.timelineMoveClip(clipId, newStartFrame.coerceAtLeast(0).toUInt(), targetTrackId, done)
         timeline = s.timelineState()
-        if (done) refresh() else refreshFlags()
+        if (done) {
+            refresh()
+            timeline?.let { syncVideoClipsAt(it.playhead.toInt()) }
+        } else refreshFlags()
     }
 
     fun resizeTimelineClip(clipId: ULong, newDurationFrames: Int, done: Boolean) {
@@ -8723,33 +8816,64 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     // ---- Live Perform Motion Recording ----
 
     private var lastPerformCommitRev: ULong? = null
+    private var performTarget: ULong? = null
+    var showPerformComparison by mutableStateOf(false)
+    var performCompareFiltering by mutableFloatStateOf(0f)
+    val canComparePerform: Boolean
+        get() = !performRecording && timeline?.activeClipId == performTarget && performSamplesCount > 1 &&
+            recordedPerformDeforms.isEmpty()
+
+    fun performComparison(): Pair<List<Pair<Float, Float>>, List<Pair<Float, Float>>> {
+        val s = session ?: return emptyList<Pair<Float, Float>>() to emptyList()
+        if (timeline?.activeClipId != performTarget || recordedPerformDeforms.isNotEmpty()) {
+            return emptyList<Pair<Float, Float>>() to emptyList()
+        }
+        val raw = recordedPerformSamples.asReversed().distinctBy { it.frame }.sortedBy { it.frame }
+        val filtered = s.timelinePerformCurve(recordedPerformSamples.toList(), performCompareFiltering)
+        return raw.map { it.transform.x to it.transform.y } to filtered.map { it.transform.x to it.transform.y }
+    }
 
     fun beginPerformRecording() {
         val s = session ?: return
         val tl = timeline ?: return
+        val target = tl.tracks.asSequence().flatMap { it.clips.asSequence() }
+            .firstOrNull { it.id == tl.activeClipId } ?: return
+        val clipEnd = target.startFrame + target.durationFrames - 1u
+        val start = maxOf(target.startFrame, tl.workArea?.start ?: target.startFrame)
+        val end = minOf(clipEnd, tl.workArea?.end ?: clipEnd)
+        if (start > end) {
+            message = "The work area does not overlap this clip"
+            return
+        }
         stopPlaying()
+        showPerformComparison = false
+        performTarget = target.id
         recordedPerformSamples.clear()
         recordedPerformDeforms.clear()
         lastPerformCommitRev = null
-        performSamplesCount = 0
+        val initial = tl.playhead.takeIf { it in start..end } ?: start
+        setTimelinePlayhead(initial.toInt())
+        val initialTransform = timeline?.activeEvaluatedTransform ?: return
         s.timelineBeginPerform()
         performRecording = true
-        val startTransform = tl.activeEvaluatedTransform
-        recordedPerformSamples.add(
-            io.github.artcraftandroid.procraft.core.PerformSampleInfo(tl.playhead, startTransform),
-        )
+        recordedPerformSamples.add(io.github.artcraftandroid.procraft.core.PerformSampleInfo(initial, initialTransform))
         performSamplesCount = 1
 
         val fps = tl.fps.toInt().coerceIn(1, 60)
-        val duration = tl.durationFrames.toInt().coerceAtLeast(1)
+        val epoch = android.os.SystemClock.elapsedRealtimeNanos()
         performPlayJob?.cancel()
         performPlayJob = viewModelScope.launch {
-            while (performRecording) {
-                kotlinx.coroutines.delay(1000L / fps)
-                val curr = timeline?.playhead?.toInt() ?: 0
-                val next = (curr + 1) % duration
-                s.timelineSetPlayhead(next.toUInt())
-                timeline = s.timelineState()
+            var frame = initial
+            while (performRecording && session === s) {
+                val tick = (frame - initial + 1u).toLong()
+                val wait = epoch + tick * 1_000_000_000L / fps - android.os.SystemClock.elapsedRealtimeNanos()
+                if (wait > 0) kotlinx.coroutines.delay((wait + 999_999L) / 1_000_000L)
+                if (frame == end) {
+                    finishPerformRecording()
+                    break
+                }
+                frame += 1u
+                setTimelinePlayhead(frame.toInt())
             }
         }
     }
@@ -8757,7 +8881,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     fun recordPerformTransform(transform: io.github.artcraftandroid.procraft.core.TimelineTransformInfo) {
         val s = session ?: return
         val tl = timeline ?: return
-        val cid = tl.activeClipId ?: return
+        val cid = performTarget ?: return
         val frame = tl.playhead
         recordedPerformSamples.add(
             io.github.artcraftandroid.procraft.core.PerformSampleInfo(frame, transform),
@@ -8770,7 +8894,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     fun recordPerformDeform(deform: io.github.artcraftandroid.procraft.core.TimelineDeformInfo) {
         val s = session ?: return
         val tl = timeline ?: return
-        val cid = tl.activeClipId ?: return
+        val cid = performTarget ?: return
         val frame = tl.playhead
         recordedPerformDeforms.add(
             io.github.artcraftandroid.procraft.core.PerformDeformSampleInfo(frame, deform),
@@ -8788,6 +8912,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         recordedPerformDeforms.clear()
         performSamplesCount = 0
         lastPerformCommitRev = null
+        performTarget = null
+        showPerformComparison = false
         session?.timelineCancelPerform()
         refresh()
     }
@@ -8799,7 +8925,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         performRecording = false
         val s = session ?: return
         val tl = timeline ?: return
-        val cid = tl.activeClipId ?: return
+        val cid = performTarget ?: return
         val filtering = tl.motionFiltering
         val deformSamples = recordedPerformDeforms.toList()
         if (deformSamples.isNotEmpty()) {
@@ -8823,13 +8949,13 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         val s = session ?: return
         val clamped = filtering.coerceIn(0f, 1f)
         s.timelineSetMotionFiltering(clamped)
-        val cid = timeline?.activeClipId
-        if (cid != null && (recordedPerformDeforms.isNotEmpty() || recordedPerformSamples.isNotEmpty())) {
+        val cid = performTarget
+        if (!performRecording && cid != null && timeline?.activeClipId == cid && lastPerformCommitRev == s.info().revision &&
+            (recordedPerformDeforms.isNotEmpty() || recordedPerformSamples.isNotEmpty())
+        ) {
             // If the user is adjusting Motion Filtering right after a Perform take, replace that
             // single Perform undo step instead of stacking duplicate Perform steps!
-            if (lastPerformCommitRev != null && s.info().revision == lastPerformCommitRev) {
-                s.undo()
-            }
+            s.undo()
             if (recordedPerformDeforms.isNotEmpty()) {
                 s.timelineCommitPerformDeform(cid, recordedPerformDeforms.toList(), clamped)
             } else {
@@ -8881,7 +9007,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     fun mergeTimelineTrackDown(trackId: ULong) {
         if (trackOptionsTrackId == trackId) trackOptionsTrackId = null
-        layerChange { it.timelineMergeTrackDown(trackId) }
+        layerChange { if (!it.timelineMergeTrackDown(trackId)) message = "Merge needs two unlocked tracks in the same group" }
     }
 
     fun setTimelineTrackColor(trackId: ULong, colorArgb: UInt) {
@@ -8967,7 +9093,9 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 return@launch
             }
             val label = uri.lastPathSegment?.substringAfterLast('/')?.substringBeforeLast('.')?.ifBlank { "Audio" } ?: "Audio"
-            val cid = s.timelineImportAudioWav(label, wav, startFrame)
+            if (session !== s) return@launch
+            val cid = withContext(Dispatchers.Default) { s.timelineImportAudioWav(label, wav, startFrame) }
+            if (session !== s) return@launch
             if (cid == null) {
                 message = "Could not import audio track"
             } else {
@@ -8992,33 +9120,58 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     fun importTimelineVideo(uri: android.net.Uri) {
         val s = session ?: return
         val tl = timeline ?: return
+        val project = artworkDir ?: return
         val ctx = getApplication<Application>()
-        val (cw, ch) = canvasSize()
+        val filename = "video-${java.util.UUID.randomUUID().toString().replace("-", "")}.media"
+        val media = File(project, "media")
+        val target = File(media, filename)
+        val work = File(media, "$filename.tmp")
         viewModelScope.launch {
-            val probe = withContext(Dispatchers.IO) { VideoDecoder.probe(ctx, uri) }
-            if (probe == null) {
-                message = "Could not read video file"
-                return@launch
+            var kept = false
+            try {
+                val probe = withContext(Dispatchers.IO) {
+                    val info = VideoDecoder.probe(ctx, uri) ?: return@withContext null
+                    media.mkdirs()
+                    val input = ctx.contentResolver.openInputStream(uri) ?: return@withContext null
+                    input.use {
+                        work.outputStream().use { output ->
+                            val buffer = ByteArray(64 * 1024)
+                            while (true) {
+                                ensureActive()
+                                val n = input.read(buffer)
+                                if (n < 0) break
+                                output.write(buffer, 0, n)
+                            }
+                        }
+                    }
+                    info.takeIf { work.renameTo(target) }
+                }
+                if (session !== s) return@launch
+                if (probe == null || probe.durationMs <= 0) {
+                    message = "Could not read video file"
+                    return@launch
+                }
+                val label = fileName(uri)?.substringBeforeLast('.')?.ifBlank { "Video" } ?: "Video"
+                val frames = ((probe.durationMs / 1000.0) * tl.fps.toDouble()).roundToInt().coerceIn(1, 36_000)
+                val clip = s.timelineImportVideo(label, tl.playhead, frames.toUInt(), probe.fps, probe.frameCount.toUInt(), filename)
+                if (clip == null) {
+                    message = noRoom()
+                    return@launch
+                }
+                kept = true
+                refresh()
+                syncVideoClipsAt(tl.playhead.toInt())
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                AppLog.w("DreamsCraft", "Could not copy video", e)
+                if (session === s) message = "Could not import video file"
+            } finally {
+                if (!kept) withContext(NonCancellable + Dispatchers.IO) {
+                    work.delete()
+                    target.delete()
+                }
             }
-            val label = uri.lastPathSegment?.substringAfterLast('/')?.substringBeforeLast('.')?.ifBlank { "Video" } ?: "Video"
-            val tid = s.timelineAddTrack(label, false)
-            if (tid == 0uL) {
-                message = noRoom()
-                return@launch
-            }
-            val durFrames = ((probe.durationMs / 1000.0) * tl.fps.toDouble()).roundToInt().coerceIn(1, 3600).toUInt()
-            val cid = s.timelineAddVideoClip(tid, tl.playhead, durFrames, probe.fps, probe.frameCount.toUInt(), label)
-            if (cid == 0uL) {
-                message = noRoom()
-                return@launch
-            }
-            videoClipSources[cid] = uri
-            val firstFrame = withContext(Dispatchers.IO) { VideoDecoder.decodeFrameAt(ctx, uri, 0L, cw, ch) }
-            if (firstFrame != null) {
-                s.timelineSupplyVideoFrame(cid, firstFrame.width.toUInt(), firstFrame.height.toUInt(), firstFrame.rgba)
-            }
-            message = "Video clip added: $label"
-            refresh()
         }
     }
 
@@ -9073,7 +9226,125 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         layerChange(thumbs = false) { it.timelineDeleteCameraKeyframe(frame.coerceAtLeast(0).toUInt()) }
     }
 
+    fun toggleTimelineKey(address: TimelineKeyframeAddress) {
+        selectedClipIds = emptySet()
+        selectedKeyframes = if (address in selectedKeyframes) selectedKeyframes - address else selectedKeyframes + address
+    }
+
+    fun copyTimelineSelection() {
+        val s = session ?: return
+        if (selectedKeyframes.isNotEmpty()) {
+            copiedTimelineKeys = s.timelineCopyKeyframes(selectedKeyframes.toList())
+            copiedTimelineClips = emptyList()
+            if (copiedTimelineKeys.isNotEmpty()) message = "Keyframes copied"
+        } else if (selectedClipIds.isNotEmpty()) {
+            copiedTimelineClips = selectedClipIds.toList()
+            copiedTimelineKeys = emptyList()
+            message = "Clips copied"
+        }
+    }
+
+    fun pasteTimelineSelection() {
+        val tl = timeline ?: return
+        layerChange {
+            if (copiedTimelineKeys.isNotEmpty()) {
+                val oneSource = copiedTimelineKeys.map { key -> key.address.clipId }.distinct().size == 1
+                if (!it.timelinePasteKeyframes(copiedTimelineKeys, tl.playhead, tl.activeClipId.takeIf { oneSource }, false)) {
+                    message = "Keyframes don't fit at the playhead"
+                }
+            } else {
+                val copies = it.timelinePasteClips(copiedTimelineClips, tl.playhead)
+                if (copies.isEmpty()) message = "Could not paste clips here" else selectClips(copies.toSet())
+            }
+        }
+    }
+
+    fun editTimelineSelection(edit: TimelineClipBatch) {
+        val tl = timeline ?: return
+        layerChange(thumbs = false) {
+            if (selectedKeyframes.isNotEmpty() && edit == TimelineClipBatch.MOVE) {
+                val keys = it.timelineCopyKeyframes(selectedKeyframes.toList())
+                val origin = keys.minOfOrNull { key -> key.address.frame }
+                if (origin == null || keys.size != selectedKeyframes.size ||
+                    !it.timelinePasteKeyframes(keys, tl.playhead, null, true)
+                ) {
+                    message = "Keyframes don't fit at the playhead"
+                } else {
+                    selectedKeyframes = keys.map { key ->
+                        key.address.copy(frame = tl.playhead + key.address.frame - origin)
+                    }.toSet()
+                }
+            } else if (!it.timelineEditClips(selectedClipIds.toList(), edit, tl.playhead)) {
+                message = "The selection can't be edited at this frame"
+            }
+        }
+    }
+
+    fun inspectTimelineKey(clip: ULong, key: TimelineKeyframeInfo, channel: TimelineKeyframeChannel) {
+        val address = TimelineKeyframeAddress(clip, key.frame, channel)
+        if (dreamsMode == DreamsWorkMode.TIMELINE_EDIT) toggleTimelineKey(address)
+        else {
+            selectTimelineClip(clip)
+            setTimelinePlayhead(key.frame.toInt())
+            editingKeyframe = address
+        }
+    }
+
+    fun changeTimelineKeyEasing(address: TimelineKeyframeAddress, kind: TimelineEasingKind) {
+        val easing = TimelineEasingInfo(kind, 0.42f, 0f, 0.58f, 1f)
+        layerChange(thumbs = false) { it.timelineSetKeyframeEasing(address, easing) }
+    }
+
+    fun deleteTimelineKey(address: TimelineKeyframeAddress) {
+        layerChange(thumbs = false) { it.timelineRemoveKeyframe(address) }
+        editingKeyframe = null
+    }
+
+    fun editFlipbook(clip: ULong, indices: Set<UInt>, mode: FlipbookBatch, exposure: Int = 1) {
+        layerChange {
+            if (!it.timelineEditFlipbook(clip, indices.toList(), mode, exposure.toUInt())) {
+                message = "Could not edit the selected frames"
+            }
+        }
+    }
+
+    fun addFlipbookFrame(clip: ULong) {
+        layerChange { if (it.timelineAddCel(clip) == null) message = noRoom() }
+    }
+
+    fun addFlipbookTrack(clip: ULong) {
+        layerChange { if (it.timelineAddFlipbookTrack(clip) == null) message = noRoom() }
+    }
+
+    fun saveDialogueMarker(label: String?) {
+        val frame = timeline?.playhead ?: return
+        layerChange(thumbs = false) { it.timelineSetDialogueMarker(frame, label) }
+    }
+
+    fun jumpDialogueMarker(next: Boolean) {
+        val tl = timeline ?: return
+        val frame = if (next) tl.dialogueMarkers.firstOrNull { it.frame > tl.playhead }
+            else tl.dialogueMarkers.lastOrNull { it.frame < tl.playhead }
+        frame?.let {
+            stopPlaying()
+            setTimelinePlayhead(it.frame.toInt())
+        }
+    }
+
+    fun loopDialogue() {
+        val tl = timeline ?: return
+        val first = tl.dialogueMarkers.lastOrNull { it.frame <= tl.playhead }?.frame ?: tl.playhead
+        val next = tl.dialogueMarkers.firstOrNull { it.frame > first }?.frame
+            ?: (first + tl.fps * 2u).coerceAtMost(tl.durationFrames)
+        stopPlaying()
+        setTimelineWorkArea(first.toInt(), (next - 1u).coerceAtLeast(first).toInt())
+        setTimelinePlayback(io.github.artcraftandroid.procraft.core.AnimationPlayback.LOOP)
+        setTimelinePlayhead(first.toInt())
+        play()
+    }
+
     fun selectClips(ids: Set<ULong>) {
+        selectedKeyframes = emptySet()
         selectedClipIds = ids
     }
 
@@ -9204,63 +9475,61 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     private fun play() {
         val s = session ?: return
         val tl = timeline
-        if (tl != null && !tl.flipbookOpen) {
-            val total = s.animationFrameCount().toInt()
-            if (total <= 0) return
+        if (tl != null) {
+            val frames = s.timelinePlayOrder()
+            if (frames.isEmpty()) return
             movieSettingsOpen = false
             playheadActionMenuOpen = false
             addTrackMenuOpen = false
             trackOptionsTrackId = null
             liveFilterPopoverOpen = false
-            val startIdx = (tl.playhead.toInt()).coerceIn(0, total - 1)
+            val start = tl.playhead.takeIf { it in frames.first()..frames.last() } ?: frames.first()
+            val fps = tl.fps.toInt().coerceAtLeast(1)
+            val rate = TimelineAudioPlayer.SAMPLE_RATE
             playJob?.cancel()
             audioPlayer.stop()
+            playingFrame = start.toInt()
             playJob = viewModelScope.launch {
-                val wa0 = tl.workArea
-                val audioStartFrame = wa0?.start?.toInt() ?: startIdx
-                val audioEndFrame = wa0?.end?.toInt() ?: (total - 1)
-                if (tl.hasAudio && audioEndFrame >= audioStartFrame) {
-                    val pcmList = withContext(Dispatchers.Default) {
-                        s.timelineMixAudioPcm(
-                            audioStartFrame.toUInt(),
-                            audioEndFrame.toUInt(),
-                            TimelineAudioPlayer.SAMPLE_RATE.toUInt(),
-                        )
-                    }
-                    if (pcmList.isNotEmpty()) {
-                        audioPlayer.playPcm(ShortArray(pcmList.size) { idx -> pcmList[idx] })
+                val samples = if (tl.hasAudio) withContext(Dispatchers.Default) {
+                    s.timelineMixAudioPcm(frames.first(), frames.last(), rate.toUInt()).toShortArray()
+                } else ShortArray(0)
+                fun sound(at: Int, direction: Int) {
+                    if (samples.isEmpty()) return
+                    val end = samples.size / 2
+                    val from = (at.toDouble() * rate / fps).roundToInt().coerceIn(0, end)
+                    if (direction > 0) {
+                        audioPlayer.startPlayback(samples, from * 2, samples.size, reverse = false)
+                    } else {
+                        val until = (((at + 1).toDouble() * rate) / fps).roundToInt().coerceIn(0, end)
+                        audioPlayer.startPlayback(samples, 0, until * 2, reverse = true)
                     }
                 }
-                var at = startIdx
-                var step = 1
-                while (true) {
-                    val wa = timeline?.workArea
-                    val realFrame = if (wa != null) (wa.start.toInt() + at).coerceAtMost(wa.end.toInt()) else at
-                    playingFrame = realFrame
+                var at = (start - frames.first()).toInt()
+                var direction = 1
+                var tick = 0L
+                val epoch = android.os.SystemClock.elapsedRealtimeNanos()
+                sound(at, direction)
+                while (session === s) {
+                    val frame = frames[at]
+                    playingFrame = frame.toInt()
                     playingSlot = at
-                    s.setPlayFrame(realFrame.toUInt())
-                    s.timelineSetPlayhead(realFrame.toUInt())
+                    s.setPlayFrame(frame)
+                    s.timelineSetPlayhead(frame)
                     timeline = s.timelineState()
-                    syncVideoClipsAt(realFrame)
-                    val fps = (timeline?.fps ?: tl.fps).toInt().coerceAtLeast(1)
-                    kotlinx.coroutines.delay(1000L / fps)
-                    val mode = timeline?.playback ?: tl.playback
-                    val next = io.github.artcraftandroid.procraft.core.animationNextStep(mode, total.toUInt(), at.toUInt(), step) ?: break
+                    syncVideoClipsAt(frame.toInt())
+                    val deadline = epoch + (++tick * 1_000_000_000L) / fps
+                    val wait = deadline - android.os.SystemClock.elapsedRealtimeNanos()
+                    if (wait > 0) kotlinx.coroutines.delay((wait + 999_999L) / 1_000_000L)
+                    val next = io.github.artcraftandroid.procraft.core.animationNextStep(tl.playback, frames.size.toUInt(), at.toUInt(), direction) ?: break
+                    val boundary = direction != next.step || next.at.toInt() < at && direction > 0
                     at = next.at.toInt()
-                    step = next.step
-                    // Restart audio on loop wrap
-                    if (at == 0 && tl.hasAudio) {
-                        val loopStart = wa?.start?.toInt() ?: 0
-                        val loopEnd = wa?.end?.toInt() ?: (total - 1)
-                        val loopPcm = withContext(Dispatchers.Default) {
-                            s.timelineMixAudioPcm(loopStart.toUInt(), loopEnd.toUInt(), TimelineAudioPlayer.SAMPLE_RATE.toUInt())
-                        }
-                        if (loopPcm.isNotEmpty()) {
-                            audioPlayer.playPcm(ShortArray(loopPcm.size) { idx -> loopPcm[idx] })
-                        }
-                    }
+                    direction = next.step
+                    if (boundary) sound(at, direction)
                 }
                 audioPlayer.stop()
+                playingFrame = null
+                playingSlot = null
+                s.setPlayFrame(null)
             }
             return
         }

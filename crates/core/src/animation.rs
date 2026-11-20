@@ -76,20 +76,7 @@ fn timeline_export_frames(tl: &procraft_engine::timeline::Timeline) -> Vec<u32> 
                 .chain(t.keyframes.opacity.iter().map(|k| k.frame.saturating_add(1)))
                 .max()
                 .unwrap_or(1);
-            t.clips
-                .iter()
-                .map(|c| {
-                    let c_kf = c
-                        .keyframes
-                        .transform
-                        .iter()
-                        .map(|k| k.frame.saturating_add(1))
-                        .chain(c.keyframes.opacity.iter().map(|k| k.frame.saturating_add(1)))
-                        .max()
-                        .unwrap_or(1);
-                    c.end_frame().max(c_kf)
-                })
-                .chain(std::iter::once(t_kf))
+            t.clips.iter().map(procraft_engine::timeline::Clip::end_frame).chain(std::iter::once(t_kf))
         })
         .max()
         .unwrap_or(1)
@@ -149,6 +136,24 @@ impl CanvasSession {
             .collect()
     }
 
+    /// Actual timeline frames, including a nonzero work area. Empty for legacy Animation Assist.
+    pub fn timeline_play_order(&self) -> Vec<u32> {
+        self.shared.lock().doc.timeline.as_ref().map(timeline_export_frames).unwrap_or_default()
+    }
+
+    /// Renders an absolute timeline frame with the matching decoded media.
+    pub fn timeline_animation_frame(
+        &self,
+        frame: u32,
+        transparent: bool,
+        max_side: u32,
+        media: Option<std::sync::Arc<dyn crate::timeline::TimelineMediaProvider>>,
+    ) -> Option<ThumbnailImage> {
+        let (width, height, rgba) =
+            self.render_timeline_frame_with_media(frame, transparent, max_side, media.as_deref()).ok()?;
+        Some(ThumbnailImage { width, height, rgba })
+    }
+
     /// Gives an artwork opened to be looked at, with no window, the app's device and its canvas,
     /// so its frames can be drawn (`animation_frame`). False if either can't be had. Slow: call it
     /// off the main thread.
@@ -206,6 +211,19 @@ impl CanvasSession {
         per_frame_palette: bool,
         transparent: bool,
     ) -> Result<(), MobileError> {
+        self.export_gif_with_media(path, max_side, fps, dither, per_frame_palette, transparent, None)
+    }
+
+    pub fn export_gif_with_media(
+        &self,
+        path: String,
+        max_side: u32,
+        fps: f32,
+        dither: bool,
+        per_frame_palette: bool,
+        transparent: bool,
+        media: Option<std::sync::Arc<dyn crate::timeline::TimelineMediaProvider>>,
+    ) -> Result<(), MobileError> {
         let units = sequence_targets(&self.shared.lock().doc);
         let delay = (100.0 / fps.clamp(0.1, 100.0)).round() as u16;
         // the frames made take it to 0.95 (sharing a palette, its look at them to 0.45 first), the
@@ -214,7 +232,7 @@ impl CanvasSession {
         let (mut gif, start): (Option<GifWriter>, f32) = if per_frame_palette {
             (None, 0.0)
         } else {
-            (self.shared_palette_gif(&units, transparent, max_side)?, 0.45)
+            (self.shared_palette_gif(&units, transparent, max_side, media.as_deref())?, 0.45)
         };
         // drawn a few at a time (a frame to a core, as many as fit in GIF_BATCH_BYTES), each few
         // made into the GIF's frames side by side, then added in order
@@ -225,7 +243,7 @@ impl CanvasSession {
                 .iter()
                 .skip(next)
                 .take(few)
-                .map(|&unit| self.render_target(unit, transparent, max_side))
+                .map(|&unit| self.render_target_with_media(unit, transparent, max_side, media.as_deref()))
                 .collect::<Result<Vec<_>, _>>()?;
             next += frames.len();
             let Some(&(w, h, _)) = frames.first() else { break };
@@ -253,6 +271,17 @@ impl CanvasSession {
     /// The animation as a looping animated PNG at `path`, `fps` frames a second, scaled to fit
     /// `max_side` (0: full size), `transparent` leaving the background out.
     pub fn export_apng(&self, path: String, max_side: u32, fps: f32, transparent: bool) -> Result<(), MobileError> {
+        self.export_apng_with_media(path, max_side, fps, transparent, None)
+    }
+
+    pub fn export_apng_with_media(
+        &self,
+        path: String,
+        max_side: u32,
+        fps: f32,
+        transparent: bool,
+        media: Option<std::sync::Arc<dyn crate::timeline::TimelineMediaProvider>>,
+    ) -> Result<(), MobileError> {
         let units = sequence_targets(&self.shared.lock().doc);
         let count = u32::try_from(units.len()).unwrap_or(u32::MAX);
         let Some((&first, rest)) = units.split_first() else {
@@ -261,7 +290,7 @@ impl CanvasSession {
         // as the GIF's: the frames to 0.95, the file to 1
         self.exported(0.0);
         let made = |k: usize| self.exported(0.95 * k as f32 / count.max(1) as f32);
-        let (w, h, rgba) = self.render_target(first, transparent, max_side)?;
+        let (w, h, rgba) = self.render_target_with_media(first, transparent, max_side, media.as_deref())?;
         // a frame lasts 1/fps seconds, in thousandths
         let delay = (1000.0 / fps.clamp(0.1, 1000.0)).round().clamp(1.0, 65535.0) as u16;
         write_atomically(Path::new(&path), |f| {
@@ -276,7 +305,7 @@ impl CanvasSession {
             writer.write_image_data(&rgba).map_err(|e| file_error("saving", e))?;
             made(1);
             for (k, &unit) in rest.iter().enumerate() {
-                let (fw, fh, frame) = self.render_target(unit, transparent, max_side)?;
+                let (fw, fh, frame) = self.render_target_with_media(unit, transparent, max_side, media.as_deref())?;
                 if (fw, fh) != (w, h) {
                     return Err(file_error("saving", "the frames differ in size"));
                 }
@@ -298,6 +327,7 @@ impl CanvasSession {
         units: &[FrameTarget],
         transparent: bool,
         max_side: u32,
+        media: Option<&dyn crate::timeline::TimelineMediaProvider>,
     ) -> Result<Option<GifWriter>, MobileError> {
         // a held frame is drawn once, however many places it holds
         let mut seen = std::collections::HashSet::new();
@@ -307,7 +337,7 @@ impl CanvasSession {
         let mut samples: Vec<[u8; 4]> = Vec::new();
         let mut size = None;
         for (k, &unit) in units.iter().enumerate() {
-            let (w, h, rgba) = self.render_target(unit, transparent, max_side)?;
+            let (w, h, rgba) = self.render_target_with_media(unit, transparent, max_side, media)?;
             size.get_or_insert((w, h));
             let pixels = rgba.as_chunks::<4>().0;
             let step = (pixels.len() / per_frame).max(1);
@@ -323,20 +353,44 @@ impl CanvasSession {
         transparent: bool,
         max_side: u32,
     ) -> Result<(u32, u32, Vec<u8>), MobileError> {
+        self.render_target_with_media(target, transparent, max_side, None)
+    }
+
+    fn render_target_with_media(
+        &self,
+        target: FrameTarget,
+        transparent: bool,
+        max_side: u32,
+        media: Option<&dyn crate::timeline::TimelineMediaProvider>,
+    ) -> Result<(u32, u32, Vec<u8>), MobileError> {
         match target {
-            FrameTarget::TimelineFrame(frame) => self.render_timeline_frame(frame, transparent, max_side),
+            FrameTarget::TimelineFrame(frame) => {
+                self.render_timeline_frame_with_media(frame, transparent, max_side, media)
+            }
             FrameTarget::Layer(unit) => self.render_frame(unit, transparent, max_side),
         }
     }
 
     /// Renders multi-track timeline `frame` (including all visible tracks, clips, cels, and
     /// non-destructive keyframe transforms/opacities, without onion skins).
-    fn render_timeline_frame(
+    fn render_timeline_frame_with_media(
         &self,
         frame: u32,
         transparent: bool,
         max_side: u32,
+        media: Option<&dyn crate::timeline::TimelineMediaProvider>,
     ) -> Result<(u32, u32, Vec<u8>), MobileError> {
+        if let Some(media) = media {
+            for request in self.timeline_video_requests(frame) {
+                let clip_id = request.clip_id;
+                let decoded = media
+                    .video_frame(request)
+                    .ok_or_else(|| file_error("reading a video frame", "video media is unavailable"))?;
+                if !self.timeline_supply_video_frame(clip_id, decoded.width, decoded.height, decoded.rgba) {
+                    return Err(file_error("reading a video frame", "could not upload the decoded pixels"));
+                }
+            }
+        }
         let (w, h, rgba) = {
             let mut guard = self.shared.lock();
             let st = &mut *guard;

@@ -55,6 +55,33 @@ pub fn artwork_plays(dir: String) -> bool {
     file.is_some_and(|f| f.document.animation.is_some() || f.document.timeline.is_some() || f.model.is_some())
 }
 
+/// Media referenced by the saved timeline. None identifies an artwork without a timeline.
+#[uniffi::export]
+pub fn artwork_timeline_media(dir: String) -> Option<Vec<String>> {
+    let json = fs::read_to_string(Path::new(&dir).join("artwork.json")).ok()?;
+    let timeline = serde_json::from_str::<ArtworkFile>(&json).ok()?.document.timeline?;
+    let mut names = std::collections::BTreeSet::new();
+    for clip in timeline.tracks.iter().flat_map(|track| &track.clips) {
+        use procraft_engine::timeline::ClipKind;
+        match clip.kind {
+            ClipKind::Video { video_id, .. } => {
+                names.extend(
+                    timeline
+                        .video_files
+                        .get(&video_id)
+                        .filter(|name| procraft_engine::timeline::Timeline::valid_video_filename(name))
+                        .cloned(),
+                );
+            }
+            ClipKind::Audio { asset_id, .. } => {
+                names.extend(timeline.audio_asset(asset_id).and_then(|asset| asset.storage_name()));
+            }
+            _ => {}
+        }
+    }
+    Some(names.into_iter().collect())
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ArtworkFile {
     format: String,
@@ -248,6 +275,43 @@ impl Saved {
     pub(crate) fn read(&mut self, id: LayerId, hash: u64) {
         self.layers.insert(id, hash);
     }
+}
+
+fn write_audio_pcm(path: &Path, pcm: &[f32]) -> Result<(), MobileError> {
+    use std::io::Write;
+    let write = || -> std::io::Result<()> {
+        let mut file = std::io::BufWriter::new(fs::File::create(path)?);
+        for &sample in pcm {
+            file.write_all(&sample.to_le_bytes())?;
+        }
+        file.flush()
+    };
+    write().map_err(|e| file_error("writing audio", e))
+}
+
+fn read_audio_pcm(path: &Path, expected: Option<u64>) -> std::io::Result<Arc<[f32]>> {
+    let file = fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if Some(len) != expected || len > procraft_engine::audio::MAX_AUDIO_PCM_BYTES || !len.is_multiple_of(4) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "audio sample count"));
+    }
+    use std::io::Read;
+    let mut file = BufReader::new(file);
+    let mut samples = Vec::new();
+    samples.try_reserve_exact((len / 4) as usize).map_err(std::io::Error::other)?;
+    let mut chunk = [0u8; 16 * 1024];
+    let mut remaining = len as usize;
+    while remaining > 0 {
+        let count = remaining.min(chunk.len());
+        let Some(bytes) = chunk.get_mut(..count) else { break };
+        file.read_exact(bytes)?;
+        samples.extend(bytes.as_chunks::<4>().0.iter().map(|raw| {
+            let sample = f32::from_le_bytes(*raw);
+            if sample.is_finite() { sample.clamp(-1.0, 1.0) } else { 0.0 }
+        }));
+        remaining -= count;
+    }
+    Ok(samples.into())
 }
 
 /// A quick hash of pixels, to tell a changed layer from one saved already.
@@ -841,6 +905,21 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
                 write_beside(&path, |p| fs::write(p, data).map_err(|e| file_error("writing the plugin's artwork", e)));
             stage(written, path, &mut staged)?;
         }
+        if let Some(timeline) = &file.document.timeline {
+            let media = dir.join("media");
+            for audio in &timeline.audio_assets {
+                let Some(name) = audio.storage_name() else { continue };
+                if audio.pcm.is_empty() {
+                    continue;
+                }
+                let to = media.join(name);
+                if fs::metadata(&to).ok().map(|f| f.len()) == audio.storage_size() {
+                    continue;
+                }
+                fs::create_dir_all(&media).map_err(|e| file_error("making the media folder", e))?;
+                stage(write_beside(&to, |p| write_audio_pcm(p, &audio.pcm)), to, &mut staged)?;
+            }
+        }
         let json = serde_json::to_string(&file).map_err(|e| file_error("writing the artwork", e))?;
         let doc = dir.join("artwork.json");
         stage(
@@ -988,6 +1067,16 @@ impl CanvasSession {
             });
         }
         let mut doc = file.document.repaired();
+        if let Some(timeline) = &mut doc.timeline {
+            for audio in &mut timeline.audio_assets {
+                let Some(name) = audio.storage_name() else { continue };
+                let path = dir.join("media").join(name);
+                match read_audio_pcm(&path, audio.storage_size()) {
+                    Ok(pcm) => audio.pcm = pcm,
+                    Err(e) => log::warn!("opening audio {}: {e}", audio.id.0),
+                }
+            }
+        }
         // plugins' layers' data, as it is (an empty file: none yet). One whose file is gone or can't
         // be read takes no strokes, which would draw it again without what its pixels show, and
         // its file is left as it is

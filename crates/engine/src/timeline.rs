@@ -635,6 +635,27 @@ impl KeyframeTrack {
     }
 
     /// Retains keyframes matching `pred` across all property sub-tracks.
+    fn split_at(&self, frame: u32) -> (Self, Self) {
+        fn split<T: Copy>(keys: &[Keyframe<T>], frame: u32) -> (Vec<Keyframe<T>>, Vec<Keyframe<T>>) {
+            let left_end = keys.partition_point(|key| key.frame < frame);
+            let right_start = keys.partition_point(|key| key.frame <= frame);
+            // Include one endpoint beyond each piece whenever its easing needs that endpoint.
+            let left = keys.get(..(left_end + 1).min(keys.len())).unwrap_or_default();
+            let right = keys.get(right_start.saturating_sub(1)..).unwrap_or_default();
+            (left.to_vec(), right.to_vec())
+        }
+        let (lt, rt) = split(&self.transform, frame);
+        let (lo, ro) = split(&self.opacity, frame);
+        let (lf, rf) = split(&self.filter, frame);
+        let (ld, rd) = split(&self.deform, frame);
+        let (lv, rv) = split(&self.volume, frame);
+        let (lp, rp) = split(&self.pan, frame);
+        (
+            Self { transform: lt, opacity: lo, filter: lf, deform: ld, volume: lv, pan: lp },
+            Self { transform: rt, opacity: ro, filter: rf, deform: rd, volume: rv, pan: rp },
+        )
+    }
+
     pub fn retain_frames(&mut self, mut pred: impl FnMut(u32) -> bool) {
         self.transform.retain(|k| pred(k.frame));
         self.opacity.retain(|k| pred(k.frame));
@@ -863,17 +884,13 @@ fn eval_keyframes<T: Copy>(keys: &[Keyframe<T>], frame: f32, default: T, lerp: i
     if frame >= last.frame as f32 {
         return last.value;
     }
-    for pair in keys.windows(2) {
-        let (Some(a), Some(b)) = (pair.first(), pair.get(1)) else { continue };
-        let (fa, fb) = (a.frame as f32, b.frame as f32);
-        if frame >= fa && frame <= fb {
-            let span = (fb - fa).max(1e-6);
-            let raw_t = ((frame - fa) / span).clamp(0.0, 1.0);
-            let eased_t = a.easing.sample(raw_t);
-            return lerp(a.value, b.value, eased_t);
-        }
-    }
-    last.value
+    let index = keys.partition_point(|key| key.frame as f32 <= frame);
+    let (Some(a), Some(b)) = (keys.get(index.saturating_sub(1)), keys.get(index)) else {
+        return last.value;
+    };
+    let span = b.frame.saturating_sub(a.frame).max(1) as f32;
+    let t = (frame - a.frame as f32) / span;
+    lerp(a.value, b.value, a.easing.sample(t))
 }
 
 /// A single hand-drawn cel inside a Flipbook [`ClipKind::Cel`] sequence.
@@ -918,7 +935,7 @@ pub enum ClipKind {
         layer: LayerId,
         source_fps: f32,
         #[serde(default)]
-        trim_in_frames: u32,
+        trim_start_us: u64,
         frame_count: u32,
     },
     /// Animated text clip referencing a `LayerKind::Paint` text layer in [`Document`].
@@ -1230,6 +1247,10 @@ pub struct Timeline {
     /// Imported audio assets referenced by [`ClipKind::Audio`] clips.
     #[serde(default)]
     pub audio_assets: Vec<AudioAsset>,
+    /// Source files relative to the artwork's media folder, keyed by Video clip source ID.
+    pub video_files: std::collections::BTreeMap<u64, String>,
+    pub dialogue_markers: std::collections::BTreeMap<u32, String>,
+    pub flipbook_groups: std::collections::BTreeSet<TrackId>,
     next_id: u64,
 }
 
@@ -1253,6 +1274,9 @@ impl Default for Timeline {
             camera: KeyframeTrack::default(),
             camera_enabled: false,
             audio_assets: Vec::new(),
+            video_files: Default::default(),
+            dialogue_markers: Default::default(),
+            flipbook_groups: Default::default(),
             next_id: 1,
         }
     }
@@ -1328,6 +1352,9 @@ impl Timeline {
             camera: KeyframeTrack::default(),
             camera_enabled: false,
             audio_assets: Vec::new(),
+            video_files: Default::default(),
+            dialogue_markers: Default::default(),
+            flipbook_groups: Default::default(),
             next_id: 1,
         };
 
@@ -1557,6 +1584,7 @@ impl Timeline {
                 track.parent_group = None;
             }
         }
+        self.flipbook_groups.retain(|id| group_ids.contains(id));
         let parent_map: HashMap<TrackId, Option<TrackId>> =
             self.tracks.iter().map(|t| (t.id, t.parent_group)).collect();
         for track in &mut self.tracks {
@@ -1575,6 +1603,8 @@ impl Timeline {
         let max_end = self.tracks.iter().flat_map(|t| &t.clips).map(Clip::end_frame).max().unwrap_or(1);
         self.duration_frames = self.duration_frames.max(max_end).clamp(1, MAX_TIMELINE_DURATION);
         self.playhead = self.playhead.min(self.duration_frames.saturating_sub(1));
+        self.dialogue_markers.retain(|frame, _| *frame < self.duration_frames);
+        self.video_files.retain(|_, name| Self::valid_video_filename(name));
         self.work_area = self.work_area.map(|w| w.repaired(self.duration_frames));
         self.next_id = self.next_id.max(max_seen_id.saturating_add(1));
 
@@ -1706,29 +1736,51 @@ impl Timeline {
         Some(layers)
     }
 
-    /// Merges `track_id`'s clips into the track immediately below it (`index - 1`) and removes `track_id`.
+    /// Combines a pair of adjacent tracks without changing their rendered or mixed output.
+    /// Tracks that need separate compositing are kept as children of a neutral group.
     pub fn merge_track_down(&mut self, track_id: TrackId) -> bool {
-        let Some(pos) = self.tracks.iter().position(|t| t.id == track_id) else {
-            return false;
-        };
-        if pos == 0 {
+        let Some(pos) = self.tracks.iter().position(|t| t.id == track_id) else { return false };
+        let Some(upper) = self.tracks.get(pos) else { return false };
+        let Some(lower) = pos.checked_sub(1).and_then(|i| self.tracks.get(i)) else { return false };
+        if upper.locked || lower.locked || upper.parent_group != lower.parent_group {
             return false;
         }
-        if self.tracks.get(pos).is_some_and(|t| t.locked) || self.tracks.get(pos - 1).is_some_and(|t| t.locked) {
-            return false;
+        let lower_id = lower.id;
+        let neutral = |track: &Track| {
+            track.visible
+                && !track.muted
+                && !track.solo
+                && !track.is_group
+                && !track.clip_to_below
+                && !track.alpha_lock
+                && track.opacity == 1.0
+                && track.blend == BlendMode::Normal
+                && track.keyframes.is_empty()
+                && !track.effects.is_active()
+        };
+        let overlaps = upper
+            .clips
+            .iter()
+            .any(|a| lower.clips.iter().any(|b| a.start_frame < b.end_frame() && b.start_frame < a.end_frame()));
+        if !neutral(upper) || !neutral(lower) || overlaps {
+            let parent = upper.parent_group;
+            let name = format!("{} + {}", lower.name, upper.name);
+            let group_id = self.add_track(Some(&name), true);
+            let Some(mut group) = self.tracks.pop() else { return false };
+            group.parent_group = parent;
+            self.tracks.insert(pos + 1, group);
+            for tid in [lower_id, track_id] {
+                if let Some(track) = self.track_mut(tid) {
+                    track.parent_group = Some(group_id);
+                }
+            }
+            self.active_track = Some(track_id);
+            return true;
         }
         let upper = self.tracks.remove(pos);
-        let Some(lower) = self.tracks.get_mut(pos - 1) else {
-            return false;
-        };
-        let lower_id = lower.id;
+        let Some(lower) = self.tracks.get_mut(pos - 1) else { return false };
         lower.clips.extend(upper.clips);
         lower.clips.sort_by_key(|c| c.start_frame);
-        for t in &mut self.tracks {
-            if t.parent_group == Some(track_id) {
-                t.parent_group = Some(lower_id);
-            }
-        }
         self.active_track = Some(lower_id);
         true
     }
@@ -1744,6 +1796,9 @@ impl Timeline {
         pcm: Vec<f32>,
         start_frame: u32,
     ) -> Option<(TrackId, ClipId, AudioAssetId)> {
+        if pcm.is_empty() || (pcm.len() as u64).saturating_mul(4) > crate::audio::MAX_AUDIO_PCM_BYTES {
+            return None;
+        }
         let asset_id = self.alloc_audio_asset_id();
         let asset = AudioAsset::from_pcm(asset_id, name.clone(), sample_rate, channels, pcm);
         let dur_frames = asset.duration_in_timeline_frames(self.fps).clamp(1, MAX_TIMELINE_DURATION);
@@ -1779,6 +1834,12 @@ impl Timeline {
         Some((tid, clip_id, asset_id))
     }
 
+    pub fn valid_video_filename(name: &str) -> bool {
+        name.strip_prefix("video-")
+            .and_then(|s| s.strip_suffix(".media"))
+            .is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+    }
+
     /// Adds a [`ClipKind::Video`] clip on `track_id` backed by managed `layer`.
     pub fn add_video_clip(
         &mut self,
@@ -1805,7 +1866,7 @@ impl Timeline {
                 video_id,
                 layer,
                 source_fps: if source_fps.is_finite() { source_fps.clamp(1.0, 120.0) } else { 24.0 },
-                trim_in_frames: 0,
+                trim_start_us: 0,
                 frame_count: frame_count.max(1),
             },
         );
@@ -1857,15 +1918,19 @@ impl Timeline {
         // Cap to 10 minutes of stereo samples to avoid accidental huge allocations
         let capped_samples = total_samples.min((sr as usize).saturating_mul(600));
         let mut out = vec![0.0_f32; capped_samples.saturating_mul(2)];
-        let any_solo = self.tracks.iter().any(|t| t.solo && t.visible && !t.muted);
+        let any_solo = self.tracks.iter().any(|t| t.solo && self.audio_track_is_audible(t.id));
 
         for track in &self.tracks {
-            if !track.visible || track.muted || track.is_group {
+            if track.is_group || !self.audio_track_is_audible(track.id) {
                 continue;
             }
             if any_solo && !self.track_or_ancestor_is_solo(track.id) {
                 continue;
             }
+            let lineage: Vec<&Track> =
+                std::iter::successors(Some(track), |t| t.parent_group.and_then(|id| self.track(id)))
+                    .take(self.tracks.len())
+                    .collect();
             for clip in &track.clips {
                 let ClipKind::Audio { asset_id, trim_start_samples, .. } = clip.kind else {
                     continue;
@@ -1885,7 +1950,13 @@ impl Timeline {
                 let clip_end_sec = f64::from(clip.end_frame()) / fps;
                 let range_start_sec = f64::from(start_frame) / fps;
 
-                for i in 0..capped_samples {
+                let to_sample = |frame: u32| {
+                    (u64::from(frame.saturating_sub(start_frame)) * u64::from(sr))
+                        .div_ceil(u64::from(self.fps.clamp(1, 60))) as usize
+                };
+                let first = to_sample(clip.start_frame);
+                let last = to_sample(clip.end_frame()).min(capped_samples);
+                for i in first..last {
                     let t_sec = range_start_sec + (i as f64 / dst_sr);
                     if t_sec < clip_start_sec || t_sec >= clip_end_sec {
                         continue;
@@ -1894,24 +1965,29 @@ impl Timeline {
                     let src_pos = (trim_start_samples as f64) + local_sec * src_sr;
                     let (sl, sr_sample) = asset.sample_stereo(src_pos);
                     let timeline_frame = (t_sec * fps) as f32;
-                    let gain = (clip.keyframes.evaluate_volume(timeline_frame)
-                        * track.keyframes.evaluate_volume(timeline_frame)
-                        * clip.opacity.clamp(0.0, 1.0)
-                        * track.opacity.clamp(0.0, 1.0))
-                    .clamp(0.0, 2.0);
-                    let pan = (clip.keyframes.evaluate_pan(timeline_frame)
-                        + track.keyframes.evaluate_pan(timeline_frame))
-                    .clamp(-1.0, 1.0);
+                    let mut gain = clip.keyframes.evaluate_volume(timeline_frame) * clip.opacity;
+                    let mut pan = clip.keyframes.evaluate_pan(timeline_frame);
+                    for parent in &lineage {
+                        gain *= parent.opacity
+                            * parent.keyframes.evaluate_opacity(timeline_frame)
+                            * parent.keyframes.evaluate_volume(timeline_frame);
+                        pan += parent.keyframes.evaluate_pan(timeline_frame);
+                    }
+                    let gain = gain.clamp(0.0, 2.0);
+                    let pan = pan.clamp(-1.0, 1.0);
                     let (gl, gr) = stereo_pan_gains(pan);
                     let idx = i.saturating_mul(2);
                     if let Some(slot_l) = out.get_mut(idx) {
-                        *slot_l = (*slot_l + sl * gain * gl).clamp(-1.0, 1.0);
+                        *slot_l += sl * gain * gl;
                     }
                     if let Some(slot_r) = out.get_mut(idx + 1) {
-                        *slot_r = (*slot_r + sr_sample * gain * gr).clamp(-1.0, 1.0);
+                        *slot_r += sr_sample * gain * gr;
                     }
                 }
             }
+        }
+        for sample in &mut out {
+            *sample = sample.clamp(-1.0, 1.0);
         }
         out
     }
@@ -1997,13 +2073,13 @@ impl Timeline {
         let existing_hit = self.track(tid).and_then(|t| {
             t.clips.iter().find(|c| c.contains_frame(frame)).map(|c| {
                 let cel_hit = c.cel_at(frame);
-                (c.id, c.layer_at(frame), cel_hit, matches!(c.kind, ClipKind::Audio { .. }))
+                (c.id, c.layer_at(frame), cel_hit, matches!(c.kind, ClipKind::Audio { .. } | ClipKind::Video { .. }))
             })
         });
 
-        if let Some((cid, layer_opt, cel_hit, is_audio)) = existing_hit {
-            if is_audio {
-                // Don't paint onto an audio track; create a fresh drawing track above it
+        if let Some((cid, layer_opt, cel_hit, is_media)) = existing_hit {
+            if is_media {
+                // Don't paint onto an imported media track; create a fresh drawing track above it
                 if !self.auto_create_frame_on_draw {
                     return None;
                 }
@@ -2076,7 +2152,7 @@ impl Timeline {
             return false;
         }
         let dst_track_id = target_track.unwrap_or(src_track_id);
-        if self.track(dst_track_id).is_some_and(|t| t.locked) {
+        if self.track(dst_track_id).is_none_or(|t| t.locked || t.is_group) {
             return false;
         }
         let new_start = new_start_frame.min(MAX_TIMELINE_DURATION.saturating_sub(1));
@@ -2145,6 +2221,69 @@ impl Timeline {
         true
     }
 
+    /// Trims to the playhead while retaining the clip ID and its visible animation.
+    pub fn trim_clip(&mut self, clip: ClipId, frame: u32, trim_start: bool) -> Option<Vec<LayerId>> {
+        let previous = self.active_clip;
+        let track = self.track_of_clip(clip)?;
+        let right = self.split_clip(clip, frame)?;
+        let track = self.track_mut(track)?;
+        let remove = if trim_start { clip } else { right };
+        let index = track.clips.iter().position(|c| c.id == remove)?;
+        let dropped = track.clips.remove(index).referenced_layers();
+        if trim_start {
+            track.clips.iter_mut().find(|c| c.id == right)?.id = clip;
+        }
+        self.active_clip = previous;
+        Some(dropped)
+    }
+
+    /// Places a copied clip independently of the source clip, retaining source media references.
+    pub fn place_clip_copy(&mut self, track: TrackId, mut clip: Clip, start: u32) -> Option<ClipId> {
+        if self.track(track)?.locked || start.saturating_add(clip.effective_duration()) > MAX_TIMELINE_DURATION {
+            return None;
+        }
+        let id = self.alloc_clip_id();
+        clip.id = id;
+        clip.name.push_str(" Copy");
+        clip.keyframes.shift(i64::from(start) - i64::from(clip.start_frame));
+        clip.start_frame = start;
+        let end = clip.end_frame();
+        let row = self.track_mut(track)?;
+        row.clips.push(clip);
+        row.clips.sort_by_key(|c| c.start_frame);
+        self.duration_frames = self.duration_frames.max(end);
+        self.active_track = Some(track);
+        self.active_clip = Some(id);
+        self.playhead = start;
+        Some(id)
+    }
+
+    pub fn add_flipbook_track(&mut self, clip: ClipId, layer: LayerId) -> Option<ClipId> {
+        let track = self.track_of_clip(clip)?;
+        let source = self.clip(clip)?;
+        if !matches!(source.kind, ClipKind::Cel { .. }) || self.track(track)?.locked {
+            return None;
+        }
+        let start = self.playhead.max(source.start_frame).min(source.end_frame().saturating_sub(1));
+        let parent = self.track(track)?.parent_group;
+        let group = match parent {
+            Some(id) if self.flipbook_groups.contains(&id) => id,
+            _ => {
+                let id = self.add_track(Some("Flipbook"), true);
+                self.track_mut(id)?.parent_group = parent;
+                self.track_mut(track)?.parent_group = Some(id);
+                self.flipbook_groups.insert(id);
+                id
+            }
+        };
+        let new_track = self.add_track(None, false);
+        self.track_mut(new_track)?.parent_group = Some(group);
+        let index = self.tracks.iter().rposition(|t| t.parent_group == Some(group) && t.id != new_track)?;
+        let row = self.tracks.pop()?;
+        self.tracks.insert(index + 1, row);
+        self.add_cel_clip(new_track, start, layer, 0)
+    }
+
     /// Splits `clip_id` at `at_frame` into two consecutive clips on the same track, returning the
     /// newly created right-hand clip's [`ClipId`].
     pub fn split_clip(&mut self, clip_id: ClipId, at_frame: u32) -> Option<ClipId> {
@@ -2161,11 +2300,7 @@ impl Timeline {
         let right_dur = clip.end_frame().saturating_sub(at_frame);
         let fps = self.fps.clamp(1, 60);
 
-        let mut left_kf = clip.keyframes.clone();
-        left_kf.retain_frames(|f| f < at_frame);
-
-        let mut right_kf = clip.keyframes.clone();
-        right_kf.retain_frames(|f| f >= at_frame);
+        let (left_kf, right_kf) = clip.keyframes.split_at(at_frame);
 
         let (left_kind, right_kind) = match &clip.kind {
             ClipKind::Layer { layer } => (ClipKind::Layer { layer: *layer }, ClipKind::Layer { layer: *layer }),
@@ -2191,19 +2326,19 @@ impl Timeline {
                     },
                 )
             }
-            ClipKind::Video { video_id, layer, source_fps, trim_in_frames, frame_count } => (
+            ClipKind::Video { video_id, layer, source_fps, trim_start_us, frame_count } => (
                 ClipKind::Video {
                     video_id: *video_id,
                     layer: *layer,
                     source_fps: *source_fps,
-                    trim_in_frames: *trim_in_frames,
+                    trim_start_us: *trim_start_us,
                     frame_count: *frame_count,
                 },
                 ClipKind::Video {
                     video_id: *video_id,
                     layer: *layer,
                     source_fps: *source_fps,
-                    trim_in_frames: trim_in_frames.saturating_add(left_dur),
+                    trim_start_us: trim_start_us.saturating_add(u64::from(left_dur) * 1_000_000 / u64::from(fps)),
                     frame_count: *frame_count,
                 },
             ),
@@ -2703,6 +2838,19 @@ impl Timeline {
         (Affine::IDENTITY, 2, false)
     }
 
+    fn audio_track_is_audible(&self, track_id: TrackId) -> bool {
+        let mut cursor = Some(track_id);
+        for _ in 0..self.tracks.len() {
+            let Some(id) = cursor else { return true };
+            let Some(track) = self.track(id) else { return false };
+            if !track.visible || track.muted {
+                return false;
+            }
+            cursor = track.parent_group;
+        }
+        cursor.is_none()
+    }
+
     fn track_or_ancestor_is_solo(&self, track_id: TrackId) -> bool {
         let mut seen = HashSet::new();
         let mut cursor = Some(track_id);
@@ -3110,28 +3258,32 @@ mod tests {
     }
 
     #[test]
-    fn splitting_and_moving_clips_preserve_duration_and_shift_keyframes() {
+    fn splitting_and_moving_clips_preserve_duration_and_easing() {
         let l1 = LayerId(1);
         let mut tl = Timeline::new_with_layer(l1);
-        let track_id = tl.active_track.unwrap();
-        let clip_id = tl.add_layer_clip(track_id, 10, 20, l1, Some("Block")).unwrap();
-        tl.clip_mut(clip_id).unwrap().keyframes.set_transform(
-            15,
-            Transform2D { position: [40.0, 20.0], ..Transform2D::default() },
-            Some(Easing::Linear),
-        );
+        let track = tl.active_track.unwrap();
+        let clip = tl.add_layer_clip(track, 10, 20, l1, Some("Block")).unwrap();
+        let keys = &mut tl.clip_mut(clip).unwrap().keyframes;
+        keys.set_transform(10, Transform2D::default(), Some(Easing::EaseInOut));
+        keys.set_transform(24, Transform2D { position: [100.0, 0.0], ..Transform2D::default() }, None);
+        keys.set_opacity(14, 0.2, Some(Easing::Hold));
+        keys.set_opacity(22, 0.8, None);
+        keys.set_opacity(28, 1.0, None);
 
-        // Move clip from 10 to 30 (+20 frames) -> keyframe shifts from 15 to 35
-        assert!(tl.move_clip(clip_id, 30, None));
-        assert_eq!(tl.clip(clip_id).unwrap().keyframes.transform[0].frame, 35);
-
-        // Split clip (30..50) at frame 40 -> left (30..40) keeps keyframe at 35, right (40..50) has none
-        let right_id = tl.split_clip(clip_id, 40).unwrap();
-        assert_eq!(tl.clip(clip_id).unwrap().duration_frames, 10);
-        assert_eq!(tl.clip(clip_id).unwrap().keyframes.transform.len(), 1);
-        assert_eq!(tl.clip(right_id).unwrap().start_frame, 40);
-        assert_eq!(tl.clip(right_id).unwrap().duration_frames, 10);
-        assert!(tl.clip(right_id).unwrap().keyframes.transform.is_empty());
+        assert!(tl.move_clip(clip, 30, None));
+        assert_eq!(tl.clip(clip).unwrap().keyframes.transform[0].frame, 30);
+        let before = tl.clip(clip).unwrap().keyframes.clone();
+        let right = tl.split_clip(clip, 40).unwrap();
+        assert_eq!(tl.clip(clip).unwrap().duration_frames, 10);
+        assert_eq!(tl.clip(right).unwrap().start_frame, 40);
+        assert_eq!(tl.clip(right).unwrap().duration_frames, 10);
+        for half_frame in 60..100 {
+            let frame = half_frame as f32 / 2.0;
+            let after = &tl.clip(if frame < 40.0 { clip } else { right }).unwrap().keyframes;
+            assert_eq!(before.evaluate_transform(frame), after.evaluate_transform(frame));
+            assert_eq!(before.evaluate_opacity(frame), after.evaluate_opacity(frame));
+        }
+        assert_eq!(before.evaluate_opacity(42.0), 0.8);
     }
 
     #[test]
@@ -3234,15 +3386,16 @@ mod tests {
         assert!(tl.move_track(t2, -1));
         assert_eq!(tl.tracks[0].id, t2);
         assert!(tl.move_track(t2, 1));
+        tl.track_mut(t2).unwrap().opacity = 0.4;
+        let before = tl.evaluate(&doc, 0.0, true);
         assert!(tl.merge_track_down(t2));
-        assert_eq!(tl.tracks.len(), 1);
-        assert_eq!(tl.tracks[0].id, t1);
-        assert_eq!(tl.tracks[0].clips.len(), 2);
+        let after = tl.evaluate(&doc, 0.0, true);
+        assert_eq!(tl.track(t1).unwrap().parent_group, tl.track(t2).unwrap().parent_group);
+        assert_eq!(before.items, after.items);
 
-        // Delete track returns referenced layers
-        let removed_layers = tl.delete_track(t1).unwrap();
-        assert!(removed_layers.contains(&l1));
-        assert!(removed_layers.contains(&l2));
+        // Delete track returns the layers of its own clips.
+        assert_eq!(tl.delete_track(t1).unwrap(), vec![l1]);
+        assert_eq!(tl.delete_track(t2).unwrap(), vec![l2]);
     }
 
     #[test]
@@ -3274,6 +3427,24 @@ mod tests {
         tl.track_mut(tid).unwrap().muted = true;
         let muted = tl.mix_audio_range(0, 11, 24_000);
         assert!(muted.iter().all(|&s| s.abs() < 1e-6));
+    }
+
+    #[test]
+    fn audio_mix_is_order_independent_and_respects_group_visibility() {
+        let mut tl = Timeline::default();
+        let mut tracks = Vec::new();
+        for sample in [0.8, 0.8, -0.8] {
+            let (track, clip, _) = tl.add_audio_clip(None, "Tone".into(), 8_000, 1, vec![sample; 8_000], 0).unwrap();
+            tl.clip_mut(clip).unwrap().keyframes.set_pan(0, -1.0, None);
+            tracks.push(track);
+        }
+        let mix = tl.mix_audio_range(0, 0, 8_000);
+        assert!((mix[0] - 0.8).abs() < 1e-5);
+        assert!(tl.move_track(tracks[2], -2));
+        assert_eq!(mix, tl.mix_audio_range(0, 0, 8_000));
+        let group = tl.group_tracks(&tracks, None).unwrap();
+        tl.track_mut(group).unwrap().visible = false;
+        assert!(tl.mix_audio_range(0, 0, 8_000).iter().all(|&sample| sample == 0.0));
     }
 
     #[test]

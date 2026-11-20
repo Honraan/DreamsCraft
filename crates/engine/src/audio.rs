@@ -1,6 +1,11 @@
 //! Clean-room audio asset model, WAV PCM decoder, multi-resolution waveform peak generator,
 //! and deterministic frame-accurate timeline audio mixer for DreamsCraft.
 
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+
+pub const MAX_AUDIO_PCM_BYTES: u64 = 512 * 1024 * 1024;
+
 /// Unique identifier of an audio asset stored in a [`crate::timeline::Timeline`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
@@ -17,8 +22,7 @@ pub struct DecodedAudio {
 
 /// Metadata and precomputed waveform peaks for an audio file attached to a timeline.
 ///
-/// The raw PCM samples are kept alongside in memory (and skipped in lightweight document JSON)
-/// so the UI can draw waveforms immediately without holding huge JSON arrays.
+/// Sample data is shared by editing history and saved in a binary file beside the document.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct AudioAsset {
@@ -30,9 +34,10 @@ pub struct AudioAsset {
     pub duration_samples: u64,
     /// Precomputed waveform peaks `[min, max]` in `-1.0..=1.0` evenly spanning the asset.
     pub peaks: Vec<[f32; 2]>,
+    pub storage_key: Option<u64>,
     /// Interleaved PCM float samples (`-1.0..=1.0`), kept in memory for scrubbing/playback/muxing.
     #[serde(skip)]
-    pub pcm: Vec<f32>,
+    pub pcm: Arc<[f32]>,
 }
 
 impl Default for AudioAsset {
@@ -44,19 +49,25 @@ impl Default for AudioAsset {
             channels: 2,
             duration_samples: 0,
             peaks: Vec::new(),
-            pcm: Vec::new(),
+            storage_key: None,
+            pcm: Arc::default(),
         }
     }
 }
 
 impl AudioAsset {
     /// Builds an [`AudioAsset`] from interleaved float PCM samples (`-1.0..=1.0`).
-    pub fn from_pcm(id: AudioAssetId, name: String, sample_rate: u32, channels: u8, pcm: Vec<f32>) -> AudioAsset {
+    pub fn from_pcm(id: AudioAssetId, name: String, sample_rate: u32, channels: u8, mut pcm: Vec<f32>) -> AudioAsset {
         let safe_rate = sample_rate.clamp(8_000, 192_000);
         let safe_ch = channels.clamp(1, 2);
         let frame_count = pcm.len() / usize::from(safe_ch);
+        pcm.truncate(frame_count * usize::from(safe_ch));
         let bucket_count = (frame_count / 256).clamp(16, 4096);
         let peaks = compute_waveform_peaks(&pcm, safe_ch, bucket_count);
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        (safe_rate, safe_ch).hash(&mut hash);
+        pcm.iter().for_each(|sample| sample.to_bits().hash(&mut hash));
+        let storage_key = Some(hash.finish());
         AudioAsset {
             id,
             name: if name.trim().is_empty() { "Audio".to_owned() } else { name },
@@ -64,7 +75,8 @@ impl AudioAsset {
             channels: safe_ch,
             duration_samples: frame_count as u64,
             peaks,
-            pcm,
+            storage_key,
+            pcm: pcm.into(),
         }
     }
 
@@ -72,6 +84,14 @@ impl AudioAsset {
     pub fn from_i16_pcm(id: AudioAssetId, name: String, sample_rate: u32, channels: u8, pcm_i16: &[i16]) -> AudioAsset {
         let floats: Vec<f32> = pcm_i16.iter().map(|&s| f32::from(s) / 32_768.0).collect();
         AudioAsset::from_pcm(id, name, sample_rate, channels, floats)
+    }
+
+    pub fn storage_name(&self) -> Option<String> {
+        self.storage_key.map(|key| format!("audio-{}-{key:016x}.pcm", self.id.0))
+    }
+
+    pub fn storage_size(&self) -> Option<u64> {
+        self.duration_samples.checked_mul(u64::from(self.channels.clamp(1, 2)))?.checked_mul(4)
     }
 
     /// Duration in timeline frames at `fps`.
