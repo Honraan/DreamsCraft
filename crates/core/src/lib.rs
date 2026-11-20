@@ -2999,6 +2999,7 @@ impl CanvasSession {
             // Liquify open: its first step undone closes it
             can_undo: st.plugin_steps().is_some_and(|(undo, _)| undo)
                 || st.liquify_open()
+                || st.pending_doc.is_some()
                 || st.canvas.as_ref().is_some_and(Canvas::can_undo)
                 || st.crop_undo.is_some()
                 || st.shape.is_some()
@@ -3053,6 +3054,12 @@ impl CanvasSession {
         if let Some(canvas) = st.canvas.as_mut() {
             f(canvas);
             st.flush();
+            if st.doc.timeline.is_some() {
+                crate::timeline::sync_current_layer_to_playhead(&mut st.doc);
+            }
+            if let Some(c) = st.canvas.as_mut() {
+                c.invalidate();
+            }
             // a stroke on a model's colour painted its roughness and metalness too; a tile's choice
             // chooses again what was before (or after) it
             if let Some(before) = before {

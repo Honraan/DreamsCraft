@@ -111,4 +111,16 @@ class TimelineUiTest {
         assertEquals(0.9f, skewed[6], 0.001f)
         assertEquals(0.5f, (skewed[0] + skewed[6]) / 2f, 0.001f)
     }
+
+    @Test
+    fun multiFingerTapClassifiesUndoRedoAndRejectsDragsOrLongPresses() {
+        assertEquals(MultiFingerTapAction.UNDO, classifyMultiFingerTap(maxPointers = 2, maxTravelPx = 8f, durationMs = 110L))
+        assertEquals(MultiFingerTapAction.REDO, classifyMultiFingerTap(maxPointers = 3, maxTravelPx = 12f, durationMs = 150L))
+        assertEquals(MultiFingerTapAction.NONE, classifyMultiFingerTap(maxPointers = 1, maxTravelPx = 4f, durationMs = 80L))
+        assertEquals(MultiFingerTapAction.NONE, classifyMultiFingerTap(maxPointers = 4, maxTravelPx = 4f, durationMs = 80L))
+        // Rejects pinches/drags (> 24px) and long presses (> 320ms)
+        assertEquals(MultiFingerTapAction.NONE, classifyMultiFingerTap(maxPointers = 2, maxTravelPx = 30f, durationMs = 120L))
+        assertEquals(MultiFingerTapAction.NONE, classifyMultiFingerTap(maxPointers = 3, maxTravelPx = 5f, durationMs = 400L))
+        assertEquals(MultiFingerTapAction.NONE, classifyMultiFingerTap(maxPointers = 2, maxTravelPx = Float.NaN, durationMs = 100L))
+    }
 }

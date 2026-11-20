@@ -7008,6 +7008,13 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     fun undo() {
         feedback()
+        stopPlaying()
+        if (performRecording) {
+            cancelPerformRecording()
+            showDone("Undo Perform")
+            return
+        }
+        editingKeyframe = null
         // a finished text's step goes back to editing that text first, as a step of its own
         if (textInfo == null && !transforming) session?.textUndoLayer()?.let { if (resumeText(it)) return }
         // editing text, a change to its box's width goes back a step at a time, still editing
@@ -7037,6 +7044,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         refresh()
         // the thumbnails of the layers it put back (only those) read again
         if (layersShown) refreshThumbnails()
+        if (timeline != null) refreshFrameThumbnails()
         refreshModelThumbnails()
     }
 
@@ -7086,6 +7094,9 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     fun redo() {
         feedback()
+        stopPlaying()
+        if (performRecording) return
+        editingKeyframe = null
         if (transforming) return
         if (textInfo != null && stepTextBox(undo = false)) return
         // text being edited is kept first
@@ -7102,6 +7113,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         if (modelOpen) followModelChannel()
         refresh()
         if (layersShown) refreshThumbnails()
+        if (timeline != null) refreshFrameThumbnails()
         refreshModelThumbnails()
         followAdjustmentStep()
         text?.let { resumeText(it) }
@@ -8500,6 +8512,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         s.timelineSetFps(fps.coerceIn(1, 60).toUInt())
         timeline = s.timelineState()
         animation = s.animationSettings()
+        refreshFlags()
     }
 
     fun setTimelineDuration(frames: Int) {
@@ -8513,6 +8526,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         s.timelineSetPlayback(playback)
         timeline = s.timelineState()
         animation = s.animationSettings()
+        refreshFlags()
     }
 
     fun setTimelineWorkArea(start: Int?, end: Int?) {
@@ -8527,6 +8541,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         }
         s.timelineSetWorkArea(wa)
         timeline = s.timelineState()
+        refreshFlags()
     }
 
     fun updateTimelineOnion(transform: (io.github.artcraftandroid.procraft.core.TimelineOnionInfo) -> io.github.artcraftandroid.procraft.core.TimelineOnionInfo) {
@@ -8535,6 +8550,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         s.timelineSetOnionSkin(transform(current))
         timeline = s.timelineState()
         animation = s.animationSettings()
+        refreshFlags()
     }
 
     fun setFlipbookMode(open: Boolean) {
@@ -8637,14 +8653,14 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         val s = session ?: return
         s.timelineMoveClip(clipId, newStartFrame.coerceAtLeast(0).toUInt(), targetTrackId, done)
         timeline = s.timelineState()
-        if (done) refresh()
+        if (done) refresh() else refreshFlags()
     }
 
     fun resizeTimelineClip(clipId: ULong, newDurationFrames: Int, done: Boolean) {
         val s = session ?: return
         s.timelineResizeClip(clipId, newDurationFrames.coerceAtLeast(1).toUInt(), done)
         timeline = s.timelineState()
-        if (done) refresh()
+        if (done) refresh() else refreshFlags()
     }
 
     fun splitActiveClipAtPlayhead(clipId: ULong? = null) {
@@ -8678,14 +8694,14 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         val s = session ?: return
         s.timelineSetTransformKeyframe(clipId, frame.coerceAtLeast(0).toUInt(), transform, done)
         timeline = s.timelineState()
-        if (done) refresh()
+        if (done) refresh() else refreshFlags()
     }
 
     fun setClipOpacityKeyframe(clipId: ULong, frame: Int, opacity: Float, done: Boolean) {
         val s = session ?: return
         s.timelineSetOpacityKeyframe(clipId, frame.coerceAtLeast(0).toUInt(), opacity.coerceIn(0f, 1f), done)
         timeline = s.timelineState()
-        if (done) refresh()
+        if (done) refresh() else refreshFlags()
     }
 
     fun deleteClipTransformKeyframe(clipId: ULong, frame: Int) {
@@ -8708,13 +8724,17 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---- Live Perform Motion Recording ----
 
+    private var lastPerformCommitRev: ULong? = null
+
     fun beginPerformRecording() {
         val s = session ?: return
         val tl = timeline ?: return
         stopPlaying()
         recordedPerformSamples.clear()
         recordedPerformDeforms.clear()
+        lastPerformCommitRev = null
         performSamplesCount = 0
+        s.timelineBeginPerform()
         performRecording = true
         val startTransform = tl.activeEvaluatedTransform
         recordedPerformSamples.add(
@@ -8745,8 +8765,9 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             io.github.artcraftandroid.procraft.core.PerformSampleInfo(frame, transform),
         )
         performSamplesCount = recordedPerformSamples.size
-        s.timelineSetTransformKeyframe(cid, frame, transform, false)
+        s.timelinePreviewPerformTransform(cid, frame, transform)
         timeline = s.timelineState()
+        refreshFlags()
     }
 
     fun recordPerformDeform(deform: io.github.artcraftandroid.procraft.core.TimelineDeformInfo) {
@@ -8758,8 +8779,21 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             io.github.artcraftandroid.procraft.core.PerformDeformSampleInfo(frame, deform),
         )
         performSamplesCount = recordedPerformDeforms.size
-        s.timelineSetDeformKeyframe(cid, frame, deform, false)
+        s.timelinePreviewPerformDeform(cid, frame, deform)
         timeline = s.timelineState()
+        refreshFlags()
+    }
+
+    fun cancelPerformRecording() {
+        performPlayJob?.cancel()
+        performPlayJob = null
+        performRecording = false
+        recordedPerformSamples.clear()
+        recordedPerformDeforms.clear()
+        performSamplesCount = 0
+        lastPerformCommitRev = null
+        session?.timelineCancelPerform()
+        refresh()
     }
 
     fun finishPerformRecording() {
@@ -8774,12 +8808,16 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         val deformSamples = recordedPerformDeforms.toList()
         if (deformSamples.isNotEmpty()) {
             val written = s.timelineCommitPerformDeform(cid, deformSamples, filtering)
+            lastPerformCommitRev = s.info().revision
             message = "Perform Warp recorded $written keyframes"
         } else {
             val samples = recordedPerformSamples.toList()
             if (samples.isNotEmpty()) {
                 val written = s.timelineCommitPerform(cid, samples, filtering)
+                lastPerformCommitRev = s.info().revision
                 message = "Perform recorded $written keyframes"
+            } else {
+                s.timelineCancelPerform()
             }
         }
         refresh()
@@ -8790,12 +8828,18 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         val clamped = filtering.coerceIn(0f, 1f)
         s.timelineSetMotionFiltering(clamped)
         val cid = timeline?.activeClipId
-        if (cid != null) {
+        if (cid != null && (recordedPerformDeforms.isNotEmpty() || recordedPerformSamples.isNotEmpty())) {
+            // If the user is adjusting Motion Filtering right after a Perform take, replace that
+            // single Perform undo step instead of stacking duplicate Perform steps!
+            if (lastPerformCommitRev != null && s.info().revision == lastPerformCommitRev) {
+                s.undo()
+            }
             if (recordedPerformDeforms.isNotEmpty()) {
                 s.timelineCommitPerformDeform(cid, recordedPerformDeforms.toList(), clamped)
-            } else if (recordedPerformSamples.isNotEmpty()) {
+            } else {
                 s.timelineCommitPerform(cid, recordedPerformSamples.toList(), clamped)
             }
+            lastPerformCommitRev = s.info().revision
         }
         refresh()
     }
@@ -8856,7 +8900,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         val s = session ?: return
         s.timelineSetTrackOpacity(trackId, opacity.coerceIn(0f, 1f), done)
         timeline = s.timelineState()
-        if (done) refresh()
+        if (done) refresh() else refreshFlags()
     }
 
     fun setTimelineTrackClipToBelow(trackId: ULong, enabled: Boolean) {
@@ -8879,7 +8923,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         val s = session ?: return
         s.timelineSetTrackEffects(trackId, effects, done)
         timeline = s.timelineState()
-        if (done) refresh()
+        if (done) refresh() else refreshFlags()
     }
 
     fun setClipFilterKeyframe(
@@ -8891,7 +8935,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         val s = session ?: return
         s.timelineSetFilterKeyframe(clipId, frame.coerceAtLeast(0).toUInt(), filter, done)
         timeline = s.timelineState()
-        if (done) refresh()
+        if (done) refresh() else refreshFlags()
     }
 
     fun deleteClipFilterKeyframe(clipId: ULong, frame: Int) {
@@ -8912,7 +8956,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         val s = session ?: return
         s.timelineSetDeformKeyframe(clipId, frame.coerceAtLeast(0).toUInt(), deform, done)
         timeline = s.timelineState()
-        if (done) refresh()
+        if (done) refresh() else refreshFlags()
     }
 
     fun deleteClipDeformKeyframe(clipId: ULong, frame: Int) {
@@ -8945,14 +8989,14 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         val s = session ?: return
         s.timelineSetAudioVolumeKeyframe(clipId, frame.coerceAtLeast(0).toUInt(), volume.coerceIn(0f, 2f), done)
         timeline = s.timelineState()
-        if (done) refresh()
+        if (done) refresh() else refreshFlags()
     }
 
     fun setAudioPanKeyframe(clipId: ULong, frame: Int, pan: Float, done: Boolean) {
         val s = session ?: return
         s.timelineSetAudioPanKeyframe(clipId, frame.coerceAtLeast(0).toUInt(), pan.coerceIn(-1f, 1f), done)
         timeline = s.timelineState()
-        if (done) refresh()
+        if (done) refresh() else refreshFlags()
     }
 
     fun importTimelineVideo(uri: android.net.Uri) {
@@ -9012,6 +9056,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         val s = session ?: return
         s.timelineSetCameraEnabled(enabled)
         timeline = s.timelineState()
+        refreshFlags()
     }
 
     fun setCameraTransformKeyframe(
@@ -9022,7 +9067,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         val s = session ?: return
         s.timelineSetCameraTransformKeyframe(frame.coerceAtLeast(0).toUInt(), transform, done)
         timeline = s.timelineState()
-        if (done) refresh()
+        if (done) refresh() else refreshFlags()
     }
 
     fun setCameraFilterKeyframe(
@@ -9033,7 +9078,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         val s = session ?: return
         s.timelineSetCameraFilterKeyframe(frame.coerceAtLeast(0).toUInt(), filter, done)
         timeline = s.timelineState()
-        if (done) refresh()
+        if (done) refresh() else refreshFlags()
     }
 
     fun deleteCameraKeyframe(frame: Int) {
@@ -9044,13 +9089,17 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         selectedClipIds = ids
     }
 
+    fun deleteTimelineClips(ids: List<ULong>) {
+        if (ids.isEmpty()) return
+        selectedClipIds = selectedClipIds - ids.toSet()
+        layerChange(thumbs = false) { s -> s.timelineDeleteClips(ids) }
+    }
+
     fun deleteSelectedClips() {
         val ids = selectedClipIds.toList()
         if (ids.isEmpty()) return
         selectedClipIds = emptySet()
-        layerChange(thumbs = false) { s ->
-            for (cid in ids) s.timelineDeleteClip(cid)
-        }
+        layerChange(thumbs = false) { s -> s.timelineDeleteClips(ids) }
     }
 
     fun changeAnimation(f: (io.github.artcraftandroid.procraft.core.AnimationSettings) -> io.github.artcraftandroid.procraft.core.AnimationSettings) {

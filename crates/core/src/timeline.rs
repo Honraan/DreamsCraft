@@ -806,16 +806,20 @@ impl CanvasSession {
         next
     }
 
-    /// Updates the timeline frame rate (`1..=60` fps).
+    /// Updates the timeline frame rate (`1..=60` fps) as an undo step.
     pub fn timeline_set_fps(&self, fps: u32) {
-        let mut guard = self.shared.lock();
-        let st = &mut *guard;
         let clamped = fps.clamp(1, 60);
-        st.doc.ensure_timeline().fps = clamped;
-        if let Some(a) = st.doc.animation.as_mut() {
-            a.fps = clamped;
-        }
-        self.shared.frame(st);
+        let _ = self.change("frame rate", |d| {
+            let tl = d.ensure_timeline();
+            if tl.fps == clamped {
+                return None;
+            }
+            tl.fps = clamped;
+            if let Some(a) = d.animation.as_mut() {
+                a.fps = clamped;
+            }
+            Some(())
+        });
     }
 
     /// Updates the total timeline duration in frames.
@@ -833,65 +837,74 @@ impl CanvasSession {
         });
     }
 
-    /// Updates the timeline playback mode (`Loop`, `PingPong`, `OneShot`).
+    /// Updates the timeline playback mode (`Loop`, `PingPong`, `OneShot`) as an undo step.
     pub fn timeline_set_playback(&self, playback: AnimationPlayback) {
-        let mut guard = self.shared.lock();
-        let st = &mut *guard;
         let mode = match playback {
             AnimationPlayback::Loop => Playback::Loop,
             AnimationPlayback::PingPong => Playback::PingPong,
             AnimationPlayback::OneShot => Playback::OneShot,
         };
-        st.doc.ensure_timeline().playback = mode;
-        if let Some(a) = st.doc.animation.as_mut() {
-            a.playback = mode;
-        }
-        self.shared.frame(st);
+        let _ = self.change("playback mode", |d| {
+            let tl = d.ensure_timeline();
+            if tl.playback == mode {
+                return None;
+            }
+            tl.playback = mode;
+            if let Some(a) = d.animation.as_mut() {
+                a.playback = mode;
+            }
+            Some(())
+        });
     }
 
-    /// Sets or clears the timeline Work Area (In/Out loop markers).
+    /// Sets or clears the timeline Work Area (In/Out loop markers) as an undo step.
     pub fn timeline_set_work_area(&self, work_area: Option<TimelineWorkAreaInfo>) {
-        let mut guard = self.shared.lock();
-        let st = &mut *guard;
-        let tl = st.doc.ensure_timeline();
-        let dur = tl.duration_frames;
-        tl.work_area = work_area.map(|w| WorkArea { start: w.start, end: w.end }.repaired(dur));
-        self.shared.frame(st);
+        let _ = self.change("work area", |d| {
+            let tl = d.ensure_timeline();
+            let dur = tl.duration_frames;
+            let next = work_area.map(|w| WorkArea { start: w.start, end: w.end }.repaired(dur));
+            if tl.work_area == next {
+                return None;
+            }
+            tl.work_area = next;
+            Some(())
+        });
     }
 
-    /// Updates the timeline's Onion Skin settings live.
+    /// Updates the timeline's Onion Skin settings as an undo step.
     pub fn timeline_set_onion_skin(&self, onion: TimelineOnionInfo) {
-        let mut guard = self.shared.lock();
-        let st = &mut *guard;
         let color3 = |v: &[f32], fallback: [f32; 3]| match v {
             [r, g, b, ..] => [*r, *g, *b],
             _ => fallback,
         };
-        let tl = st.doc.ensure_timeline();
-        let prev_before = tl.onion.before_color;
-        let prev_after = tl.onion.after_color;
-        tl.onion = OnionSkinSettings {
-            enabled: onion.enabled,
-            before_frames: onion.before_frames,
-            after_frames: onion.after_frames,
-            opacity: onion.opacity,
-            before_color: color3(&onion.before_color, prev_before),
-            after_color: color3(&onion.after_color, prev_after),
-            blend_primary: onion.blend_primary,
-            active_track_only: onion.active_track_only,
-        }
-        .repaired();
-        if let Some(a) = st.doc.animation.as_mut() {
-            a.onion_frames = if onion.enabled { onion.before_frames.max(onion.after_frames) } else { 0 };
-            a.onion_opacity = onion.opacity;
-            a.before = color3(&onion.before_color, a.before);
-            a.after = color3(&onion.after_color, a.after);
-            a.blend_primary = onion.blend_primary;
-        }
-        if let Some(c) = st.canvas.as_mut() {
-            c.invalidate();
-        }
-        self.shared.frame(st);
+        let _ = self.change("onion skin", |d| {
+            let tl = d.ensure_timeline();
+            let prev_before = tl.onion.before_color;
+            let prev_after = tl.onion.after_color;
+            let next = OnionSkinSettings {
+                enabled: onion.enabled,
+                before_frames: onion.before_frames,
+                after_frames: onion.after_frames,
+                opacity: onion.opacity,
+                before_color: color3(&onion.before_color, prev_before),
+                after_color: color3(&onion.after_color, prev_after),
+                blend_primary: onion.blend_primary,
+                active_track_only: onion.active_track_only,
+            }
+            .repaired();
+            if tl.onion == next {
+                return None;
+            }
+            tl.onion = next;
+            if let Some(a) = d.animation.as_mut() {
+                a.onion_frames = if onion.enabled { onion.before_frames.max(onion.after_frames) } else { 0 };
+                a.onion_opacity = onion.opacity;
+                a.before = color3(&onion.before_color, a.before);
+                a.after = color3(&onion.after_color, a.after);
+                a.blend_primary = onion.blend_primary;
+            }
+            Some(())
+        });
     }
 
     /// Toggles Flipbook drawing mode (collapsed full-stage frame strip vs full multi-track timeline).
@@ -1536,11 +1549,151 @@ impl CanvasSession {
         .is_some()
     }
 
-    /// Commits a live Perform motion recording on `clip_id`: simplifies `samples` with
-    /// `filtering` (`0.0..=1.0`, Ramer–Douglas–Peucker) and writes the resulting `Move` keyframes
-    /// as a single atomic undo step. Returns the number of simplified keyframes written.
+    /// Deletes a batch of clips (e.g. from Stylus Scratch-to-Delete or Lasso multi-selection) as
+    /// one atomic undo step.
+    pub fn timeline_delete_clips(&self, clip_ids: Vec<u64>) -> bool {
+        if clip_ids.is_empty() {
+            return false;
+        }
+        self.change("delete clips", |d| {
+            let mut any = false;
+            let mut removed_layers = Vec::new();
+            {
+                let tl = d.ensure_timeline();
+                for raw in &clip_ids {
+                    let cid = ClipId(*raw);
+                    let Some(tid) = tl.track_of_clip(cid) else { continue };
+                    if tl.track(tid).is_some_and(|t| t.locked) {
+                        continue;
+                    }
+                    let total_clips: usize = tl.tracks.iter().map(|t| t.clips.len()).sum();
+                    if total_clips <= 1 {
+                        break;
+                    }
+                    if let Some(track) = tl.track_mut(tid)
+                        && let Some(pos) = track.clips.iter().position(|c| c.id == cid)
+                    {
+                        let removed = track.clips.remove(pos);
+                        removed_layers.extend(removed.referenced_layers());
+                        any = true;
+                    }
+                }
+                if any {
+                    tl.active_clip = tl
+                        .active_track
+                        .and_then(|t| tl.track(t))
+                        .and_then(|t| t.clips.first())
+                        .map(|c| c.id)
+                        .or_else(|| tl.tracks.iter().flat_map(|t| &t.clips).next().map(|c| c.id));
+                }
+            }
+            if !any {
+                return None;
+            }
+            let still_managed = d.ensure_timeline().managed_layers();
+            for lid in removed_layers {
+                if !still_managed.contains(&lid) && d.layers().len() > 1 {
+                    let _ = d.delete_layer(lid);
+                }
+            }
+            sync_current_layer_to_playhead(d);
+            Some(())
+        })
+        .is_some()
+    }
+
+    /// Starts a live Perform recording session: flushes any pending edit and captures a single
+    /// pre-Perform document snapshot so all live preview updates collapse into 1 atomic undo step.
+    pub fn timeline_begin_perform(&self) {
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        st.finish_stroke();
+        st.settle();
+        let before = st.doc.clone();
+        st.pending_doc = Some(before);
+        st.pending_name = Some("perform motion".to_owned());
+    }
+
+    /// Updates `clip_id`'s live transform during Perform playback without creating extra undo steps.
+    pub fn timeline_preview_perform_transform(
+        &self,
+        clip_id: u64,
+        frame: u32,
+        transform: TimelineTransformInfo,
+    ) -> bool {
+        let t2d = Transform2D::from(&transform);
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        st.finish_stroke();
+        if st.pending_doc.is_none() {
+            st.pending_doc = Some(st.doc.clone());
+            st.pending_name = Some("perform motion".to_owned());
+        }
+        let tl = st.doc.ensure_timeline();
+        let cid = ClipId(clip_id);
+        if tl.track_of_clip(cid).and_then(|t| tl.track(t)).is_some_and(|t| t.locked) {
+            return false;
+        }
+        let Some(clip) = tl.clip_mut(cid) else { return false };
+        clip.keyframes.set_transform(frame, t2d, None);
+        if let Some(canvas) = st.canvas.as_mut() {
+            canvas.invalidate();
+        }
+        st.revision += 1;
+        self.shared.frame(st);
+        true
+    }
+
+    /// Updates `clip_id`'s live Warp/Distort deformation during Perform playback without creating
+    /// extra undo steps.
+    pub fn timeline_preview_perform_deform(&self, clip_id: u64, frame: u32, deform: TimelineDeformInfo) -> bool {
+        let def = Deform2D::from(&deform);
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        st.finish_stroke();
+        if st.pending_doc.is_none() {
+            st.pending_doc = Some(st.doc.clone());
+            st.pending_name = Some("perform warp".to_owned());
+        }
+        let tl = st.doc.ensure_timeline();
+        let cid = ClipId(clip_id);
+        if tl.track_of_clip(cid).and_then(|t| tl.track(t)).is_some_and(|t| t.locked) {
+            return false;
+        }
+        let Some(clip) = tl.clip_mut(cid) else { return false };
+        clip.keyframes.set_deform(frame, def, None);
+        if let Some(canvas) = st.canvas.as_mut() {
+            canvas.invalidate();
+        }
+        st.revision += 1;
+        self.shared.frame(st);
+        true
+    }
+
+    /// Cancels an active Perform recording, restoring the exact pre-Perform document cleanly.
+    pub fn timeline_cancel_perform(&self) -> bool {
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        st.pending_name = None;
+        let Some(before) = st.pending_doc.take() else {
+            return false;
+        };
+        st.doc = before;
+        sync_current_layer_to_playhead(&mut st.doc);
+        if let Some(canvas) = st.canvas.as_mut() {
+            canvas.invalidate();
+        }
+        st.revision += 1;
+        self.shared.frame(st);
+        true
+    }
+
+    /// Commits a live Perform motion recording on `clip_id`: restores pre-Perform keyframes from
+    /// the session snapshot, simplifies `samples` with `filtering` (`0.0..=1.0`, RDP), and pushes
+    /// **exactly one** atomic undo step (`"perform motion"`).
     pub fn timeline_commit_perform(&self, clip_id: u64, samples: Vec<PerformSampleInfo>, filtering: f32) -> u32 {
         if samples.is_empty() {
+            let _ = self.timeline_cancel_perform();
             return 0;
         }
         let engine_samples: Vec<MotionSample> = samples
@@ -1549,31 +1702,51 @@ impl CanvasSession {
             .collect();
         let simplified = simplify_motion_samples(&engine_samples, filtering);
         if simplified.is_empty() {
+            let _ = self.timeline_cancel_perform();
             return 0;
         }
         let first_frame = simplified.first().map_or(0, |k| k.frame);
         let last_frame = simplified.last().map_or(first_frame, |k| k.frame);
         let count = u32::try_from(simplified.len()).unwrap_or(0);
-        let ok = self
-            .change("perform motion", |d| {
-                let tl = d.ensure_timeline();
-                tl.motion_filtering =
-                    if filtering.is_finite() { filtering.clamp(0.0, 1.0) } else { tl.motion_filtering };
-                let cid = ClipId(clip_id);
-                let tid = tl.track_of_clip(cid)?;
-                if tl.track(tid).is_some_and(|t| t.locked) {
-                    return None;
-                }
-                let clip = tl.clip_mut(cid)?;
-                // Replace any existing transform keyframes within the recorded range [first_frame..=last_frame]
-                clip.keyframes.transform.retain(|k| k.frame < first_frame || k.frame > last_frame);
-                for kf in &simplified {
-                    clip.keyframes.set_transform(kf.frame, kf.value, Some(kf.easing));
-                }
-                Some(())
-            })
-            .is_some();
-        if ok { count } else { 0 }
+
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        st.finish_stroke();
+        // Consume the pre-Perform snapshot directly (avoiding a separate intermediate settle step!)
+        let before = st.pending_doc.take().unwrap_or_else(|| st.doc.clone());
+        st.pending_name = None;
+
+        // Start from the clean pre-Perform clip keyframes so raw preview frames don't linger
+        let cid = ClipId(clip_id);
+        let orig_transform_kfs =
+            before.timeline.as_ref().and_then(|t| t.clip(cid)).map(|c| c.keyframes.transform.clone());
+
+        let tl = st.doc.ensure_timeline();
+        tl.motion_filtering = if filtering.is_finite() { filtering.clamp(0.0, 1.0) } else { tl.motion_filtering };
+        if tl.track_of_clip(cid).and_then(|t| tl.track(t)).is_some_and(|t| t.locked) {
+            st.doc = before;
+            return 0;
+        }
+        let Some(clip) = tl.clip_mut(cid) else {
+            st.doc = before;
+            return 0;
+        };
+        if let Some(orig) = orig_transform_kfs {
+            clip.keyframes.transform = orig;
+        }
+        // Replace any existing transform keyframes within the recorded range [first_frame..=last_frame]
+        clip.keyframes.transform.retain(|k| k.frame < first_frame || k.frame > last_frame);
+        for kf in &simplified {
+            clip.keyframes.set_transform(kf.frame, kf.value, Some(kf.easing));
+        }
+
+        if let Some(canvas) = st.canvas.as_mut() {
+            canvas.name_next_step("perform motion");
+            canvas.record_document(before);
+        }
+        st.revision += 1;
+        self.shared.frame(st);
+        count
     }
 
     /// Exports the animation (either the full timeline or the active `WorkArea` when
@@ -1942,7 +2115,7 @@ impl CanvasSession {
     }
 
     /// Commits a live Perform Warp/Distort recording on `clip_id` with Ramer–Douglas–Peucker
-    /// simplification as one atomic undo step.
+    /// simplification as **one atomic undo step** (`"perform warp"`).
     pub fn timeline_commit_perform_deform(
         &self,
         clip_id: u64,
@@ -1950,33 +2123,54 @@ impl CanvasSession {
         filtering: f32,
     ) -> u32 {
         if samples.is_empty() {
+            let _ = self.timeline_cancel_perform();
             return 0;
         }
         let engine_samples: Vec<DeformSample> =
             samples.iter().map(|s| DeformSample { frame: s.frame, deform: Deform2D::from(&s.deform) }).collect();
         let simplified = simplify_deform_samples(&engine_samples, filtering);
         if simplified.is_empty() {
+            let _ = self.timeline_cancel_perform();
             return 0;
         }
         let first_frame = simplified.first().map_or(0, |k| k.frame);
         let last_frame = simplified.last().map_or(first_frame, |k| k.frame);
         let count = u32::try_from(simplified.len()).unwrap_or(0);
-        let ok = self
-            .change("perform warp", |d| {
-                let tl = d.ensure_timeline();
-                let cid = ClipId(clip_id);
-                if tl.track_of_clip(cid).and_then(|t| tl.track(t)).is_some_and(|t| t.locked) {
-                    return None;
-                }
-                let clip = tl.clip_mut(cid)?;
-                clip.keyframes.deform.retain(|k| k.frame < first_frame || k.frame > last_frame);
-                for kf in &simplified {
-                    clip.keyframes.set_deform(kf.frame, kf.value, Some(kf.easing));
-                }
-                Some(())
-            })
-            .is_some();
-        if ok { count } else { 0 }
+
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        st.finish_stroke();
+        let before = st.pending_doc.take().unwrap_or_else(|| st.doc.clone());
+        st.pending_name = None;
+
+        let cid = ClipId(clip_id);
+        let orig_deform_kfs = before.timeline.as_ref().and_then(|t| t.clip(cid)).map(|c| c.keyframes.deform.clone());
+
+        let tl = st.doc.ensure_timeline();
+        tl.motion_filtering = if filtering.is_finite() { filtering.clamp(0.0, 1.0) } else { tl.motion_filtering };
+        if tl.track_of_clip(cid).and_then(|t| tl.track(t)).is_some_and(|t| t.locked) {
+            st.doc = before;
+            return 0;
+        }
+        let Some(clip) = tl.clip_mut(cid) else {
+            st.doc = before;
+            return 0;
+        };
+        if let Some(orig) = orig_deform_kfs {
+            clip.keyframes.deform = orig;
+        }
+        clip.keyframes.deform.retain(|k| k.frame < first_frame || k.frame > last_frame);
+        for kf in &simplified {
+            clip.keyframes.set_deform(kf.frame, kf.value, Some(kf.easing));
+        }
+
+        if let Some(canvas) = st.canvas.as_mut() {
+            canvas.name_next_step("perform warp");
+            canvas.record_document(before);
+        }
+        st.revision += 1;
+        self.shared.frame(st);
+        count
     }
 
     /// Imports WAV audio bytes (8/16/24-bit PCM or 32-bit float WAV, e.g. from `SoundDecode.kt`)
@@ -2210,15 +2404,16 @@ impl CanvasSession {
         })
     }
 
-    /// Enables or disables the global Camera Track transform on Stage preview and Export.
+    /// Enables or disables the global Camera Track transform on Stage preview and Export as an undo step.
     pub fn timeline_set_camera_enabled(&self, enabled: bool) {
-        let mut guard = self.shared.lock();
-        let st = &mut *guard;
-        st.doc.ensure_timeline().camera_enabled = enabled;
-        if let Some(c) = st.canvas.as_mut() {
-            c.invalidate();
-        }
-        self.shared.frame(st);
+        let _ = self.change("camera track", |d| {
+            let tl = d.ensure_timeline();
+            if tl.camera_enabled == enabled {
+                return None;
+            }
+            tl.camera_enabled = enabled;
+            Some(())
+        });
     }
 
     /// Sets a global Camera Track `Transform2D` keyframe (Pan/Zoom/Rotate) at `frame`,

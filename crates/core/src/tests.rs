@@ -6720,6 +6720,92 @@ fn dreamscraft_v2_auto_draw_perform_ghost_track_effects_audio_filters_warp_and_c
 }
 
 #[test]
+fn dreamscraft_v2_1_perform_and_timeline_undo_redo_are_atomic() {
+    let Some(s) = session(40, 40) else { return };
+    s.enable_animation_for_new_artwork();
+    let tl0 = s.timeline_state().unwrap();
+    let clip0 = tl0.active_clip_id.unwrap();
+    let track0 = tl0.tracks[0].id;
+    assert!(!s.info().can_undo, "fresh animation starts with clean undo stack");
+
+    // 1. Live Perform Motion (begin -> live previews across advancing playhead -> commit):
+    //    ONE single undo() must revert ALL Perform keyframes back to empty!
+    s.timeline_begin_perform();
+    let mut samples = Vec::new();
+    for f in 0..=8u32 {
+        s.timeline_set_playhead(f);
+        let xf = crate::TimelineTransformInfo {
+            x: f as f32 * 10.0,
+            y: f as f32 * 2.0,
+            scale_x: 1.0,
+            scale_y: 1.0,
+            rotation: 0.0,
+            anchor_x: 0.5,
+            anchor_y: 0.5,
+        };
+        assert!(s.timeline_preview_perform_transform(clip0, f, xf.clone()));
+        assert!(s.info().can_undo, "can_undo must be true even during live preview");
+        samples.push(crate::PerformSampleInfo { frame: f, transform: xf });
+    }
+    let written = s.timeline_commit_perform(clip0, samples, 0.4);
+    assert!(written >= 2);
+    assert!(s.info().can_undo);
+    assert!(!s.timeline_state().unwrap().tracks[0].clips[0].transform_keyframes.is_empty());
+
+    // SINGLE undo reverts the ENTIRE Perform motion recording!
+    assert_eq!(s.undo().as_deref(), Some("perform motion"));
+    assert!(
+        s.timeline_state().unwrap().tracks[0].clips[0].transform_keyframes.is_empty(),
+        "1 single undo must remove ALL Perform motion keyframes (no leftover raw preview keyframes!)"
+    );
+    assert!(s.info().can_redo);
+    assert_eq!(s.redo().as_deref(), Some("perform motion"));
+    assert_eq!(s.timeline_state().unwrap().tracks[0].clips[0].transform_keyframes.len(), written as usize);
+
+    // 2. Live Perform Warp -> ONE single undo reverts ALL warp keyframes!
+    s.timeline_begin_perform();
+    let mut deform_samples = Vec::new();
+    for f in 0..=4u32 {
+        let mut pts = Vec::with_capacity(32);
+        for r in 0..4 {
+            for c in 0..4 {
+                pts.push(c as f32 / 3.0);
+                pts.push(r as f32 / 3.0 + if r == 3 { f as f32 * 0.05 } else { 0.0 });
+            }
+        }
+        let d = crate::TimelineDeformInfo { distort_corners: Vec::new(), warp_mesh: pts };
+        assert!(s.timeline_preview_perform_deform(clip0, f, d.clone()));
+        deform_samples.push(crate::PerformDeformSampleInfo { frame: f, deform: d });
+    }
+    assert!(s.timeline_commit_perform_deform(clip0, deform_samples, 0.3) >= 2);
+    assert_eq!(s.undo().as_deref(), Some("perform warp"));
+    assert!(s.timeline_state().unwrap().tracks[0].clips[0].deform_keyframes.is_empty());
+
+    // 3. Timeline settings (FPS, Work Area, Camera Track) & Batch Clip Delete are all undoable!
+    s.timeline_set_fps(24);
+    assert_eq!(s.timeline_state().unwrap().fps, 24);
+    assert_eq!(s.undo().as_deref(), Some("frame rate"));
+    assert_eq!(s.timeline_state().unwrap().fps, 15);
+
+    s.timeline_set_work_area(Some(crate::TimelineWorkAreaInfo { start: 2, end: 10 }));
+    assert!(s.timeline_state().unwrap().work_area.is_some());
+    assert_eq!(s.undo().as_deref(), Some("work area"));
+    assert!(s.timeline_state().unwrap().work_area.is_none());
+
+    s.timeline_set_camera_enabled(true);
+    assert!(s.timeline_state().unwrap().camera_enabled);
+    assert_eq!(s.undo().as_deref(), Some("camera track"));
+    assert!(!s.timeline_state().unwrap().camera_enabled);
+
+    let c2 = s.timeline_add_layer_clip(track0, 10, 5);
+    let c3 = s.timeline_add_layer_clip(track0, 20, 5);
+    assert!(s.timeline_delete_clips(vec![c2, c3]));
+    assert_eq!(s.timeline_state().unwrap().tracks[0].clips.len(), 1);
+    assert_eq!(s.undo().as_deref(), Some("delete clips"));
+    assert_eq!(s.timeline_state().unwrap().tracks[0].clips.len(), 3);
+}
+
+#[test]
 fn animation_assist_shows_onion_skins_and_plays() {
     let Some(s) = session(40, 40) else { return };
     s.set_brush_size(0.6);

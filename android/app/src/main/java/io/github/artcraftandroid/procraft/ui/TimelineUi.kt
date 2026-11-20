@@ -56,6 +56,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -68,6 +69,7 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
@@ -336,6 +338,76 @@ internal fun distortCornersToDeformPoints(corners: List<Pair<Float, Float>>): Li
     }
 }
 
+/** Classification of a short multi-finger tap on the Stage Gizmo or Timeline. */
+internal enum class MultiFingerTapAction { NONE, UNDO, REDO }
+
+/**
+ * Recognizes Procreate-style **2-finger tap = Undo** and **3-finger tap = Redo** gestures while
+ * rejecting pinches, drags (`maxTravelPx > 24f`), or long presses (`durationMs > 320L`).
+ */
+internal fun classifyMultiFingerTap(
+    maxPointers: Int,
+    maxTravelPx: Float,
+    durationMs: Long,
+): MultiFingerTapAction {
+    if (!maxTravelPx.isFinite() || maxTravelPx > 24f || durationMs < 0L || durationMs > 320L) {
+        return MultiFingerTapAction.NONE
+    }
+    return when (maxPointers) {
+        2 -> MultiFingerTapAction.UNDO
+        3 -> MultiFingerTapAction.REDO
+        else -> MultiFingerTapAction.NONE
+    }
+}
+
+/**
+ * Passive observer for 2-finger tap (Undo) and 3-finger tap (Redo) on surfaces above the canvas
+ * (`StageKeyTransformOverlay` and `MultiTrackDopesheet`) without blocking single-finger drags or
+ * 2-finger pinch-zoom gestures.
+ */
+@Composable
+private fun Modifier.multiFingerUndoRedo(
+    onUndo: () -> Unit,
+    onRedo: () -> Unit,
+): Modifier {
+    val currentUndo by rememberUpdatedState(onUndo)
+    val currentRedo by rememberUpdatedState(onRedo)
+    val view = LocalView.current
+    return pointerInput(Unit) {
+        awaitEachGesture {
+            val first = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+            val startMs = first.uptimeMillis
+            val origins = mutableMapOf(first.id to first.position)
+            var maxPointers = 1
+            var maxTravel = 0f
+            var endMs = startMs
+            do {
+                val event = awaitPointerEvent(PointerEventPass.Initial)
+                val pressed = event.changes.filter { it.pressed }
+                if (pressed.size > maxPointers) maxPointers = pressed.size
+                for (c in event.changes) {
+                    endMs = max(endMs, c.uptimeMillis)
+                    val origin = origins.getOrPut(c.id) { c.position }
+                    val travel = hypot(c.position.x - origin.x, c.position.y - origin.y)
+                    if (travel > maxTravel) maxTravel = travel
+                }
+            } while (event.changes.any { it.pressed })
+
+            when (classifyMultiFingerTap(maxPointers, maxTravel, endMs - startMs)) {
+                MultiFingerTapAction.UNDO -> {
+                    view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                    currentUndo()
+                }
+                MultiFingerTapAction.REDO -> {
+                    view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                    currentRedo()
+                }
+                MultiFingerTapAction.NONE -> Unit
+            }
+        }
+    }
+}
+
 // ---- Theme Tokens for DreamsCraft Workspace ----
 
 private val CenterBarHeight = 46.dp
@@ -392,7 +464,7 @@ private fun hasAnyTrackEffect(fx: TimelineTrackEffectsInfo): Boolean =
  * Root DreamsCraft Animation Workspace overlay:
  * - When `timeline == null`, falls back to legacy `AnimationBar` (for Page Assist).
  * - When `timeline.flipbookOpen == true`, maximizes the Stage and shows the floating Flipbook dock
- *   with 1-tap expand, Onion Skin, **Perform Motion Ghost**, and **Multi-Layer Cel** controls.
+ *   with 1-tap expand, Undo/Redo, Onion Skin, **Perform Motion Ghost**, and **Multi-Layer Cel** controls.
  * - Otherwise, shows the Stage above the timeline:
  *   1. Stage Backstage & Non-Destructive Keyframe / Warp / Distort / Camera / Live Perform Gizmo
  *   2. Draggable **Center Action Bar** in the middle
@@ -416,6 +488,7 @@ fun BoxScope.DreamsWorkspaceOverlay(
     }
 
     val density = LocalDensity.current
+    val view = LocalView.current
     val totalHeightPx = with(density) { windowHeight.toPx() }
     val timelineHeightDp = (windowHeight * vm.timelineSplitRatio).coerceIn(140.dp, windowHeight * 0.70f)
     val dockBottomPx = with(density) {
@@ -442,7 +515,7 @@ fun BoxScope.DreamsWorkspaceOverlay(
         val activeClip = remember(tl) { activeClipOf(tl) }
         Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth()) {
             AnimationBar(vm)
-            // Floating Pill above the Flipbook bar: Timeline, Onion Skin, Perform Motion Ghost, Cel Sub-Layers, Timecode
+            // Floating Pill above the Flipbook bar: Timeline, Undo/Redo, Onion Skin, Perform Motion Ghost, Cel Sub-Layers, Timecode
             Row(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -460,6 +533,31 @@ fun BoxScope.DreamsWorkspaceOverlay(
                     fontSize = 14.sp,
                     fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.clickable { vm.setFlipbookMode(false) },
+                )
+                Box(Modifier.width(1.dp).height(14.dp).background(DreamsEdge))
+                Text(
+                    text = "↶",
+                    color = if (vm.canUndo || vm.performRecording) DreamsInk else DreamsDimInk.copy(alpha = 0.4f),
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier
+                        .clickable(enabled = vm.canUndo || vm.performRecording) {
+                            view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                            vm.undo()
+                        }
+                        .padding(horizontal = 2.dp),
+                )
+                Text(
+                    text = "↷",
+                    color = if (vm.canRedo) DreamsInk else DreamsDimInk.copy(alpha = 0.4f),
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier
+                        .clickable(enabled = vm.canRedo) {
+                            view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                            vm.redo()
+                        }
+                        .padding(horizontal = 2.dp),
                 )
                 Box(Modifier.width(1.dp).height(14.dp).background(DreamsEdge))
                 Text(
@@ -605,7 +703,7 @@ fun BoxScope.DreamsWorkspaceOverlay(
 
 /**
  * The center action bar between the Stage and the timeline:
- * - Left: Play/Pause + Timecode (`MM:SS:FF` & FPS) + Onion Skin badge + Camera badge
+ * - Left: Play/Pause + Undo/Redo + Timecode (`MM:SS:FF` & FPS) + Onion Skin badge + Camera badge
  * - Center: Draggable Split Handle (pull down to collapse into Flipbook!) + Flipbook button
  * - Right: Mode switches (`Draw`, `Perform`, `Move`, `FX`, `Edit`, `+ Add`)
  */
@@ -625,7 +723,7 @@ private fun CenterActionBar(
             .padding(horizontal = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        // Left: Play/Pause + Timecode + Quick Onion Toggle + Camera Track toggle
+        // Left: Play/Pause + Undo/Redo + Timecode + Quick Onion Toggle + Camera Track toggle
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -644,6 +742,45 @@ private fun CenterActionBar(
                 Text(
                     text = if (isPlaying) "Pause" else "Play",
                     color = if (isPlaying) Color.White else DreamsInk,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+
+            // Quick Undo / Redo buttons (works for Perform, Timeline, Keyframes, Tracks & Painting)
+            val undoReady = vm.canUndo || vm.performRecording
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(if (undoReady) DreamsClipFill else Color.Transparent)
+                    .border(1.dp, if (undoReady) DreamsEdge else DreamsEdge.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
+                    .clickable(enabled = undoReady) {
+                        view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                        vm.undo()
+                    }
+                    .padding(horizontal = 7.dp, vertical = 5.dp),
+            ) {
+                Text(
+                    text = "↶",
+                    color = if (undoReady) DreamsInk else DreamsDimInk.copy(alpha = 0.4f),
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(if (vm.canRedo) DreamsClipFill else Color.Transparent)
+                    .border(1.dp, if (vm.canRedo) DreamsEdge else DreamsEdge.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
+                    .clickable(enabled = vm.canRedo) {
+                        view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                        vm.redo()
+                    }
+                    .padding(horizontal = 7.dp, vertical = 5.dp),
+            ) {
+                Text(
+                    text = "↷",
+                    color = if (vm.canRedo) DreamsInk else DreamsDimInk.copy(alpha = 0.4f),
                     fontSize = 13.sp,
                     fontWeight = FontWeight.Bold,
                 )
@@ -940,6 +1077,11 @@ private fun MultiTrackDopesheet(
     Column(
         modifier = modifier
             .background(DreamsTrackBg)
+            // Procreate-style 2-finger tap = Undo, 3-finger tap = Redo right over the Timeline
+            .multiFingerUndoRedo(
+                onUndo = { vm.undo() },
+                onRedo = { vm.redo() },
+            )
             // 2-finger pinch gesture: horizontal spread zooms time, vertical spread zooms track height
             .pointerInput(Unit) {
                 awaitEachGesture {
@@ -1222,7 +1364,7 @@ private fun MultiTrackDopesheet(
                                         val hit = clipsInLasso(pts, bounds)
                                         if (isScratchToDeleteGesture(pts) && hit.isNotEmpty()) {
                                             view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-                                            for (cid in hit) vm.deleteTimelineClip(cid)
+                                            vm.deleteTimelineClips(hit.toList())
                                         } else if (hit.isNotEmpty()) {
                                             vm.selectClips(hit)
                                         }
@@ -1937,15 +2079,19 @@ private fun BoxScope.StageKeyTransformOverlay(
     val isWarp = vm.stageGizmoMode == StageGizmoSubMode.WARP
     if (!isCamera && activeClipId == null) return
 
+    val view = LocalView.current
+    val currentPlayhead by rememberUpdatedState(tl.playhead.toInt())
     val baseTransform = if (isCamera) tl.cameraTransform else tl.activeEvaluatedTransform
-    var liveTransform by remember(activeClipId, isCamera, tl.playhead, baseTransform) {
+    var isInteracting by remember { mutableStateOf(false) }
+    var didMutateTransform by remember { mutableStateOf(false) }
+    var liveTransform by remember(activeClipId, isCamera) {
         mutableStateOf(baseTransform)
     }
-    var warpPoints by remember(activeClipId, tl.playhead, tl.activeEvaluatedDeform) {
+    var warpPoints by remember(activeClipId) {
         val raw = tl.activeEvaluatedDeform.warpMesh
         mutableStateOf(if (raw.size >= 32) raw.take(32) else defaultIdentityDeformPoints())
     }
-    var distortCorners by remember(activeClipId, tl.playhead, tl.activeEvaluatedDeform) {
+    var distortCorners by remember(activeClipId) {
         val raw = tl.activeEvaluatedDeform.distortCorners
         mutableStateOf(
             if (raw.size >= 8) {
@@ -1954,6 +2100,25 @@ private fun BoxScope.StageKeyTransformOverlay(
                 listOf(0f to 0f, 1f to 0f, 1f to 1f, 0f to 1f)
             },
         )
+    }
+    // Sync Stage gizmo state from evaluated timeline ONLY when not actively dragging/recording Perform,
+    // so live Perform playback never resets liveTransform or warp handles mid-gesture!
+    LaunchedEffect(activeClipId, isCamera, tl.playhead, baseTransform, isInteracting, vm.performRecording) {
+        if (!isInteracting && !vm.performRecording) {
+            liveTransform = baseTransform
+        }
+    }
+    LaunchedEffect(activeClipId, tl.playhead, tl.activeEvaluatedDeform, isInteracting, vm.performRecording) {
+        if (!isInteracting && !vm.performRecording) {
+            val rawW = tl.activeEvaluatedDeform.warpMesh
+            warpPoints = if (rawW.size >= 32) rawW.take(32) else defaultIdentityDeformPoints()
+            val rawD = tl.activeEvaluatedDeform.distortCorners
+            distortCorners = if (rawD.size >= 8) {
+                listOf(rawD[0] to rawD[1], rawD[2] to rawD[3], rawD[4] to rawD[5], rawD[6] to rawD[7])
+            } else {
+                listOf(0f to 0f, 1f to 0f, 1f to 1f, 0f to 1f)
+            }
+        }
     }
     var activeDeformHandle by remember { mutableIntStateOf(-1) }
 
@@ -1969,12 +2134,21 @@ private fun BoxScope.StageKeyTransformOverlay(
             .align(Alignment.TopCenter)
             .width(stageWidth)
             .height(stageHeight)
+            // Procreate-style 2-finger tap = Undo, 3-finger tap = Redo right over Perform & Stage Gizmo
+            .multiFingerUndoRedo(
+                onUndo = { vm.undo() },
+                onRedo = { vm.redo() },
+            )
             // Move & Scale / Camera multi-touch gestures
             .then(
                 if (!isWarp && !isDistort) {
                     Modifier
                         .pointerInput(activeClipId, isCamera, vm.dreamsMode) {
                             detectTransformGestures { _, pan, zoom, rotationDeg ->
+                                val hasDelta = pan != Offset.Zero || abs(zoom - 1f) > 0.0005f || abs(rotationDeg) > 0.01f
+                                if (!hasDelta) return@detectTransformGestures
+                                isInteracting = true
+                                didMutateTransform = true
                                 if (vm.dreamsMode == DreamsWorkMode.PERFORM && !vm.performRecording) {
                                     vm.beginPerformRecording()
                                 }
@@ -1990,9 +2164,9 @@ private fun BoxScope.StageKeyTransformOverlay(
                                 )
                                 liveTransform = updated
                                 when {
-                                    isCamera -> vm.setCameraTransformKeyframe(tl.playhead.toInt(), updated, done = false)
+                                    isCamera -> vm.setCameraTransformKeyframe(currentPlayhead, updated, done = false)
                                     vm.dreamsMode == DreamsWorkMode.PERFORM -> vm.recordPerformTransform(updated)
-                                    activeClipId != null -> vm.setClipTransformKeyframe(activeClipId, tl.playhead.toInt(), updated, done = false)
+                                    activeClipId != null -> vm.setClipTransformKeyframe(activeClipId, currentPlayhead, updated, done = false)
                                 }
                             }
                         }
@@ -2002,10 +2176,13 @@ private fun BoxScope.StageKeyTransformOverlay(
                                 do {
                                     val event = awaitPointerEvent()
                                 } while (event.changes.any { it.pressed })
+                                val mutated = didMutateTransform
+                                isInteracting = false
+                                didMutateTransform = false
                                 when {
                                     vm.dreamsMode == DreamsWorkMode.PERFORM && vm.performRecording -> vm.finishPerformRecording()
-                                    isCamera -> vm.setCameraTransformKeyframe(tl.playhead.toInt(), liveTransform, done = true)
-                                    vm.stageGizmoActive && activeClipId != null -> vm.setClipTransformKeyframe(activeClipId, tl.playhead.toInt(), liveTransform, done = true)
+                                    mutated && isCamera -> vm.setCameraTransformKeyframe(currentPlayhead, liveTransform, done = true)
+                                    mutated && vm.stageGizmoActive && activeClipId != null -> vm.setClipTransformKeyframe(activeClipId, currentPlayhead, liveTransform, done = true)
                                 }
                             }
                         }
@@ -2042,8 +2219,11 @@ private fun BoxScope.StageKeyTransformOverlay(
                                     }
                                 }
                                 activeDeformHandle = bestIdx
-                                if (bestIdx >= 0 && vm.dreamsMode == DreamsWorkMode.PERFORM && !vm.performRecording) {
-                                    vm.beginPerformRecording()
+                                if (bestIdx >= 0) {
+                                    isInteracting = true
+                                    if (vm.dreamsMode == DreamsWorkMode.PERFORM && !vm.performRecording) {
+                                        vm.beginPerformRecording()
+                                    }
                                 }
                             },
                             onDrag = { change, drag ->
@@ -2076,7 +2256,7 @@ private fun BoxScope.StageKeyTransformOverlay(
                                 if (vm.dreamsMode == DreamsWorkMode.PERFORM) {
                                     vm.recordPerformDeform(info)
                                 } else {
-                                    vm.setClipDeformKeyframe(activeClipId, tl.playhead.toInt(), info, done = false)
+                                    vm.setClipDeformKeyframe(activeClipId, currentPlayhead, info, done = false)
                                 }
                             },
                             onDragEnd = {
@@ -2095,12 +2275,19 @@ private fun BoxScope.StageKeyTransformOverlay(
                                                 warpMesh = warpPoints,
                                             )
                                         }
-                                        vm.setClipDeformKeyframe(activeClipId, tl.playhead.toInt(), info, done = true)
+                                        vm.setClipDeformKeyframe(activeClipId, currentPlayhead, info, done = true)
                                     }
                                 }
+                                isInteracting = false
                                 activeDeformHandle = -1
                             },
-                            onDragCancel = { activeDeformHandle = -1 },
+                            onDragCancel = {
+                                if (vm.performRecording) {
+                                    vm.cancelPerformRecording()
+                                }
+                                isInteracting = false
+                                activeDeformHandle = -1
+                            },
                         )
                     }
                 },
@@ -2272,7 +2459,7 @@ private fun BoxScope.StageKeyTransformOverlay(
                 )
             }
 
-            // Second Row when in Perform Mode: Recording indicator + Motion Filtering + Perform Motion Ghost (1st Frame Onion Skin)!
+            // Second Row when in Perform Mode: Recording indicator + Undo + Motion Filtering + Perform Motion Ghost!
             if (vm.dreamsMode == DreamsWorkMode.PERFORM && activeClip != null) {
                 Row(
                     modifier = Modifier
@@ -2288,6 +2475,21 @@ private fun BoxScope.StageKeyTransformOverlay(
                         color = PerformRed,
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Bold,
+                    )
+                    val undoReady = vm.canUndo || vm.performRecording
+                    Text(
+                        text = "↶ Undo",
+                        color = if (undoReady) DreamsInk else DreamsDimInk.copy(alpha = 0.45f),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(if (undoReady) DreamsClipFill else Color.Transparent)
+                            .clickable(enabled = undoReady) {
+                                view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                                vm.undo()
+                            }
+                            .padding(horizontal = 7.dp, vertical = 3.dp),
                     )
                     val filterPct = (tl.motionFiltering * 100).roundToInt()
                     Text(

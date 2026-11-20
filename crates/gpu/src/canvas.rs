@@ -5626,6 +5626,7 @@ impl Canvas {
         for op in &self.ops {
             match op {
                 Op::Record(d)
+                | Op::AttachDoc(Some(d))
                 | Op::Duplicate { before: d, .. }
                 | Op::MergeDown { before: d, .. }
                 | Op::MergeMany { before: d, .. }
@@ -5709,6 +5710,7 @@ impl Canvas {
         }
         for op in &self.ops {
             if let Op::Record(d)
+            | Op::AttachDoc(Some(d))
             | Op::Duplicate { before: d, .. }
             | Op::MergeDown { before: d, .. }
             | Op::MergeMany { before: d, .. }
