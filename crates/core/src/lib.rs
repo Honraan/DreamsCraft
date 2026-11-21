@@ -247,8 +247,8 @@ pub use timeline::{
     PerformDeformSampleInfo, PerformFilterSampleInfo, PerformSampleInfo, PerformScalarSampleInfo, TimelineCelInfo,
     TimelineClipInfo, TimelineClipKind, TimelineClipLoopMode, TimelineDeformInfo, TimelineEasingInfo,
     TimelineEasingKind, TimelineKeyframeChannel, TimelineKeyframeInfo, TimelineLiveFilterInfo, TimelineMarkerInfo,
-    TimelineOnionInfo, TimelineState, TimelineTrackEffectsInfo, TimelineTrackInfo, TimelineTransformInfo,
-    TimelineWorkAreaInfo,
+    TimelineMediaProvider, TimelineOnionInfo, TimelineState, TimelineTrackEffectsInfo, TimelineTrackInfo,
+    TimelineTransformInfo, TimelineVideoPixels, TimelineVideoRequest, TimelineWorkAreaInfo,
 };
 pub use touch::{
     COMPANION_ZOOM_DISTANCE, CompanionMode, Fill, GestureAction, HoverCursor, LOUPE_LIFT, PenHover, PenPreferred,

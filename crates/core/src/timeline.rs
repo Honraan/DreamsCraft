@@ -298,6 +298,7 @@ pub struct TimelineKeyframeInfo {
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct TimelineCelInfo {
     pub index: u32,
+    pub first_exposure: Option<u32>,
     pub layer_id: u64,
     pub start_frame: u32,
     pub duration_frames: u32,
@@ -377,6 +378,7 @@ pub struct TimelineClipInfo {
     pub loop_mode: TimelineClipLoopMode,
     pub primary_layer_id: u64,
     pub cels: Vec<TimelineCelInfo>,
+    pub active_cel_index: Option<u32>,
     pub transform_keyframes: Vec<TimelineKeyframeInfo>,
     pub opacity_keyframes: Vec<TimelineKeyframeInfo>,
     pub filter_keyframes: Vec<TimelineKeyframeInfo>,
@@ -517,6 +519,25 @@ pub struct PerformFilterSampleInfo {
     pub filter: TimelineLiveFilterInfo,
 }
 
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct TimelineVideoRequest {
+    pub clip_id: u64,
+    pub file: String,
+    pub time_us: u64,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct TimelineVideoPixels {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+#[uniffi::export(with_foreign)]
+pub trait TimelineMediaProvider: Send + Sync {
+    fn video_frame(&self, request: TimelineVideoRequest) -> Option<TimelineVideoPixels>;
+}
+
 fn map_transform_kfs(kfs: &[Keyframe<Transform2D>]) -> Vec<TimelineKeyframeInfo> {
     kfs.iter()
         .map(|k| TimelineKeyframeInfo {
@@ -593,10 +614,12 @@ fn snapshot_clip(tl: &Timeline, track_id: TrackId, clip: &Clip, playhead: u32) -
     let (kind, primary_layer_id, cels) = match &clip.kind {
         ClipKind::Cel { cels } => {
             let mut cursor = clip.start_frame;
+            let period = clip.loop_period();
             let mut out = Vec::with_capacity(cels.len());
             for (idx, cel) in cels.iter().enumerate() {
                 let dur = cel.duration_frames();
                 out.push(TimelineCelInfo {
+                    first_exposure: clip.first_exposure(cursor - clip.start_frame, dur, period),
                     index: u32::try_from(idx).unwrap_or(0),
                     layer_id: cel.layer.0,
                     start_frame: cursor,
@@ -643,6 +666,7 @@ fn snapshot_clip(tl: &Timeline, track_id: TrackId, clip: &Clip, playhead: u32) -
         kind,
         loop_mode: TimelineClipLoopMode::from(clip.loop_mode),
         primary_layer_id,
+        active_cel_index: clip.cel_at(playhead).and_then(|(index, _, _)| u32::try_from(index).ok()),
         cels,
         transform_keyframes: map_transform_kfs(&clip.keyframes.transform),
         opacity_keyframes: map_opacity_kfs(&clip.keyframes.opacity),
@@ -1264,9 +1288,22 @@ impl CanvasSession {
     /// Splits `clip_id` at the current timeline playhead as an undo step, returning the new clip id.
     pub fn timeline_split_clip_at_playhead(&self, clip_id: u64) -> Option<u64> {
         self.change("split clip", |d| {
+            let id = ClipId(clip_id);
             let tl = d.ensure_timeline();
-            let at = tl.playhead;
-            tl.split_clip(ClipId(clip_id), at).map(|c| c.0)
+            let video =
+                matches!(tl.clip(id)?.kind, ClipKind::Video { video_id, .. } if tl.video_files.contains_key(&video_id));
+            if video && !d.has_room(1) {
+                return None;
+            }
+            let tl = d.ensure_timeline();
+            let right = tl.split_clip(id, tl.playhead)?;
+            if video {
+                let layer = d.add_layer();
+                if let ClipKind::Video { layer: target, .. } = &mut d.ensure_timeline().clip_mut(right)?.kind {
+                    *target = layer;
+                }
+            }
+            Some(right.0)
         })
     }
 
@@ -1303,7 +1340,7 @@ impl CanvasSession {
         let new_kind = match &clip.kind {
             ClipKind::Cel { cels } => {
                 let new_cels: Vec<Cel> =
-                    cels.iter().map(|c| Cel { layer: map_layer(&mut st.doc, c.layer), hold: c.hold }).collect();
+                    cels.iter().map(|c| Cel { layer: map_layer(&mut st.doc, c.layer), ..*c }).collect();
                 ClipKind::Cel { cels: new_cels }
             }
             ClipKind::Layer { layer } => ClipKind::Layer { layer: map_layer(&mut st.doc, *layer) },
@@ -1347,6 +1384,7 @@ impl CanvasSession {
             perform_guide_opacity: clip.perform_guide_opacity,
             perform_guide_color: clip.perform_guide_color,
             loop_mode: clip.loop_mode,
+            loop_offset: clip.loop_offset,
         };
         new_clip.sync_duration();
         let end = new_clip.end_frame();
@@ -1460,14 +1498,17 @@ impl CanvasSession {
         };
         self.duplicated(src_layer, "duplicate cel", |doc, copy_layer| {
             let tl = doc.ensure_timeline();
-            let hold = tl
-                .clip(ClipId(clip_id))
-                .and_then(|c| match &c.kind {
-                    ClipKind::Cel { cels } => cels.get(cel_index as usize).map(|cel| cel.hold),
-                    _ => None,
-                })
-                .unwrap_or(0);
-            tl.insert_cel(ClipId(clip_id), Some(cel_index as usize), copy_layer, hold);
+            let cid = ClipId(clip_id);
+            if let Some(source) = tl.clip(cid).and_then(|c| match &c.kind {
+                ClipKind::Cel { cels } => cels.get(cel_index as usize).copied(),
+                _ => None,
+            }) && let Some(index) = tl.insert_cel(cid, Some(cel_index as usize), copy_layer, source.hold)
+                && let Some(clip) = tl.clip_mut(cid)
+                && let ClipKind::Cel { cels } = &mut clip.kind
+                && let Some(cel) = cels.get_mut(index)
+            {
+                cel.stage_space = source.stage_space;
+            }
             sync_current_layer_to_playhead(doc);
         })
     }
@@ -1672,6 +1713,23 @@ impl CanvasSession {
             Some(())
         })
         .is_some()
+    }
+
+    /// Parent track and preview camera mapped into screen coordinates for editing a clip.
+    pub fn timeline_stage_edit_matrix(&self, clip_id: u64) -> Vec<f32> {
+        use procraft_engine::geom::Affine;
+        let st = self.shared.lock();
+        let view = st.view.map_or(Affine::IDENTITY, |view| view.to_screen());
+        let m = st
+            .doc
+            .timeline
+            .as_ref()
+            .and_then(|tl| {
+                let track_id = tl.track_of_clip(ClipId(clip_id))?;
+                Some(tl.clip_stage_affine(track_id, tl.playhead as f32, st.doc.width(), st.doc.height()).then(view))
+            })
+            .unwrap_or(view);
+        vec![m.a, m.b, m.c, m.d, m.e, m.f]
     }
 
     /// Starts a live Perform recording session: flushes any pending edit and captures a single
@@ -2117,7 +2175,7 @@ impl CanvasSession {
             next_id = next_id.saturating_add(1);
             let new_kind = match &clip.kind {
                 ClipKind::Cel { cels } => ClipKind::Cel {
-                    cels: cels.iter().map(|c| Cel { layer: map_layer(&mut st.doc, c.layer), hold: c.hold }).collect(),
+                    cels: cels.iter().map(|c| Cel { layer: map_layer(&mut st.doc, c.layer), ..*c }).collect(),
                 },
                 ClipKind::Layer { layer } => ClipKind::Layer { layer: map_layer(&mut st.doc, *layer) },
                 ClipKind::Text { layer } => ClipKind::Text { layer: map_layer(&mut st.doc, *layer) },
@@ -2152,6 +2210,7 @@ impl CanvasSession {
                 perform_guide_opacity: clip.perform_guide_opacity,
                 perform_guide_color: clip.perform_guide_color,
                 loop_mode: clip.loop_mode,
+                loop_offset: clip.loop_offset,
             });
         }
         let mut copy_track = src_track;
@@ -2470,6 +2529,71 @@ impl CanvasSession {
         float_pcm_to_i16(&floats)
     }
 
+    /// Creates the track, clip, and source reference as one undo step.
+    pub fn timeline_import_video(
+        &self,
+        name: String,
+        start_frame: u32,
+        duration_frames: u32,
+        source_fps: f32,
+        frame_count: u32,
+        file: String,
+    ) -> Option<u64> {
+        if !Timeline::valid_video_filename(&file) {
+            return None;
+        }
+        self.change("import video", |doc| {
+            if !doc.has_room(1) {
+                return None;
+            }
+            let layer = doc.add_layer();
+            let tl = doc.ensure_timeline();
+            let track = tl.add_track(Some(&name), false);
+            let clip =
+                tl.add_video_clip(track, start_frame, duration_frames, layer, source_fps, frame_count, Some(&name))?;
+            tl.video_files.insert(clip.0, file);
+            Some(clip.0)
+        })
+    }
+
+    /// Restore a missing project source, keeping cuts and keyframes of every linked clip.
+    pub fn timeline_relink_video(&self, id: u64, file: String) -> bool {
+        if !Timeline::valid_video_filename(&file) {
+            return false;
+        }
+        self.change("relink video", |doc| {
+            let tl = doc.timeline.as_mut()?;
+            let ClipKind::Video { video_id, .. } = tl.clip(ClipId(id))?.kind else {
+                return None;
+            };
+            tl.video_files.insert(video_id, file);
+            Some(())
+        })
+        .is_some()
+    }
+
+    /// Video input for an absolute timeline frame, in source microseconds.
+    pub fn timeline_video_requests(&self, frame: u32) -> Vec<TimelineVideoRequest> {
+        let st = self.shared.lock();
+        let Some(tl) = st.doc.timeline.as_ref() else { return Vec::new() };
+        if tl.video_files.is_empty() {
+            return Vec::new();
+        }
+        let scene = tl.evaluate(&st.doc, frame as f32, true);
+        scene
+            .items
+            .iter()
+            .filter_map(|item| {
+                let clip = tl.clip(item.clip)?;
+                let ClipKind::Video { video_id, trim_in_frames, .. } = clip.kind else { return None };
+                let file = tl.video_files.get(&video_id)?.clone();
+                let time_us = (u64::from(trim_in_frames) + u64::from(frame - clip.start_frame)) * 1_000_000
+                    / u64::from(tl.fps.clamp(1, 60));
+                Some(TimelineVideoRequest { clip_id: clip.id.0, file, time_us })
+            })
+            .collect()
+    }
+
     /// Adds a `VideoClip` (for rotoscoping or video compositing) on `track_id` as an undo step.
     pub fn timeline_add_video_clip(
         &self,
@@ -2715,6 +2839,7 @@ impl CanvasSession {
                 return None;
             }
             clip.loop_mode = next;
+            clip.loop_offset = 0;
             clip.sync_duration();
             Some(())
         })
@@ -3139,6 +3264,9 @@ fn ensure_clip_covers_frame(clip: &mut procraft_engine::timeline::Clip, frame: u
     }
     let needed_extra = frame.saturating_sub(clip.end_frame()).saturating_add(1);
     match &mut clip.kind {
+        ClipKind::Cel { .. } if clip.loop_mode != ClipLoopMode::None => {
+            clip.duration_frames = clip.duration_frames.saturating_add(needed_extra);
+        }
         ClipKind::Cel { cels } => {
             if let Some(last) = cels.last_mut() {
                 last.hold = last.hold.saturating_add(needed_extra).min(600);

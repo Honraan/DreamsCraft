@@ -759,6 +759,24 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
     if gpu.as_ref().is_some_and(procraft_gpu::Gpu::is_lost) {
         return Err(file_error("reading the layers", "the graphics device was lost"));
     }
+    // Resolve media against the last successful directory, including after a failed Save As.
+    if let Some(tl) = file.document.timeline.as_ref() {
+        for name in tl.video_sources() {
+            let path = dir.join("media").join(name);
+            if path.is_file() {
+                continue;
+            }
+            fs::create_dir_all(dir.join("media")).map_err(|e| file_error("making the video folder", e))?;
+            write_atomically(&path, |tmp| {
+                if let Some(bytes) = tl.packaged_video.get(name) {
+                    fs::write(tmp, bytes.as_slice())
+                } else {
+                    fs::copy(saved.dir.join("media").join(name), tmp).map(|_| ())
+                }
+                .map_err(|e| file_error("saving video media", e))
+            })?;
+        }
+    }
     if saved.dir != dir {
         saved.dir = dir.to_path_buf();
         saved.layers.clear();
@@ -898,7 +916,7 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
                 if asset.pcm.is_empty() {
                     continue;
                 }
-                let path = audio_dir.join(format!("{}.wav", asset.id.0));
+                let path = audio_dir.join(asset.wav_filename());
                 if path.exists() {
                     continue;
                 }
@@ -1058,7 +1076,7 @@ impl CanvasSession {
         if let Some(tl) = doc.timeline.as_mut() {
             let audio_dir = dir.join("audio");
             for asset in &mut tl.audio_assets {
-                let path = audio_dir.join(format!("{}.wav", asset.id.0));
+                let path = audio_dir.join(asset.wav_filename());
                 if let Ok(wav) = fs::read(&path)
                     && let Some(decoded) = procraft_engine::audio::decode_wav_pcm(&wav)
                 {
@@ -1907,6 +1925,11 @@ impl<'a> ExportLayers<'a> {
 }
 
 impl procraft_engine::native::LayerPixels for ExportLayers<'_> {
+    fn video(&self, name: &str) -> std::io::Result<Vec<u8>> {
+        let dir = self.session.shared.saving.lock().unwrap_or_else(|e| e.into_inner()).dir.clone();
+        fs::read(dir.join("media").join(name))
+    }
+
     fn pixels(&self, id: LayerId) -> std::io::Result<Option<std::borrow::Cow<'_, [u8]>>> {
         Ok(Some(std::borrow::Cow::Owned(self.premultiplied(id)?)))
     }

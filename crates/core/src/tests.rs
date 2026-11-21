@@ -7005,6 +7005,73 @@ fn dreamscraft_v2_3_procraft_package_preserves_full_timeline_camera_and_audio() 
 }
 
 #[test]
+fn dreamscraft_reused_audio_id_keeps_replacement_and_absolute_work_area() {
+    let Some(s) = session(32, 32) else { return };
+    s.enable_animation_for_new_artwork();
+    s.timeline_set_fps(24);
+    s.timeline_set_duration(48);
+    let dir = std::env::temp_dir().join(format!("dreamscraft-audio-replacement-{}", std::process::id()));
+    let path = dir.to_string_lossy().into_owned();
+    let original = s.timeline_import_audio_pcm("First".into(), 8000, 1, vec![24000; 8000], 24).unwrap();
+    s.save(path.clone()).unwrap();
+    assert_eq!(s.undo().as_deref(), Some("import audio"));
+    let replaced = s.timeline_import_audio_pcm("New".into(), 8000, 1, vec![-24000; 8000], 24).unwrap();
+    assert_eq!(replaced, original);
+    s.timeline_set_work_area(Some(crate::TimelineWorkAreaInfo { start: 24, end: 47 }));
+    let frames = s.timeline_play_order();
+    assert_eq!(frames, (24..48).collect::<Vec<_>>());
+    assert!(s.timeline_mix_audio_pcm(0, 23, 8000).iter().all(|x| *x == 0));
+    let before = s.timeline_mix_audio_pcm(frames[0], frames[23], 8000);
+    assert_eq!(before.len(), 16000);
+    assert!(before.iter().all(|x| *x < 0));
+    s.save(path.clone()).unwrap();
+    let reopened = CanvasSession::open(path).unwrap();
+    assert_eq!(reopened.timeline_play_order(), frames);
+    assert_eq!(reopened.timeline_mix_audio_pcm(frames[0], frames[23], 8000), before);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn dreamscraft_cut_video_survives_save_package_and_frame_export() {
+    struct TestFrames;
+    impl crate::TimelineMediaProvider for TestFrames {
+        fn video_frame(&self, request: crate::TimelineVideoRequest) -> Option<crate::TimelineVideoPixels> {
+            let pixel = if request.time_us == 0 { [255, 0, 0, 255] } else { [0, 255, 0, 255] };
+            Some(crate::TimelineVideoPixels { width: 32, height: 32, rgba: pixel.repeat(32 * 32) })
+        }
+    }
+    let Some(s) = session(32, 32) else { return };
+    s.enable_animation_for_new_artwork();
+    s.timeline_set_fps(24);
+    let dir = std::env::temp_dir().join(format!("dreamscraft-video-project-{}", std::process::id()));
+    let project = dir.join("project");
+    std::fs::create_dir_all(project.join("media")).unwrap();
+    let file = "video-0123456789abcdef0123456789abcdef.media";
+    std::fs::write(project.join("media").join(file), b"sample source").unwrap();
+    let clip = s.timeline_import_video("Reference".into(), 24, 24, 30.0, 30, file.into()).unwrap();
+    s.timeline_set_playhead(36);
+    let cut = s.timeline_split_clip_at_playhead(clip).unwrap();
+    s.save(project.to_string_lossy().into_owned()).unwrap();
+    let reopened = CanvasSession::open(project.to_string_lossy().into_owned()).unwrap();
+    let requests = reopened.timeline_video_requests(36);
+    assert_eq!(requests.len(), 1);
+    assert_eq!((requests[0].clip_id, requests[0].file.as_str(), requests[0].time_us), (cut, file, 500000));
+    let media: std::sync::Arc<dyn crate::TimelineMediaProvider> = std::sync::Arc::new(TestFrames);
+    let first = s.timeline_animation_frame(24, false, 32, true, Some(media.clone())).unwrap();
+    let later = s.timeline_animation_frame(36, false, 32, true, Some(media)).unwrap();
+    assert_eq!(&first.rgba[..4], &[255, 0, 0, 255]);
+    assert_eq!(&later.rgba[..4], &[0, 255, 0, 255]);
+    let package = dir.join("movie.procraft").to_string_lossy().into_owned();
+    s.export_package(package.clone(), 42, None).unwrap();
+    let imported = CanvasSession::open_package(package).unwrap();
+    let other = dir.join("other-device");
+    imported.save(other.to_string_lossy().into_owned()).unwrap();
+    assert_eq!(std::fs::read(other.join("media").join(file)).unwrap(), b"sample source");
+    assert_eq!(imported.timeline_video_requests(36)[0].time_us, 500000);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn dreamscraft_v2_3_perform_step_holds_auto_extend_and_camera_perform() {
     let Some(s) = session(64, 64) else { return };
     s.set_timeline_enabled(true);

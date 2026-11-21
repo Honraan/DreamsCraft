@@ -1188,6 +1188,7 @@ pub fn read(bytes: &[u8]) -> Result<Imported, ReadError> {
                                 opacity: 1.0,
                                 kind: ClipKind::Cel { cels: std::mem::take(&mut current_cels) },
                                 keyframes: Default::default(),
+                                loop_offset: 0,
                                 perform_onion_guide: false,
                                 perform_guide_layer: None,
                                 perform_guide_opacity: 0.45,
@@ -1204,7 +1205,7 @@ pub fn read(bytes: &[u8]) -> Result<Imported, ReadError> {
                     if current_start.is_none() {
                         current_start = Some(time);
                     }
-                    current_cels.push(Cel { layer: lid, hold });
+                    current_cels.push(Cel { stage_space: Some(false), layer: lid, hold });
                 }
                 if let Some(start) = current_start
                     && !current_cels.is_empty()
@@ -1220,6 +1221,7 @@ pub fn read(bytes: &[u8]) -> Result<Imported, ReadError> {
                         opacity: 1.0,
                         kind: ClipKind::Cel { cels: current_cels },
                         keyframes: Default::default(),
+                        loop_offset: 0,
                         perform_onion_guide: false,
                         perform_guide_layer: None,
                         perform_guide_opacity: 0.45,
@@ -1241,6 +1243,7 @@ pub fn read(bytes: &[u8]) -> Result<Imported, ReadError> {
                     opacity: 1.0,
                     kind: ClipKind::Layer { layer: lid },
                     keyframes: Default::default(),
+                    loop_offset: 0,
                     perform_onion_guide: false,
                     perform_guide_layer: None,
                     perform_guide_opacity: 0.45,
@@ -1567,6 +1570,7 @@ mod tests {
                 opacity: 1.0,
                 kind: ClipKind::Layer { layer: l_bg },
                 keyframes: Default::default(),
+                loop_offset: 0,
                 perform_onion_guide: false,
                 perform_guide_layer: None,
                 perform_guide_opacity: 0.45,
@@ -1600,8 +1604,14 @@ mod tests {
                 duration_frames: 5,
                 blend: BlendMode::Normal,
                 opacity: 1.0,
-                kind: ClipKind::Cel { cels: vec![Cel { layer: l_cel1, hold: 2 }, Cel { layer: l_cel2, hold: 1 }] },
+                kind: ClipKind::Cel {
+                    cels: vec![
+                        Cel { stage_space: Some(false), layer: l_cel1, hold: 2 },
+                        Cel { stage_space: Some(false), layer: l_cel2, hold: 1 },
+                    ],
+                },
                 keyframes: Default::default(),
+                loop_offset: 0,
                 perform_onion_guide: false,
                 perform_guide_layer: None,
                 perform_guide_opacity: 0.45,

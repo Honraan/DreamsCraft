@@ -69,12 +69,13 @@ impl DreamsTimelineDock {
             return;
         }
         let fps = tl.fps.max(1);
-        self.playing = Some(Playing {
-            at: tl.playhead,
-            step: 1,
-            next_at: Instant::now() + Duration::from_secs_f64(1.0 / f64::from(fps)),
-        });
-        session.set_play_frame(Some(tl.playhead));
+        let first = tl.work_area.as_ref().map_or(0, |area| area.start);
+        let len = session.animation_frame_count().max(1);
+        let at = tl.playhead.checked_sub(first).filter(|&i| i < len).unwrap_or(0);
+        self.playing =
+            Some(Playing { at, step: 1, next_at: Instant::now() + Duration::from_secs_f64(1.0 / f64::from(fps)) });
+        session.timeline_set_playhead(first + at);
+        session.set_play_frame(Some(first + at));
     }
 
     fn tick_playback(&mut self, ctx: &egui::Context, session: &CanvasSession, tl: &TimelineState) {
@@ -143,7 +144,13 @@ impl DreamsTimelineDock {
 
             // 3. Multi-Track Dopesheet
             let body = Rect::from_min_max(pos2(dock.left(), ruler.bottom()), dock.max);
-            self.draw_tracks(ui, session, &tl, body);
+            let mut rows = ui.new_child(egui::UiBuilder::new().max_rect(body));
+            rows.set_clip_rect(body);
+            egui::ScrollArea::vertical().id_salt("timeline_tracks").auto_shrink([false, false]).show(&mut rows, |ui| {
+                let size = vec2(ui.available_width(), (tl.tracks.len() as f32 * TRACK_H).max(body.height()));
+                let (_, content) = ui.allocate_space(size);
+                self.draw_tracks(ui, session, &tl, content);
+            });
         });
 
         true
@@ -407,7 +414,10 @@ impl DreamsTimelineDock {
 
         for (row_idx, track) in tl.tracks.iter().rev().enumerate() {
             let y0 = body.top() + (row_idx as f32) * TRACK_H;
-            if y0 > body.bottom() {
+            if y0 + TRACK_H < ui.clip_rect().top() {
+                continue;
+            }
+            if y0 > ui.clip_rect().bottom() {
                 break;
             }
             let h_rect = Rect::from_min_size(pos2(header_col.left(), y0), vec2(HEADER_W, TRACK_H));
@@ -638,14 +648,9 @@ impl DreamsTimelineDock {
             let strip_y = bar.top() + 38.0;
             if let Some(clip) = active_clip(tl).filter(|c| c.kind == TimelineClipKind::Cel) {
                 let mut cx = bar.left() + 12.0;
-                let mut f_cursor = clip.start_frame;
-                let mut active_idx = 0usize;
+                let active_idx = clip.active_cel_index;
                 for (i, cel) in clip.cels.iter().enumerate() {
-                    let dur = cel.duration_frames.max(1);
-                    let is_curr = tl.playhead >= f_cursor && tl.playhead < f_cursor + dur;
-                    if is_curr {
-                        active_idx = i;
-                    }
+                    let is_curr = active_idx == Some(cel.index);
                     let cel_r = Rect::from_min_size(pos2(cx, strip_y), vec2(44.0, 38.0));
                     if cel_r.right() < bar.right() - 160.0 {
                         ui.painter().rect_filled(cel_r, 8.0, argb(CLIP_FILL));
@@ -668,13 +673,14 @@ impl DreamsTimelineDock {
                             Weight::SemiBold,
                             argb(INK),
                         );
-                        if ui.interact(cel_r, ui.scope_id().with(("fb_cel", clip.id, i)), Sense::click()).clicked() {
+                        if let Some(frame) = cel.first_exposure
+                            && ui.interact(cel_r, ui.scope_id().with(("fb_cel", clip.id, i)), Sense::click()).clicked()
+                        {
                             self.reset(session);
-                            session.timeline_set_playhead(f_cursor);
+                            session.timeline_set_playhead(frame);
                         }
                         cx += 50.0;
                     }
-                    f_cursor = f_cursor.saturating_add(dur);
                 }
 
                 let mut rx = bar.right() - 150.0;
@@ -682,11 +688,16 @@ impl DreamsTimelineDock {
                 if pill(ui, &mut rx, ry, "+Cel", ACCENT, 0xFFFF_FFFF, "fb_add_cel") {
                     let _ = session.timeline_add_cel(clip.id);
                 }
-                if pill(ui, &mut rx, ry, "Dup", PILL_BG.value(), INK.value(), "fb_dup_cel") {
-                    let _ = session.timeline_duplicate_cel(clip.id, active_idx as u32);
+                if let Some(index) = active_idx
+                    && pill(ui, &mut rx, ry, "Dup", PILL_BG.value(), INK.value(), "fb_dup_cel")
+                {
+                    let _ = session.timeline_duplicate_cel(clip.id, index);
                 }
-                if clip.cels.len() > 1 && pill(ui, &mut rx, ry, "Del", PILL_BG.value(), PERFORM_RED, "fb_del_cel") {
-                    let _ = session.timeline_delete_cel(clip.id, active_idx as u32);
+                if let Some(index) = active_idx
+                    && clip.cels.len() > 1
+                    && pill(ui, &mut rx, ry, "Del", PILL_BG.value(), PERFORM_RED, "fb_del_cel")
+                {
+                    let _ = session.timeline_delete_cel(clip.id, index);
                 }
             }
         });
