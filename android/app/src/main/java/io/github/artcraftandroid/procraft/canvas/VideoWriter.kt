@@ -294,8 +294,8 @@ object VideoWriter {
 
     /**
      * Writes an MP4 video with an optional stereo 16-bit PCM audio track encoded to AAC
-     * (`audio/mp4a-latm`) and muxed alongside the video track. Falls back cleanly to video-only
-     * if [audioPcmStereo] is null/empty or AAC encoding fails on the device.
+     * (`audio/mp4a-latm`) and muxed alongside the video track. Writes video-only
+     * if [audioPcmStereo] is null/empty. A failed AAC mux fails the export.
      */
     fun writeWithAudio(
         out: File,
@@ -323,10 +323,9 @@ object VideoWriter {
             videoOnly.delete()
             return true
         }
-        // Fallback: keep video-only MP4 if AAC muxing failed
-        videoOnly.copyTo(out, overwrite = true)
         videoOnly.delete()
-        return true
+        out.delete()
+        return false
     }
 
     /** Encodes [pcmStereo] (interleaved 16-bit stereo at [sampleRate] Hz) to AAC and muxes it with [videoMp4] into [out]. */
@@ -367,7 +366,7 @@ object VideoWriter {
                 if (!eosSent) {
                     val inIdx = aac.dequeueInputBuffer(TIMEOUT_US)
                     if (inIdx >= 0) {
-                        val inBuf = aac.getInputBuffer(inIdx) ?: break
+                        val inBuf = aac.getInputBuffer(inIdx) ?: return false
                         inBuf.clear()
                         val remain = rawBytes.size - readPos
                         if (remain <= 0) {
@@ -403,6 +402,7 @@ object VideoWriter {
                     }
                 }
             }
+            if (encodedPackets.isEmpty()) return false
             val finalAudioFormat = aacOutputFormat ?: return false
 
             val m = MediaMuxer(out.path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
@@ -433,6 +433,8 @@ object VideoWriter {
             for ((bytes, aInfo) in encodedPackets) {
                 m.writeSampleData(outAudioTrack, ByteBuffer.wrap(bytes), aInfo)
             }
+            m.stop()
+            muxerStarted = false
             true
         } catch (e: Exception) {
             AppLog.w("DreamsCraft", "AAC audio muxing failed", e)

@@ -679,6 +679,28 @@ impl KeyframeTrack {
         }
     }
 
+    /// Preserve the two endpoints of any interpolation crossing the cut.
+    fn split_at(&self, frame: u32) -> (Self, Self) {
+        fn split<T: Copy>(keys: &[Keyframe<T>], frame: u32) -> (Vec<Keyframe<T>>, Vec<Keyframe<T>>) {
+            let left_end = keys.partition_point(|key| key.frame < frame);
+            let right_start = keys.partition_point(|key| key.frame <= frame);
+            // Include one endpoint beyond each piece whenever its easing needs that endpoint.
+            let left = keys.get(..(left_end + 1).min(keys.len())).unwrap_or_default();
+            let right = keys.get(right_start.saturating_sub(1)..).unwrap_or_default();
+            (left.to_vec(), right.to_vec())
+        }
+        let (lt, rt) = split(&self.transform, frame);
+        let (lo, ro) = split(&self.opacity, frame);
+        let (lf, rf) = split(&self.filter, frame);
+        let (ld, rd) = split(&self.deform, frame);
+        let (lv, rv) = split(&self.volume, frame);
+        let (lp, rp) = split(&self.pan, frame);
+        (
+            Self { transform: lt, opacity: lo, filter: lf, deform: ld, volume: lv, pan: lp },
+            Self { transform: rt, opacity: ro, filter: rf, deform: rd, volume: rv, pan: rp },
+        )
+    }
+
     /// Retains keyframes matching `pred` across all property sub-tracks.
     pub fn retain_frames(&mut self, mut pred: impl FnMut(u32) -> bool) {
         self.transform.retain(|k| pred(k.frame));
@@ -1036,6 +1058,9 @@ pub struct Cel {
     /// Additional frames this cel stays on screen (`0` = 1 frame total, `1` = 2 frames, etc.).
     #[serde(default)]
     pub hold: u32,
+    /// Coordinate space used when drawing this cel. Missing on pre-2.4.1 projects.
+    #[serde(default)]
+    pub stage_space: Option<bool>,
 }
 
 impl Cel {
@@ -1135,6 +1160,9 @@ pub struct Clip {
     /// Loop / Ping-Pong repetition mode for `Cel` clips stretched past their natural cel span.
     #[serde(default)]
     pub loop_mode: ClipLoopMode,
+    /// Phase into the source sequence at the left edge of a repeated clip.
+    #[serde(default)]
+    pub loop_offset: u32,
 }
 
 fn unit_one() -> f32 {
@@ -1157,18 +1185,9 @@ impl Clip {
     }
 
     /// For a non-looping `Cel` clip, its duration is the sum of its cels' durations (at least 1);
-    /// for looping/ping-pong `Cel` clips or other clips, `self.duration_frames.max(cels_duration)`.
+    /// for looping/ping-pong `Cel` clips or other clips, the trimmed duration.
     pub fn effective_duration(&self) -> u32 {
-        match &self.kind {
-            ClipKind::Cel { cels } if !cels.is_empty() => {
-                let cels_len = self.cels_duration();
-                match self.loop_mode {
-                    ClipLoopMode::None => cels_len,
-                    ClipLoopMode::Loop | ClipLoopMode::PingPong => self.duration_frames.max(cels_len),
-                }
-            }
-            _ => self.duration_frames.max(1),
-        }
+        if self.loop_mode == ClipLoopMode::None { self.cels_duration() } else { self.duration_frames.max(1) }
     }
 
     pub fn sync_duration(&mut self) {
@@ -1177,6 +1196,40 @@ impl Clip {
 
     pub fn contains_frame(&self, frame: u32) -> bool {
         frame >= self.start_frame && frame < self.end_frame()
+    }
+
+    pub fn loop_period(&self) -> u32 {
+        let length = self.cels_duration();
+        if self.loop_mode == ClipLoopMode::PingPong {
+            length.saturating_sub(1).saturating_mul(2).max(1)
+        } else {
+            length
+        }
+    }
+
+    fn phase_at(&self, frame: u32) -> u32 {
+        if self.loop_mode == ClipLoopMode::None {
+            return 0;
+        }
+        (i64::from(self.loop_offset) + i64::from(frame) - i64::from(self.start_frame))
+            .rem_euclid(i64::from(self.loop_period())) as u32
+    }
+
+    /// First visible occurrence of a source exposure after a cut or trim.
+    pub fn first_exposure(&self, start: u32, duration: u32, period: u32) -> Option<u32> {
+        let period = i64::from(period.max(1));
+        let phase = i64::from(self.loop_offset) % period;
+        let distance = |lo: i64, hi: i64| {
+            if (lo..=hi).contains(&phase) { 0 } else { (lo - phase).rem_euclid(period) as u32 }
+        };
+        let lo = i64::from(start);
+        let hi = lo + i64::from(duration) - 1;
+        let offset = match self.loop_mode {
+            ClipLoopMode::None => start,
+            ClipLoopMode::Loop => distance(lo, hi),
+            ClipLoopMode::PingPong => distance(lo, hi).min(distance(period - hi, period - lo)),
+        };
+        (offset < self.duration_frames).then(|| self.start_frame.saturating_add(offset))
     }
 
     /// For a `Cel` clip, returns `(cel_index, cel, offset_into_cel)` at timeline `frame`,
@@ -1189,16 +1242,18 @@ impl Clip {
             return None;
         };
         let cels_len = self.cels_duration();
-        let raw_local = frame.saturating_sub(self.start_frame);
+        let raw_local = frame - self.start_frame;
         let local = match self.loop_mode {
             ClipLoopMode::None => raw_local,
-            ClipLoopMode::Loop => raw_local % cels_len.max(1),
+            ClipLoopMode::Loop => {
+                (u64::from(raw_local) + u64::from(self.loop_offset)).rem_euclid(u64::from(cels_len)) as u32
+            }
             ClipLoopMode::PingPong => {
                 if cels_len <= 1 {
                     0
                 } else {
                     let period = cels_len.saturating_sub(1).saturating_mul(2).max(1);
-                    let m = raw_local % period;
+                    let m = ((u64::from(raw_local) + u64::from(self.loop_offset)) % u64::from(period)) as u32;
                     if m < cels_len { m } else { period.saturating_sub(m) }
                 }
             }
@@ -1226,7 +1281,7 @@ impl Clip {
         for cel in cels.iter().take(cel_index) {
             offset = offset.saturating_add(cel.duration_frames());
         }
-        Some(self.start_frame.saturating_add(offset))
+        self.first_exposure(offset, cels.get(cel_index)?.duration_frames(), self.loop_period())
     }
 
     /// First visual layer of this clip (used as the default Perform motion ghost reference).
@@ -1283,6 +1338,7 @@ impl Clip {
             perform_guide_opacity: default_perform_guide_opacity(),
             perform_guide_color: default_perform_guide_color(),
             loop_mode: ClipLoopMode::None,
+            loop_offset: 0,
         }
     }
 }
@@ -1441,6 +1497,12 @@ pub struct Timeline {
     /// Imported audio assets referenced by [`ClipKind::Audio`] clips.
     #[serde(default)]
     pub audio_assets: Vec<AudioAsset>,
+    /// Project-relative video source names, shared by copies and cuts of the same clip.
+    #[serde(default)]
+    pub video_files: std::collections::BTreeMap<u64, String>,
+    /// Embedded sources from an opened package, available before its first directory save.
+    #[serde(skip)]
+    pub packaged_video: std::collections::BTreeMap<String, std::sync::Arc<Vec<u8>>>,
     /// Named beat / bookmark markers on the timeline ruler.
     #[serde(default)]
     pub markers: Vec<TimelineMarker>,
@@ -1467,6 +1529,8 @@ impl Default for Timeline {
             camera: KeyframeTrack::default(),
             camera_enabled: false,
             audio_assets: Vec::new(),
+            video_files: Default::default(),
+            packaged_video: Default::default(),
             markers: Vec::new(),
             next_id: 1,
         }
@@ -1484,7 +1548,7 @@ impl Timeline {
             "Drawing 1".to_owned(),
             0,
             1,
-            ClipKind::Cel { cels: vec![Cel { layer: first_layer, hold: 0 }] },
+            ClipKind::Cel { cels: vec![Cel { stage_space: Some(false), layer: first_layer, hold: 0 }] },
         );
         let track = Track {
             id: track_id,
@@ -1543,6 +1607,8 @@ impl Timeline {
             camera: KeyframeTrack::default(),
             camera_enabled: false,
             audio_assets: Vec::new(),
+            video_files: Default::default(),
+            packaged_video: Default::default(),
             markers: Vec::new(),
             next_id: 1,
         };
@@ -1550,7 +1616,10 @@ impl Timeline {
         // Calculate total played cels duration first
         let played_layers: Vec<LayerId> =
             all_frames.get(played_range.clone()).map(<[LayerId]>::to_vec).unwrap_or_default();
-        let cels: Vec<Cel> = played_layers.iter().map(|&layer| Cel { layer, hold: anim.hold(layer) }).collect();
+        let cels: Vec<Cel> = played_layers
+            .iter()
+            .map(|&layer| Cel { stage_space: Some(false), layer, hold: anim.hold(layer) })
+            .collect();
         let cels_duration: u32 = cels.iter().map(|c| c.duration_frames()).fold(0u32, u32::saturating_add).max(1);
         tl.duration_frames = tl.duration_frames.max(cels_duration);
 
@@ -1591,7 +1660,12 @@ impl Timeline {
         let main_track_id = tl.alloc_track_id();
         let main_clip_id = tl.alloc_clip_id();
         let fallback_cels = if cels.is_empty() {
-            all_frames.first().copied().into_iter().map(|layer| Cel { layer, hold: 0 }).collect()
+            all_frames
+                .first()
+                .copied()
+                .into_iter()
+                .map(|layer| Cel { stage_space: Some(false), layer, hold: 0 })
+                .collect()
         } else {
             cels
         };
@@ -1723,6 +1797,7 @@ impl Timeline {
 
     /// Sanitizes and repairs the timeline against `valid_layers` in the document.
     pub fn repaired(mut self, valid_layers: &HashSet<LayerId>) -> Timeline {
+        self.video_files.retain(|_, name| Self::valid_video_filename(name));
         self.fps = self.fps.clamp(1, 60);
         self.duration_frames = self.duration_frames.clamp(1, MAX_TIMELINE_DURATION);
         self.onion = self.onion.repaired();
@@ -1775,7 +1850,8 @@ impl Timeline {
                         if !valid_layers.is_empty() {
                             cels.retain(|c| valid_layers.contains(&c.layer));
                         }
-                        for cel in cels.iter_mut() {
+                        for (idx, cel) in cels.iter_mut().enumerate() {
+                            cel.stage_space.get_or_insert(clip.perform_onion_guide && idx > 0);
                             cel.hold = cel.hold.min(600);
                         }
                     }
@@ -2047,6 +2123,23 @@ impl Timeline {
         Some((tid, clip_id, asset_id))
     }
 
+    pub fn valid_video_filename(name: &str) -> bool {
+        name.strip_prefix("video-")
+            .and_then(|s| s.strip_suffix(".media"))
+            .is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+    }
+
+    pub fn video_sources(&self) -> std::collections::BTreeSet<&str> {
+        self.tracks
+            .iter()
+            .flat_map(|track| &track.clips)
+            .filter_map(|clip| {
+                let ClipKind::Video { video_id, .. } = clip.kind else { return None };
+                self.video_files.get(&video_id).map(String::as_str).filter(|name| Self::valid_video_filename(name))
+            })
+            .collect()
+    }
+
     /// Adds a [`ClipKind::Video`] clip on `track_id` backed by managed `layer`.
     pub fn add_video_clip(
         &mut self,
@@ -2125,15 +2218,19 @@ impl Timeline {
         // Cap to 10 minutes of stereo samples to avoid accidental huge allocations
         let capped_samples = total_samples.min((sr as usize).saturating_mul(600));
         let mut out = vec![0.0_f32; capped_samples.saturating_mul(2)];
-        let any_solo = self.tracks.iter().any(|t| t.solo && t.visible && !t.muted);
+        let any_solo = self.tracks.iter().any(|t| t.solo && self.audio_track_is_audible(t.id));
 
         for track in &self.tracks {
-            if !track.visible || track.muted || track.is_group {
+            if track.is_group || !self.audio_track_is_audible(track.id) {
                 continue;
             }
             if any_solo && !self.track_or_ancestor_is_solo(track.id) {
                 continue;
             }
+            let lineage: Vec<&Track> =
+                std::iter::successors(Some(track), |t| t.parent_group.and_then(|id| self.track(id)))
+                    .take(self.tracks.len())
+                    .collect();
             for clip in &track.clips {
                 let ClipKind::Audio { asset_id, trim_start_samples, .. } = clip.kind else {
                     continue;
@@ -2153,7 +2250,13 @@ impl Timeline {
                 let clip_end_sec = f64::from(clip.end_frame()) / fps;
                 let range_start_sec = f64::from(start_frame) / fps;
 
-                for i in 0..capped_samples {
+                let to_sample = |frame: u32| {
+                    (u64::from(frame.saturating_sub(start_frame)) * u64::from(sr))
+                        .div_ceil(u64::from(self.fps.clamp(1, 60))) as usize
+                };
+                let first = to_sample(clip.start_frame);
+                let last = to_sample(clip.end_frame()).min(capped_samples);
+                for i in first..last {
                     let t_sec = range_start_sec + (i as f64 / dst_sr);
                     if t_sec < clip_start_sec || t_sec >= clip_end_sec {
                         continue;
@@ -2162,24 +2265,29 @@ impl Timeline {
                     let src_pos = (trim_start_samples as f64) + local_sec * src_sr;
                     let (sl, sr_sample) = asset.sample_stereo(src_pos);
                     let timeline_frame = (t_sec * fps) as f32;
-                    let gain = (clip.keyframes.evaluate_volume(timeline_frame)
-                        * track.keyframes.evaluate_volume(timeline_frame)
-                        * clip.opacity.clamp(0.0, 1.0)
-                        * track.opacity.clamp(0.0, 1.0))
-                    .clamp(0.0, 2.0);
-                    let pan = (clip.keyframes.evaluate_pan(timeline_frame)
-                        + track.keyframes.evaluate_pan(timeline_frame))
-                    .clamp(-1.0, 1.0);
+                    let mut gain = clip.keyframes.evaluate_volume(timeline_frame) * clip.opacity;
+                    let mut pan = clip.keyframes.evaluate_pan(timeline_frame);
+                    for parent in &lineage {
+                        gain *= parent.opacity
+                            * parent.keyframes.evaluate_opacity(timeline_frame)
+                            * parent.keyframes.evaluate_volume(timeline_frame);
+                        pan += parent.keyframes.evaluate_pan(timeline_frame);
+                    }
+                    let gain = gain.clamp(0.0, 2.0);
+                    let pan = pan.clamp(-1.0, 1.0);
                     let (gl, gr) = stereo_pan_gains(pan);
                     let idx = i.saturating_mul(2);
                     if let Some(slot_l) = out.get_mut(idx) {
-                        *slot_l = (*slot_l + sl * gain * gl).clamp(-1.0, 1.0);
+                        *slot_l += sl * gain * gl;
                     }
                     if let Some(slot_r) = out.get_mut(idx + 1) {
-                        *slot_r = (*slot_r + sr_sample * gain * gr).clamp(-1.0, 1.0);
+                        *slot_r += sr_sample * gain * gr;
                     }
                 }
             }
+        }
+        for sample in &mut out {
+            *sample = sample.clamp(-1.0, 1.0);
         }
         out
     }
@@ -2195,7 +2303,7 @@ impl Timeline {
         let clip_id = self.alloc_clip_id();
         let track = self.track_mut(track_id)?;
         let idx = track.clips.len() + 1;
-        let cel = Cel { layer: initial_layer, hold: hold.min(600) };
+        let cel = Cel { stage_space: Some(false), layer: initial_layer, hold: hold.min(600) };
         let dur = cel.duration_frames();
         let clip =
             Clip::new_visual(clip_id, format!("Drawing {idx}"), start_frame, dur, ClipKind::Cel { cels: vec![cel] });
@@ -2296,7 +2404,10 @@ impl Timeline {
                 {
                     let remaining_hold = cel.hold.saturating_sub(offset);
                     slot.hold = offset.saturating_sub(1);
-                    cels.insert(cel_idx + 1, Cel { layer: new_layer, hold: remaining_hold });
+                    cels.insert(
+                        cel_idx + 1,
+                        Cel { stage_space: Some(clip.perform_onion_guide), layer: new_layer, hold: remaining_hold },
+                    );
                     clip.sync_duration();
                     return Some((new_layer, true));
                 }
@@ -2313,14 +2424,21 @@ impl Timeline {
         // If a CelClip ends right at `frame` (contiguous frame-by-frame drawing), append a new cel
         // to that CelClip so Flipbook sequencing stays seamless.
         let contiguous_cel_clip = self.track(tid).and_then(|t| {
-            t.clips.iter().find(|c| matches!(c.kind, ClipKind::Cel { .. }) && c.end_frame() == frame).map(|c| c.id)
+            t.clips
+                .iter()
+                .find(|c| {
+                    matches!(c.kind, ClipKind::Cel { .. })
+                        && c.loop_mode == ClipLoopMode::None
+                        && c.end_frame() == frame
+                })
+                .map(|c| c.id)
         });
 
         if let Some(cid) = contiguous_cel_clip
             && let Some(clip) = self.clip_mut(cid)
             && let ClipKind::Cel { cels } = &mut clip.kind
         {
-            cels.push(Cel { layer: new_layer, hold: 0 });
+            cels.push(Cel { stage_space: Some(clip.perform_onion_guide), layer: new_layer, hold: 0 });
             clip.sync_duration();
             let end = clip.end_frame();
             self.duration_frames = self.duration_frames.max(end).min(MAX_TIMELINE_DURATION);
@@ -2438,19 +2556,16 @@ impl Timeline {
         }
         let new_dur = old_end.saturating_sub(clamped_start).max(1);
         let loop_mode = clip.loop_mode;
+        let phase = clip.phase_at(clamped_start);
         match &mut clip.kind {
             ClipKind::Cel { cels } => {
                 if cels.is_empty() {
                     return false;
                 }
                 if loop_mode != ClipLoopMode::None {
-                    let min_dur = clip.cels_duration();
-                    let effective_start = clamped_start.min(old_end.saturating_sub(min_dur));
-                    if effective_start == old_start {
-                        return false;
-                    }
-                    clip.start_frame = effective_start;
-                    clip.duration_frames = old_end.saturating_sub(effective_start).max(min_dur);
+                    clip.loop_offset = phase;
+                    clip.start_frame = clamped_start;
+                    clip.duration_frames = new_dur;
                 } else if clamped_start < old_start {
                     // Expanding left: extend first cel hold
                     let grow = old_start.saturating_sub(clamped_start);
@@ -2564,11 +2679,7 @@ impl Timeline {
         let right_dur = clip.end_frame().saturating_sub(at_frame);
         let fps = self.fps.clamp(1, 60);
 
-        let mut left_kf = clip.keyframes.clone();
-        left_kf.retain_frames(|f| f < at_frame);
-
-        let mut right_kf = clip.keyframes.clone();
-        right_kf.retain_frames(|f| f >= at_frame);
+        let (left_kf, right_kf) = clip.keyframes.split_at(at_frame);
 
         let (left_kind, right_kind) = match &clip.kind {
             ClipKind::Layer { layer } => (ClipKind::Layer { layer: *layer }, ClipKind::Layer { layer: *layer }),
@@ -2626,8 +2737,16 @@ impl Timeline {
                             return None;
                         }
                         let mut left_cels = cels.get(..cel_idx)?.to_vec();
-                        left_cels.push(Cel { layer: cel.layer, hold: offset.saturating_sub(1) });
-                        let mut right_cels = vec![Cel { layer: cel.layer, hold: total_hold.saturating_sub(offset) }];
+                        left_cels.push(Cel {
+                            stage_space: cel.stage_space,
+                            layer: cel.layer,
+                            hold: offset.saturating_sub(1),
+                        });
+                        let mut right_cels = vec![Cel {
+                            stage_space: cel.stage_space,
+                            layer: cel.layer,
+                            hold: total_hold.saturating_sub(offset),
+                        }];
                         if let Some(rest) = cels.get(cel_idx + 1..) {
                             right_cels.extend_from_slice(rest);
                         }
@@ -2658,6 +2777,7 @@ impl Timeline {
             perform_guide_opacity: clip.perform_guide_opacity,
             perform_guide_color: clip.perform_guide_color,
             loop_mode: clip.loop_mode,
+            loop_offset: clip.phase_at(at_frame),
         };
         right_clip.sync_duration();
         track.clips.push(right_clip);
@@ -2721,7 +2841,10 @@ impl Timeline {
             return None;
         };
         let insert_at = after_cel_index.map(|i| (i + 1).min(cels.len())).unwrap_or(cels.len());
-        cels.insert(insert_at, Cel { layer, hold: hold.min(600) });
+        cels.insert(
+            insert_at,
+            Cel { stage_space: Some(clip.perform_onion_guide && insert_at > 0), layer, hold: hold.min(600) },
+        );
         clip.sync_duration();
         let new_cel_frame = clip.cel_start_frame(insert_at);
         let end = clip.end_frame();
@@ -2754,6 +2877,15 @@ impl Timeline {
             acc = acc.then(m);
         }
         acc
+    }
+
+    pub fn clip_stage_affine(&self, track_id: TrackId, frame: f32, width: u32, height: u32) -> Affine {
+        let track = self.evaluate_track_affine(track_id, frame, width, height);
+        if !self.camera_enabled {
+            return track;
+        }
+        let camera = self.camera.evaluate_transform(frame).to_affine(width, height);
+        track.then(camera.inverse().unwrap_or(Affine::IDENTITY))
     }
 
     /// Evaluates the combined hierarchical opacity of `track_id` at `frame`.
@@ -2852,11 +2984,10 @@ impl Timeline {
                 let clip_filter = track_filter.combine(clip.keyframes.evaluate_filter(frame)).combine(scene_cam_filter);
                 let clip_deform = clip.keyframes.evaluate_deform(frame);
 
-                // 0. Perform Motion Ghost (Onion Skin of the first frame following the Perform motion!)
-                // Shown whenever `!playing && clip.perform_onion_guide` so the artist can trace and
-                // animate frame-by-frame right on top of the Perform trajectory.
+                // The motion guide belongs to this clip's editing exposure.
                 if !playing
                     && clip.perform_onion_guide
+                    && clip.contains_frame(frame_u32)
                     && let Some(guide_layer) = clip.perform_guide_layer.or_else(|| clip.first_layer())
                 {
                     let guide_alpha = (clip.perform_guide_opacity.clamp(0.0, 1.0) * clip_base_opacity).clamp(0.0, 1.0);
@@ -2907,7 +3038,7 @@ impl Timeline {
                                     && let Some(cel) = cels.get(idx)
                                 {
                                     // When tracing over Perform Motion Ghost, drawn cels sit in stage space
-                                    let onion_xform = if clip.perform_onion_guide && idx > 0 {
+                                    let onion_xform = if cel.stage_space == Some(true) {
                                         clip_stage_affine
                                     } else {
                                         clip_motion_affine
@@ -2942,7 +3073,7 @@ impl Timeline {
                                 if onion_alpha > 1e-4
                                     && let Some(cel) = cels.get(idx)
                                 {
-                                    let onion_xform = if clip.perform_onion_guide && idx > 0 {
+                                    let onion_xform = if cel.stage_space == Some(true) {
                                         clip_stage_affine
                                     } else {
                                         clip_motion_affine
@@ -2981,12 +3112,9 @@ impl Timeline {
                         let effective_blend = if clip.blend != BlendMode::Normal { clip.blend } else { track.blend };
                         match &clip.kind {
                             ClipKind::Cel { .. } => {
-                                if let Some((cel_idx, cel, _)) = clip.cel_at(frame_u32) {
-                                    // If Perform Motion Ghost is active and the artist has drawn a
-                                    // dedicated frame-by-frame cel (`cel_idx > 0`), keep the drawn
-                                    // cel in stage space so it doesn't double-transform on top of the
-                                    // moving ghost!
-                                    let use_stage_space = clip.perform_onion_guide && cel_idx > 0;
+                                if let Some((_, cel, _)) = clip.cel_at(frame_u32) {
+                                    // Tracing cels were painted in stage coordinates.
+                                    let use_stage_space = cel.stage_space == Some(true);
                                     let item_xform =
                                         if use_stage_space { clip_stage_affine } else { clip_motion_affine };
                                     let item_deform = if use_stage_space { Deform2D::default() } else { clip_deform };
@@ -3152,6 +3280,19 @@ impl Timeline {
             }
         }
         (Affine::IDENTITY, 4, false)
+    }
+
+    fn audio_track_is_audible(&self, track_id: TrackId) -> bool {
+        let mut cursor = Some(track_id);
+        for _ in 0..self.tracks.len() {
+            let Some(id) = cursor else { return true };
+            let Some(track) = self.track(id) else { return false };
+            if !track.visible || track.muted {
+                return false;
+            }
+            cursor = track.parent_group;
+        }
+        cursor.is_none()
     }
 
     fn track_or_ancestor_is_solo(&self, track_id: TrackId) -> bool {
@@ -3718,28 +3859,50 @@ mod tests {
     }
 
     #[test]
-    fn splitting_and_moving_clips_preserve_duration_and_shift_keyframes() {
+    fn audio_mix_is_order_independent_and_respects_group_visibility() {
+        let mut tl = Timeline::default();
+        let mut tracks = Vec::new();
+        for sample in [0.8, 0.8, -0.8] {
+            let (track, clip, _) = tl.add_audio_clip(None, "Tone".into(), 8_000, 1, vec![sample; 8_000], 0).unwrap();
+            tl.clip_mut(clip).unwrap().keyframes.set_pan(0, -1.0, None);
+            tracks.push(track);
+        }
+        let mix = tl.mix_audio_range(0, 0, 8_000);
+        assert!((mix[0] - 0.8).abs() < 1e-5);
+        assert!(tl.move_track(tracks[2], -2));
+        assert_eq!(mix, tl.mix_audio_range(0, 0, 8_000));
+        let group = tl.group_tracks(&tracks, None).unwrap();
+        tl.track_mut(group).unwrap().visible = false;
+        assert!(tl.mix_audio_range(0, 0, 8_000).iter().all(|&sample| sample == 0.0));
+    }
+
+    #[test]
+    fn splitting_and_moving_clips_preserve_duration_and_easing() {
         let l1 = LayerId(1);
         let mut tl = Timeline::new_with_layer(l1);
-        let track_id = tl.active_track.unwrap();
-        let clip_id = tl.add_layer_clip(track_id, 10, 20, l1, Some("Block")).unwrap();
-        tl.clip_mut(clip_id).unwrap().keyframes.set_transform(
-            15,
-            Transform2D { position: [40.0, 20.0], ..Transform2D::default() },
-            Some(Easing::Linear),
-        );
+        let track = tl.active_track.unwrap();
+        let clip = tl.add_layer_clip(track, 10, 20, l1, Some("Block")).unwrap();
+        let keys = &mut tl.clip_mut(clip).unwrap().keyframes;
+        keys.set_transform(10, Transform2D::default(), Some(Easing::EaseInOut));
+        keys.set_transform(24, Transform2D { position: [100.0, 0.0], ..Transform2D::default() }, None);
+        keys.set_opacity(14, 0.2, Some(Easing::Hold));
+        keys.set_opacity(22, 0.8, None);
+        keys.set_opacity(28, 1.0, None);
 
-        // Move clip from 10 to 30 (+20 frames) -> keyframe shifts from 15 to 35
-        assert!(tl.move_clip(clip_id, 30, None));
-        assert_eq!(tl.clip(clip_id).unwrap().keyframes.transform[0].frame, 35);
-
-        // Split clip (30..50) at frame 40 -> left (30..40) keeps keyframe at 35, right (40..50) has none
-        let right_id = tl.split_clip(clip_id, 40).unwrap();
-        assert_eq!(tl.clip(clip_id).unwrap().duration_frames, 10);
-        assert_eq!(tl.clip(clip_id).unwrap().keyframes.transform.len(), 1);
-        assert_eq!(tl.clip(right_id).unwrap().start_frame, 40);
-        assert_eq!(tl.clip(right_id).unwrap().duration_frames, 10);
-        assert!(tl.clip(right_id).unwrap().keyframes.transform.is_empty());
+        assert!(tl.move_clip(clip, 30, None));
+        assert_eq!(tl.clip(clip).unwrap().keyframes.transform[0].frame, 30);
+        let before = tl.clip(clip).unwrap().keyframes.clone();
+        let right = tl.split_clip(clip, 40).unwrap();
+        assert_eq!(tl.clip(clip).unwrap().duration_frames, 10);
+        assert_eq!(tl.clip(right).unwrap().start_frame, 40);
+        assert_eq!(tl.clip(right).unwrap().duration_frames, 10);
+        for half_frame in 60..100 {
+            let frame = half_frame as f32 / 2.0;
+            let after = &tl.clip(if frame < 40.0 { clip } else { right }).unwrap().keyframes;
+            assert_eq!(before.evaluate_transform(frame), after.evaluate_transform(frame));
+            assert_eq!(before.evaluate_opacity(frame), after.evaluate_opacity(frame));
+        }
+        assert_eq!(before.evaluate_opacity(42.0), 0.8);
     }
 
     #[test]
@@ -3783,6 +3946,7 @@ mod tests {
         let drawn_cel = doc.add_layer();
         let mut tl = Timeline::new_with_layer(guide_cel);
         let cid = tl.active_clip.unwrap();
+        tl.clip_mut(cid).unwrap().perform_onion_guide = true;
         tl.insert_cel(cid, Some(0), drawn_cel, 10);
 
         // Record Perform motion from x=0 at frame 0 to x=100 at frame 10 and enable Perform Motion Ghost
@@ -3810,9 +3974,42 @@ mod tests {
         let primary = scene.items.iter().find(|i| !i.is_onion && i.layer == drawn_cel).unwrap();
         assert!(primary.transform.e.abs() < 1e-3);
 
+        assert!(tl.evaluate(&doc, 20.0, false).items.iter().all(|item| !item.is_perform_guide));
+        tl.clip_mut(cid).unwrap().perform_onion_guide = false;
+        let hidden = tl.evaluate(&doc, 5.0, true);
+        assert_eq!(
+            hidden.items.iter().find(|i| !i.is_onion && i.layer == drawn_cel).unwrap().transform,
+            primary.transform
+        );
+        tl.clip_mut(cid).unwrap().perform_onion_guide = true;
+
         // During playback (playing = true), the onion ghost turns off cleanly
         let play_scene = tl.evaluate(&doc, 5.0, true);
         assert!(play_scene.items.iter().all(|i| !i.is_perform_guide));
+    }
+
+    #[test]
+    fn loop_cuts_and_trims_keep_cel_phase_and_visible_exposure() {
+        for mode in [ClipLoopMode::Loop, ClipLoopMode::PingPong] {
+            let mut tl = Timeline::new_with_layer(LayerId(1));
+            let id = tl.active_clip.unwrap();
+            tl.insert_cel(id, Some(0), LayerId(2), 1);
+            tl.insert_cel(id, Some(1), LayerId(3), 0);
+            tl.clip_mut(id).unwrap().loop_mode = mode;
+            tl.resize_clip(id, 13);
+            let before = tl.clip(id).unwrap().clone();
+            let right = tl.split_clip(id, 1).unwrap();
+            assert_eq!(tl.clip(id).unwrap().end_frame(), 1);
+            assert!(tl.trim_clip_left(right, 5));
+            let after = tl.clip(right).unwrap();
+            assert_eq!(after.end_frame(), before.end_frame());
+            for frame in 5..after.end_frame() {
+                assert_eq!(after.cel_at(frame), before.cel_at(frame));
+            }
+            for index in 0..3 {
+                assert_eq!(after.cel_start_frame(index), (5..13).find(|&f| before.cel_at(f).unwrap().0 == index));
+            }
+        }
     }
 
     #[test]
@@ -3967,7 +4164,11 @@ mod tests {
         {
             let clip = tl.clip_mut(cid).unwrap();
             clip.kind = ClipKind::Cel {
-                cels: vec![Cel { layer: l1, hold: 0 }, Cel { layer: l2, hold: 0 }, Cel { layer: l3, hold: 0 }],
+                cels: vec![
+                    Cel { stage_space: Some(false), layer: l1, hold: 0 },
+                    Cel { stage_space: Some(false), layer: l2, hold: 0 },
+                    Cel { stage_space: Some(false), layer: l3, hold: 0 },
+                ],
             };
             clip.loop_mode = ClipLoopMode::Loop;
         }

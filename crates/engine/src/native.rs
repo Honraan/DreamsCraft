@@ -253,6 +253,10 @@ pub fn read(bytes: &[u8]) -> Result<Imported, ReadError> {
                 asset.pcm = decoded.samples;
             }
         }
+        for name in saved.timeline.video_sources().into_iter().map(str::to_owned).collect::<Vec<_>>() {
+            let bytes = zip.read(&format!("DreamsCraft/media/{name}")).ok_or(ReadError::Damaged("timeline video"))?;
+            saved.timeline.packaged_video.insert(name, std::sync::Arc::new(bytes));
+        }
         document.timeline = Some(saved.timeline);
     }
     let document = document.repaired();
@@ -848,6 +852,9 @@ pub trait LayerPixels {
     /// Layer `id`'s pixels (premultiplied RGBA8, the canvas's size; a mask's too), none if it has
     /// none; an error if they can't be read (the package isn't made).
     fn pixels(&self, id: LayerId) -> std::io::Result<Option<std::borrow::Cow<'_, [u8]>>>;
+    fn video(&self, _name: &str) -> std::io::Result<Vec<u8>> {
+        Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing project video"))
+    }
 }
 
 impl LayerPixels for std::collections::HashMap<LayerId, Vec<u8>> {
@@ -1061,6 +1068,17 @@ fn write_into<W: std::io::Write>(e: &Export<'_>, zip: &mut ZipWriter<W>) {
         let payload = PackageTimeline { version: 1, layer_uuids, timeline: tl.clone() };
         if let Ok(json) = serde_json::to_vec(&payload) {
             zip.add(TIMELINE_ENTRY, &json);
+        }
+        for name in tl.video_sources() {
+            let entry = format!("DreamsCraft/media/{name}");
+            if let Some(bytes) = tl.packaged_video.get(name) {
+                zip.add_ready(&entry, Ready::of(bytes, false));
+            } else {
+                match e.pixels.video(name) {
+                    Ok(bytes) => zip.add_ready(&entry, Ready::of(&bytes, false)),
+                    Err(error) => zip.fail(error),
+                }
+            }
         }
         for asset in &tl.audio_assets {
             if !asset.pcm.is_empty() {

@@ -23,6 +23,8 @@ pub struct DecodedAudio {
 #[serde(default)]
 pub struct AudioAsset {
     pub id: AudioAssetId,
+    /// Immutable WAV identity, independent of the undoable clip/asset counter.
+    pub storage_key: Option<u64>,
     pub name: String,
     pub sample_rate: u32,
     pub channels: u8,
@@ -39,6 +41,7 @@ impl Default for AudioAsset {
     fn default() -> Self {
         AudioAsset {
             id: AudioAssetId(0),
+            storage_key: None,
             name: String::new(),
             sample_rate: 44_100,
             channels: 2,
@@ -57,8 +60,15 @@ impl AudioAsset {
         let frame_count = pcm.len() / usize::from(safe_ch);
         let bucket_count = (frame_count / 256).clamp(16, 4096);
         let peaks = compute_waveform_peaks(&pcm, safe_ch, bucket_count);
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        (safe_rate, safe_ch).hash(&mut hash);
+        for sample in &pcm {
+            sample.to_bits().hash(&mut hash);
+        }
         AudioAsset {
             id,
+            storage_key: Some(hash.finish()),
             name: if name.trim().is_empty() { "Audio".to_owned() } else { name },
             sample_rate: safe_rate,
             channels: safe_ch,
@@ -66,6 +76,10 @@ impl AudioAsset {
             peaks,
             pcm,
         }
+    }
+
+    pub fn wav_filename(&self) -> String {
+        self.storage_key.map_or_else(|| format!("{}.wav", self.id.0), |key| format!("{}-{key:016x}.wav", self.id.0))
     }
 
     /// Builds an [`AudioAsset`] from interleaved signed 16-bit PCM samples.
@@ -267,7 +281,7 @@ pub fn float_pcm_to_i16(samples: &[f32]) -> Vec<i16> {
         .iter()
         .map(|&s| {
             let c = if s.is_finite() { s.clamp(-1.0, 1.0) } else { 0.0 };
-            (c * 32_767.0).round() as i16
+            (c * 32_768.0).round() as i16
         })
         .collect()
 }

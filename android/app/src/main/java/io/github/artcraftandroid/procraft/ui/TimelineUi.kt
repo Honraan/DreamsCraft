@@ -22,7 +22,14 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.calculateCentroid
+import androidx.compose.foundation.gestures.calculateCentroidSize
+import androidx.compose.foundation.gestures.calculateRotation
+import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.foundation.gestures.draggable
 import androidx.compose.foundation.gestures.rememberDraggableState
 import androidx.compose.foundation.horizontalScroll
@@ -908,27 +915,10 @@ private fun BoxScope.DreamsFlipbookDock(
     val playing = vm.playingFrame != null
     var onionDrawerOpen by remember { mutableStateOf(false) }
 
-    // Determine active cel index & start frame of each cel inside activeClip
-    val celSpans = remember(activeClip) {
-        if (activeClip == null || activeClip.kind != TimelineClipKind.CEL) {
-            emptyList()
-        } else {
-            var cursor = activeClip.startFrame.toInt()
-            activeClip.cels.mapIndexed { idx, cel ->
-                val start = cursor
-                cursor += cel.durationFrames.toInt().coerceAtLeast(1)
-                Triple(idx, start, cel)
-            }
-        }
-    }
+    val cels = activeClip?.cels.orEmpty()
     val playhead = tl.playhead.toInt()
-    val activeCelIndex = remember(celSpans, playhead) {
-        val hit = celSpans.indexOfFirst { (_, start, cel) ->
-            playhead >= start && playhead < start + cel.durationFrames.toInt().coerceAtLeast(1)
-        }
-        if (hit >= 0) hit else (celSpans.lastIndex).coerceAtLeast(0)
-    }
-    val activeCel = celSpans.getOrNull(activeCelIndex)?.third
+    val activeCelIndex = activeClip?.activeCelIndex?.toInt() ?: -1
+    val activeCel = cels.getOrNull(activeCelIndex)
 
     Column(
         modifier = Modifier
@@ -1038,19 +1028,19 @@ private fun BoxScope.DreamsFlipbookDock(
                     Text("Timeline", color = Pc.Accent, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                 }
 
-                // Play / Pause button
                 Box(
-                    modifier = Modifier
-                        .size(28.dp)
-                        .clip(CircleShape)
-                        .background(if (playing) PerformRed else Pc.Accent)
-                        .clickable {
+                    modifier = Modifier.size(48.dp)
+                        .semantics { contentDescription = if (playing) "Pause animation" else "Play animation" }
+                        .clickable(role = Role.Button) {
                             view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
                             vm.togglePlaying()
                         },
                     contentAlignment = Alignment.Center,
                 ) {
-                    DreamsPlayPauseIcon(playing = playing, tint = Color.White, size = 12.dp)
+                    Box(Modifier.size(28.dp).background(if (playing) PerformRed else Pc.Accent, CircleShape),
+                        contentAlignment = Alignment.Center) {
+                        DreamsPlayPauseIcon(playing = playing, tint = Color.White, size = 12.dp)
+                    }
                 }
 
                 // Frame Stepper + Timecode
@@ -1157,7 +1147,7 @@ private fun BoxScope.DreamsFlipbookDock(
                 }
 
                 // Native Cel Sub-layers shortcut
-                if (isCelClip && activeClip != null) {
+                if (activeCel != null && activeClip != null) {
                     val sublayers = remember(activeClip.id, activeCelIndex, vm.layers) {
                         vm.celSublayerIds(activeClip.id, activeCelIndex)
                     }
@@ -1194,7 +1184,7 @@ private fun BoxScope.DreamsFlipbookDock(
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    for ((idx, startFrame, cel) in celSpans) {
+                    for ((idx, cel) in cels.withIndex()) {
                         val selected = idx == activeCelIndex
                         Box(
                             modifier = Modifier
@@ -1207,9 +1197,9 @@ private fun BoxScope.DreamsFlipbookDock(
                                     color = if (selected) Pc.Accent else DreamsEdge,
                                     shape = RoundedCornerShape(10.dp),
                                 )
-                                .clickable {
+                                .clickable(enabled = cel.firstExposure != null) {
                                     view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
-                                    vm.setTimelinePlayhead(startFrame)
+                                    cel.firstExposure?.let { vm.setTimelinePlayhead(it.toInt()) }
                                 },
                         ) {
                             vm.frameThumbnails[cel.layerId]?.let { thumb ->
@@ -1281,7 +1271,7 @@ private fun BoxScope.DreamsFlipbookDock(
                         modifier = Modifier
                             .clip(RoundedCornerShape(9.dp))
                             .background(DreamsPillBg)
-                            .clickable {
+                            .clickable(enabled = activeCel != null) {
                                 vm.setTimelineCelHold(activeClip.id, activeCelIndex, curHold + 1, done = true)
                             }
                             .padding(horizontal = 7.dp, vertical = 8.dp),
@@ -1292,17 +1282,17 @@ private fun BoxScope.DreamsFlipbookDock(
                         modifier = Modifier
                             .clip(RoundedCornerShape(9.dp))
                             .background(DreamsPillBg)
-                            .clickable { vm.duplicateTimelineCel(activeClip.id, activeCelIndex) }
+                            .clickable(enabled = activeCel != null) { vm.duplicateTimelineCel(activeClip.id, activeCelIndex) }
                             .padding(horizontal = 8.dp, vertical = 8.dp),
                     ) {
                         Text("Dup", color = DreamsInk, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
                     }
-                    if (celSpans.size > 1) {
+                    if (cels.size > 1) {
                         Box(
                             modifier = Modifier
                                 .clip(RoundedCornerShape(9.dp))
                                 .background(PerformRed.copy(alpha = 0.16f))
-                                .clickable { vm.deleteTimelineCel(activeClip.id, activeCelIndex) }
+                                .clickable(enabled = activeCel != null) { vm.deleteTimelineCel(activeClip.id, activeCelIndex) }
                                 .padding(horizontal = 8.dp, vertical = 8.dp),
                         ) {
                             Text("Del", color = PerformRed, fontSize = 11.sp, fontWeight = FontWeight.Bold)
@@ -3263,13 +3253,15 @@ private fun BoxScope.StageKeyTransformOverlay(
 
     val view = LocalView.current
     val currentPlayhead by rememberUpdatedState(tl.playhead.toInt())
-    val latestViewMatrix by rememberUpdatedState(vm.viewMatrix)
+    val viewMatrix = vm.viewMatrix
+    val latestViewMatrix by rememberUpdatedState(remember(tl, viewMatrix, isCamera) {
+        if (isCamera || activeClipId == null) viewMatrix else vm.session?.timelineStageEditMatrix(activeClipId) ?: viewMatrix
+    })
     val (cwInt, chInt) = remember(vm.session) { vm.canvasSize() }
     val stageCanvasW = cwInt.coerceAtLeast(1).toFloat()
     val stageCanvasH = chInt.coerceAtLeast(1).toFloat()
     val baseTransform = if (isCamera) tl.cameraTransform else tl.activeEvaluatedTransform
     var isInteracting by remember { mutableStateOf(false) }
-    var didMutateTransform by remember { mutableStateOf(false) }
     var liveTransform by remember(activeClipId, isCamera) {
         mutableStateOf(baseTransform)
     }
@@ -3286,6 +3278,14 @@ private fun BoxScope.StageKeyTransformOverlay(
                 listOf(0f to 0f, 1f to 0f, 1f to 1f, 0f to 1f)
             },
         )
+    }
+    fun warpHandle(u: Float, v: Float): Offset {
+        val t = liveTransform
+        val dx = (u - t.anchorX) * stageCanvasW * t.scaleX
+        val dy = (v - t.anchorY) * stageCanvasH * t.scaleY
+        return applyViewMatrix(latestViewMatrix,
+            t.anchorX * stageCanvasW + t.x + dx * cos(t.rotation) - dy * sin(t.rotation),
+            t.anchorY * stageCanvasH + t.y + dx * sin(t.rotation) + dy * cos(t.rotation))
     }
     // Sync Stage gizmo state from evaluated timeline ONLY when not actively dragging/recording Perform,
     // so live Perform playback never resets liveTransform or warp handles mid-gesture!
@@ -3321,6 +3321,7 @@ private fun BoxScope.StageKeyTransformOverlay(
             .align(Alignment.TopCenter)
             .width(stageWidth)
             .height(stageHeight)
+            .clipToBounds()
             // Procreate-style 2-finger tap = Undo, 3-finger tap = Redo right over Perform & Stage Gizmo
             .multiFingerUndoRedo(
                 onUndo = { vm.undo() },
@@ -3357,105 +3358,106 @@ private fun BoxScope.StageKeyTransformOverlay(
                         )
                     }
                 } else if (!isWarp && !isDistort) {
-                    Modifier
-                        .pointerInput(activeClipId, isCamera, vm.dreamsMode) {
-                            detectTransformGestures { _, pan, zoom, rotationDeg ->
-                                val hasDelta = pan != Offset.Zero || abs(zoom - 1f) > 0.0005f || abs(rotationDeg) > 0.01f
-                                if (!hasDelta) return@detectTransformGestures
-                                isInteracting = true
-                                didMutateTransform = true
-                                if (vm.dreamsMode == DreamsWorkMode.PERFORM && !vm.performRecording) {
-                                    vm.beginPerformRecording(isCamera = isCamera, initialTransform = liveTransform)
-                                }
-                                val rotRad = (rotationDeg * Math.PI / 180.0).toFloat()
-                                val canvasDelta = canvasDeltaFromScreen(latestViewMatrix, pan.x, pan.y)
-                                val updated = if (isCamera) {
-                                    // Camera applies camera_inv to the stage: pinch-out zooms IN (smaller
-                                    // camera scale), drag moves the stage 1:1 under the fingers, rotate turns with fingers.
-                                    val safeZoom = zoom.coerceIn(0.25f, 4f)
-                                    val nextSx = (liveTransform.scaleX / safeZoom).coerceIn(0.08f, 12f)
-                                    val nextSy = (liveTransform.scaleY / safeZoom).coerceIn(0.08f, 12f)
-                                    val nextRot = liveTransform.rotation - rotRad
-                                    val cosR = cos(nextRot)
-                                    val sinR = sin(nextRot)
-                                    val camDx = (canvasDelta.x * cosR - canvasDelta.y * sinR) * nextSx
-                                    val camDy = (canvasDelta.x * sinR + canvasDelta.y * cosR) * nextSy
-                                    TimelineTransformInfo(
-                                        x = liveTransform.x - camDx,
-                                        y = liveTransform.y - camDy,
-                                        scaleX = nextSx,
-                                        scaleY = nextSy,
-                                        rotation = nextRot,
-                                        anchorX = liveTransform.anchorX,
-                                        anchorY = liveTransform.anchorY,
-                                    )
-                                } else {
-                                    TimelineTransformInfo(
-                                        x = liveTransform.x + canvasDelta.x,
-                                        y = liveTransform.y + canvasDelta.y,
-                                        scaleX = (liveTransform.scaleX * zoom).coerceIn(0.05f, 16f),
-                                        scaleY = (liveTransform.scaleY * zoom).coerceIn(0.05f, 16f),
-                                        rotation = liveTransform.rotation + rotRad,
-                                        anchorX = liveTransform.anchorX,
-                                        anchorY = liveTransform.anchorY,
-                                    )
-                                }
-                                liveTransform = updated
-                                when {
-                                    vm.dreamsMode == DreamsWorkMode.PERFORM -> vm.recordPerformTransform(updated, isCamera = isCamera)
-                                    isCamera -> vm.setCameraTransformKeyframe(currentPlayhead, updated, done = false)
-                                    activeClipId != null -> vm.setClipTransformKeyframe(activeClipId, currentPlayhead, updated, done = false)
-                                }
-                            }
-                        }
-                        .pointerInput(activeClipId, isCamera, vm.dreamsMode) {
-                            awaitEachGesture {
-                                awaitFirstDown(requireUnconsumed = false)
-                                do {
+                    Modifier.pointerInput(activeClipId, isCamera, vm.dreamsMode) {
+                        awaitEachGesture {
+                            awaitFirstDown(requireUnconsumed = false)
+                            val perform = vm.dreamsMode == DreamsWorkMode.PERFORM
+                            var started = false
+                            var released = false
+                            var travel = Offset.Zero
+                            var zoomTravel = 1f
+                            var turnTravel = 0f
+                            try {
+                                while (true) {
                                     val event = awaitPointerEvent()
-                                } while (event.changes.any { it.pressed })
-                                val mutated = didMutateTransform
-                                isInteracting = false
-                                didMutateTransform = false
-                                when {
-                                    vm.dreamsMode == DreamsWorkMode.PERFORM && vm.performRecording -> vm.finishPerformRecording()
-                                    mutated && isCamera -> vm.setCameraTransformKeyframe(currentPlayhead, liveTransform, done = true)
-                                    mutated && vm.stageGizmoActive && activeClipId != null -> vm.setClipTransformKeyframe(activeClipId, currentPlayhead, liveTransform, done = true)
+                                    if (event.changes.none { it.pressed }) {
+                                        released = true
+                                        break
+                                    }
+                                    if (event.changes.any { it.isConsumed }) break
+                                    fun bounded(p: Offset) = Offset(p.x.coerceIn(0f, size.width.toFloat()), p.y.coerceIn(0f, size.height.toFloat()))
+                                    val from = event.calculateCentroid(useCurrent = false)
+                                    val to = event.calculateCentroid()
+                                    if (!from.x.isFinite() || !to.x.isFinite()) continue
+                                    val pan = bounded(to) - bounded(from)
+                                    val zoom = event.calculateZoom()
+                                    val rotationDeg = event.calculateRotation()
+                                    if (!started) {
+                                        travel += pan
+                                        zoomTravel *= zoom
+                                        turnTravel += rotationDeg
+                                        val radius = event.calculateCentroidSize(useCurrent = false)
+                                        val slop = viewConfiguration.touchSlop
+                                        if (travel.getDistance() <= slop && abs(1f - zoomTravel) * radius <= slop &&
+                                            abs(turnTravel) * Math.PI / 180.0 * radius <= slop) continue
+                                        if (perform) vm.beginPerformRecording(isCamera = isCamera, initialTransform = liveTransform)
+                                        started = true
+                                        isInteracting = true
+                                    }
+                                    if (perform && !vm.performRecording) break
+                                    val rotRad = (rotationDeg * Math.PI / 180.0).toFloat()
+                                    val canvasDelta = canvasDeltaFromScreen(latestViewMatrix, pan.x, pan.y)
+                                    val updated = if (isCamera) {
+                                        // Camera applies camera_inv to the stage: pinch-out zooms IN (smaller
+                                        // camera scale), drag moves the stage 1:1 under the fingers, rotate turns with fingers.
+                                        val safeZoom = zoom.coerceIn(0.25f, 4f)
+                                        val nextSx = (liveTransform.scaleX / safeZoom).coerceIn(0.08f, 12f)
+                                        val nextSy = (liveTransform.scaleY / safeZoom).coerceIn(0.08f, 12f)
+                                        val nextRot = liveTransform.rotation - rotRad
+                                        val cosR = cos(nextRot)
+                                        val sinR = sin(nextRot)
+                                        val camDx = (canvasDelta.x * cosR - canvasDelta.y * sinR) * nextSx
+                                        val camDy = (canvasDelta.x * sinR + canvasDelta.y * cosR) * nextSy
+                                        TimelineTransformInfo(
+                                            x = liveTransform.x - camDx,
+                                            y = liveTransform.y - camDy,
+                                            scaleX = nextSx,
+                                            scaleY = nextSy,
+                                            rotation = nextRot,
+                                            anchorX = liveTransform.anchorX,
+                                            anchorY = liveTransform.anchorY,
+                                        )
+                                    } else {
+                                        TimelineTransformInfo(
+                                            x = liveTransform.x + canvasDelta.x,
+                                            y = liveTransform.y + canvasDelta.y,
+                                            scaleX = (liveTransform.scaleX * zoom).coerceIn(0.05f, 16f),
+                                            scaleY = (liveTransform.scaleY * zoom).coerceIn(0.05f, 16f),
+                                            rotation = liveTransform.rotation + rotRad,
+                                            anchorX = liveTransform.anchorX,
+                                            anchorY = liveTransform.anchorY,
+                                        )
+                                    }
+                                    liveTransform = updated
+                                    when {
+                                        vm.dreamsMode == DreamsWorkMode.PERFORM -> vm.recordPerformTransform(updated, isCamera = isCamera)
+                                        isCamera -> vm.setCameraTransformKeyframe(currentPlayhead, updated, done = false)
+                                        activeClipId != null -> vm.setClipTransformKeyframe(activeClipId, currentPlayhead, updated, done = false)
+                                    }
+                                    event.changes.filter { it.position != it.previousPosition }.forEach { it.consume() }
                                 }
+                            } finally {
+                                if (started) {
+                                    when {
+                                        perform -> if (vm.performRecording) {
+                                            if (released) vm.finishPerformRecording() else vm.cancelPerformRecording()
+                                        }
+                                        isCamera -> vm.setCameraTransformKeyframe(currentPlayhead, liveTransform, done = true)
+                                        activeClipId != null -> vm.setClipTransformKeyframe(activeClipId, currentPlayhead, liveTransform, done = true)
+                                    }
+                                }
+                                isInteracting = false
                             }
                         }
+                    }
                 } else {
                     // Distort (4 corners) or Warp (4x4 16 nodes) drag interaction (+ Perform Warp!)
                     Modifier.pointerInput(activeClipId, isWarp, isDistort, vm.dreamsMode) {
                         detectDragGestures(
                             onDragStart = { pos ->
-                                val bx = size.width * 0.25f
-                                val by = size.height * 0.22f
-                                val bw = size.width * 0.50f
-                                val bh = size.height * 0.56f
-                                var bestIdx = -1
-                                var bestDist = 72f
-                                if (isDistort) {
-                                    for (i in 0..3) {
-                                        val hx = bx + distortCorners[i].first * bw
-                                        val hy = by + distortCorners[i].second * bh
-                                        val d = hypot(pos.x - hx, pos.y - hy)
-                                        if (d < bestDist) {
-                                            bestDist = d
-                                            bestIdx = i
-                                        }
-                                    }
-                                } else {
-                                    for (i in 0 until 16) {
-                                        val hx = bx + warpPoints[i * 2] * bw
-                                        val hy = by + warpPoints[i * 2 + 1] * bh
-                                        val d = hypot(pos.x - hx, pos.y - hy)
-                                        if (d < bestDist) {
-                                            bestDist = d
-                                            bestIdx = i
-                                        }
-                                    }
-                                }
+                                val points = if (isDistort) distortCorners else warpPoints.chunked(2).map { it[0] to it[1] }
+                                fun distance(i: Int) = (pos - warpHandle(points[i].first, points[i].second)).getDistance()
+                                val bestIdx = points.indices.minByOrNull(::distance)?.takeIf { distance(it) <= 40.dp.toPx() } ?: -1
                                 activeDeformHandle = bestIdx
                                 if (bestIdx >= 0) {
                                     isInteracting = true
@@ -3479,10 +3481,11 @@ private fun BoxScope.StageKeyTransformOverlay(
                                 val idx = activeDeformHandle
                                 if (idx < 0 || activeClipId == null) return@detectDragGestures
                                 change.consume()
-                                val bw = (size.width * 0.50f).coerceAtLeast(1f)
-                                val bh = (size.height * 0.56f).coerceAtLeast(1f)
-                                val du = drag.x / bw
-                                val dv = drag.y / bh
+                                if (vm.dreamsMode == DreamsWorkMode.PERFORM && !vm.performRecording) return@detectDragGestures
+                                val delta = canvasDeltaFromScreen(latestViewMatrix, drag.x, drag.y)
+                                val t = liveTransform
+                                val du = (delta.x * cos(t.rotation) + delta.y * sin(t.rotation)) / (stageCanvasW * t.scaleX)
+                                val dv = (delta.y * cos(t.rotation) - delta.x * sin(t.rotation)) / (stageCanvasH * t.scaleY)
                                 val info = if (isDistort) {
                                     val next = distortCorners.toMutableList()
                                     val cur = next[idx]
@@ -3510,8 +3513,8 @@ private fun BoxScope.StageKeyTransformOverlay(
                             },
                             onDragEnd = {
                                 if (activeDeformHandle >= 0 && activeClipId != null) {
-                                    if (vm.dreamsMode == DreamsWorkMode.PERFORM && vm.performRecording) {
-                                        vm.finishPerformRecording()
+                                    if (vm.dreamsMode == DreamsWorkMode.PERFORM) {
+                                        if (vm.performRecording) vm.finishPerformRecording()
                                     } else {
                                         val info = if (isDistort) {
                                             TimelineDeformInfo(
@@ -3623,14 +3626,10 @@ private fun BoxScope.StageKeyTransformOverlay(
             }
 
             if (isDistort || isWarp) {
-                val bx = size.width * 0.25f
-                val by = size.height * 0.22f
-                val bw = size.width * 0.50f
-                val bh = size.height * 0.56f
                 val mesh = if (isDistort) distortCornersToDeformPoints(distortCorners) else warpPoints
                 fun pt(row: Int, col: Int): Offset {
                     val idx = (row * 4 + col) * 2
-                    return Offset(bx + mesh[idx] * bw, by + mesh[idx + 1] * bh)
+                    return warpHandle(mesh[idx], mesh[idx + 1])
                 }
                 // Draw 4x4 grid lines
                 for (r in 0..3) {
@@ -3646,13 +3645,13 @@ private fun BoxScope.StageKeyTransformOverlay(
                 // Draw draggable handles
                 if (isDistort) {
                     for ((i, c) in distortCorners.withIndex()) {
-                        val o = Offset(bx + c.first * bw, by + c.second * bh)
+                        val o = warpHandle(c.first, c.second)
                         drawCircle(Color.White, radius = if (i == activeDeformHandle) 12f else 9f, center = o)
                         drawCircle(gizmoColor, radius = if (i == activeDeformHandle) 9f else 6.5f, center = o)
                     }
                 } else {
                     for (i in 0 until 16) {
-                        val o = Offset(bx + warpPoints[i * 2] * bw, by + warpPoints[i * 2 + 1] * bh)
+                        val o = warpHandle(warpPoints[i * 2], warpPoints[i * 2 + 1])
                         drawCircle(Color.White, radius = if (i == activeDeformHandle) 10f else 7f, center = o)
                         drawCircle(gizmoColor, radius = if (i == activeDeformHandle) 7.5f else 5f, center = o)
                     }
@@ -4247,6 +4246,11 @@ private fun BoxScope.PlayheadActionPopover(
     tl: TimelineState,
     bottomOffset: Dp,
 ) {
+    val video = activeClipOf(tl)?.takeIf { it.kind == TimelineClipKind.VIDEO }
+    val relink = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        vm.playheadActionMenuOpen = false
+        if (video != null && uri != null) vm.importTimelineVideo(uri, video.id)
+    }
     val popShape = RoundedCornerShape(22.dp)
     Column(
         modifier = Modifier
@@ -4284,6 +4288,9 @@ private fun BoxScope.PlayheadActionPopover(
                 fontSize = 11.sp,
                 modifier = Modifier.clickable { vm.playheadActionMenuOpen = false },
             )
+        }
+        if (video != null) {
+            MenuActionRow("Relink Video Source", color = CameraSky) { relink.launch(arrayOf("video/*")) }
         }
         MenuActionRow("Move & Scale Keyframe", color = KeyframeGold, badge = "KEY", badgeColor = KeyframeGold) {
             vm.playheadActionMenuOpen = false
@@ -4684,15 +4691,21 @@ private fun BoxScope.LiveFilterPopover(
     var filter by remember(activeClipId, isCam, tl.playhead, baseFilter) { mutableStateOf(baseFilter) }
     var opacity by remember(activeClipId, tl.playhead, tl.activeEvaluatedOpacity) { mutableFloatStateOf(tl.activeEvaluatedOpacity) }
 
+    var sliderTakeStarted by remember(activeClipId, isPerform) { mutableStateOf(false) }
+
     fun pushOpacity(next: Float, done: Boolean) {
         opacity = next
         if (activeClipId == null) return
         if (isPerform) {
             if (!done) {
-                if (!vm.performRecording) vm.beginPerformOpacity(next)
+                if (!sliderTakeStarted) {
+                    sliderTakeStarted = true
+                    vm.beginPerformOpacity(next)
+                }
                 vm.recordPerformOpacity(next)
-            } else if (vm.performRecording) {
-                vm.finishPerformRecording()
+            } else {
+                sliderTakeStarted = false
+                if (vm.performRecording) vm.finishPerformRecording()
             }
         } else {
             vm.setClipOpacityKeyframe(activeClipId, tl.playhead.toInt(), next, done)
@@ -4706,10 +4719,14 @@ private fun BoxScope.LiveFilterPopover(
         } else if (activeClipId != null) {
             if (isPerform) {
                 if (!done) {
-                    if (!vm.performRecording) vm.beginPerformFilter(next)
+                    if (!sliderTakeStarted) {
+                        sliderTakeStarted = true
+                        vm.beginPerformFilter(next)
+                    }
                     vm.recordPerformFilter(next)
-                } else if (vm.performRecording) {
-                    vm.finishPerformRecording()
+                } else {
+                    sliderTakeStarted = false
+                    if (vm.performRecording) vm.finishPerformRecording()
                 }
             } else {
                 vm.setClipFilterKeyframe(activeClipId, tl.playhead.toInt(), next, done)

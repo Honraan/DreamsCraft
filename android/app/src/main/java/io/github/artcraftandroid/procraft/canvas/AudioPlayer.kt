@@ -15,6 +15,10 @@ class TimelineAudioPlayer(private val sampleRate: Int = 44_100) {
         Thread(r, "DreamsCraftAudio").apply { isDaemon = true }
     }
 
+    private val trackLock = Any()
+    private var generation = 0L
+    private var closed = false
+
     @Volatile
     private var playbackTrack: AudioTrack? = null
 
@@ -47,29 +51,51 @@ class TimelineAudioPlayer(private val sampleRate: Int = 44_100) {
     }.onFailure { AppLog.w("DreamsCraft", "AudioTrack init failed", it) }.getOrNull()
 
     /** Plays a mixed stereo 16-bit PCM clip for continuous timeline playback. */
-    fun startPlayback(pcmStereo: ShortArray) {
-        if (pcmStereo.isEmpty()) return
-        stopPlayback()
-        executor.execute {
-            val track = buildTrack(pcmStereo.size.coerceAtMost(sampleRate * 2) * 2) ?: return@execute
-            playbackTrack = track
-            runCatching {
-                track.play()
-                var offset = 0
-                while (offset < pcmStereo.size && playbackTrack === track) {
-                    val chunk = minOf(4096, pcmStereo.size - offset)
-                    val written = track.write(pcmStereo, offset, chunk, AudioTrack.WRITE_BLOCKING)
-                    if (written <= 0) break
-                    offset += written
+    fun startPlayback(pcmStereo: ShortArray, first: Int, end: Int, reverse: Boolean) {
+        val from = first.coerceIn(0, pcmStereo.size) and -2
+        val until = end.coerceIn(from, pcmStereo.size) and -2
+        if (from == until) return
+        synchronized(trackLock) {
+            if (closed) return
+            stopPlaybackLocked()
+            val ticket = generation
+            executor.execute {
+                val track = buildTrack((until - from).coerceAtMost(sampleRate / 5) * 2) ?: return@execute
+                synchronized(trackLock) {
+                    if (ticket != generation || closed) {
+                        runCatching { track.release() }
+                        return@execute
+                    }
+                    playbackTrack = track
+                    runCatching { track.play() }
+                }
+                runCatching {
+                    val reversed = if (reverse) ShortArray(4096) else null
+                    var offset = 0
+                    while (offset < until - from && playbackTrack === track) {
+                        val chunk = minOf(4096, until - from - offset)
+                        val written = if (reversed == null) {
+                            track.write(pcmStereo, from + offset, chunk, AudioTrack.WRITE_BLOCKING)
+                        } else {
+                            for (i in 0 until chunk) {
+                                val sample = offset + i
+                                reversed[i] = pcmStereo[until - 2 - (sample and -2) + (sample and 1)]
+                            }
+                            track.write(reversed, 0, chunk, AudioTrack.WRITE_BLOCKING)
+                        }
+                        if (written <= 0) break
+                        offset += written
+                    }
                 }
             }
         }
     }
 
-    fun playPcm(pcmStereo: ShortArray) = startPlayback(pcmStereo)
-
     /** Stops continuous timeline audio playback immediately. */
-    fun stopPlayback() {
+    fun stopPlayback() = synchronized(trackLock) { stopPlaybackLocked() }
+
+    private fun stopPlaybackLocked() {
+        generation++
         val old = playbackTrack
         playbackTrack = null
         if (old != null) {
@@ -92,26 +118,37 @@ class TimelineAudioPlayer(private val sampleRate: Int = 44_100) {
      */
     fun scrubSlice(pcmStereo: ShortArray) {
         if (pcmStereo.isEmpty()) return
-        executor.execute {
-            val track = scrubTrack ?: buildTrack(pcmStereo.size.coerceAtLeast(2048) * 2)?.also {
-                scrubTrack = it
-                runCatching { it.play() }
-            } ?: return@execute
-            runCatching {
-                track.flush()
-                track.write(pcmStereo, 0, pcmStereo.size, AudioTrack.WRITE_NON_BLOCKING)
+        synchronized(trackLock) {
+            if (closed || playbackTrack != null) return
+            val ticket = generation
+            executor.execute {
+                synchronized(trackLock) {
+                    if (closed || ticket != generation || playbackTrack != null) return@execute
+                    val track = scrubTrack ?: buildTrack(pcmStereo.size.coerceAtLeast(2048) * 2)?.also {
+                        scrubTrack = it
+                    } ?: return@execute
+                    runCatching {
+                        track.pause()
+                        track.flush()
+                        track.write(pcmStereo, 0, pcmStereo.size, AudioTrack.WRITE_NON_BLOCKING)
+                        track.play()
+                    }
+                }
             }
         }
     }
 
-    fun release() {
-        stopPlayback()
-        val oldScrub = scrubTrack
-        scrubTrack = null
-        if (oldScrub != null) {
-            runCatching { oldScrub.stop() }
-            runCatching { oldScrub.release() }
+    fun release(): Unit = synchronized(trackLock) {
+        if (!closed) {
+            closed = true
+            stopPlaybackLocked()
+            val old = scrubTrack
+            scrubTrack = null
+            if (old != null) {
+                runCatching { old.stop() }
+                runCatching { old.release() }
+            }
+            executor.shutdownNow()
         }
-        executor.shutdownNow()
     }
 }
