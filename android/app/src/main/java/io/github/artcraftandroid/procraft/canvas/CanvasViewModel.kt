@@ -163,8 +163,18 @@ enum class SelectionPopup { NONE, FEATHER, SAVED }
 /** The active workspace mode shown in the center action bar. */
 enum class DreamsWorkMode { TIMELINE, DRAW_PAINT, PERFORM, TIMELINE_EDIT }
 
-/** Sub-mode of the non-destructive Stage Gizmo (Move & Scale, 4-corner Distort, 4x4 Warp, or Camera Track). */
-enum class StageGizmoSubMode { MOVE_SCALE, DISTORT, WARP, CAMERA }
+/** Sub-mode of the non-destructive Stage Gizmo (Move & Scale, Anchor Point, 4-corner Distort, 4x4 Warp, or Camera Track). */
+enum class StageGizmoSubMode { MOVE_SCALE, ANCHOR, DISTORT, WARP, CAMERA }
+
+/** Clipboard snapshot of a keyframe's evaluated values for Copy & Paste Keyframe across frames or clips. */
+data class CopiedKeyframe(
+    val transform: io.github.artcraftandroid.procraft.core.TimelineTransformInfo? = null,
+    val opacity: Float? = null,
+    val filter: io.github.artcraftandroid.procraft.core.TimelineLiveFilterInfo? = null,
+    val deform: io.github.artcraftandroid.procraft.core.TimelineDeformInfo? = null,
+    val volume: Float? = null,
+    val pan: Float? = null,
+)
 
 /**
  * A brush ([single]) or a brush set called [name] as a file it is shared in: its letters and
@@ -1644,6 +1654,10 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 CanvasSession.newCustom(p.width.toUInt(), p.height.toUInt(), p.dpi, rgb, !p.backgroundHidden, "Untitled Artwork").also {
                     it.setNewProfile(p.profile)
                     it.enableAnimationForNewArtwork()
+                    if (p.animation) {
+                        it.timelineSetFps(p.fps.coerceIn(1, 60).toUInt())
+                        it.timelineSetDuration(p.durationFrames.coerceAtLeast(1).toUInt())
+                    }
                     loadBrushes(it)
                 }
             }
@@ -3630,9 +3644,69 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             pluginPanelKey(io.github.artcraftandroid.procraft.core.KeyCombo(name, command, shift, alt))
             return true
         }
+        // DreamsCraft timeline shortcuts that use Shift modifiers over ProCraft keys (zero collision)
+        val tlNow = timeline
+        if (tlNow != null && !command && !alt && !repeat) {
+            when {
+                name == "enter" || (name == "space" && shift) -> {
+                    togglePlaying()
+                    return true
+                }
+                name == "k" && shift -> {
+                    tlNow.activeClipId?.let { cid ->
+                        setClipTransformKeyframe(cid, tlNow.playhead.toInt(), tlNow.activeEvaluatedTransform, done = true)
+                        showDone("Keyframe added · F${tlNow.playhead + 1u}")
+                    }
+                    return true
+                }
+                name == "m" && shift -> {
+                    addTimelineMarker(tlNow.playhead.toInt())
+                    showDone("Marker added · F${tlNow.playhead + 1u}")
+                    return true
+                }
+            }
+        }
         // the arrows move what is transformed, or the strokes the selection takes
         val nudges = transforming || takenBox.isNotEmpty()
-        val shortcut = plugins.keyShortcut(name, command, shift, alt, nudges) ?: return pluginPress(press, repeat)
+        val shortcut = plugins.keyShortcut(name, command, shift, alt, nudges)
+        if (shortcut == null) {
+            if (pluginPress(press, repeat)) return true
+            if (tlNow != null && !command && !alt) {
+                when (name) {
+                    ",", "left" -> {
+                        if (shift && !repeat) jumpTimelineKeyframe(forward = false) else stepTimelineFrame(-1)
+                        return true
+                    }
+                    ".", "right" -> {
+                        if (shift && !repeat) jumpTimelineKeyframe(forward = true) else stepTimelineFrame(1)
+                        return true
+                    }
+                    "p" -> if (!repeat) {
+                        val nextPerform = dreamsMode != DreamsWorkMode.PERFORM
+                        dreamsMode = if (nextPerform) DreamsWorkMode.PERFORM else DreamsWorkMode.DRAW_PAINT
+                        stageGizmoActive = nextPerform
+                        if (nextPerform) {
+                            stopPlaying()
+                            closePanels()
+                        }
+                        return true
+                    }
+                    "f" -> if (!repeat) {
+                        setFlipbookMode(!tlNow.flipbookOpen)
+                        return true
+                    }
+                    "o" -> if (!repeat) {
+                        updateTimelineOnion { it.copy(enabled = !it.enabled) }
+                        return true
+                    }
+                    "n" -> if (!repeat) {
+                        addTimelineCel()
+                        return true
+                    }
+                }
+            }
+            return false
+        }
         if (repeat && !movesView(shortcut)) return false
         when (shortcut) {
             KeyShortcut.Undo -> undo()
@@ -7573,8 +7647,12 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         readAdjust()
     }
 
-    /** The Adjustments button: ends Layer Opacity, Recolor or the open adjustment, else opens its menu. */
+    /** The Adjustments button: ends Live Filters, Layer Opacity, Recolor or the open adjustment, else opens its menu. */
     fun adjustmentsPressed() {
+        if (liveFilterPopoverOpen) {
+            liveFilterPopoverOpen = false
+            return
+        }
         if (switchModes(ModeButton.Adjustments)) toggle(Panel.ADJUSTMENTS)
     }
 
@@ -8149,7 +8227,11 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---- transform ----
 
-    /** The transform button: opens transform on the current layer, or keeps it and closes. */
+    /**
+     * The transform button: when DreamsCraft timeline is active and no pixel selection is active,
+     * toggles the non-destructive Stage Keyframe Gizmo (with 1-tap switching to pixel Transform);
+     * otherwise toggles ProCraft's native pixel Transform on the current layer or selection.
+     */
     fun toggleTransform() {
         // a picture being placed on a model is kept
         if (modelPictureBox != null) {
@@ -8160,7 +8242,39 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             switchModes(ModeButton.Transform)
             return
         }
+        if (stageGizmoActive) {
+            stageGizmoActive = false
+            if (dreamsMode == DreamsWorkMode.PERFORM) {
+                dreamsMode = DreamsWorkMode.DRAW_PAINT
+            }
+            return
+        }
+        if (timeline != null && !hasSelection) {
+            enterStageKeyframeTransform()
+            return
+        }
+        enterPixelTransform()
+    }
+
+    /** Switches cleanly to the non-destructive DreamsCraft Stage Keyframe Transform gizmo. */
+    fun enterStageKeyframeTransform(subMode: StageGizmoSubMode = StageGizmoSubMode.MOVE_SCALE) {
+        if (timeline == null) return
+        if (transforming) endTransform(commit = true)
+        switchModes(ModeButton.Transform)
+        panel = Panel.NONE
+        pickNext = false
+        stopPlaying()
+        stageGizmoMode = subMode
+        stageGizmoActive = true
+    }
+
+    /** Opens ProCraft's native destructive pixel Transform box on the current cel / layer / selection. */
+    fun enterPixelTransform() {
         val s = session ?: return
+        if (stageGizmoActive) {
+            stageGizmoActive = false
+            if (dreamsMode == DreamsWorkMode.PERFORM) dreamsMode = DreamsWorkMode.DRAW_PAINT
+        }
         if (!currentTakesChanges()) return
         switchModes(ModeButton.Transform)
         panel = Panel.NONE
@@ -8393,15 +8507,21 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     var trackOptionsTrackId by mutableStateOf<ULong?>(null)
     /** Whether the Live Filters (Blur, HSB, Sharpen, Noise) popover is open. */
     var liveFilterPopoverOpen by mutableStateOf(false)
-    /** Sub-mode of the Stage Gizmo: Move & Scale, 4-corner Distort, 4x4 Warp, or Camera Track. */
+    /** Sub-mode of the Stage Gizmo: Move & Scale, Anchor Point, 4-corner Distort, 4x4 Warp, or Camera Track. */
     var stageGizmoMode by mutableStateOf(StageGizmoSubMode.MOVE_SCALE)
     /** Whether scrubbing the playhead plays a brief lip-sync audio slice. */
     var audioScrubbingEnabled by mutableStateOf(true)
+    /** Whether ProCraft's native Layers panel scopes to the active timeline cel's layers by default. */
+    var layersScopeToCel by mutableStateOf(true)
+    /** Clipboard snapshot for Copy / Paste Keyframe across frames or clips. */
+    var copiedKeyframe by mutableStateOf<CopiedKeyframe?>(null)
 
     private val audioPlayer = TimelineAudioPlayer()
     private val videoClipSources = mutableMapOf<ULong, android.net.Uri>()
     private var lastAudioScrubMs = 0L
     private val recordedPerformDeforms = mutableListOf<io.github.artcraftandroid.procraft.core.PerformDeformSampleInfo>()
+    private val recordedPerformOpacities = mutableListOf<io.github.artcraftandroid.procraft.core.PerformScalarSampleInfo>()
+    private val recordedPerformFilters = mutableListOf<io.github.artcraftandroid.procraft.core.PerformFilterSampleInfo>()
 
     private var lastStageBottomInsetPx = -1f
 
@@ -8770,6 +8890,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     private var performStartFrame: UInt = 0u
     private var activePerformTransform: io.github.artcraftandroid.procraft.core.TimelineTransformInfo? = null
     private var activePerformDeform: io.github.artcraftandroid.procraft.core.TimelineDeformInfo? = null
+    private var activePerformOpacity: Float? = null
+    private var activePerformFilter: io.github.artcraftandroid.procraft.core.TimelineLiveFilterInfo? = null
 
     /** Start frame of the most recent Perform take (for 1-tap Replay). */
     var lastPerformStartFrame by androidx.compose.runtime.mutableIntStateOf(0)
@@ -8796,6 +8918,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         stopPlaying()
         recordedPerformSamples.clear()
         recordedPerformDeforms.clear()
+        recordedPerformOpacities.clear()
+        recordedPerformFilters.clear()
         lastPerformCommitRev = null
         performSamplesCount = 0
         performIsCamera = isCamera
@@ -8803,6 +8927,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         performStartFrame = tl.playhead
         lastPerformStartFrame = tl.playhead.toInt()
         activePerformDeform = initialDeform
+        activePerformOpacity = null
+        activePerformFilter = null
         val startTransform = initialTransform ?: if (isCamera) tl.cameraTransform else tl.activeEvaluatedTransform
         activePerformTransform = if (initialDeform == null) startTransform else null
         performTrailPoints = if (initialDeform == null) listOf(startTransform.x to startTransform.y) else emptyList()
@@ -8829,7 +8955,111 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 s.timelinePreviewPerformTransform(cid, tl.playhead, startTransform)
             }
         }
+        launchPerformTicker(s, tl)
+    }
 
+    /** Begins a real-time Live Perform recording take for clip Opacity. */
+    fun beginPerformOpacity(initialOpacity: Float) {
+        val s = session ?: return
+        val tl = timeline ?: return
+        val cid = tl.activeClipId ?: return
+        stopPlaying()
+        recordedPerformSamples.clear()
+        recordedPerformDeforms.clear()
+        recordedPerformOpacities.clear()
+        recordedPerformFilters.clear()
+        lastPerformCommitRev = null
+        performSamplesCount = 0
+        performIsCamera = false
+        performClipId = cid
+        performStartFrame = tl.playhead
+        lastPerformStartFrame = tl.playhead.toInt()
+        activePerformTransform = null
+        activePerformDeform = null
+        activePerformFilter = null
+        val clamped = initialOpacity.coerceIn(0f, 1f)
+        activePerformOpacity = clamped
+        performTrailPoints = emptyList()
+
+        s.timelineBeginPerform()
+        performRecording = true
+        recordedPerformOpacities.add(io.github.artcraftandroid.procraft.core.PerformScalarSampleInfo(tl.playhead, clamped))
+        performSamplesCount = 1
+        s.timelineStepPerformOpacity(cid, tl.playhead, clamped)
+        launchPerformTicker(s, tl)
+    }
+
+    /** Records an Opacity sample at the current Perform playhead frame. */
+    fun recordPerformOpacity(opacity: Float) {
+        val s = session ?: return
+        val tl = timeline ?: return
+        val cid = performClipId ?: tl.activeClipId ?: return
+        val frame = tl.playhead
+        val clamped = opacity.coerceIn(0f, 1f)
+        activePerformOpacity = clamped
+        val sample = io.github.artcraftandroid.procraft.core.PerformScalarSampleInfo(frame, clamped)
+        if (recordedPerformOpacities.lastOrNull()?.frame == frame) {
+            recordedPerformOpacities[recordedPerformOpacities.lastIndex] = sample
+        } else {
+            recordedPerformOpacities.add(sample)
+        }
+        performSamplesCount = recordedPerformOpacities.size
+        s.timelineStepPerformOpacity(cid, frame, clamped)
+        canUndo = true
+    }
+
+    /** Begins a real-time Live Perform recording take for clip Live Filters (Blur, HSB, Sharpen, Noise). */
+    fun beginPerformFilter(initialFilter: io.github.artcraftandroid.procraft.core.TimelineLiveFilterInfo) {
+        val s = session ?: return
+        val tl = timeline ?: return
+        val cid = tl.activeClipId ?: return
+        stopPlaying()
+        recordedPerformSamples.clear()
+        recordedPerformDeforms.clear()
+        recordedPerformOpacities.clear()
+        recordedPerformFilters.clear()
+        lastPerformCommitRev = null
+        performSamplesCount = 0
+        performIsCamera = false
+        performClipId = cid
+        performStartFrame = tl.playhead
+        lastPerformStartFrame = tl.playhead.toInt()
+        activePerformTransform = null
+        activePerformDeform = null
+        activePerformOpacity = null
+        activePerformFilter = initialFilter
+        performTrailPoints = emptyList()
+
+        s.timelineBeginPerform()
+        performRecording = true
+        recordedPerformFilters.add(io.github.artcraftandroid.procraft.core.PerformFilterSampleInfo(tl.playhead, initialFilter))
+        performSamplesCount = 1
+        s.timelineStepPerformFilter(cid, tl.playhead, initialFilter)
+        launchPerformTicker(s, tl)
+    }
+
+    /** Records a Live Filter sample at the current Perform playhead frame. */
+    fun recordPerformFilter(filter: io.github.artcraftandroid.procraft.core.TimelineLiveFilterInfo) {
+        val s = session ?: return
+        val tl = timeline ?: return
+        val cid = performClipId ?: tl.activeClipId ?: return
+        val frame = tl.playhead
+        activePerformFilter = filter
+        val sample = io.github.artcraftandroid.procraft.core.PerformFilterSampleInfo(frame, filter)
+        if (recordedPerformFilters.lastOrNull()?.frame == frame) {
+            recordedPerformFilters[recordedPerformFilters.lastIndex] = sample
+        } else {
+            recordedPerformFilters.add(sample)
+        }
+        performSamplesCount = recordedPerformFilters.size
+        s.timelineStepPerformFilter(cid, frame, filter)
+        canUndo = true
+    }
+
+    private fun launchPerformTicker(
+        s: CanvasSession,
+        tl: io.github.artcraftandroid.procraft.core.TimelineState,
+    ) {
         val fps = tl.fps.toInt().coerceIn(1, 60)
         val duration = tl.durationFrames.toInt().coerceAtLeast(1)
         val endLimit = tl.workArea?.end?.toInt()?.coerceIn(0, duration - 1) ?: (duration - 1)
@@ -8845,9 +9075,31 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                     break
                 }
                 val nextU = next.toUInt()
+                val heldOpacity = activePerformOpacity
+                val heldFilter = activePerformFilter
                 val heldDeform = activePerformDeform
                 val heldTransform = activePerformTransform
                 when {
+                    heldOpacity != null && performClipId != null -> {
+                        val sample = io.github.artcraftandroid.procraft.core.PerformScalarSampleInfo(nextU, heldOpacity)
+                        if (recordedPerformOpacities.lastOrNull()?.frame == nextU) {
+                            recordedPerformOpacities[recordedPerformOpacities.lastIndex] = sample
+                        } else {
+                            recordedPerformOpacities.add(sample)
+                        }
+                        performSamplesCount = recordedPerformOpacities.size
+                        s.timelineStepPerformOpacity(performClipId!!, nextU, heldOpacity)
+                    }
+                    heldFilter != null && performClipId != null -> {
+                        val sample = io.github.artcraftandroid.procraft.core.PerformFilterSampleInfo(nextU, heldFilter)
+                        if (recordedPerformFilters.lastOrNull()?.frame == nextU) {
+                            recordedPerformFilters[recordedPerformFilters.lastIndex] = sample
+                        } else {
+                            recordedPerformFilters.add(sample)
+                        }
+                        performSamplesCount = recordedPerformFilters.size
+                        s.timelineStepPerformFilter(performClipId!!, nextU, heldFilter)
+                    }
                     heldDeform != null && performClipId != null -> {
                         if (recordedPerformDeforms.lastOrNull()?.frame == nextU) {
                             recordedPerformDeforms[recordedPerformDeforms.lastIndex] =
@@ -8942,9 +9194,13 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         performRecording = false
         activePerformTransform = null
         activePerformDeform = null
+        activePerformOpacity = null
+        activePerformFilter = null
         performTrailPoints = emptyList()
         recordedPerformSamples.clear()
         recordedPerformDeforms.clear()
+        recordedPerformOpacities.clear()
+        recordedPerformFilters.clear()
         performSamplesCount = 0
         lastPerformCommitRev = null
         session?.timelineCancelPerform()
@@ -8964,11 +9220,25 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         val startFrame = performStartFrame
         activePerformTransform = null
         activePerformDeform = null
+        activePerformOpacity = null
+        activePerformFilter = null
         performTrailPoints = emptyList()
 
+        val opacitySamples = recordedPerformOpacities.toList()
+        val filterSamples = recordedPerformFilters.toList()
         val deformSamples = recordedPerformDeforms.toList()
         var committed = false
-        if (deformSamples.isNotEmpty() && cid != null) {
+        if (opacitySamples.isNotEmpty() && cid != null) {
+            val written = s.timelineCommitPerformOpacity(cid, opacitySamples, filtering)
+            lastPerformCommitRev = s.info().revision
+            committed = written > 0u
+            message = "Perform Opacity recorded $written keyframes"
+        } else if (filterSamples.isNotEmpty() && cid != null) {
+            val written = s.timelineCommitPerformFilter(cid, filterSamples, filtering)
+            lastPerformCommitRev = s.info().revision
+            committed = written > 0u
+            message = "Perform FX recorded $written keyframes"
+        } else if (deformSamples.isNotEmpty() && cid != null) {
             val written = s.timelineCommitPerformDeform(cid, deformSamples, filtering)
             lastPerformCommitRev = s.info().revision
             committed = written > 0u
@@ -9016,13 +9286,17 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         val clamped = filtering.coerceIn(0f, 1f)
         s.timelineSetMotionFiltering(clamped)
         val cid = performClipId ?: timeline?.activeClipId
-        if (recordedPerformDeforms.isNotEmpty() || recordedPerformSamples.isNotEmpty()) {
+        if (recordedPerformOpacities.isNotEmpty() || recordedPerformFilters.isNotEmpty() || recordedPerformDeforms.isNotEmpty() || recordedPerformSamples.isNotEmpty()) {
             // If the user is adjusting Motion Filtering right after a Perform take, replace that
             // single Perform undo step instead of stacking duplicate Perform steps!
             if (lastPerformCommitRev != null && s.info().revision == lastPerformCommitRev) {
                 s.undo()
             }
-            if (recordedPerformDeforms.isNotEmpty() && cid != null) {
+            if (recordedPerformOpacities.isNotEmpty() && cid != null) {
+                s.timelineCommitPerformOpacity(cid, recordedPerformOpacities.toList(), clamped)
+            } else if (recordedPerformFilters.isNotEmpty() && cid != null) {
+                s.timelineCommitPerformFilter(cid, recordedPerformFilters.toList(), clamped)
+            } else if (recordedPerformDeforms.isNotEmpty() && cid != null) {
                 s.timelineCommitPerformDeform(cid, recordedPerformDeforms.toList(), clamped)
             } else if (performIsCamera) {
                 s.timelineCommitPerformCamera(recordedPerformSamples.toList(), clamped)
@@ -9181,6 +9455,193 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         val s = session ?: return
         s.timelineSetAudioPanKeyframe(clipId, frame.coerceAtLeast(0).toUInt(), pan.coerceIn(-1f, 1f), done)
         if (done) refresh() else canUndo = true
+    }
+
+    fun deleteAudioVolumeKeyframe(clipId: ULong, frame: Int) {
+        layerChange(thumbs = false) { it.timelineDeleteAudioVolumeKeyframe(clipId, frame.coerceAtLeast(0).toUInt()) }
+    }
+
+    fun deleteAudioPanKeyframe(clipId: ULong, frame: Int) {
+        layerChange(thumbs = false) { it.timelineDeleteAudioPanKeyframe(clipId, frame.coerceAtLeast(0).toUInt()) }
+    }
+
+    // ---- DreamsCraft v2.4: Markers, Clip Timing, Keyframe Curves, Anchor, Flipbook Cels & Native Cel Layers ----
+
+    fun addTimelineMarker(frame: Int = timeline?.playhead?.toInt() ?: 0, label: String? = null, color: UInt? = null) {
+        layerChange(thumbs = false) { it.timelineAddMarker(frame.coerceAtLeast(0).toUInt(), label, color) }
+    }
+
+    fun deleteTimelineMarker(markerId: ULong) {
+        layerChange(thumbs = false) { it.timelineDeleteMarker(markerId) }
+    }
+
+    fun moveTimelineMarker(markerId: ULong, newFrame: Int, done: Boolean) {
+        val s = session ?: return
+        s.timelineMoveMarker(markerId, newFrame.coerceAtLeast(0).toUInt(), done)
+        timeline = s.timelineState()
+        if (done) refresh() else refreshFlags()
+    }
+
+    fun setClipLoopMode(clipId: ULong, mode: io.github.artcraftandroid.procraft.core.TimelineClipLoopMode) {
+        layerChange(thumbs = false) { it.timelineSetClipLoopMode(clipId, mode) }
+    }
+
+    fun trimTimelineClipLeft(clipId: ULong, newStartFrame: Int, done: Boolean) {
+        val s = session ?: return
+        s.timelineTrimClipLeft(clipId, newStartFrame.coerceAtLeast(0).toUInt(), done)
+        timeline = s.timelineState()
+        if (done) refresh() else refreshFlags()
+    }
+
+    fun fillTimelineClipDuration(clipId: ULong) {
+        layerChange(thumbs = false) { it.timelineFillClipDuration(clipId) }
+    }
+
+    fun reverseTimelineClip(clipId: ULong) {
+        layerChange(thumbs = false) { it.timelineReverseClip(clipId) }
+    }
+
+    fun ungroupTimelineTrack(groupId: ULong) {
+        if (trackOptionsTrackId == groupId) trackOptionsTrackId = null
+        layerChange(thumbs = false) { it.timelineUngroupTrack(groupId) }
+    }
+
+    fun moveTimelineKeyframe(
+        clipId: ULong,
+        channel: io.github.artcraftandroid.procraft.core.TimelineKeyframeChannel,
+        fromFrame: Int,
+        toFrame: Int,
+        done: Boolean,
+    ) {
+        val s = session ?: return
+        s.timelineMoveKeyframe(clipId, channel, fromFrame.coerceAtLeast(0).toUInt(), toFrame.coerceAtLeast(0).toUInt(), done)
+        timeline = s.timelineState()
+        if (done) refresh() else refreshFlags()
+    }
+
+    fun setClipDeformEasing(clipId: ULong, frame: Int, info: io.github.artcraftandroid.procraft.core.TimelineEasingInfo) {
+        layerChange(thumbs = false) { it.timelineSetDeformEasing(clipId, frame.coerceAtLeast(0).toUInt(), info) }
+    }
+
+    fun setCameraEasing(frame: Int, info: io.github.artcraftandroid.procraft.core.TimelineEasingInfo) {
+        layerChange(thumbs = false) { it.timelineSetCameraEasing(frame.coerceAtLeast(0).toUInt(), info) }
+    }
+
+    /** Applies a full [TimelineEasingInfo] (including custom Cubic Bezier handles) across all keyframes at [frame] on [clipId] (or Camera if `clipId == 0uL`). */
+    fun applyKeyframeEasing(clipId: ULong, frame: Int, info: io.github.artcraftandroid.procraft.core.TimelineEasingInfo) {
+        val f = frame.coerceAtLeast(0).toUInt()
+        if (clipId == 0uL) {
+            layerChange(thumbs = false) { it.timelineSetCameraEasing(f, info) }
+            return
+        }
+        layerChange(thumbs = false) { s ->
+            s.timelineSetTransformEasing(clipId, f, info)
+            s.timelineSetOpacityEasing(clipId, f, info)
+            s.timelineSetFilterEasing(clipId, f, info)
+            s.timelineSetDeformEasing(clipId, f, info)
+        }
+    }
+
+    fun jumpTimelineKeyframe(forward: Boolean) {
+        stopPlaying()
+        val s = session ?: return
+        val tl = timeline ?: return
+        val cid = if (stageGizmoMode == StageGizmoSubMode.CAMERA) 0uL else (tl.activeClipId ?: 0uL)
+        val target = s.timelineJumpKeyframe(cid, if (forward) 1 else -1)
+        if (target != null) {
+            timeline = s.timelineState()
+            currentFrame = s.currentFrame()?.toInt()
+            syncVideoClipsAt(target.toInt())
+        }
+    }
+
+    fun copyKeyframeAt(clipId: ULong, frame: Int) {
+        val tl = timeline ?: return
+        val f = frame.coerceAtLeast(0).toUInt()
+        if (clipId == 0uL) {
+            val t = tl.cameraTransformKeyframes.firstOrNull { it.frame == f }?.transform ?: tl.cameraTransform
+            val flt = tl.cameraFilterKeyframes.firstOrNull { it.frame == f }?.filter
+            copiedKeyframe = CopiedKeyframe(transform = t, filter = flt)
+            showDone("Camera keyframe copied")
+            return
+        }
+        val clip = tl.tracks.asSequence().flatMap { it.clips.asSequence() }.firstOrNull { it.id == clipId } ?: return
+        val t = clip.transformKeyframes.firstOrNull { it.frame == f }?.transform
+        val op = clip.opacityKeyframes.firstOrNull { it.frame == f }?.let { it.opacity ?: it.scalar }
+        val flt = clip.filterKeyframes.firstOrNull { it.frame == f }?.filter
+        val def = clip.deformKeyframes.firstOrNull { it.frame == f }?.deform
+        val vol = clip.volumeKeyframes.firstOrNull { it.frame == f }?.scalar
+        val pan = clip.panKeyframes.firstOrNull { it.frame == f }?.scalar
+        copiedKeyframe = CopiedKeyframe(transform = t, opacity = op, filter = flt, deform = def, volume = vol, pan = pan)
+        showDone("Keyframe copied · F${frame + 1}")
+    }
+
+    fun pasteKeyframeAt(clipId: ULong, frame: Int) {
+        val snap = copiedKeyframe ?: return
+        val f = frame.coerceAtLeast(0).toUInt()
+        if (clipId == 0uL) {
+            layerChange(thumbs = false) { s ->
+                snap.transform?.let { s.timelineSetCameraTransformKeyframe(f, it, true) }
+                snap.filter?.let { s.timelineSetCameraFilterKeyframe(f, it, true) }
+            }
+            showDone("Camera keyframe pasted · F${frame + 1}")
+            return
+        }
+        layerChange(thumbs = false) { s ->
+            snap.transform?.let { s.timelineSetTransformKeyframe(clipId, f, it, true) }
+            snap.opacity?.let { s.timelineSetOpacityKeyframe(clipId, f, it, true) }
+            snap.filter?.let { s.timelineSetFilterKeyframe(clipId, f, it, true) }
+            snap.deform?.let { s.timelineSetDeformKeyframe(clipId, f, it, true) }
+            snap.volume?.let { s.timelineSetAudioVolumeKeyframe(clipId, f, it, true) }
+            snap.pan?.let { s.timelineSetAudioPanKeyframe(clipId, f, it, true) }
+        }
+        showDone("Keyframe pasted · F${frame + 1}")
+    }
+
+    fun setClipAnchorKeepPosition(
+        clipId: ULong,
+        frame: Int,
+        anchorX: Float,
+        anchorY: Float,
+        done: Boolean,
+    ): io.github.artcraftandroid.procraft.core.TimelineTransformInfo? {
+        val s = session ?: return null
+        val updated = s.timelineSetClipAnchorKeepPosition(
+            clipId,
+            frame.coerceAtLeast(0).toUInt(),
+            anchorX.coerceIn(-1f, 2f),
+            anchorY.coerceIn(-1f, 2f),
+            done,
+        )
+        if (done) refresh() else canUndo = true
+        return updated
+    }
+
+    fun activeCelLayerIds(): List<ULong> = session?.timelineActiveCelLayerIds().orEmpty()
+
+    fun addActiveCelSublayer() {
+        layerChange {
+            if (it.timelineAddActiveCelSublayer() == null) message = noRoom()
+        }
+    }
+
+    fun duplicateTimelineCel(clipId: ULong, celIndex: Int) {
+        stopPlaying()
+        layerChange {
+            if (it.timelineDuplicateCel(clipId, celIndex.coerceAtLeast(0).toUInt()) == null) message = noRoom()
+        }
+    }
+
+    fun deleteTimelineCel(clipId: ULong, celIndex: Int) {
+        stopPlaying()
+        layerChange { it.timelineDeleteCel(clipId, celIndex.coerceAtLeast(0).toUInt()) }
+    }
+
+    fun setTimelineCelHold(clipId: ULong, celIndex: Int, hold: Int, done: Boolean) {
+        val s = session ?: return
+        s.timelineSetCelHold(clipId, celIndex.coerceAtLeast(0).toUInt(), hold.coerceIn(0, MAX_HOLD).toUInt(), done)
+        timeline = s.timelineState()
+        if (done) refresh() else refreshFlags()
     }
 
     fun importTimelineVideo(uri: android.net.Uri) {
@@ -9398,7 +9859,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     private fun play() {
         val s = session ?: return
         val tl = timeline
-        if (tl != null && !tl.flipbookOpen) {
+        if (tl != null) {
             val total = s.animationFrameCount().toInt()
             if (total <= 0) return
             movieSettingsOpen = false

@@ -119,6 +119,10 @@ class ArtworkStore(val root: File) {
 
     private fun artwork(a: GalleryArtwork) = Artwork(File(a.dir), a.name, a.width.toInt(), a.height.toInt(), a.modifiedMs, a.turns.toInt())
 
+    /** Reads lightweight DreamsCraft movie metadata (FPS, duration, tracks, audio, camera) for gallery badges. */
+    fun movieMeta(a: Artwork): io.github.artcraftandroid.procraft.core.ArtworkMovieMeta? =
+        io.github.artcraftandroid.procraft.core.artworkMovieMeta(a.dir.path)
+
     private fun entry(e: CoreGalleryEntry): GalleryEntry = when (e) {
         is CoreGalleryEntry.Artwork -> artwork(e.artwork)
         is CoreGalleryEntry.Stack -> Stack(File(e.dir), e.name, e.artworks.map(::artwork))
@@ -127,8 +131,9 @@ class ArtworkStore(val root: File) {
 
 /**
  * A canvas to start from, in the New canvas list: its name, its size in [unit] ("px", "mm", "cm"
- * or "in"), DPI, background (and whether it is hidden) and time-lapse video. What its size comes to
- * and how the list shows it are the shared core's (crates/core presets.rs).
+ * or "in"), DPI, background (and whether it is hidden), time-lapse video, and optional DreamsCraft
+ * animation/movie configuration ([animation], [fps], [durationFrames]). What its size comes to and
+ * how the list shows it are the shared core's (crates/core presets.rs).
  */
 data class CanvasPreset(
     val name: String,
@@ -141,6 +146,10 @@ data class CanvasPreset(
     val timeLapse: TimeLapseSettings = TimeLapseSettings(),
     /** The colour profile, by name. */
     val profile: String = SRGB,
+    /** Whether this preset configures a DreamsCraft movie timeline with [fps] and [durationFrames]. */
+    val animation: Boolean = false,
+    val fps: Int = 24,
+    val durationFrames: Int = 120,
 ) {
     val width: Int get() = io.github.artcraftandroid.procraft.core.presetWidth(core()).toInt()
     val height: Int get() = io.github.artcraftandroid.procraft.core.presetHeight(core()).toInt()
@@ -152,6 +161,7 @@ data class CanvasPreset(
     fun core() = io.github.artcraftandroid.procraft.core.CanvasPreset(
         name, unit, sizeWidth, sizeHeight, dpi, background.toUInt(), backgroundHidden,
         timeLapse.resolution.toUInt(), timeLapse.quality.toUInt(), timeLapse.hevc, profile,
+        animation, fps.coerceIn(1, 60).toUInt(), durationFrames.coerceAtLeast(1).toUInt(),
     )
 
     companion object {
@@ -161,6 +171,7 @@ data class CanvasPreset(
         fun from(p: io.github.artcraftandroid.procraft.core.CanvasPreset) = CanvasPreset(
             p.name, p.unit, p.sizeWidth, p.sizeHeight, p.dpi, p.background.toInt(), p.backgroundHidden,
             TimeLapseSettings(p.timeLapseResolution.toInt(), p.timeLapseQuality.toInt(), p.timeLapseHevc), p.profile,
+            p.animation, p.fps.toInt().coerceIn(1, 60), p.durationFrames.toInt().coerceAtLeast(1),
         )
 
         /** A profile as a list's chip shows it. */

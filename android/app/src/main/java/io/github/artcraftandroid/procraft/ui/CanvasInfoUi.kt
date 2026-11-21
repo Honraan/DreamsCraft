@@ -126,6 +126,7 @@ private val InfoTabs = listOf(
     InfoTab("Layers", PcIcons.InfoLayers, 35.dp),
     InfoTab("Color profile", PcIcons.InfoProfile, 33.dp),
     InfoTab("Video settings", PcIcons.InfoVideo, 55.dp),
+    InfoTab("Animation / Movie", PcIcons.InfoVideo, 45.dp),
     InfoTab("Statistics", PcIcons.InfoStatistics, 35.dp),
 )
 
@@ -284,6 +285,95 @@ fun CanvasInfo(vm: CanvasViewModel) {
                             "Video codec" to codec,
                         ),
                     )
+                }
+                5 -> {
+                    val tl = vm.timeline
+                    if (tl == null) {
+                        Rows(listOf("DreamsCraft Timeline" to "Disabled"))
+                        Spacer(Modifier.height(16.dp))
+                        Box(
+                            Modifier.fillMaxWidth().height(48.dp).clip(RoundedCornerShape(CardCorner))
+                                .background(Pc.Accent).clickable { vm.changeAnimationAssist(true) },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text("Enable DreamsCraft Timeline", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    } else {
+                        val secs = tl.durationFrames.toFloat() / tl.fps.coerceAtLeast(1u).toFloat()
+                        Rows(
+                            listOf(
+                                "Frames per second" to "${tl.fps} fps",
+                                "Duration" to "${tl.durationFrames} frames (%.1fs)".format(secs),
+                                "Tracks" to "${tl.tracks.size}",
+                                "Markers" to "${tl.markers.size}",
+                            ),
+                        )
+                        Spacer(Modifier.height(16.dp))
+                        Text("Frame rate", color = Ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(start = 16.dp, bottom = 8.dp))
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            for (presetFps in listOf(12, 24, 30, 60)) {
+                                val chosen = tl.fps.toInt() == presetFps
+                                Box(
+                                    Modifier.weight(1f).height(42.dp).clip(RoundedCornerShape(14.dp))
+                                        .background(if (chosen) Pc.Accent else CardFill)
+                                        .clickable { vm.setTimelineFps(presetFps) },
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Text("$presetFps fps", color = if (chosen) Color.White else Ink, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                                }
+                            }
+                        }
+                        Spacer(Modifier.height(16.dp))
+                        Text("Duration", color = Ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(start = 16.dp, bottom = 8.dp))
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            for (secPreset in listOf(3, 5, 10, 30)) {
+                                val frames = secPreset * tl.fps.toInt().coerceAtLeast(1)
+                                val chosen = tl.durationFrames.toInt() == frames
+                                Box(
+                                    Modifier.weight(1f).height(42.dp).clip(RoundedCornerShape(14.dp))
+                                        .background(if (chosen) Pc.Accent else CardFill)
+                                        .clickable { vm.setTimelineDuration(frames) },
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Text("${secPreset}s", color = if (chosen) Color.White else Ink, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                                }
+                            }
+                        }
+                        Spacer(Modifier.height(16.dp))
+                        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(CardCorner)).background(CardFill)) {
+                            Row(
+                                Modifier.fillMaxWidth().height(50.dp).clickable { vm.setBackstageShown(!tl.showBackstage) }.padding(horizontal = 16.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text("Show Backstage", color = Ink, fontSize = 17.sp, modifier = Modifier.weight(1f))
+                                Text(if (tl.showBackstage) "On" else "Off", color = if (tl.showBackstage) Pc.Accent else Ink, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                            }
+                            Box(Modifier.fillMaxWidth().height(1.dp).background(ScreenFill))
+                            Row(
+                                Modifier.fillMaxWidth().height(50.dp).clickable { vm.setCameraEnabled(!tl.cameraEnabled) }.padding(horizontal = 16.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text("Camera Viewport", color = Ink, fontSize = 17.sp, modifier = Modifier.weight(1f))
+                                Text(if (tl.cameraEnabled) "On" else "Off", color = if (tl.cameraEnabled) Pc.Accent else Ink, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                            }
+                            Box(Modifier.fillMaxWidth().height(1.dp).background(ScreenFill))
+                            Row(
+                                Modifier.fillMaxWidth().height(50.dp).clickable { vm.setAutoDrawOptions(!tl.autoCreateFrameOnDraw, tl.autoSplitCelOnDraw) }.padding(horizontal = 16.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text("Auto-Create Frame on Draw", color = Ink, fontSize = 17.sp, modifier = Modifier.weight(1f))
+                                Text(if (tl.autoCreateFrameOnDraw) "On" else "Off", color = if (tl.autoCreateFrameOnDraw) Pc.Accent else Ink, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                            }
+                            Box(Modifier.fillMaxWidth().height(1.dp).background(ScreenFill))
+                            Row(
+                                Modifier.fillMaxWidth().height(50.dp).clickable { vm.setAutoDrawOptions(tl.autoCreateFrameOnDraw, !tl.autoSplitCelOnDraw) }.padding(horizontal = 16.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text("Auto-Split Held Cel on Draw", color = Ink, fontSize = 17.sp, modifier = Modifier.weight(1f))
+                                Text(if (tl.autoSplitCelOnDraw) "On" else "Off", color = if (tl.autoSplitCelOnDraw) Pc.Accent else Ink, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                            }
+                        }
+                    }
                 }
                 else -> {
                     val minutes = (info?.trackedMs?.toLong() ?: 0L) / 60_000L

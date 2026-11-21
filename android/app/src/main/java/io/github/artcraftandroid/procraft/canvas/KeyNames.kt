@@ -17,6 +17,7 @@ private val NAMED = listOf(
     KeyEvent.KEYCODE_EQUALS to "=",
     KeyEvent.KEYCODE_PLUS to "plus",
     KeyEvent.KEYCODE_SPACE to "space",
+    KeyEvent.KEYCODE_ENTER to "enter",
     KeyEvent.KEYCODE_DEL to "backspace",
     KeyEvent.KEYCODE_FORWARD_DEL to "delete",
     KeyEvent.KEYCODE_ESCAPE to "escape",

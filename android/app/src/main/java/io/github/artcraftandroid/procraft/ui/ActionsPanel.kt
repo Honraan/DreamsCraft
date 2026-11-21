@@ -251,13 +251,18 @@ fun ActionsPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier)
         )
         1 -> listOf(
             listOf(Act("Crop & Resize") { vm.beginCrop() }),
-            listOf(
-                Toggle("Animation Assist", vm.animation?.pages == false) { vm.changeAnimationAssist(it) },
-                Toggle("Page Assist", vm.animation?.pages == true) { vm.changePageAssist(it) },
-                Toggle("Drawing Guide", vm.guide?.on == true) { vm.setGuideOn(it) },
+            buildList {
+                add(Toggle(if (vm.timeline != null) "Timeline (Dreams)" else "Animation Assist", vm.animation?.pages == false || vm.timeline != null) { vm.changeAnimationAssist(it) })
+                if (vm.timeline != null) {
+                    add(Toggle("Show Backstage", vm.timeline?.showBackstage == true) { vm.setBackstageShown(it) })
+                    add(Toggle("Camera Viewport", vm.timeline?.cameraEnabled == true) { vm.setCameraEnabled(it) })
+                    add(Toggle("Flipbook Mode", vm.timeline?.flipbookOpen == true) { vm.setFlipbookMode(it) })
+                }
+                add(Toggle("Page Assist", vm.animation?.pages == true) { vm.changePageAssist(it) })
+                add(Toggle("Drawing Guide", vm.guide?.on == true) { vm.setGuideOn(it) })
                 // only with the guide on
-                Act("Edit Drawing Guide", onClick = if (vm.guide?.on == true) ({ vm.openGuideEditor() }) else null),
-            ),
+                add(Act("Edit Drawing Guide", onClick = if (vm.guide?.on == true) ({ vm.openGuideEditor() }) else null))
+            },
             listOf(Toggle("Reference", vm.referenceOn) { vm.changeReferenceOn(it) }),
             listOf(Act("Flip horizontal") { vm.flipCanvas(horizontal = true) }, Act("Flip vertical") { vm.flipCanvas(horizontal = false) }),
             listOf(Act("Canvas information") { vm.canvasInfoOpen = true }),

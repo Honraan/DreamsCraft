@@ -11,7 +11,8 @@ pub const P3: &str = "Display P3";
 
 /// A canvas to start from: its size in `unit` ("px", "mm", "cm" or "in"), DPI, background
 /// (0xRRGGBB, and whether it is hidden), time-lapse video (resolution 0..2 for 1080p, 2K and 4K;
-/// quality 0..3; HEVC) and colour profile, by name.
+/// quality 0..3; HEVC), colour profile by name, and optional DreamsCraft animation movie settings
+/// (`animation`, `fps`, `duration_frames`).
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
 pub struct CanvasPreset {
     pub name: String,
@@ -25,6 +26,12 @@ pub struct CanvasPreset {
     pub time_lapse_quality: u32,
     pub time_lapse_hevc: bool,
     pub profile: String,
+    /// When true, opens with the DreamsCraft multi-track Timeline active at `fps` and `duration_frames`.
+    pub animation: bool,
+    /// Frame rate for animation presets (`1..=60`, default 24 fps).
+    pub fps: u32,
+    /// Total duration in frames for animation presets (default 120 = 5 seconds at 24 fps).
+    pub duration_frames: u32,
 }
 
 impl CanvasPreset {
@@ -41,6 +48,18 @@ impl CanvasPreset {
             time_lapse_quality: 1,
             time_lapse_hevc: false,
             profile: profile.to_owned(),
+            animation: false,
+            fps: procraft_engine::timeline::DEFAULT_TIMELINE_FPS,
+            duration_frames: procraft_engine::timeline::DEFAULT_TIMELINE_DURATION,
+        }
+    }
+
+    fn movie(name: &str, size: (f32, f32), fps: u32, duration_frames: u32, profile: &str) -> CanvasPreset {
+        CanvasPreset {
+            animation: true,
+            fps: fps.clamp(1, 60),
+            duration_frames: duration_frames.clamp(1, procraft_engine::timeline::MAX_TIMELINE_DURATION),
+            ..CanvasPreset::new(name, "px", size, 132.0, profile)
         }
     }
 
@@ -62,6 +81,9 @@ impl CanvasPreset {
             "quality": self.time_lapse_quality,
             "hevc": self.time_lapse_hevc,
             "profile": self.profile,
+            "animation": self.animation,
+            "fps": self.fps,
+            "duration_frames": self.duration_frames,
         })
     }
 
@@ -82,6 +104,10 @@ impl CanvasPreset {
             time_lapse_quality: whole("quality", 1),
             time_lapse_hevc: flag("hevc"),
             profile: text("profile", SRGB),
+            animation: flag("animation"),
+            fps: whole("fps", u64::from(procraft_engine::timeline::DEFAULT_TIMELINE_FPS)).clamp(1, 60),
+            duration_frames: whole("duration_frames", u64::from(procraft_engine::timeline::DEFAULT_TIMELINE_DURATION))
+                .clamp(1, procraft_engine::timeline::MAX_TIMELINE_DURATION),
         }
     }
 }
@@ -116,14 +142,20 @@ pub fn preset_height(preset: CanvasPreset) -> u32 {
     preset.pixels(preset.size_height)
 }
 
-/// The size as the list shows it, in its unit.
+/// The size as the list shows it, in its unit (plus frame rate & duration for movie presets).
 #[uniffi::export]
 pub fn preset_label(preset: CanvasPreset) -> String {
     let (w, h) = (preset_number(preset.size_width), preset_number(preset.size_height));
-    if preset.unit == "in" {
+    let dims = if preset.unit == "in" {
         format!("{w}\u{2033} \u{d7} {h}\u{2033}")
     } else {
         format!("{w} \u{d7} {h}{}", preset.unit)
+    };
+    if preset.animation {
+        let secs = preset.duration_frames as f32 / preset.fps.max(1) as f32;
+        format!("{dims} \u{b7} {}fps \u{b7} {}s", preset.fps, preset_number(secs))
+    } else {
+        dims
     }
 }
 
@@ -139,12 +171,16 @@ pub fn profile_chip(profile: String) -> String {
     }
 }
 
-/// The presets a new gallery starts with.
+/// The presets a new gallery starts with (illustration + DreamsCraft Movie presets).
 #[uniffi::export]
 pub fn standard_presets() -> Vec<CanvasPreset> {
     let comic = cmyk_profiles().into_iter().next().unwrap_or_else(|| SRGB.to_owned());
     vec![
         CanvasPreset::new("Square", "px", (2048.0, 2048.0), 132.0, SRGB),
+        CanvasPreset::movie("Widescreen 16:9", (1920.0, 1080.0), 24, 120, P3),
+        CanvasPreset::movie("Square Movie", (1080.0, 1080.0), 24, 120, P3),
+        CanvasPreset::movie("Social 9:16", (1080.0, 1920.0), 24, 120, P3),
+        CanvasPreset::movie("4K Cinema", (3840.0, 2160.0), 24, 120, P3),
         CanvasPreset::new("4K", "px", (4096.0, 1714.0), 132.0, SRGB),
         CanvasPreset::new("A4", "mm", (210.0, 297.0), 300.0, SRGB),
         CanvasPreset::new("4 \u{d7} 6 Photo", "in", (6.0, 4.0), 300.0, SRGB),
@@ -186,6 +222,10 @@ mod tests {
         assert_eq!((preset_width(paper.clone()), preset_height(paper.clone())), (3300, 2550));
         let square = list.first().unwrap();
         assert_eq!(preset_label(square.clone()), "2048 \u{d7} 2048px");
+        let wide = list.iter().find(|p| p.name == "Widescreen 16:9").unwrap();
+        assert!(wide.animation);
+        assert_eq!((wide.fps, wide.duration_frames), (24, 120));
+        assert_eq!(preset_label(wide.clone()), "1920 \u{d7} 1080px \u{b7} 24fps \u{b7} 5s");
         assert_eq!(profile_chip(list.last().unwrap().profile.clone()), "CMYK");
         assert_eq!(profile_chip(P3.into()), "P3");
         assert_eq!(profile_chip(SRGB.into()), "sRGB");
@@ -207,6 +247,9 @@ mod tests {
             time_lapse_quality: 3,
             time_lapse_hevc: true,
             profile: P3.into(),
+            animation: true,
+            fps: 30,
+            duration_frames: 150,
             ..CanvasPreset::new("Mine", "cm", (10.5, 20.0), 150.0, SRGB)
         });
         assert_eq!(presets_from_json(Some(presets_json(list.clone()))), list);
@@ -214,6 +257,9 @@ mod tests {
         assert_eq!(presets_from_json(Some("not json".into())), standard_presets());
         // as the Android app kept them before: missing keys take their defaults
         let old = presets_from_json(Some(r#"[{"name":"Old","unit":"px","width":800,"height":600}]"#.into()));
-        assert_eq!(old.first().map(|p| (p.dpi, p.background, p.profile.as_str())), Some((300.0, 0xFF_FFFF, SRGB)));
+        assert_eq!(
+            old.first().map(|p| (p.dpi, p.background, p.profile.as_str(), p.animation, p.fps, p.duration_frames)),
+            Some((300.0, 0xFF_FFFF, SRGB, false, 24, 120))
+        );
     }
 }

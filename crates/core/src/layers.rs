@@ -1428,6 +1428,12 @@ impl CanvasSession {
         st.finish_stroke();
         let before = if st.pending_doc.is_none() { Some(st.doc.clone()) } else { None };
         if !f(&mut st.doc) {
+            if done && st.pending_doc.is_some() {
+                st.settle();
+                st.revision += 1;
+                self.shared.frame(st);
+                return true;
+            }
             return false;
         }
         if let Some(before) = before {

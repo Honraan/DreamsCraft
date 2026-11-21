@@ -11,13 +11,17 @@ struct DisplayUniform {
     c1: vec4<f32>,
     c2: vec4<f32>,
     // how far the quad reaches past the canvas's sides (its 0..1 across and down), then 1 to
-    // smooth the edge over that; all 0 for a quad drawn exactly
+    // smooth the edge over that, then optional backstage opacity (> 0 renders only outside Stage [0..1]);
+    // all 0 for a quad drawn exactly
     edge: vec4<f32>,
     // a look the colours go through, in linear light (the display only): rows red, green and
     // blue, each three weights and what is added
     l0: vec4<f32>,
     l1: vec4<f32>,
     l2: vec4<f32>,
+    // backstage map from quad uv (0..1) into normalized Stage coordinates (0..1): (a, b, c, d) and (e, f, 0, 0)
+    stage0: vec4<f32>,
+    stage1: vec4<f32>,
 }
 
 @group(0) @binding(0) var composite: texture_2d<f32>;
@@ -69,7 +73,18 @@ fn fs_display(i: Out) -> @location(0) vec4<f32> {
     let inside = min(i.uv, vec2<f32>(1.0) - i.uv) / max(vec2<f32>(across, down), vec2<f32>(1e-9));
     let covered = clamp(inside + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
     let cover = select(1.0, covered.x * covered.y, du.edge.z > 0.5);
-    return shown(textureSample(composite, smp, i.uv)) * cover;
+    let sample = textureSample(composite, smp, i.uv);
+    if (du.edge.w > 0.0) {
+        let suv = vec2<f32>(
+            du.stage0.x * i.uv.x + du.stage0.z * i.uv.y + du.stage1.x,
+            du.stage0.y * i.uv.x + du.stage0.w * i.uv.y + du.stage1.y,
+        );
+        if (suv.x >= 0.0 && suv.x <= 1.0 && suv.y >= 0.0 && suv.y <= 1.0) {
+            return vec4<f32>(0.0);
+        }
+        return shown(sample) * (cover * du.edge.w);
+    }
+    return shown(sample) * cover;
 }
 
 // a canvas colour (premultiplied) as the target shows it

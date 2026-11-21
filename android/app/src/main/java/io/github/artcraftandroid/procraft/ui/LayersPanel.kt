@@ -231,7 +231,13 @@ fun LayersPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier, 
             ) {
                 val kinds = vm.layerKinds()
                 Box(
-                    Modifier.padding(top = 12.dp).size(40.dp, 41.dp).clickable { if (kinds.isEmpty()) vm.addLayer() else addMenu = true },
+                    Modifier.padding(top = 12.dp).size(40.dp, 41.dp).clickable {
+                        if (kinds.isEmpty()) {
+                            if (vm.timeline != null && vm.layersScopeToCel) vm.addActiveCelSublayer() else vm.addLayer()
+                        } else {
+                            addMenu = true
+                        }
+                    },
                     contentAlignment = Alignment.Center,
                 ) {
                     Icon(PcIcons.PlusMedium, contentDescription = "New layer", tint = Pc.PanelGlyph, modifier = Modifier.requiredSize(41.dp))
@@ -243,10 +249,52 @@ fun LayersPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier, 
                 PanelGrabber(vm, io.github.artcraftandroid.procraft.core.FloatingPanel.LAYERS)
             }
         }
+        val tlNow = vm.timeline
+        val scopedCelIds = remember(tlNow, vm.layers, vm.layersScopeToCel) {
+            if (tlNow != null && vm.layersScopeToCel) vm.activeCelLayerIds().toSet() else emptySet()
+        }
+        if (tlNow != null) {
+            val activeTrack = tlNow.tracks.firstOrNull { it.id == tlNow.activeTrackId }
+            Row(
+                Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, bottom = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Row(
+                    Modifier.weight(1f).height(28.dp).clip(CircleShape).background(Pc.Row).padding(2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    for ((label, celOnly) in listOf("Cel Layers" to true, "All Layers" to false)) {
+                        val on = vm.layersScopeToCel == celOnly
+                        Box(
+                            Modifier.weight(1f).fillMaxHeight().clip(CircleShape)
+                                .background(if (on) Pc.Accent else Color.Transparent)
+                                .clickable { vm.layersScopeToCel = celOnly },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                label,
+                                color = if (on) Color.White else Pc.TextDim,
+                                fontSize = 12.sp,
+                                fontWeight = if (on) FontWeight.SemiBold else FontWeight.Medium,
+                                maxLines = 1,
+                            )
+                        }
+                    }
+                }
+                Text(
+                    "${activeTrack?.name ?: "Track"} · F${tlNow.playhead + 1u}",
+                    color = Pc.TextDim,
+                    fontSize = 11.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
         // a layer added at the top of what shows comes in there, the rows under it sliding down,
         // rather than the list holding its place and leaving the new row out of sight above
         val list = rememberLazyListState()
-        val ids = vm.layers.filter { !vm.hidden(it) }.map { it.id }
+        val ids = vm.layers.filter { !vm.hidden(it) && (scopedCelIds.isEmpty() || it.id in scopedCelIds) }.map { it.id }
         val lastIds = remember { arrayOfNulls<List<ULong>>(1) }
         val before = lastIds[0]
         if (before != null && ids != before) {
@@ -311,8 +359,8 @@ fun LayersPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier, 
             verticalArrangement = Arrangement.spacedBy(RowGap),
             contentPadding = PaddingValues(bottom = 12.dp),
         ) {
-            // a closed group's layers are left out
-            val shown = vm.layers.filter { !vm.hidden(it) }
+            // a closed group's layers are left out; when Cel Layers is active, scope to the current cel
+            val shown = vm.layers.filter { !vm.hidden(it) && (scopedCelIds.isEmpty() || it.id in scopedCelIds) }
             // a layer's row: in the list, or on a model under its submesh, indented
             val layerItem: @Composable LazyItemScope.(Int, LayerInfo, Shape, Dp, String?) -> Unit = { index, l, shape, indent, subtitle ->
                 val dragging = l.id in dragUnit
@@ -599,9 +647,10 @@ private fun NewLayerMenu(open: Boolean, kinds: List<io.github.artcraftandroid.pr
         onDismiss,
         overPanel = true,
     ) {
-        MenuItem(PcIcons.MenuNewLayer, "Layer") {
+        val celScoped = vm.timeline != null && vm.layersScopeToCel
+        MenuItem(PcIcons.MenuNewLayer, if (celScoped) "Cel Layer" else "Layer") {
             onDismiss()
-            vm.addLayer()
+            if (celScoped) vm.addActiveCelSublayer() else vm.addLayer()
         }
         for (kind in kinds) {
             // beside its badge, as its layers' thumbnails show it (a plug when it draws none)

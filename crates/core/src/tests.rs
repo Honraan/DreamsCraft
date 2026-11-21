@@ -7188,6 +7188,139 @@ fn dreamscraft_v2_3_krita_plugin_export_and_animation_interop() {
 }
 
 #[test]
+fn dreamscraft_v2_4_parity_and_native_integration() {
+    let Some(s) = session(120, 80) else { return };
+    s.set_timeline_enabled(true);
+    s.timeline_set_fps(24);
+    s.timeline_set_duration(60);
+
+    let tl0 = s.timeline_state().unwrap();
+    let tid = tl0.active_track_id.unwrap();
+    let cid = tl0.active_clip_id.unwrap();
+
+    // 1. Timeline Markers CRUD + Undo
+    let m1 = s.timeline_add_marker(10, Some("Beat 1".into()), None);
+    assert_ne!(m1, 0);
+    assert!(s.timeline_move_marker(m1, 18, true));
+    assert_eq!(s.timeline_state().unwrap().markers[0].frame, 18);
+    assert!(s.timeline_delete_marker(m1));
+    assert!(s.timeline_state().unwrap().markers.is_empty());
+    assert!(s.undo().is_some());
+    assert_eq!(s.timeline_state().unwrap().markers.len(), 1);
+
+    // 2. Active Cel Layers + Sublayer creation (native ProCraft LayersPanel integration)
+    let before_cel_layers = s.timeline_active_cel_layer_ids();
+    assert_eq!(before_cel_layers.len(), 1);
+    let sub = s.timeline_add_active_cel_sublayer().expect("sublayer created inside active cel");
+    let after_cel_layers = s.timeline_active_cel_layer_ids();
+    assert!(after_cel_layers.contains(&sub));
+    assert!(after_cel_layers.len() >= 2);
+
+    // 3. Clip Loop Mode, Left Trim, Fill Duration, Reverse & Track Ungroup
+    let _c2 = s.timeline_add_cel(cid).unwrap();
+    assert!(s.timeline_set_clip_loop_mode(cid, crate::TimelineClipLoopMode::PingPong));
+    assert_eq!(s.timeline_state().unwrap().tracks[0].clips[0].loop_mode, crate::TimelineClipLoopMode::PingPong);
+    assert!(s.timeline_fill_clip_duration(cid));
+    assert_eq!(s.timeline_state().unwrap().tracks[0].clips[0].duration_frames, 60);
+    assert!(s.timeline_trim_clip_left(cid, 5, true));
+    assert_eq!(s.timeline_state().unwrap().tracks[0].clips[0].start_frame, 5);
+    assert_eq!(s.timeline_state().unwrap().tracks[0].clips[0].duration_frames, 55);
+    assert!(s.timeline_reverse_clip(cid));
+
+    let tid2 = s.timeline_add_track(Some("FG".into()), true);
+    let gid = s.timeline_add_group_track(vec![tid, tid2], Some("Chars".into()));
+    assert_ne!(gid, 0);
+    assert!(s.timeline_ungroup_track(gid));
+    assert!(s.timeline_state().unwrap().tracks.iter().all(|t| t.id != gid));
+
+    // 4. Anchor keep-position + Keyframe Move + Keyframe Jump + Deform & Camera Easing
+    let init_t = crate::TimelineTransformInfo {
+        x: 20.0,
+        y: -10.0,
+        scale_x: 1.5,
+        scale_y: 1.5,
+        rotation: 0.5,
+        anchor_x: 0.5,
+        anchor_y: 0.5,
+    };
+    assert!(s.timeline_set_transform_keyframe(cid, 5, init_t.clone(), true));
+    let anchored = s.timeline_set_clip_anchor_keep_position(cid, 5, 0.2, 0.8, true).unwrap();
+    assert!((anchored.anchor_x - 0.2).abs() < 1e-4);
+    assert!((anchored.anchor_y - 0.8).abs() < 1e-4);
+    assert!(s.timeline_move_keyframe(cid, crate::TimelineKeyframeChannel::Transform, 5, 12, true));
+    s.timeline_set_playhead(0);
+    assert_eq!(s.timeline_jump_keyframe(cid, 1), Some(12));
+    assert_eq!(s.timeline_state().unwrap().playhead, 12);
+
+    let bezier = crate::TimelineEasingInfo {
+        kind: crate::TimelineEasingKind::CubicBezier,
+        x1: 0.25,
+        y1: 1.25,
+        x2: 0.75,
+        y2: 1.0,
+    };
+    assert!(s.timeline_set_camera_transform_keyframe(0, init_t, true));
+    assert!(s.timeline_set_camera_easing(0, bezier.clone()));
+    assert!(s.timeline_set_deform_keyframe(
+        cid,
+        12,
+        crate::TimelineDeformInfo { distort_corners: vec![0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0], warp_mesh: vec![] },
+        true,
+    ));
+    assert!(s.timeline_set_deform_easing(cid, 12, bezier));
+
+    // 5. Perform Opacity + Atomic 1-step Undo
+    s.timeline_begin_perform();
+    let op_samples: Vec<crate::PerformScalarSampleInfo> = (0..=8)
+        .map(|f| {
+            let v = 1.0 - f as f32 * 0.1;
+            s.timeline_step_perform_opacity(cid, f, v);
+            crate::PerformScalarSampleInfo { frame: f, value: v }
+        })
+        .collect();
+    let written_op = s.timeline_commit_perform_opacity(cid, op_samples, 0.5);
+    assert!(written_op >= 2);
+    assert!(!s.timeline_state().unwrap().tracks[0].clips[0].opacity_keyframes.is_empty());
+    assert!(s.undo().is_some());
+    assert!(s.timeline_state().unwrap().tracks[0].clips[0].opacity_keyframes.is_empty());
+
+    // 6. Perform Live Filters + Atomic 1-step Undo
+    s.timeline_begin_perform();
+    let flt_samples: Vec<crate::PerformFilterSampleInfo> = (0..=8)
+        .map(|f| {
+            let flt = crate::TimelineLiveFilterInfo {
+                gaussian_blur: f as f32 * 3.0,
+                hue_shift: 0.0,
+                saturation: 1.0,
+                brightness: 0.0,
+                sharpen: 0.0,
+                noise: 0.0,
+            };
+            s.timeline_step_perform_filter(cid, f, flt.clone());
+            crate::PerformFilterSampleInfo { frame: f, filter: flt }
+        })
+        .collect();
+    let written_flt = s.timeline_commit_perform_filter(cid, flt_samples, 0.5);
+    assert!(written_flt >= 2);
+    assert!(!s.timeline_state().unwrap().tracks[0].clips[0].filter_keyframes.is_empty());
+    assert!(s.undo().is_some());
+    assert!(s.timeline_state().unwrap().tracks[0].clips[0].filter_keyframes.is_empty());
+
+    // 7. Gallery Theater Movie Metadata (artwork_movie_meta)
+    let dir = std::env::temp_dir().join(format!("dreamscraft-v24-meta-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    s.timeline_set_camera_enabled(true);
+    s.save(dir.to_string_lossy().into_owned()).unwrap();
+    let meta = crate::artwork_movie_meta(dir.to_string_lossy().into_owned()).expect("movie meta parsed");
+    assert!(meta.is_timeline);
+    assert_eq!(meta.fps, 24);
+    assert_eq!(meta.duration_frames, 60);
+    assert_eq!(meta.track_count, 2);
+    assert!(meta.has_camera);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn animation_assist_shows_onion_skins_and_plays() {
     let Some(s) = session(40, 40) else { return };
     s.set_brush_size(0.6);

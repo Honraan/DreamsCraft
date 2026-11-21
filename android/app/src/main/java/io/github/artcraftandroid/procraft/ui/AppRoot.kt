@@ -72,13 +72,25 @@ private fun Screens(vm: CanvasViewModel, keptClear: Clearance) {
         WrongBuildAlert(vm)
         return
     }
-    // back closes an open panel first, then leaves the artwork for the gallery
+    // back closes an open panel or DreamsCraft overlay first, then leaves the artwork for the gallery
     BackHandler {
         when {
             vm.guideEditing -> vm.closeGuideEditor(keep = false)
             vm.cropRect != null -> vm.endCrop(false)
             vm.lightingStudioOpen -> vm.closeLightingStudio(keep = false)
             vm.studioOpen -> vm.closeStudio(keep = false)
+            vm.performRecording -> vm.cancelPerformRecording()
+            vm.movieSettingsOpen -> vm.movieSettingsOpen = false
+            vm.addTrackMenuOpen -> vm.addTrackMenuOpen = false
+            vm.playheadActionMenuOpen -> vm.playheadActionMenuOpen = false
+            vm.liveFilterPopoverOpen -> vm.liveFilterPopoverOpen = false
+            vm.trackOptionsTrackId != null -> vm.trackOptionsTrackId = null
+            vm.editingKeyframe != null -> vm.editingKeyframe = null
+            vm.stageGizmoActive || vm.dreamsMode == io.github.artcraftandroid.procraft.canvas.DreamsWorkMode.PERFORM -> {
+                vm.stageGizmoActive = false
+                vm.dreamsMode = io.github.artcraftandroid.procraft.canvas.DreamsWorkMode.DRAW_PAINT
+            }
+            vm.timeline?.flipbookOpen == true -> vm.setFlipbookMode(false)
             vm.transformPopup != TransformPopup.NONE -> vm.transformPopup = TransformPopup.NONE
             vm.selectionPopup != SelectionPopup.NONE -> vm.selectionPopup = SelectionPopup.NONE
             vm.selecting -> vm.closeSelecting()

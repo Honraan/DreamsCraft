@@ -55,6 +55,53 @@ pub fn artwork_plays(dir: String) -> bool {
     file.is_some_and(|f| f.document.animation.is_some() || f.document.timeline.is_some() || f.model.is_some())
 }
 
+/// Lightweight animation/movie summary read from an artwork's `artwork.json` for Theater / Gallery badges.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ArtworkMovieMeta {
+    pub fps: u32,
+    pub duration_frames: u32,
+    pub track_count: u32,
+    pub has_audio: bool,
+    pub has_camera: bool,
+    pub is_timeline: bool,
+}
+
+/// Reads lightweight animation/movie metadata from `dir/artwork.json` if the artwork is animated.
+#[uniffi::export]
+pub fn artwork_movie_meta(dir: String) -> Option<ArtworkMovieMeta> {
+    let text = fs::read_to_string(Path::new(&dir).join("artwork.json")).ok()?;
+    let file = serde_json::from_str::<ArtworkFile>(&text).ok()?;
+    if let Some(tl) = file.document.timeline.as_ref() {
+        let has_audio = tl
+            .tracks
+            .iter()
+            .flat_map(|t| &t.clips)
+            .any(|c| matches!(c.kind, procraft_engine::timeline::ClipKind::Audio { .. }));
+        return Some(ArtworkMovieMeta {
+            fps: tl.fps.clamp(1, 60),
+            duration_frames: tl.duration_frames.max(1),
+            track_count: u32::try_from(tl.tracks.len()).unwrap_or(1),
+            has_audio,
+            has_camera: tl.camera_enabled || !tl.camera.is_empty(),
+            is_timeline: true,
+        });
+    }
+    if let Some(anim) = file.document.animation.as_ref()
+        && !anim.pages
+    {
+        let frames = procraft_engine::animation::frames(&file.document);
+        return Some(ArtworkMovieMeta {
+            fps: anim.fps.clamp(1, 60),
+            duration_frames: u32::try_from(frames.len().max(1)).unwrap_or(1),
+            track_count: 1,
+            has_audio: false,
+            has_camera: false,
+            is_timeline: false,
+        });
+    }
+    None
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ArtworkFile {
     format: String,

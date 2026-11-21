@@ -268,35 +268,65 @@ internal fun Modifier.tap(onClick: () -> Unit): Modifier = composed {
 /** The floating toolbar at the foot of the screen while transforming. */
 @Composable
 fun TransformToolbar(vm: CanvasViewModel, screenWidth: Dp, modifier: Modifier = Modifier) {
-    FloatingToolbar(
-        toolbarLayout(screenWidth, 7, TransformButtonRoomy, TransformIcon, TransformPill),
-        onBackground = { vm.transformPopup = TransformPopup.NONE },
-        modifier = modifier,
-        segments = {
-            Segment(PcIcons.Freeform, "Freeform", vm.transformKind == TransformKind.FREEFORM, iconSize = 43.dp) { vm.chooseTransformKind(TransformKind.FREEFORM) }
-            Segment(PcIcons.Uniform, "Uniform", vm.transformKind == TransformKind.UNIFORM, iconSize = 43.dp) { vm.chooseTransformKind(TransformKind.UNIFORM) }
-            Segment(PcIcons.Distort, "Distort", vm.transformKind == TransformKind.DISTORT, iconSize = 43.dp) { vm.chooseTransformKind(TransformKind.DISTORT) }
-            Segment(PcIcons.Warp, "Warp", vm.transformKind == TransformKind.WARP, iconSize = 43.dp) { vm.chooseTransformKind(TransformKind.WARP) }
-        },
-    ) { w ->
-            val popup = vm.transformPopup
-            // a long name smaller only where the buttons are narrow
-            val long = if (w < TransformButtonRoomy) 11.sp else 12.5.sp
-            if (vm.transformKind == TransformKind.WARP) {
-                ToolbarButton(PcIcons.AdvancedMesh, "Advanced Mesh", active = vm.advancedMesh, width = w, iconSize = 28.8.dp, labelSize = long) { vm.toggleAdvancedMesh() }
-            } else {
-                ToolbarButton(PcIcons.Snapping, "Snapping", active = popup == TransformPopup.SNAPPING, width = w, iconSize = 44.dp) {
-                    vm.transformPopup = if (popup == TransformPopup.SNAPPING) TransformPopup.NONE else TransformPopup.SNAPPING
+    Column(modifier = modifier, horizontalAlignment = Alignment.CenterHorizontally) {
+        if (vm.timeline != null) {
+            Row(
+                modifier = Modifier
+                    .padding(bottom = 8.dp)
+                    .clip(CircleShape)
+                    .background(ToolbarFill)
+                    .border(1.dp, SegmentEdge.copy(alpha = 0.55f), CircleShape)
+                    .padding(horizontal = 4.dp, vertical = 3.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .background(Pc.Accent)
+                        .padding(horizontal = 12.dp, vertical = 4.dp),
+                ) {
+                    Text("Edit Pixels", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                }
+                Box(
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .clickable { vm.enterStageKeyframeTransform() }
+                        .padding(horizontal = 12.dp, vertical = 4.dp),
+                ) {
+                    Text("Keyframe Motion", color = SegmentText, fontSize = 12.sp, fontWeight = FontWeight.Medium)
                 }
             }
-            ToolbarButton(PcIcons.FlipHorizontal, "Flip Horizontal", width = w, iconSize = 50.dp) { vm.transformAction(TransformAction.FLIP_HORIZONTAL) }
-            ToolbarButton(PcIcons.FlipVertical, "Flip Vertical", width = w, iconSize = 50.dp) { vm.transformAction(TransformAction.FLIP_VERTICAL) }
-            ToolbarButton(PcIcons.Rotate45, "Rotate 45°", width = w, iconSize = 44.dp) { vm.transformAction(TransformAction.ROTATE45) }
-            ToolbarButton(PcIcons.FitToCanvas, "Fit to Canvas", width = w, iconSize = 35.dp) { vm.transformAction(TransformAction.FIT_TO_CANVAS) }
-            ToolbarButton(PcIcons.Interpolation, interpolationName(vm.interpolation, short = true), active = popup == TransformPopup.INTERPOLATION, width = w, iconSize = 44.dp) {
-                vm.transformPopup = if (popup == TransformPopup.INTERPOLATION) TransformPopup.NONE else TransformPopup.INTERPOLATION
-            }
-            ToolbarButton(PcIcons.TransformReset, "Reset", width = w, iconSize = 44.dp) { vm.transformAction(TransformAction.RESET) }
+        }
+        FloatingToolbar(
+            toolbarLayout(screenWidth, 7, TransformButtonRoomy, TransformIcon, TransformPill),
+            onBackground = { vm.transformPopup = TransformPopup.NONE },
+            segments = {
+                Segment(PcIcons.Freeform, "Freeform", vm.transformKind == TransformKind.FREEFORM, iconSize = 43.dp) { vm.chooseTransformKind(TransformKind.FREEFORM) }
+                Segment(PcIcons.Uniform, "Uniform", vm.transformKind == TransformKind.UNIFORM, iconSize = 43.dp) { vm.chooseTransformKind(TransformKind.UNIFORM) }
+                Segment(PcIcons.Distort, "Distort", vm.transformKind == TransformKind.DISTORT, iconSize = 43.dp) { vm.chooseTransformKind(TransformKind.DISTORT) }
+                Segment(PcIcons.Warp, "Warp", vm.transformKind == TransformKind.WARP, iconSize = 43.dp) { vm.chooseTransformKind(TransformKind.WARP) }
+            },
+        ) { w ->
+                val popup = vm.transformPopup
+                // a long name smaller only where the buttons are narrow
+                val long = if (w < TransformButtonRoomy) 11.sp else 12.5.sp
+                if (vm.transformKind == TransformKind.WARP) {
+                    ToolbarButton(PcIcons.AdvancedMesh, "Advanced Mesh", active = vm.advancedMesh, width = w, iconSize = 28.8.dp, labelSize = long) { vm.toggleAdvancedMesh() }
+                } else {
+                    ToolbarButton(PcIcons.Snapping, "Snapping", active = popup == TransformPopup.SNAPPING, width = w, iconSize = 44.dp) {
+                        vm.transformPopup = if (popup == TransformPopup.SNAPPING) TransformPopup.NONE else TransformPopup.SNAPPING
+                    }
+                }
+                ToolbarButton(PcIcons.FlipHorizontal, "Flip Horizontal", width = w, iconSize = 50.dp) { vm.transformAction(TransformAction.FLIP_HORIZONTAL) }
+                ToolbarButton(PcIcons.FlipVertical, "Flip Vertical", width = w, iconSize = 50.dp) { vm.transformAction(TransformAction.FLIP_VERTICAL) }
+                ToolbarButton(PcIcons.Rotate45, "Rotate 45°", width = w, iconSize = 44.dp) { vm.transformAction(TransformAction.ROTATE45) }
+                ToolbarButton(PcIcons.FitToCanvas, "Fit to Canvas", width = w, iconSize = 35.dp) { vm.transformAction(TransformAction.FIT_TO_CANVAS) }
+                ToolbarButton(PcIcons.Interpolation, interpolationName(vm.interpolation, short = true), active = popup == TransformPopup.INTERPOLATION, width = w, iconSize = 44.dp) {
+                    vm.transformPopup = if (popup == TransformPopup.INTERPOLATION) TransformPopup.NONE else TransformPopup.INTERPOLATION
+                }
+                ToolbarButton(PcIcons.TransformReset, "Reset", width = w, iconSize = 44.dp) { vm.transformAction(TransformAction.RESET) }
+        }
     }
 }
 

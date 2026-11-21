@@ -1766,6 +1766,9 @@ private fun Thumbnail(a: Artwork, version: Int, chosen: Boolean? = null, wash: B
         if (decoded != null) ThumbnailsShown.put(a.thumbnail.path, decoded)
         value = decoded ?: value
     }
+    val movieMeta by produceState<io.github.artcraftandroid.procraft.core.ArtworkMovieMeta?>(null, a.dir.path, a.modified, version) {
+        value = withContext(Dispatchers.IO) { io.github.artcraftandroid.procraft.core.artworkMovieMeta(a.dir.path) }
+    }
     val ratio = a.ratio
     val cell = LocalCell.current
     val tall = ratio <= cell.width / cell.thumb
@@ -1790,6 +1793,34 @@ private fun Thumbnail(a: Artwork, version: Int, chosen: Boolean? = null, wash: B
             .border(1.dp, ThumbRim, RoundedCornerShape(8.dp)),
     ) {
         image?.let { ThumbnailImage(it, a.name, ContentScale.FillBounds) }
+        // Theater movie metadata badge on animated / multi-track DreamsCraft projects
+        movieMeta?.let { meta ->
+            val secs = (meta.durationFrames.toFloat() / meta.fps.coerceAtLeast(1u).toFloat())
+            val durLabel = if (secs >= 10f) "${secs.roundToInt()}s" else "%.1fs".format(secs)
+            val extras = buildString {
+                if (meta.hasCamera) append(" · CAM")
+                if (meta.hasAudio) append(" · ♪")
+            }
+            Row(
+                Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(6.dp)
+                    .clip(CircleShape)
+                    .background(Color(0xB8141414))
+                    .border(0.5.dp, Color(0x33FFFFFF), CircleShape)
+                    .padding(horizontal = 7.dp, vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text(
+                    "▶ ${meta.fps}fps · $durLabel$extras",
+                    color = Color.White,
+                    fontSize = 9.5.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                )
+            }
+        }
         // blue while an artwork dragged over it would be stacked with it
         if (wash) Box(Modifier.matchParentSize().background(DropWash))
         // the marks fade in as Select starts, and out as it ends
@@ -1932,7 +1963,8 @@ private fun SwipeRow(p: CanvasPreset, modifier: Modifier, open: Boolean, onOpen:
                     dragX = (dragX + dx).coerceIn(-reveal, 0f)
                 }
             },
-            onClick,
+            movie = p.animation,
+            onClick = onClick,
         )
     }
 }
@@ -1945,9 +1977,14 @@ private fun SwipeButton(label: String, fill: Color, ink: Color, onClick: () -> U
 }
 
 @Composable
-private fun PresetRow(name: String, label: String, profile: String, modifier: Modifier, onClick: () -> Unit) {
+private fun PresetRow(name: String, label: String, profile: String, modifier: Modifier, movie: Boolean = false, onClick: () -> Unit) {
     Row(modifier.fillMaxWidth().clickable(onClick = onClick).padding(start = 17.dp, end = 16.dp), verticalAlignment = Alignment.CenterVertically) {
         Text(name, color = Pc.LightText, fontSize = 17.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+        if (movie) {
+            Box(Modifier.padding(end = 4.dp).height(18.dp).clip(CircleShape).background(Pc.Accent).padding(horizontal = 7.dp), contentAlignment = Alignment.Center) {
+                Text("Movie", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+            }
+        }
         Chip(CanvasPreset.chip(profile))
         Chip(label, Modifier.padding(start = 4.dp))
     }

@@ -104,6 +104,8 @@ fun AdjustmentsPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modif
     val filters = remember { vm.plugins.filters() }
     val actions = remember { vm.plugins.actionsIn(io.github.artcraftandroid.procraft.core.PluginPlace.ADJUSTMENTS) }
     var showFilters by remember { mutableStateOf(false) }
+    val tl = vm.timeline
+    var liveTab by remember(tl != null) { mutableStateOf(tl != null) }
     androidx.activity.compose.BackHandler(enabled = showFilters) { showFilters = false }
     Popover(330.dp, arrowX, modifier) {
         // a 52 header, the title's capitals from 28.5 below the panel's top; the groups 8 into the
@@ -117,8 +119,45 @@ fun AdjustmentsPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modif
                 Text("Plugins", color = Pc.PanelTitle, fontSize = 22.sp, fontWeight = FontWeight.Bold, maxLines = 1)
             }
         } else {
-            Box(Modifier.fillMaxWidth().height(52.dp).padding(start = 24.dp, top = 22.5.dp)) {
+            Row(
+                Modifier.fillMaxWidth().height(52.dp).padding(start = 24.dp, end = 14.dp, top = 20.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
                 Text("Adjustments", color = Pc.PanelTitle, fontSize = 24.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+                if (tl != null && vm.dreamsMode == io.github.artcraftandroid.procraft.canvas.DreamsWorkMode.PERFORM) {
+                    Box(
+                        Modifier.clip(CircleShape).background(Color(0xFFFF2D55).copy(alpha = 0.2f))
+                            .border(1.dp, Color(0xFFFF2D55), CircleShape).padding(horizontal = 8.dp, vertical = 2.dp),
+                    ) {
+                        Text("● Perform REC", color = Color(0xFFFF2D55), fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+                    }
+                }
+            }
+            if (tl != null) {
+                Row(
+                    Modifier.fillMaxWidth().padding(start = 10.dp, end = 10.dp, top = 6.dp).height(30.dp)
+                        .clip(CircleShape).background(Pc.ActionsGroup).padding(2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    for ((label, isLive) in listOf("Live Keyframe" to true, "Apply to Cel" to false)) {
+                        val on = liveTab == isLive
+                        Box(
+                            Modifier.weight(1f).fillMaxHeight().clip(CircleShape)
+                                .background(if (on) Pc.Accent else Color.Transparent)
+                                .clickable { liveTab = isLive },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                label,
+                                color = if (on) Color.White else MenuText,
+                                fontSize = 12.sp,
+                                fontWeight = if (on) FontWeight.SemiBold else FontWeight.Medium,
+                                maxLines = 1,
+                            )
+                        }
+                    }
+                }
             }
         }
         Column(
@@ -128,6 +167,8 @@ fun AdjustmentsPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modif
             if (showFilters) {
                 if (filters.isNotEmpty()) MenuGroup(filters) { filter -> MenuRow(filter.name) { vm.startPluginFilter(filter) } }
                 if (actions.isNotEmpty()) MenuGroup(actions) { action -> MenuRow(action.label) { vm.runPluginAction(action.key) } }
+            } else if (tl != null && liveTab) {
+                LiveKeyframeAdjustmentsContent(vm, tl)
             } else {
                 for (group in Adjustment.groups) {
                     MenuGroup(group) { a -> MenuRow(a.label) { vm.startAdjustment(a) } }
@@ -137,6 +178,140 @@ fun AdjustmentsPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modif
                 }
             }
         }
+    }
+}
+
+/**
+ * Non-destructive keyframeable Live Adjustments embedded natively inside ProCraft's Adjustments
+ * panel. Automatically records real-time Perform takes when [CanvasViewModel.dreamsMode] is PERFORM.
+ */
+@Composable
+private fun LiveKeyframeAdjustmentsContent(
+    vm: CanvasViewModel,
+    tl: io.github.artcraftandroid.procraft.core.TimelineState,
+) {
+    val activeClipId = tl.activeClipId
+    val isCam = vm.stageGizmoMode == io.github.artcraftandroid.procraft.canvas.StageGizmoSubMode.CAMERA
+    val isPerform = vm.dreamsMode == io.github.artcraftandroid.procraft.canvas.DreamsWorkMode.PERFORM
+    val baseFilter = if (isCam) tl.cameraFilter else tl.activeEvaluatedFilter
+    var filter by remember(activeClipId, isCam, tl.playhead, baseFilter) { mutableStateOf(baseFilter) }
+    var opacity by remember(activeClipId, tl.playhead, tl.activeEvaluatedOpacity) { mutableStateOf(tl.activeEvaluatedOpacity) }
+
+    fun pushOpacity(next: Float, done: Boolean) {
+        opacity = next
+        if (activeClipId == null) return
+        if (isPerform) {
+            if (!done) {
+                if (!vm.performRecording) vm.beginPerformOpacity(next)
+                vm.recordPerformOpacity(next)
+            } else if (vm.performRecording) {
+                vm.finishPerformRecording()
+            }
+        } else {
+            vm.setClipOpacityKeyframe(activeClipId, tl.playhead.toInt(), next, done)
+        }
+    }
+
+    fun pushFilter(next: io.github.artcraftandroid.procraft.core.TimelineLiveFilterInfo, done: Boolean) {
+        filter = next
+        if (isCam) {
+            vm.setCameraFilterKeyframe(tl.playhead.toInt(), next, done)
+        } else if (activeClipId != null) {
+            if (isPerform) {
+                if (!done) {
+                    if (!vm.performRecording) vm.beginPerformFilter(next)
+                    vm.recordPerformFilter(next)
+                } else if (vm.performRecording) {
+                    vm.finishPerformRecording()
+                }
+            } else {
+                vm.setClipFilterKeyframe(activeClipId, tl.playhead.toInt(), next, done)
+            }
+        }
+    }
+
+    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(13.dp)).background(Pc.ActionsGroup).padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            if (isCam) "Camera Live FX · F${tl.playhead + 1u}" else "Live Keyframe FX · F${tl.playhead + 1u}",
+            color = Pc.Accent,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold,
+        )
+        if (!isCam && activeClipId != null) {
+            LiveAdjustSlider("Opacity", "${(opacity * 100f).roundToInt()}%", opacity, 0f..1f,
+                onChange = { pushOpacity(it, done = false) },
+                onDone = { pushOpacity(opacity, done = true) },
+            )
+        }
+        LiveAdjustSlider("Gaussian Blur", "${filter.gaussianBlur.roundToInt()}px", filter.gaussianBlur, 0f..48f,
+            onChange = { pushFilter(filter.copy(gaussianBlur = it), done = false) },
+            onDone = { pushFilter(filter, done = true) },
+        )
+        LiveAdjustSlider("Hue Shift", "${filter.hueShift.roundToInt()}°", filter.hueShift, -180f..180f,
+            onChange = { pushFilter(filter.copy(hueShift = it), done = false) },
+            onDone = { pushFilter(filter, done = true) },
+        )
+        LiveAdjustSlider("Saturation", "${(filter.saturation * 100f).roundToInt()}%", filter.saturation, 0f..2f,
+            onChange = { pushFilter(filter.copy(saturation = it), done = false) },
+            onDone = { pushFilter(filter, done = true) },
+        )
+        LiveAdjustSlider("Brightness", "${(filter.brightness * 100f).roundToInt()}%", filter.brightness, -1f..1f,
+            onChange = { pushFilter(filter.copy(brightness = it), done = false) },
+            onDone = { pushFilter(filter, done = true) },
+        )
+        LiveAdjustSlider("Sharpen", "${(filter.sharpen * 100f).roundToInt()}%", filter.sharpen, 0f..2f,
+            onChange = { pushFilter(filter.copy(sharpen = it), done = false) },
+            onDone = { pushFilter(filter, done = true) },
+        )
+        LiveAdjustSlider("Noise / Grain", "${(filter.noise * 100f).roundToInt()}%", filter.noise, 0f..1f,
+            onChange = { pushFilter(filter.copy(noise = it), done = false) },
+            onDone = { pushFilter(filter, done = true) },
+        )
+    }
+
+    MenuGroup(
+        listOfNotNull(
+            "Reset Live Filters at F${tl.playhead + 1u}" to {
+                pushFilter(io.github.artcraftandroid.procraft.core.TimelineLiveFilterInfo(0f, 0f, 1f, 0f, 0f, 0f), done = true)
+            },
+            tl.activeTrackId?.let { tid ->
+                "Track Layer Effects (Outline / Shadow / Glow)" to {
+                    vm.closePanels()
+                    vm.trackOptionsTrackId = tid
+                }
+            },
+        ),
+    ) { (label, action) ->
+        MenuRow(label, action)
+    }
+}
+
+@Composable
+private fun LiveAdjustSlider(
+    label: String,
+    valueText: String,
+    value: Float,
+    range: ClosedFloatingPointRange<Float>,
+    onChange: (Float) -> Unit,
+    onDone: () -> Unit,
+) {
+    Column(Modifier.fillMaxWidth()) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Text(label, color = MenuText, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+            Text(valueText, color = Pc.TextDim, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+        }
+        androidx.compose.material3.Slider(
+            value = value.coerceIn(range.start, range.endInclusive),
+            onValueChange = onChange,
+            onValueChangeFinished = onDone,
+            valueRange = range,
+            colors = androidx.compose.material3.SliderDefaults.colors(
+                thumbColor = Pc.Accent,
+                activeTrackColor = Pc.Accent,
+                inactiveTrackColor = Pc.ActionsSeparator,
+            ),
+            modifier = Modifier.height(28.dp),
+        )
     }
 }
 

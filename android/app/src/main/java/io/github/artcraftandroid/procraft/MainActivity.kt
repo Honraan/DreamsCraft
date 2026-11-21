@@ -246,6 +246,21 @@ class MainActivity : ComponentActivity() {
             }
             if (items.isNotEmpty()) data.add(android.view.KeyboardShortcutGroup(group.heading, items))
         }
+        val animationShortcuts = listOf(
+            android.view.KeyboardShortcutInfo("Play / Pause Timeline", android.view.KeyEvent.KEYCODE_ENTER, 0),
+            android.view.KeyboardShortcutInfo("Play / Pause Timeline (Shift+Space)", android.view.KeyEvent.KEYCODE_SPACE, android.view.KeyEvent.META_SHIFT_ON),
+            android.view.KeyboardShortcutInfo("Previous Frame", android.view.KeyEvent.KEYCODE_COMMA, 0),
+            android.view.KeyboardShortcutInfo("Next Frame", android.view.KeyEvent.KEYCODE_PERIOD, 0),
+            android.view.KeyboardShortcutInfo("Previous Keyframe", android.view.KeyEvent.KEYCODE_DPAD_LEFT, android.view.KeyEvent.META_SHIFT_ON),
+            android.view.KeyboardShortcutInfo("Next Keyframe", android.view.KeyEvent.KEYCODE_DPAD_RIGHT, android.view.KeyEvent.META_SHIFT_ON),
+            android.view.KeyboardShortcutInfo("Toggle Live Perform", android.view.KeyEvent.KEYCODE_P, 0),
+            android.view.KeyboardShortcutInfo("Toggle Flipbook Mode", android.view.KeyEvent.KEYCODE_F, 0),
+            android.view.KeyboardShortcutInfo("Toggle Onion Skin", android.view.KeyEvent.KEYCODE_O, 0),
+            android.view.KeyboardShortcutInfo("Add New Cel", android.view.KeyEvent.KEYCODE_N, 0),
+            android.view.KeyboardShortcutInfo("Add Transform Keyframe", android.view.KeyEvent.KEYCODE_K, android.view.KeyEvent.META_SHIFT_ON),
+            android.view.KeyboardShortcutInfo("Add Timeline Marker", android.view.KeyEvent.KEYCODE_M, android.view.KeyEvent.META_SHIFT_ON),
+        )
+        data.add(android.view.KeyboardShortcutGroup("DreamsCraft Animation", animationShortcuts))
     }
 
     override fun onDestroy() {

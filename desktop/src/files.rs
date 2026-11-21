@@ -423,12 +423,17 @@ pub fn write_whole(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> 
     std::fs::rename(&next, path)
 }
 
-/// A new artwork as `preset` says: its size, DPI, background and colour profile.
+/// A new artwork as `preset` says: its size, DPI, background, colour profile, and optional DreamsCraft timeline.
 pub fn new_from_preset(preset: &CanvasPreset) -> Arc<CanvasSession> {
     let rgb = [16, 8, 0].map(|shift| ((preset.background >> shift) & 0xFF) as f32 / 255.0).to_vec();
     let (w, h) = (preset_width(preset.clone()), preset_height(preset.clone()));
     let session = CanvasSession::new_custom(w, h, preset.dpi, rgb, !preset.background_hidden, String::new());
     session.set_new_profile(preset.profile.clone());
+    if preset.animation {
+        session.set_timeline_enabled(true);
+        session.timeline_set_fps(preset.fps);
+        session.timeline_set_duration(preset.duration_frames);
+    }
     session
 }
 

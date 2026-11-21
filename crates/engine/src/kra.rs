@@ -1192,6 +1192,7 @@ pub fn read(bytes: &[u8]) -> Result<Imported, ReadError> {
                                 perform_guide_layer: None,
                                 perform_guide_opacity: 0.45,
                                 perform_guide_color: [0.2, 0.78, 1.0],
+                                loop_mode: Default::default(),
                             };
                             clip.sync_duration();
                             clips.push(clip);
@@ -1223,6 +1224,7 @@ pub fn read(bytes: &[u8]) -> Result<Imported, ReadError> {
                         perform_guide_layer: None,
                         perform_guide_opacity: 0.45,
                         perform_guide_color: [0.2, 0.78, 1.0],
+                        loop_mode: Default::default(),
                     };
                     clip.sync_duration();
                     clips.push(clip);
@@ -1243,6 +1245,7 @@ pub fn read(bytes: &[u8]) -> Result<Imported, ReadError> {
                     perform_guide_layer: None,
                     perform_guide_opacity: 0.45,
                     perform_guide_color: [0.2, 0.78, 1.0],
+                    loop_mode: Default::default(),
                 });
             }
 
@@ -1568,6 +1571,7 @@ mod tests {
                 perform_guide_layer: None,
                 perform_guide_opacity: 0.45,
                 perform_guide_color: [0.2, 0.78, 1.0],
+                loop_mode: Default::default(),
             }],
             keyframes: Default::default(),
         });
@@ -1602,6 +1606,7 @@ mod tests {
                 perform_guide_layer: None,
                 perform_guide_opacity: 0.45,
                 perform_guide_color: [0.2, 0.78, 1.0],
+                loop_mode: Default::default(),
             }],
             keyframes: Default::default(),
         });

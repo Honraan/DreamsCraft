@@ -62,6 +62,7 @@ mod studio;
 mod system_clipboard;
 mod text;
 mod timelapse;
+mod timeline;
 mod tool_header;
 mod touch_keyboard;
 mod transform;

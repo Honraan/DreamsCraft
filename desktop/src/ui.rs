@@ -224,8 +224,9 @@ pub struct Interface {
     licences: bool,
     /// The keyboard shortcuts' list, from Help or while Ctrl (⌘) is held.
     shortcut_list: crate::shortcuts::Shortcuts,
-    /// Animation Assist's bar, while it is on, and sharing the layers as an animation.
+    /// Animation Assist's bar, DreamsCraft's multi-track timeline dock, and sharing animations.
     animation: crate::animation::AnimationBar,
+    timeline: crate::timeline::DreamsTimelineDock,
     animated_export: Option<crate::animated_export::AnimatedExport>,
     /// The export screen just ended, kept a frame: its preview's textures were drawn in the frame
     /// it ended in, and a texture let go of is gone before that frame is.
@@ -335,6 +336,7 @@ impl Interface {
             licences: false,
             shortcut_list: Default::default(),
             animation: crate::animation::AnimationBar::default(),
+            timeline: crate::timeline::DreamsTimelineDock::default(),
             animated_export: None,
             ended_export: None,
             exporting_from_gallery: false,
@@ -967,17 +969,23 @@ impl Interface {
         }
         // a full-screen page covers the timeline, as it covers the canvas
         if self.canvas_info.is_none() && !self.gesture_controls.open {
-            self.animation.tweens = self.prefs.plugins.tweens();
-            self.animation.frame_actions = self.prefs.plugins.actions_in(procraft_core::PluginPlace::Frame);
-            let said = self.animation.show(&ctx, &mut self.look, session, &self.colours.palettes, self.colours.harmony);
-            if let Some(key) = self.animation.run_action.take() {
-                self.run_plugin_action(&ctx, session, key);
-            }
-            if let Some(crate::animation::Said::NoRoom) = said {
-                crate::files::no_room(session);
+            if self.timeline.show(&ctx, session) {
+                self.animation.reset(session);
+            } else {
+                self.animation.tweens = self.prefs.plugins.tweens();
+                self.animation.frame_actions = self.prefs.plugins.actions_in(procraft_core::PluginPlace::Frame);
+                let said =
+                    self.animation.show(&ctx, &mut self.look, session, &self.colours.palettes, self.colours.harmony);
+                if let Some(key) = self.animation.run_action.take() {
+                    self.run_plugin_action(&ctx, session, key);
+                }
+                if let Some(crate::animation::Said::NoRoom) = said {
+                    crate::files::no_room(session);
+                }
             }
         } else {
             self.animation.reset(session);
+            self.timeline.reset(session);
         }
         self.drop.show(&ctx, session, to_hex(self.colours.rgb()), bar_bottom);
         self.copy_paste_panel(&ctx, session);
@@ -1570,12 +1578,15 @@ impl Interface {
             QuickAction::DrawingAssist => _ = session.set_guide_assisted(!session.guide().assisted),
             QuickAction::AnimationAssist | QuickAction::PageAssist => {
                 self.animation.reset(session);
+                self.timeline.reset(session);
                 let pages = action == QuickAction::PageAssist;
-                let on = session.animation_settings().is_some_and(|a| a.pages == pages);
+                let on = session.animation_settings().is_some_and(|a| a.pages == pages)
+                    || (!pages && session.timeline_state().is_some());
                 if pages {
                     session.set_page_assist(!on);
                 } else {
                     session.set_animation_assist(!on);
+                    session.set_timeline_enabled(!on);
                 }
             }
             QuickAction::NextFrame | QuickAction::PreviousFrame => {
@@ -2697,12 +2708,15 @@ impl Interface {
                     }
                     Some(act @ (Act::AnimationAssist | Act::PageAssist)) => {
                         self.animation.reset(session);
+                        self.timeline.reset(session);
                         let pages = act == Act::PageAssist;
-                        let on = session.animation_settings().is_some_and(|a| a.pages == pages);
+                        let on = session.animation_settings().is_some_and(|a| a.pages == pages)
+                            || (!pages && session.timeline_state().is_some());
                         if pages {
                             session.set_page_assist(!on);
                         } else {
                             session.set_animation_assist(!on);
+                            session.set_timeline_enabled(!on);
                         }
                     }
                     Some(Act::Licences) => self.licences = true,

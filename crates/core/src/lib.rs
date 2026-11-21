@@ -205,7 +205,8 @@ pub use presets::{
     presets_json, profile_chip, standard_presets,
 };
 pub use project::{
-    ArtworkInfo, PdfBook, export_file_name, read_signature, save_failure_said, write_photo, write_signature,
+    ArtworkInfo, ArtworkMovieMeta, PdfBook, artwork_movie_meta, export_file_name, read_signature, save_failure_said,
+    write_photo, write_signature,
 };
 pub use project::{PackageTimeLapse, artwork_plays, package_time_lapse};
 pub use project::{PagesOutcome, PsdOutcome, import_kra, import_pages, import_psd};
@@ -243,8 +244,9 @@ pub use timelapse::{
     time_lapse_setting_names, time_lapse_side,
 };
 pub use timeline::{
-    PerformDeformSampleInfo, PerformSampleInfo, TimelineCelInfo, TimelineClipInfo, TimelineClipKind,
-    TimelineDeformInfo, TimelineEasingInfo, TimelineEasingKind, TimelineKeyframeInfo, TimelineLiveFilterInfo,
+    PerformDeformSampleInfo, PerformFilterSampleInfo, PerformSampleInfo, PerformScalarSampleInfo, TimelineCelInfo,
+    TimelineClipInfo, TimelineClipKind, TimelineClipLoopMode, TimelineDeformInfo, TimelineEasingInfo,
+    TimelineEasingKind, TimelineKeyframeChannel, TimelineKeyframeInfo, TimelineLiveFilterInfo, TimelineMarkerInfo,
     TimelineOnionInfo, TimelineState, TimelineTrackEffectsInfo, TimelineTrackInfo, TimelineTransformInfo,
     TimelineWorkAreaInfo,
 };

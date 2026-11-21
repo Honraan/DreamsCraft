@@ -1330,10 +1330,13 @@ struct DisplayUniform {
     c1: [f32; 4],
     c2: [f32; 4],
     /// How far the quad reaches past the canvas's sides (its 0..1 across and down), then 1 to
-    /// smooth the edge over that; all 0 for a quad drawn exactly.
+    /// smooth the edge over that, then optional backstage opacity (> 0 draws outside Stage only).
     edge: [f32; 4],
     /// The look's rows (see [`Target::look`]), applied while `m1`'s last number is 1.
     look: [[f32; 4]; 3],
+    /// Backstage quad-uv to Stage-uv affine `(a, b, c, d)` and `(e, f, 0, 0)`.
+    stage0: [f32; 4],
+    stage1: [f32; 4],
 }
 
 impl DisplayUniform {
@@ -1343,6 +1346,14 @@ impl DisplayUniform {
             self.look = look;
             self.m1[3] = 1.0;
         }
+        self
+    }
+
+    /// Renders this quad as a dimmed Backstage layer visible only outside Stage `[0..1, 0..1]`.
+    fn backstage(mut self, stage_m: Affine, alpha: f32) -> DisplayUniform {
+        self.edge[3] = alpha.clamp(0.01, 1.0);
+        self.stage0 = [stage_m.a, stage_m.b, stage_m.c, stage_m.d];
+        self.stage1 = [stage_m.e, stage_m.f, 0.0, 0.0];
         self
     }
 
@@ -1360,6 +1371,8 @@ impl DisplayUniform {
                 c2: row(r2, 0.0),
                 edge: [0.0; 4],
                 look: [[0.0; 4]; 3],
+                stage0: [0.0; 4],
+                stage1: [0.0; 4],
             },
             None => DisplayUniform {
                 m0,
@@ -1369,6 +1382,8 @@ impl DisplayUniform {
                 c2: [0.0; 4],
                 edge: [0.0; 4],
                 look: [[0.0; 4]; 3],
+                stage0: [0.0; 4],
+                stage1: [0.0; 4],
             },
         }
     }
@@ -1381,7 +1396,7 @@ impl DisplayUniform {
         let across = (m.a * size.0 / 2.0).hypot(m.b * size.1 / 2.0);
         let down = (m.c * size.0 / 2.0).hypot(m.d * size.1 / 2.0);
         if across.is_finite() && down.is_finite() && across > 0.0 && down > 0.0 {
-            self.edge = [1.0 / across, 1.0 / down, 1.0, 0.0];
+            self.edge = [1.0 / across, 1.0 / down, 1.0, self.edge[3]];
         }
         self
     }
@@ -5826,7 +5841,15 @@ impl Canvas {
         let cached = if self.cache_composites { doc.layers().len() + 2 } else { 0 };
         let worked: usize = ops.iter().map(|op| self.slots_for(op, &ops)).sum();
         let veiled = usize::from(self.veil.is_some());
-        let slots = (worked + doc.layers().len() + 4 + veiled + frosted + cached) as u64;
+        let backstage = if target.is_some()
+            && self.play_frame.is_none()
+            && doc.timeline.as_ref().is_some_and(|tl| tl.show_backstage)
+        {
+            doc.layers().len().min(64)
+        } else {
+            0
+        };
+        let slots = (worked + doc.layers().len() + 4 + veiled + frosted + cached + backstage) as u64;
         if slots > self.uniform_slots {
             self.uniform_slots = slots.next_power_of_two();
             let (buffer, bind) = uniforms(device, &self.pipelines.uniform_layout, self.uniform_slots);
@@ -6987,7 +7010,68 @@ impl Canvas {
             let shows = |b: &Backdrop<'_>| !(b.regions.is_empty() && b.windows.is_empty()) && b.sigma > 0.0;
             let backdrop = target.backdrop.filter(shows);
             let glass = backdrop.map(|b| (b, self.frost_ready(device, &mut encoder, &mut uniforms, &target, b, None)));
-            self.display(device, &mut encoder, &mut uniforms, &target, predicted, glass, active_layer_xform);
+            let mut backstage_items: Vec<(wgpu::BindGroup, Affine, f32)> = Vec::new();
+            if self.play_frame.is_none()
+                && let Some(tl) = doc.timeline.as_ref()
+                && tl.show_backstage
+            {
+                let max_bs = doc.layers().len().min(64);
+                let scene = tl.evaluate(doc, tl.playhead as f32, false);
+                for eval in &scene.items {
+                    if backstage_items.len() >= max_bs {
+                        break;
+                    }
+                    if eval.is_onion || eval.opacity <= 1e-3 || doc.soloed_out(eval.layer) {
+                        continue;
+                    }
+                    let x = eval.transform;
+                    let is_id = (x.a - 1.0).abs() < 1e-4
+                        && x.b.abs() < 1e-4
+                        && x.c.abs() < 1e-4
+                        && (x.d - 1.0).abs() < 1e-4
+                        && x.e.abs() < 1e-3
+                        && x.f.abs() < 1e-3;
+                    if is_id {
+                        continue;
+                    }
+                    let Some(meta) = doc.layer(eval.layer) else { continue };
+                    let candidates: Vec<(LayerId, f32)> = if meta.kind == LayerKind::Group {
+                        doc.members(Some(eval.layer))
+                            .into_iter()
+                            .filter_map(|mid| {
+                                let m = doc.layer(mid)?;
+                                (m.kind == LayerKind::Paint && m.visible && !doc.soloed_out(mid))
+                                    .then_some((mid, m.opacity))
+                            })
+                            .collect()
+                    } else if meta.kind == LayerKind::Paint {
+                        vec![(eval.layer, meta.opacity)]
+                    } else {
+                        Vec::new()
+                    };
+                    for (lid, l_op) in candidates {
+                        if backstage_items.len() >= max_bs {
+                            break;
+                        }
+                        if let Some(gpu_layer) = self.layers.get(&lid) {
+                            let alpha = (eval.opacity * l_op * 0.42).clamp(0.04, 0.55);
+                            let bind =
+                                sampled_bind(device, &self.pipelines.sampled_layout, &gpu_layer.view, &self.sampler);
+                            backstage_items.push((bind, x, alpha));
+                        }
+                    }
+                }
+            }
+            self.display(
+                device,
+                &mut encoder,
+                &mut uniforms,
+                &target,
+                predicted,
+                glass,
+                active_layer_xform,
+                &backstage_items,
+            );
         }
         self.write_uniforms(gpu, &uniforms);
         let at = std::time::Instant::now();
@@ -9982,6 +10066,7 @@ impl Canvas {
         predicted: std::ops::Range<u32>,
         glass: Option<(Backdrop<'_>, f32)>,
         active_layer_xform: Affine,
+        backstage_items: &[(wgpu::BindGroup, Affine, f32)],
     ) {
         let srgb = target.format.is_srgb();
         let Pipelines {
@@ -10025,6 +10110,14 @@ impl Canvas {
         let (w, h) = (target.size.0.max(1) as f32, target.size.1.max(1) as f32);
         let to_clip = Affine { a: 2.0 / w, b: 0.0, c: 0.0, d: -2.0 / h, e: -1.0, f: 1.0 };
         let unit_to_canvas = Affine { a: self.width as f32, b: 0.0, c: 0.0, d: self.height as f32, e: 0.0, f: 0.0 };
+        let canvas_to_unit = Affine {
+            a: 1.0 / (self.width.max(1) as f32),
+            b: 0.0,
+            c: 0.0,
+            d: 1.0 / (self.height.max(1) as f32),
+            e: 0.0,
+            f: 0.0,
+        };
         let m = unit_to_canvas.then(target.to_screen).then(to_clip);
         let offset = uniforms.push(
             &DisplayUniform::new(
@@ -10036,6 +10129,25 @@ impl Canvas {
             .looking(target.look)
             .smoothed(&m, (w, h)),
         );
+        let backstage_draws: Vec<(&wgpu::BindGroup, u32)> = backstage_items
+            .iter()
+            .map(|(bind, xform, alpha)| {
+                let m_bs = unit_to_canvas.then(*xform).then(target.to_screen).then(to_clip);
+                let stage_m = unit_to_canvas.then(*xform).then(canvas_to_unit);
+                let bs_offset = uniforms.push(
+                    &DisplayUniform::new(
+                        [m_bs.a, m_bs.b, m_bs.c, m_bs.d],
+                        [m_bs.e, m_bs.f, if srgb { 1.0 } else { 0.0 }, 0.0],
+                        target.convert,
+                        target.lut.is_some(),
+                    )
+                    .looking(target.look)
+                    .backstage(stage_m, *alpha)
+                    .smoothed(&m_bs, (w, h)),
+                );
+                (bind, bs_offset)
+            })
+            .collect();
         let surround = target.surround.map(|c| if srgb { srgb_to_linear(c) } else { c });
         let clear =
             wgpu::Color { r: f64::from(surround[0]), g: f64::from(surround[1]), b: f64::from(surround[2]), a: 1.0 };
@@ -10066,11 +10178,17 @@ impl Canvas {
             pass.draw(0..3, 0..1);
         }
         pass.set_pipeline(pipeline);
+        pass.set_bind_group(2, target.lut.map_or(&self.identity_lut, |l| &l.bind), &[]);
+        // True DreamsCraft Backstage: dimmed off-stage clip regions outside the Stage bounds
+        for (bs_bind, bs_offset) in backstage_draws {
+            pass.set_bind_group(0, bs_bind, &[]);
+            pass.set_bind_group(1, &self.uniform_bind, &[bs_offset]);
+            pass.draw(0..6, 0..1);
+        }
         // a little short of the mark still counts, for a zoom that lands just under it
         let crisp = target.to_screen.scale_factor() >= target.crisp_from * 0.999;
         pass.set_bind_group(0, if crisp { &self.crisp_bind } else { &self.display_bind }, &[]);
         pass.set_bind_group(1, &self.uniform_bind, &[offset]);
-        pass.set_bind_group(2, target.lut.map_or(&self.identity_lut, |l| &l.bind), &[]);
         pass.draw(0..6, 0..1);
 
         // part of the canvas drawn again sharper, in its place
@@ -14516,5 +14634,101 @@ mod tests {
         assert!(preview.windows(2).all(|w| w[0] != w[1]));
         // the next frame's input, the next pass
         assert_ne!(wet_pass(15.0, false), wet_pass(18.0, false));
+    }
+
+    #[test]
+    fn dreamscraft_gpu_backstage_renders_offstage_only_when_enabled_and_not_playing() {
+        use procraft_engine::timeline::{Timeline, Transform2D};
+
+        let Ok(gpu) = Gpu::headless() else { return };
+        let mut doc = procraft_engine::document::Document::new(64, 64);
+        let id = doc.current();
+        doc.background_visible = false;
+        let mut tl = Timeline::new_with_layer(id);
+        tl.show_backstage = true;
+        // Shift clip +40px in X so pixels [64..104] spill outside the 64x64 Stage into Backstage.
+        if let Some(clip) = tl.tracks.first_mut().and_then(|t| t.clips.first_mut()) {
+            let mut xf = Transform2D::default();
+            xf.position[0] = 40.0;
+            clip.keyframes.set_transform(0, xf, None);
+        }
+        doc.timeline = Some(tl);
+
+        let mut canvas = Canvas::new(&gpu, &doc).unwrap();
+        let red = [255u8, 0, 0, 255].repeat(64 * 64);
+        canvas.upload_layer(&gpu, id, &red).unwrap();
+
+        let target_tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("backstage test target"),
+            size: wgpu::Extent3d { width: 128, height: 128, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let target_view = target_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let make_target = || Target {
+            view: &target_view,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            size: (128, 128),
+            to_screen: Affine { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 32.0, f: 32.0 },
+            surround: [0.1, 0.1, 0.1],
+            grid: None,
+            selection: None,
+            backdrop: None,
+            convert: None,
+            lut: None,
+            crisp_from: f32::INFINITY,
+            look: None,
+        };
+        let px_at = |buf: &[u8], x: usize, y: usize| -> [u8; 4] {
+            let i = (y * 128 + x) * 4;
+            [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+        };
+
+        // 1. Backstage enabled & editing (not playing): off-stage right pixel shows dimmed red,
+        //    far-left shows surround, inside-Stage shows pure red.
+        canvas.render(&gpu, &mut doc, Some(make_target()));
+        assert_eq!(gpu.errors(), 0);
+        let out_on = read_texture(&gpu, &target_tex, 128, 128).unwrap();
+        let offstage_right = px_at(&out_on, 110, 64);
+        let offstage_left = px_at(&out_on, 10, 64);
+        let inside_stage = px_at(&out_on, 80, 64);
+        assert!(
+            offstage_right[0] > offstage_right[1].saturating_add(40),
+            "expected dimmed red backstage at (110,64), got {offstage_right:?}",
+        );
+        assert!(offstage_right[0] < 220, "expected backstage to be dimmed below full red, got {offstage_right:?}",);
+        assert!(
+            (i32::from(offstage_left[0]) - 26).abs() <= 3 && (i32::from(offstage_left[1]) - 26).abs() <= 3,
+            "expected surround at (10,64), got {offstage_left:?}",
+        );
+        assert!(
+            inside_stage[0] >= 250 && inside_stage[1] <= 5 && inside_stage[2] <= 5,
+            "expected crisp stage pixel at (80,64), got {inside_stage:?}",
+        );
+
+        // 2. Backstage disabled: off-stage right pixel returns to pure surround.
+        doc.timeline.as_mut().unwrap().show_backstage = false;
+        canvas.render(&gpu, &mut doc, Some(make_target()));
+        let out_off = read_texture(&gpu, &target_tex, 128, 128).unwrap();
+        let off_px = px_at(&out_off, 110, 64);
+        assert!(
+            (i32::from(off_px[0]) - 26).abs() <= 3 && (i32::from(off_px[1]) - 26).abs() <= 3,
+            "expected pure surround when show_backstage=false, got {off_px:?}",
+        );
+
+        // 3. Backstage enabled during playback: never leaks outside Stage.
+        doc.timeline.as_mut().unwrap().show_backstage = true;
+        canvas.set_play_frame(Some(0));
+        canvas.render(&gpu, &mut doc, Some(make_target()));
+        let out_play = read_texture(&gpu, &target_tex, 128, 128).unwrap();
+        let play_px = px_at(&out_play, 110, 64);
+        assert!(
+            (i32::from(play_px[0]) - 26).abs() <= 3 && (i32::from(play_px[1]) - 26).abs() <= 3,
+            "expected pure surround during playback, got {play_px:?}",
+        );
     }
 }

@@ -44,11 +44,12 @@ const TYPED_BOTTOM: f32 = PAGE_TOP + ROW * 2.0 + 1.0 + 24.0 + ROW;
 const UNITS: [(&str, &str, &str); 4] =
     [("Millimeters", "mm", "mm"), ("Centimeters", "cm", "cm"), ("Inches", "in", "\u{2033}"), ("Pixels", "px", "px")];
 
-const SECTIONS: [(&str, &Icon, f32); 4] = [
+const SECTIONS: [(&str, &Icon, f32); 5] = [
     ("Dimensions", &icons::INFO_DIMENSIONS, 50.0),
     ("Color profile", &icons::INFO_PROFILE, 35.0),
     ("Time-lapse settings", &icons::INFO_VIDEO, 60.0),
     ("Canvas properties", &icons::TAB_CANVAS, 40.0),
+    ("Animation / Movie", &icons::INFO_VIDEO, 56.0),
 ];
 
 /// The fields the keypad types into.
@@ -87,6 +88,10 @@ pub struct CustomCanvas {
     profile: String,
     /// Which profiles the list shows.
     cmyk: bool,
+    /// DreamsCraft Timeline animation movie settings.
+    animation: bool,
+    fps: u32,
+    duration_frames: u32,
     /// The background's colour being picked.
     picking: Option<CompactColours>,
 }
@@ -110,6 +115,9 @@ impl CustomCanvas {
                     time_lapse_quality: 1,
                     time_lapse_hevc: false,
                     profile: SRGB.into(),
+                    animation: false,
+                    fps: 24,
+                    duration_frames: 120,
                 },
             ),
         };
@@ -130,6 +138,9 @@ impl CustomCanvas {
             hevc: p.time_lapse_hevc,
             cmyk: is_cmyk_profile(p.profile.clone()),
             profile: p.profile,
+            animation: p.animation,
+            fps: p.fps.clamp(1, 60),
+            duration_frames: p.duration_frames.max(1),
             picking: None,
         }
     }
@@ -148,6 +159,9 @@ impl CustomCanvas {
             time_lapse_quality: self.quality,
             time_lapse_hevc: self.hevc,
             profile: self.profile.clone(),
+            animation: self.animation,
+            fps: self.fps.clamp(1, 60),
+            duration_frames: self.duration_frames.max(1),
         }
     }
 
@@ -301,7 +315,8 @@ impl CustomCanvas {
                 0 => self.dimensions(ui, page),
                 1 => self.profiles(ui, look, page),
                 2 => self.time_lapse(ui, look, page),
-                _ => self.properties(ui, page),
+                3 => self.properties(ui, page),
+                _ => self.animation_movie(ui, look, page),
             }
             if self.section == 0 && self.field.is_some() {
                 self.keypad(ui, screen, wide);
@@ -521,6 +536,64 @@ impl CustomCanvas {
         let row = Rect::from_min_size(pos2(page.left(), top), vec2(page.width(), ROW));
         if switch_line(ui, row, "Background hidden", self.hidden, "hidden") {
             self.hidden = !self.hidden;
+        }
+    }
+
+    fn animation_movie(&mut self, ui: &egui::Ui, look: &mut Look, page: Rect) {
+        let mut y = page.top();
+        group(ui, pos2(page.left(), y), page.width(), 1);
+        let row = Rect::from_min_size(pos2(page.left(), y), vec2(page.width(), ROW));
+        if switch_line(ui, row, "DreamsCraft Timeline", self.animation, "anim_on") {
+            self.animation = !self.animation;
+        }
+        y = row.bottom() + 24.0;
+        let fps_choices = [12u32, 24, 30, 60];
+        group(ui, pos2(page.left(), y), page.width(), fps_choices.len());
+        for (i, &fps_opt) in fps_choices.iter().enumerate() {
+            let r = Rect::from_min_size(pos2(page.left(), y + (ROW + 1.0) * i as f32), vec2(page.width(), ROW));
+            let label = format!("{fps_opt} frames per second");
+            text(
+                ui.painter(),
+                pos2(r.left() + 16.0, r.center().y),
+                Align2::LEFT_CENTER,
+                &label,
+                15.0,
+                Weight::Regular,
+                argb(INK),
+            );
+            if self.fps == fps_opt {
+                look.icon(ui, &icons::DONE_TICK, pos2(r.right() - 24.0, r.center().y), 20.0, argb(DONE));
+            }
+            if ui.interact(r, ui.scope_id().with(("anim_fps", i)), Sense::click()).clicked() {
+                let secs = (self.duration_frames as f32 / self.fps.max(1) as f32).round().max(1.0) as u32;
+                self.fps = fps_opt;
+                self.duration_frames = secs.saturating_mul(fps_opt).max(1);
+                self.animation = true;
+            }
+        }
+        y += (ROW + 1.0) * fps_choices.len() as f32 + 24.0;
+        let sec_choices = [3u32, 5, 10, 30];
+        group(ui, pos2(page.left(), y), page.width(), sec_choices.len());
+        for (i, &secs) in sec_choices.iter().enumerate() {
+            let r = Rect::from_min_size(pos2(page.left(), y + (ROW + 1.0) * i as f32), vec2(page.width(), ROW));
+            let frames = secs.saturating_mul(self.fps.max(1));
+            let label = format!("{secs} seconds ({frames} frames)");
+            text(
+                ui.painter(),
+                pos2(r.left() + 16.0, r.center().y),
+                Align2::LEFT_CENTER,
+                &label,
+                15.0,
+                Weight::Regular,
+                argb(INK),
+            );
+            if self.duration_frames == frames {
+                look.icon(ui, &icons::DONE_TICK, pos2(r.right() - 24.0, r.center().y), 20.0, argb(DONE));
+            }
+            if ui.interact(r, ui.scope_id().with(("anim_dur", i)), Sense::click()).clicked() {
+                self.duration_frames = frames;
+                self.animation = true;
+            }
         }
     }
 

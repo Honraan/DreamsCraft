@@ -164,17 +164,19 @@ private val Sections = listOf(
     Section("Color profile", PcIcons.InfoProfile, 35.dp),
     Section("Time-lapse settings", PcIcons.InfoVideo, 60.dp),
     Section("Canvas properties", PcIcons.TabCanvas, 40.dp),
+    Section("Animation / Movie", PcIcons.InfoVideo, 48.dp),
 )
 
 /**
  * Custom Canvas, full screen: a panel of sections (dimensions, colour profile, time-lapse
- * settings, canvas properties) on the left, the chosen one on the right with the canvas's name,
- * Cancel and Done; sizes are typed on a keypad of its own, in pixels, inches, centimetres or
- * millimetres. It edits [CanvasViewModel.editingPreset], or makes a new canvas ([onMade] then).
+ * settings, canvas properties, animation/movie) on the left, the chosen one on the right with the
+ * canvas's name, Cancel and Done; sizes are typed on a keypad of its own, in pixels, inches,
+ * centimetres or millimetres. It edits [CanvasViewModel.editingPreset], or makes a new canvas
+ * ([onMade] then).
  */
 @Composable
 fun CustomCanvasScreen(vm: CanvasViewModel, onMade: () -> Unit) {
-    val start = remember { vm.editingPreset?.let { vm.canvasPresets.getOrNull(it) } ?: CanvasPreset("Untitled Canvas", "px", 1080f, 1080f, 300f) }
+    val start = remember { vm.editingPreset?.let { vm.canvasPresets.getOrNull(it) } ?: CanvasPreset("Untitled Canvas", "px", 1080f, 1080f, 300f, animation = true, fps = 24, durationFrames = 120) }
     var section by remember { mutableIntStateOf(0) }
     var name by remember { mutableStateOf(start.name) }
     // the size in the unit chosen
@@ -191,6 +193,9 @@ fun CustomCanvasScreen(vm: CanvasViewModel, onMade: () -> Unit) {
     var quality by remember { mutableIntStateOf(start.timeLapse.quality) }
     var hevc by remember { mutableStateOf(start.timeLapse.hevc) }
     var profile by remember { mutableStateOf(start.profile) }
+    var animationOn by remember { mutableStateOf(start.animation) }
+    var fps by remember { mutableIntStateOf(start.fps.coerceIn(1, 60)) }
+    var durationFrames by remember { mutableIntStateOf(start.durationFrames.coerceAtLeast(1)) }
     // which profiles the list shows
     var cmyk by remember { mutableStateOf(io.github.artcraftandroid.procraft.core.isCmykProfile(start.profile)) }
     val scope = androidx.compose.runtime.rememberCoroutineScope()
@@ -207,7 +212,11 @@ fun CustomCanvasScreen(vm: CanvasViewModel, onMade: () -> Unit) {
     // the background's colour picker is open
     var picking by remember { mutableStateOf(false) }
 
-    fun preset() = CanvasPreset(name.trim().ifEmpty { "Untitled Canvas" }, unit.key, width, height, dpi, background, hidden, TimeLapseSettings(resolution, quality, hevc), profile)
+    fun preset() = CanvasPreset(
+        name.trim().ifEmpty { "Untitled Canvas" }, unit.key, width, height, dpi,
+        background, hidden, TimeLapseSettings(resolution, quality, hevc), profile,
+        animationOn, fps, durationFrames,
+    )
     // what typing has made of the field so far goes into it
     fun commit() {
         val v = typed.toFloatOrNull()
@@ -338,7 +347,7 @@ fun CustomCanvasScreen(vm: CanvasViewModel, onMade: () -> Unit) {
                     Spacer(Modifier.height(24.dp))
                     Group { SwitchLine("HEVC", hevc) { hevc = it } }
                 }
-                else -> {
+                3 -> {
                     Group {
                         Row(
                             Modifier.fillMaxWidth().height(47.dp).clickable { picking = true }.padding(horizontal = 16.dp),
@@ -350,6 +359,32 @@ fun CustomCanvasScreen(vm: CanvasViewModel, onMade: () -> Unit) {
                     }
                     Spacer(Modifier.height(24.dp))
                     Group { SwitchLine("Background hidden", hidden) { hidden = it } }
+                }
+                else -> {
+                    Group { SwitchLine("DreamsCraft Movie Timeline", animationOn) { animationOn = it } }
+                    Spacer(Modifier.height(24.dp))
+                    Group {
+                        for ((i, f) in listOf(12, 24, 30, 60).withIndex()) {
+                            if (i > 0) Line()
+                            ChoiceRow("$f FPS", fps == f, tick = true) {
+                                val oldSecs = (durationFrames.toFloat() / fps.coerceAtLeast(1)).roundToInt().coerceAtLeast(1)
+                                fps = f
+                                durationFrames = oldSecs * f
+                                animationOn = true
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(24.dp))
+                    Group {
+                        for ((i, secs) in listOf(3, 5, 10, 30).withIndex()) {
+                            if (i > 0) Line()
+                            val targetFrames = secs * fps
+                            ChoiceRow("${secs}s", durationFrames == targetFrames, "$targetFrames frames", tick = true) {
+                                durationFrames = targetFrames
+                                animationOn = true
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -21,6 +21,25 @@ pub struct TrackId(pub u64);
 #[serde(transparent)]
 pub struct ClipId(pub u64);
 
+/// Unique identifier of a [`TimelineMarker`] on the timeline ruler.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct MarkerId(pub u64);
+
+fn default_marker_color() -> u32 {
+    0xFFF59E0B
+}
+
+/// A named beat / section marker placed on the timeline ruler.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TimelineMarker {
+    pub id: MarkerId,
+    pub frame: u32,
+    pub label: String,
+    #[serde(default = "default_marker_color")]
+    pub color: u32,
+}
+
 /// Default frame rate for new DreamsCraft projects (cinematic 24 fps).
 pub const DEFAULT_TIMELINE_FPS: u32 = 24;
 
@@ -179,6 +198,32 @@ impl Transform2D {
             .then(scale_affine)
             .then(Affine::rotate(clean.rotation))
             .then(Affine::translate(pivot + Vec2::new(clean.position[0], clean.position[1])))
+    }
+
+    /// Moves `anchor` to `new_anchor` (normalized `[0..1]` canvas coords) while compensating
+    /// `position` so the rendered pixels on the canvas do not shift at all.
+    pub fn with_anchor_preserving_visual(self, new_anchor: [f32; 2], canvas_width: u32, canvas_height: u32) -> Self {
+        let clean = self.repaired();
+        let next_anchor = [
+            if new_anchor[0].is_finite() { new_anchor[0].clamp(-4.0, 5.0) } else { clean.anchor[0] },
+            if new_anchor[1].is_finite() { new_anchor[1].clamp(-4.0, 5.0) } else { clean.anchor[1] },
+        ];
+        let cw = canvas_width.max(1) as f32;
+        let ch = canvas_height.max(1) as f32;
+        let dx = (next_anchor[0] - clean.anchor[0]) * cw;
+        let dy = (next_anchor[1] - clean.anchor[1]) * ch;
+        let sx = dx * clean.scale[0];
+        let sy = dy * clean.scale[1];
+        let (sin, cos) = clean.rotation.sin_cos();
+        let rx = sx * cos - sy * sin;
+        let ry = sx * sin + sy * cos;
+        Transform2D {
+            position: [clean.position[0] + rx - dx, clean.position[1] + ry - dy],
+            scale: clean.scale,
+            rotation: clean.rotation,
+            anchor: next_anchor,
+        }
+        .repaired()
     }
 }
 
@@ -818,6 +863,98 @@ impl KeyframeTrack {
         }
     }
 
+    /// Moves a keyframe on the specified channel from `from_frame` to `to_frame` (replacing any
+    /// keyframe already at `to_frame`).
+    pub fn move_transform(&mut self, from_frame: u32, to_frame: u32) -> bool {
+        move_kf(&mut self.transform, from_frame, to_frame)
+    }
+
+    pub fn move_opacity(&mut self, from_frame: u32, to_frame: u32) -> bool {
+        move_kf(&mut self.opacity, from_frame, to_frame)
+    }
+
+    pub fn move_filter(&mut self, from_frame: u32, to_frame: u32) -> bool {
+        move_kf(&mut self.filter, from_frame, to_frame)
+    }
+
+    pub fn move_deform(&mut self, from_frame: u32, to_frame: u32) -> bool {
+        move_kf(&mut self.deform, from_frame, to_frame)
+    }
+
+    pub fn move_volume(&mut self, from_frame: u32, to_frame: u32) -> bool {
+        move_kf(&mut self.volume, from_frame, to_frame)
+    }
+
+    pub fn move_pan(&mut self, from_frame: u32, to_frame: u32) -> bool {
+        move_kf(&mut self.pan, from_frame, to_frame)
+    }
+
+    /// Mirrors all keyframes inside `[start..end)` horizontally around the clip midpoint.
+    pub fn reverse_range(&mut self, start: u32, end: u32) {
+        if end <= start.saturating_add(1) {
+            return;
+        }
+        let last = end.saturating_sub(1);
+        let mirror = |f: &mut u32| {
+            if *f >= start && *f <= last {
+                *f = start.saturating_add(last.saturating_sub(*f));
+            }
+        };
+        for kf in &mut self.transform {
+            mirror(&mut kf.frame);
+        }
+        self.transform.sort_by_key(|k| k.frame);
+        for kf in &mut self.opacity {
+            mirror(&mut kf.frame);
+        }
+        self.opacity.sort_by_key(|k| k.frame);
+        for kf in &mut self.filter {
+            mirror(&mut kf.frame);
+        }
+        self.filter.sort_by_key(|k| k.frame);
+        for kf in &mut self.deform {
+            mirror(&mut kf.frame);
+        }
+        self.deform.sort_by_key(|k| k.frame);
+        for kf in &mut self.volume {
+            mirror(&mut kf.frame);
+        }
+        self.volume.sort_by_key(|k| k.frame);
+        for kf in &mut self.pan {
+            mirror(&mut kf.frame);
+        }
+        self.pan.sort_by_key(|k| k.frame);
+    }
+
+    /// Returns all distinct keyframe frames across every channel, sorted ascending.
+    pub fn all_keyframe_frames(&self) -> Vec<u32> {
+        let mut frames: Vec<u32> = self
+            .transform
+            .iter()
+            .map(|k| k.frame)
+            .chain(self.opacity.iter().map(|k| k.frame))
+            .chain(self.filter.iter().map(|k| k.frame))
+            .chain(self.deform.iter().map(|k| k.frame))
+            .chain(self.volume.iter().map(|k| k.frame))
+            .chain(self.pan.iter().map(|k| k.frame))
+            .collect();
+        frames.sort_unstable();
+        frames.dedup();
+        frames
+    }
+
+    /// Finds the nearest keyframe before (`direction < 0`) or after (`direction > 0`) `current_frame`.
+    pub fn adjacent_keyframe(&self, current_frame: u32, direction: i32) -> Option<u32> {
+        let frames = self.all_keyframe_frames();
+        if direction < 0 {
+            frames.into_iter().rev().find(|&f| f < current_frame)
+        } else if direction > 0 {
+            frames.into_iter().find(|&f| f > current_frame)
+        } else {
+            None
+        }
+    }
+
     /// Evaluates the interpolated [`Transform2D`] at `frame`.
     pub fn evaluate_transform(&self, frame: f32) -> Transform2D {
         eval_keyframes(&self.transform, frame, Transform2D::default(), Transform2D::lerp)
@@ -847,6 +984,21 @@ impl KeyframeTrack {
     pub fn evaluate_pan(&self, frame: f32) -> f32 {
         eval_keyframes(&self.pan, frame, 0.0, |a, b, t| (a + (b - a) * t).clamp(-1.0, 1.0))
     }
+}
+
+fn move_kf<T: Copy>(keys: &mut Vec<Keyframe<T>>, from_frame: u32, to_frame: u32) -> bool {
+    if from_frame == to_frame {
+        return false;
+    }
+    let Some(pos) = keys.iter().position(|k| k.frame == from_frame) else {
+        return false;
+    };
+    let mut moved = keys.remove(pos);
+    moved.frame = to_frame.min(MAX_TIMELINE_DURATION.saturating_sub(1));
+    keys.retain(|k| k.frame != moved.frame);
+    keys.push(moved);
+    keys.sort_by_key(|k| k.frame);
+    true
 }
 
 fn eval_keyframes<T: Copy>(keys: &[Keyframe<T>], frame: f32, default: T, lerp: impl Fn(T, T, f32) -> T) -> T {
@@ -891,6 +1043,18 @@ impl Cel {
     pub fn duration_frames(self) -> u32 {
         1u32.saturating_add(self.hold.min(600))
     }
+}
+
+/// How a [`Clip`] repeats its cels when stretched past its natural cel sequence length.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ClipLoopMode {
+    /// Plays once; stretching a `Cel` clip extends its last cel's hold duration.
+    #[default]
+    None,
+    /// Loops the cel sequence cyclically across `clip.duration_frames`.
+    Loop,
+    /// Alternates forward and backward across `clip.duration_frames`.
+    PingPong,
 }
 
 /// What a [`Clip`] on a track holds.
@@ -968,6 +1132,9 @@ pub struct Clip {
     /// Tint color `[r, g, b]` (`0..1`) of the Perform motion onion-skin ghost.
     #[serde(default = "default_perform_guide_color")]
     pub perform_guide_color: [f32; 3],
+    /// Loop / Ping-Pong repetition mode for `Cel` clips stretched past their natural cel span.
+    #[serde(default)]
+    pub loop_mode: ClipLoopMode,
 }
 
 fn unit_one() -> f32 {
@@ -979,12 +1146,26 @@ impl Clip {
         self.start_frame.saturating_add(self.effective_duration())
     }
 
-    /// For a `Cel` clip, its duration is the sum of its cels' durations (at least 1); for other
-    /// clips, `self.duration_frames.max(1)`.
-    pub fn effective_duration(&self) -> u32 {
+    /// Natural single-cycle length of this clip's cels (or `duration_frames` for non-cel clips).
+    pub fn cels_duration(&self) -> u32 {
         match &self.kind {
             ClipKind::Cel { cels } if !cels.is_empty() => {
                 cels.iter().map(|c| c.duration_frames()).fold(0u32, u32::saturating_add).max(1)
+            }
+            _ => self.duration_frames.max(1),
+        }
+    }
+
+    /// For a non-looping `Cel` clip, its duration is the sum of its cels' durations (at least 1);
+    /// for looping/ping-pong `Cel` clips or other clips, `self.duration_frames.max(cels_duration)`.
+    pub fn effective_duration(&self) -> u32 {
+        match &self.kind {
+            ClipKind::Cel { cels } if !cels.is_empty() => {
+                let cels_len = self.cels_duration();
+                match self.loop_mode {
+                    ClipLoopMode::None => cels_len,
+                    ClipLoopMode::Loop | ClipLoopMode::PingPong => self.duration_frames.max(cels_len),
+                }
             }
             _ => self.duration_frames.max(1),
         }
@@ -998,7 +1179,8 @@ impl Clip {
         frame >= self.start_frame && frame < self.end_frame()
     }
 
-    /// For a `Cel` clip, returns `(cel_index, cel, offset_into_cel)` at timeline `frame`.
+    /// For a `Cel` clip, returns `(cel_index, cel, offset_into_cel)` at timeline `frame`,
+    /// honoring [`ClipLoopMode::Loop`] and [`ClipLoopMode::PingPong`].
     pub fn cel_at(&self, frame: u32) -> Option<(usize, Cel, u32)> {
         if !self.contains_frame(frame) {
             return None;
@@ -1006,7 +1188,21 @@ impl Clip {
         let ClipKind::Cel { cels } = &self.kind else {
             return None;
         };
-        let local = frame.saturating_sub(self.start_frame);
+        let cels_len = self.cels_duration();
+        let raw_local = frame.saturating_sub(self.start_frame);
+        let local = match self.loop_mode {
+            ClipLoopMode::None => raw_local,
+            ClipLoopMode::Loop => raw_local % cels_len.max(1),
+            ClipLoopMode::PingPong => {
+                if cels_len <= 1 {
+                    0
+                } else {
+                    let period = cels_len.saturating_sub(1).saturating_mul(2).max(1);
+                    let m = raw_local % period;
+                    if m < cels_len { m } else { period.saturating_sub(m) }
+                }
+            }
+        };
         let mut cursor = 0u32;
         for (idx, &cel) in cels.iter().enumerate() {
             let len = cel.duration_frames();
@@ -1086,6 +1282,7 @@ impl Clip {
             perform_guide_layer: None,
             perform_guide_opacity: default_perform_guide_opacity(),
             perform_guide_color: default_perform_guide_color(),
+            loop_mode: ClipLoopMode::None,
         }
     }
 }
@@ -1195,6 +1392,20 @@ pub struct DeformSample {
     pub deform: Deform2D,
 }
 
+/// A recorded scalar sample (e.g. opacity, audio volume, or pan) during live Perform mode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScalarSample {
+    pub frame: u32,
+    pub value: f32,
+}
+
+/// A recorded Live Filter sample (Gaussian Blur, HSB, Sharpen, Noise) during live Perform mode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FilterSample {
+    pub frame: u32,
+    pub filter: LiveFilterState,
+}
+
 /// Multi-track timeline and animation state for a DreamsCraft [`Document`].
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -1230,6 +1441,9 @@ pub struct Timeline {
     /// Imported audio assets referenced by [`ClipKind::Audio`] clips.
     #[serde(default)]
     pub audio_assets: Vec<AudioAsset>,
+    /// Named beat / bookmark markers on the timeline ruler.
+    #[serde(default)]
+    pub markers: Vec<TimelineMarker>,
     next_id: u64,
 }
 
@@ -1253,6 +1467,7 @@ impl Default for Timeline {
             camera: KeyframeTrack::default(),
             camera_enabled: false,
             audio_assets: Vec::new(),
+            markers: Vec::new(),
             next_id: 1,
         }
     }
@@ -1328,6 +1543,7 @@ impl Timeline {
             camera: KeyframeTrack::default(),
             camera_enabled: false,
             audio_assets: Vec::new(),
+            markers: Vec::new(),
             next_id: 1,
         };
 
@@ -1465,6 +1681,46 @@ impl Timeline {
         id
     }
 
+    fn alloc_marker_id(&mut self) -> MarkerId {
+        let id = MarkerId(self.next_id.max(1));
+        self.next_id = id.0.saturating_add(1);
+        id
+    }
+
+    /// Adds a named beat/section marker at `frame` on the timeline ruler.
+    pub fn add_marker(&mut self, frame: u32, label: Option<&str>, color: Option<u32>) -> MarkerId {
+        let id = self.alloc_marker_id();
+        let clamped_frame = frame.min(self.duration_frames.saturating_sub(1));
+        let default_label = format!("M{}", self.markers.len() + 1);
+        let text =
+            label.map(str::trim).filter(|s| !s.is_empty()).map_or(default_label, |s| s.chars().take(64).collect());
+        let color = color.unwrap_or_else(default_marker_color);
+        self.markers.push(TimelineMarker { id, frame: clamped_frame, label: text, color });
+        self.markers.sort_by_key(|m| (m.frame, m.id));
+        id
+    }
+
+    /// Removes `marker_id` from the timeline ruler.
+    pub fn delete_marker(&mut self, marker_id: MarkerId) -> bool {
+        let before = self.markers.len();
+        self.markers.retain(|m| m.id != marker_id);
+        self.markers.len() != before
+    }
+
+    /// Moves `marker_id` to `new_frame` on the timeline ruler.
+    pub fn move_marker(&mut self, marker_id: MarkerId, new_frame: u32) -> bool {
+        let clamped = new_frame.min(self.duration_frames.saturating_sub(1));
+        let Some(marker) = self.markers.iter_mut().find(|m| m.id == marker_id) else {
+            return false;
+        };
+        if marker.frame == clamped {
+            return false;
+        }
+        marker.frame = clamped;
+        self.markers.sort_by_key(|m| (m.frame, m.id));
+        true
+    }
+
     /// Sanitizes and repairs the timeline against `valid_layers` in the document.
     pub fn repaired(mut self, valid_layers: &HashSet<LayerId>) -> Timeline {
         self.fps = self.fps.clamp(1, 60);
@@ -1576,6 +1832,18 @@ impl Timeline {
         self.duration_frames = self.duration_frames.max(max_end).clamp(1, MAX_TIMELINE_DURATION);
         self.playhead = self.playhead.min(self.duration_frames.saturating_sub(1));
         self.work_area = self.work_area.map(|w| w.repaired(self.duration_frames));
+
+        let mut seen_markers = HashSet::new();
+        let last_frame = self.duration_frames.saturating_sub(1);
+        self.markers.retain(|m| seen_markers.insert(m.id));
+        for marker in &mut self.markers {
+            max_seen_id = max_seen_id.max(marker.id.0);
+            marker.frame = marker.frame.min(last_frame);
+            if marker.label.trim().is_empty() {
+                marker.label = "Marker".to_owned();
+            }
+        }
+        self.markers.sort_by_key(|m| (m.frame, m.id));
         self.next_id = self.next_id.max(max_seen_id.saturating_add(1));
 
         // Ensure active_track and active_clip point to existing items
@@ -2108,7 +2376,8 @@ impl Timeline {
         true
     }
 
-    /// Resizes `clip_id`'s duration (or its last cel's hold if it is a `CelClip`).
+    /// Resizes `clip_id`'s duration (stretching the last cel's hold for non-looping `CelClip`s,
+    /// or adjusting the total repeated duration for `Loop` / `PingPong` clips and other clip kinds).
     pub fn resize_clip(&mut self, clip_id: ClipId, new_duration_frames: u32) -> bool {
         let Some(track_id) = self.track_of_clip(clip_id) else { return false };
         if self.track(track_id).is_some_and(|t| t.locked) {
@@ -2116,21 +2385,27 @@ impl Timeline {
         }
         let target_dur = new_duration_frames.clamp(1, MAX_TIMELINE_DURATION);
         let Some(clip) = self.clip_mut(clip_id) else { return false };
+        let loop_mode = clip.loop_mode;
         match &mut clip.kind {
             ClipKind::Cel { cels } => {
                 if cels.is_empty() {
                     return false;
                 }
-                let others: u32 = cels
-                    .iter()
-                    .take(cels.len().saturating_sub(1))
-                    .map(|c| c.duration_frames())
-                    .fold(0u32, u32::saturating_add);
-                if let Some(last) = cels.last_mut() {
-                    let rem = target_dur.saturating_sub(others).max(1);
-                    last.hold = rem.saturating_sub(1).min(600);
+                if loop_mode == ClipLoopMode::None {
+                    let others: u32 = cels
+                        .iter()
+                        .take(cels.len().saturating_sub(1))
+                        .map(|c| c.duration_frames())
+                        .fold(0u32, u32::saturating_add);
+                    if let Some(last) = cels.last_mut() {
+                        let rem = target_dur.saturating_sub(others).max(1);
+                        last.hold = rem.saturating_sub(1).min(600);
+                    }
+                    clip.sync_duration();
+                } else {
+                    clip.duration_frames = target_dur;
+                    clip.sync_duration();
                 }
-                clip.sync_duration();
             }
             ClipKind::Layer { .. }
             | ClipKind::Group { .. }
@@ -2143,6 +2418,134 @@ impl Timeline {
         let end = clip.end_frame();
         self.duration_frames = self.duration_frames.max(end).min(MAX_TIMELINE_DURATION);
         true
+    }
+
+    /// Trims the left edge of `clip_id` to `new_start_frame` while keeping its end frame fixed
+    /// (left-edge trim handle). For `Audio` / `Video` clips, advances source trim offset
+    /// accordingly; for `Cel` clips, shifts/adjusts the first cel hold safely.
+    pub fn trim_clip_left(&mut self, clip_id: ClipId, new_start_frame: u32) -> bool {
+        let Some(track_id) = self.track_of_clip(clip_id) else { return false };
+        if self.track(track_id).is_some_and(|t| t.locked) {
+            return false;
+        }
+        let fps = self.fps.clamp(1, 60);
+        let Some(clip) = self.clip_mut(clip_id) else { return false };
+        let old_start = clip.start_frame;
+        let old_end = clip.end_frame();
+        let clamped_start = new_start_frame.min(old_end.saturating_sub(1));
+        if clamped_start == old_start {
+            return false;
+        }
+        let new_dur = old_end.saturating_sub(clamped_start).max(1);
+        let loop_mode = clip.loop_mode;
+        match &mut clip.kind {
+            ClipKind::Cel { cels } => {
+                if cels.is_empty() {
+                    return false;
+                }
+                if loop_mode != ClipLoopMode::None {
+                    let min_dur = clip.cels_duration();
+                    let effective_start = clamped_start.min(old_end.saturating_sub(min_dur));
+                    if effective_start == old_start {
+                        return false;
+                    }
+                    clip.start_frame = effective_start;
+                    clip.duration_frames = old_end.saturating_sub(effective_start).max(min_dur);
+                } else if clamped_start < old_start {
+                    // Expanding left: extend first cel hold
+                    let grow = old_start.saturating_sub(clamped_start);
+                    if let Some(first) = cels.first_mut() {
+                        let next_hold = first.hold.saturating_add(grow).min(600);
+                        let applied = next_hold.saturating_sub(first.hold);
+                        first.hold = next_hold;
+                        clip.start_frame = old_start.saturating_sub(applied);
+                    }
+                } else {
+                    // Shrinking from left: consume holds on the first cel without deleting cels
+                    let shrink = clamped_start.saturating_sub(old_start);
+                    if let Some(first) = cels.first_mut() {
+                        let can_take = shrink.min(first.hold);
+                        if can_take == 0 {
+                            return false;
+                        }
+                        first.hold = first.hold.saturating_sub(can_take);
+                        clip.start_frame = old_start.saturating_add(can_take);
+                    }
+                }
+                clip.sync_duration();
+            }
+            ClipKind::Audio { trim_start_samples, sample_rate, .. } => {
+                let delta_frames = i64::from(clamped_start) - i64::from(old_start);
+                let delta_samples = (delta_frames * i64::from(*sample_rate)) / i64::from(fps);
+                let next_trim = (i128::from(*trim_start_samples) + i128::from(delta_samples)).max(0);
+                *trim_start_samples = u64::try_from(next_trim).unwrap_or(0);
+                clip.start_frame = clamped_start;
+                clip.duration_frames = new_dur;
+            }
+            ClipKind::Video { trim_in_frames, .. } => {
+                let delta_frames = i64::from(clamped_start) - i64::from(old_start);
+                let next_trim = (i64::from(*trim_in_frames) + delta_frames).max(0);
+                *trim_in_frames = u32::try_from(next_trim).unwrap_or(0);
+                clip.start_frame = clamped_start;
+                clip.duration_frames = new_dur;
+            }
+            ClipKind::Layer { .. } | ClipKind::Group { .. } | ClipKind::Text { .. } => {
+                clip.start_frame = clamped_start;
+                clip.duration_frames = new_dur;
+            }
+        }
+        if let Some(track) = self.track_mut(track_id) {
+            track.clips.sort_by_key(|c| c.start_frame);
+        }
+        true
+    }
+
+    /// Expands `clip_id` to fill until the next clip on the same track (or the end of the timeline
+    /// if it is the last clip on that track).
+    pub fn fill_clip_duration(&mut self, clip_id: ClipId) -> bool {
+        let Some(track_id) = self.track_of_clip(clip_id) else { return false };
+        if self.track(track_id).is_some_and(|t| t.locked) {
+            return false;
+        }
+        let Some(clip) = self.clip(clip_id) else { return false };
+        let start = clip.start_frame;
+        let current_end = clip.end_frame();
+        let next_clip_start = self
+            .track(track_id)
+            .into_iter()
+            .flat_map(|t| &t.clips)
+            .filter(|c| c.id != clip_id && c.start_frame >= current_end)
+            .map(|c| c.start_frame)
+            .min();
+        let target_end = next_clip_start.unwrap_or(self.duration_frames).max(current_end);
+        let new_dur = target_end.saturating_sub(start).max(1);
+        if new_dur <= clip.effective_duration() {
+            return false;
+        }
+        self.resize_clip(clip_id, new_dur)
+    }
+
+    /// Reverses the cel playback order and mirrors keyframes inside `clip_id`.
+    pub fn reverse_clip(&mut self, clip_id: ClipId) -> bool {
+        let Some(track_id) = self.track_of_clip(clip_id) else { return false };
+        if self.track(track_id).is_some_and(|t| t.locked) {
+            return false;
+        }
+        let Some(clip) = self.clip_mut(clip_id) else { return false };
+        let start = clip.start_frame;
+        let end = clip.end_frame();
+        let mut changed = false;
+        if let ClipKind::Cel { cels } = &mut clip.kind
+            && cels.len() > 1
+        {
+            cels.reverse();
+            changed = true;
+        }
+        if !clip.keyframes.is_empty() {
+            clip.keyframes.reverse_range(start, end);
+            changed = true;
+        }
+        changed
     }
 
     /// Splits `clip_id` at `at_frame` into two consecutive clips on the same track, returning the
@@ -2208,24 +2611,28 @@ impl Timeline {
                 },
             ),
             ClipKind::Cel { cels } => {
-                let (cel_idx, cel, offset) = clip.cel_at(at_frame)?;
-                if offset == 0 && cel_idx > 0 {
-                    let left_cels = cels.get(..cel_idx)?.to_vec();
-                    let right_cels = cels.get(cel_idx..)?.to_vec();
-                    (ClipKind::Cel { cels: left_cels }, ClipKind::Cel { cels: right_cels })
+                if clip.loop_mode != ClipLoopMode::None {
+                    (ClipKind::Cel { cels: cels.clone() }, ClipKind::Cel { cels: cels.clone() })
                 } else {
-                    // Split across a held cel
-                    let total_hold = cel.hold;
-                    if offset == 0 || offset > total_hold {
-                        return None;
+                    let (cel_idx, cel, offset) = clip.cel_at(at_frame)?;
+                    if offset == 0 && cel_idx > 0 {
+                        let left_cels = cels.get(..cel_idx)?.to_vec();
+                        let right_cels = cels.get(cel_idx..)?.to_vec();
+                        (ClipKind::Cel { cels: left_cels }, ClipKind::Cel { cels: right_cels })
+                    } else {
+                        // Split across a held cel
+                        let total_hold = cel.hold;
+                        if offset == 0 || offset > total_hold {
+                            return None;
+                        }
+                        let mut left_cels = cels.get(..cel_idx)?.to_vec();
+                        left_cels.push(Cel { layer: cel.layer, hold: offset.saturating_sub(1) });
+                        let mut right_cels = vec![Cel { layer: cel.layer, hold: total_hold.saturating_sub(offset) }];
+                        if let Some(rest) = cels.get(cel_idx + 1..) {
+                            right_cels.extend_from_slice(rest);
+                        }
+                        (ClipKind::Cel { cels: left_cels }, ClipKind::Cel { cels: right_cels })
                     }
-                    let mut left_cels = cels.get(..cel_idx)?.to_vec();
-                    left_cels.push(Cel { layer: cel.layer, hold: offset.saturating_sub(1) });
-                    let mut right_cels = vec![Cel { layer: cel.layer, hold: total_hold.saturating_sub(offset) }];
-                    if let Some(rest) = cels.get(cel_idx + 1..) {
-                        right_cels.extend_from_slice(rest);
-                    }
-                    (ClipKind::Cel { cels: left_cels }, ClipKind::Cel { cels: right_cels })
                 }
             }
         };
@@ -2250,6 +2657,7 @@ impl Timeline {
             perform_guide_layer: clip.perform_guide_layer,
             perform_guide_opacity: clip.perform_guide_opacity,
             perform_guide_color: clip.perform_guide_color,
+            loop_mode: clip.loop_mode,
         };
         right_clip.sync_duration();
         track.clips.push(right_clip);
@@ -2274,6 +2682,25 @@ impl Timeline {
             }
         }
         Some(group_id)
+    }
+
+    /// Ungroups `group_id`: unparents all its direct children (moving them to `group_id`'s parent
+    /// group, if any) and removes the group track.
+    pub fn ungroup_track(&mut self, group_id: TrackId) -> bool {
+        let Some(pos) = self.tracks.iter().position(|t| t.id == group_id && t.is_group) else {
+            return false;
+        };
+        let parent_of_group = self.tracks.get(pos).and_then(|t| t.parent_group);
+        for t in &mut self.tracks {
+            if t.parent_group == Some(group_id) {
+                t.parent_group = parent_of_group;
+            }
+        }
+        self.tracks.remove(pos);
+        if self.active_track == Some(group_id) {
+            self.active_track = self.tracks.last().map(|t| t.id);
+        }
+        true
     }
 
     /// Appends or inserts a new cel with `layer` into the active `CelClip` (or creates a `CelClip`
@@ -2921,6 +3348,163 @@ pub fn simplify_deform_samples(samples: &[DeformSample], filtering: f32) -> Vec<
         .collect()
 }
 
+/// Simplifies live-recorded scalar Perform samples (Opacity, Audio Volume, Pan) with RDP.
+pub fn simplify_scalar_samples(samples: &[ScalarSample], filtering: f32, lo: f32, hi: f32) -> Vec<Keyframe<f32>> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    let filtering = if filtering.is_finite() { filtering.clamp(0.0, 1.0) } else { 0.35 };
+    let clean = |v: f32| if v.is_finite() { v.clamp(lo, hi) } else { lo };
+    let mut sorted: Vec<ScalarSample> =
+        samples.iter().map(|s| ScalarSample { frame: s.frame, value: clean(s.value) }).collect();
+    sorted.sort_by_key(|s| s.frame);
+    let mut unique: Vec<ScalarSample> = Vec::with_capacity(sorted.len());
+    for s in sorted {
+        if let Some(last) = unique.last_mut()
+            && last.frame == s.frame
+        {
+            *last = s;
+        } else {
+            unique.push(s);
+        }
+    }
+    if unique.len() <= 2 || filtering <= 1e-4 {
+        return unique
+            .into_iter()
+            .map(|s| Keyframe { frame: s.frame, value: s.value, easing: Easing::Linear })
+            .collect();
+    }
+    let span_val = (hi - lo).abs().max(1e-3);
+    let tolerance = span_val * (filtering * filtering * 0.08 + filtering * 0.005);
+    let mut keep = vec![false; unique.len()];
+    if let Some(first) = keep.first_mut() {
+        *first = true;
+    }
+    if let Some(last) = keep.last_mut() {
+        *last = true;
+    }
+    let mut stack = vec![(0usize, unique.len().saturating_sub(1))];
+    while let Some((start_idx, end_idx)) = stack.pop() {
+        if end_idx <= start_idx + 1 {
+            continue;
+        }
+        let (Some(start), Some(end)) = (unique.get(start_idx), unique.get(end_idx)) else {
+            continue;
+        };
+        let span = (end.frame.saturating_sub(start.frame)).max(1) as f32;
+        let mut max_err = 0.0_f32;
+        let mut split_idx = None;
+        for idx in (start_idx + 1)..end_idx {
+            let Some(sample) = unique.get(idx) else { continue };
+            let t = (sample.frame.saturating_sub(start.frame) as f32 / span).clamp(0.0, 1.0);
+            let expected = start.value + (end.value - start.value) * t;
+            let err = (sample.value - expected).abs();
+            if err > max_err {
+                max_err = err;
+                split_idx = Some(idx);
+            }
+        }
+        if max_err > tolerance
+            && let Some(mid) = split_idx
+        {
+            if let Some(slot) = keep.get_mut(mid) {
+                *slot = true;
+            }
+            stack.push((start_idx, mid));
+            stack.push((mid, end_idx));
+        }
+    }
+    let easing = if filtering >= 0.25 { Easing::EaseInOut } else { Easing::Linear };
+    unique
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(s, k)| k.then_some(Keyframe { frame: s.frame, value: s.value, easing }))
+        .collect()
+}
+
+/// Simplifies live-recorded Perform Live Filter samples (Gaussian Blur, HSB, Sharpen, Noise) with RDP.
+pub fn simplify_filter_samples(samples: &[FilterSample], filtering: f32) -> Vec<Keyframe<LiveFilterState>> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    let filtering = if filtering.is_finite() { filtering.clamp(0.0, 1.0) } else { 0.35 };
+    let mut sorted: Vec<FilterSample> =
+        samples.iter().map(|s| FilterSample { frame: s.frame, filter: s.filter.repaired() }).collect();
+    sorted.sort_by_key(|s| s.frame);
+    let mut unique: Vec<FilterSample> = Vec::with_capacity(sorted.len());
+    for s in sorted {
+        if let Some(last) = unique.last_mut()
+            && last.frame == s.frame
+        {
+            *last = s;
+        } else {
+            unique.push(s);
+        }
+    }
+    if unique.len() <= 2 || filtering <= 1e-4 {
+        return unique
+            .into_iter()
+            .map(|s| Keyframe { frame: s.frame, value: s.filter, easing: Easing::Linear })
+            .collect();
+    }
+    let tolerance = filtering * filtering * 0.10 + filtering * 0.006;
+    let mut keep = vec![false; unique.len()];
+    if let Some(first) = keep.first_mut() {
+        *first = true;
+    }
+    if let Some(last) = keep.last_mut() {
+        *last = true;
+    }
+    let mut stack = vec![(0usize, unique.len().saturating_sub(1))];
+    while let Some((start_idx, end_idx)) = stack.pop() {
+        if end_idx <= start_idx + 1 {
+            continue;
+        }
+        let (Some(start), Some(end)) = (unique.get(start_idx), unique.get(end_idx)) else {
+            continue;
+        };
+        let span = (end.frame.saturating_sub(start.frame)).max(1) as f32;
+        let mut max_err = 0.0_f32;
+        let mut split_idx = None;
+        for idx in (start_idx + 1)..end_idx {
+            let Some(sample) = unique.get(idx) else { continue };
+            let t = (sample.frame.saturating_sub(start.frame) as f32 / span).clamp(0.0, 1.0);
+            let expected = start.filter.lerp(end.filter, t);
+            let err = filter_distance(sample.filter, expected);
+            if err > max_err {
+                max_err = err;
+                split_idx = Some(idx);
+            }
+        }
+        if max_err > tolerance
+            && let Some(mid) = split_idx
+        {
+            if let Some(slot) = keep.get_mut(mid) {
+                *slot = true;
+            }
+            stack.push((start_idx, mid));
+            stack.push((mid, end_idx));
+        }
+    }
+    let easing = if filtering >= 0.25 { Easing::EaseInOut } else { Easing::Linear };
+    unique
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(s, k)| k.then_some(Keyframe { frame: s.frame, value: s.filter, easing }))
+        .collect()
+}
+
+/// Normalized perceptual distance (`0..~1`) between two [`LiveFilterState`] values.
+fn filter_distance(a: LiveFilterState, b: LiveFilterState) -> f32 {
+    let db = (a.gaussian_blur - b.gaussian_blur).abs() / 64.0;
+    let dh = (a.hue_shift - b.hue_shift).abs() / 180.0;
+    let ds = (a.saturation - b.saturation).abs();
+    let dl = (a.brightness - b.brightness).abs();
+    let dsh = (a.sharpen - b.sharpen).abs();
+    let dn = (a.noise - b.noise).abs();
+    db.max(dh).max(ds).max(dl).max(dsh).max(dn)
+}
+
 /// Perceptual distance between two [`Transform2D`] states in equivalent pixel units.
 fn transform_distance(a: Transform2D, b: Transform2D) -> f32 {
     let dx = a.position[0] - b.position[0];
@@ -3352,5 +3936,111 @@ mod tests {
             .collect();
         let simplified = simplify_deform_samples(&samples, 0.4);
         assert_eq!(simplified.len(), 2);
+    }
+
+    #[test]
+    fn v24_anchor_keep_position_clip_loop_trim_fill_reverse_ungroup_markers_and_perform_rdp() {
+        let mut doc = Document::new(200, 100);
+        let l1 = doc.current();
+        let mut tl = Timeline::new_with_layer(l1);
+        let tid = tl.active_track.unwrap();
+        let cid = tl.active_clip.unwrap();
+
+        // 1. Anchor reposition preserves visual pixels under scale + rotation + translation
+        let orig = Transform2D { position: [25.0, -15.0], scale: [1.5, 0.8], rotation: 0.75, anchor: [0.5, 0.5] };
+        let shifted = orig.with_anchor_preserving_visual([0.15, 0.85], 200, 100);
+        let m_orig = orig.to_affine(200, 100);
+        let m_shifted = shifted.to_affine(200, 100);
+        for (px, py) in [(0.0, 0.0), (200.0, 0.0), (200.0, 100.0), (0.0, 100.0), (77.0, 33.0)] {
+            let (ox, oy) = (m_orig.a * px + m_orig.c * py + m_orig.e, m_orig.b * px + m_orig.d * py + m_orig.f);
+            let (sx, sy) =
+                (m_shifted.a * px + m_shifted.c * py + m_shifted.e, m_shifted.b * px + m_shifted.d * py + m_shifted.f);
+            assert!(
+                (ox - sx).abs() < 1e-3 && (oy - sy).abs() < 1e-3,
+                "pixel ({px},{py}) moved: ({ox},{oy}) vs ({sx},{sy})"
+            );
+        }
+
+        // 2. ClipLoopMode::Loop & PingPong cycle cels over extended clip duration
+        let l2 = doc.add_layer();
+        let l3 = doc.add_layer();
+        {
+            let clip = tl.clip_mut(cid).unwrap();
+            clip.kind = ClipKind::Cel {
+                cels: vec![Cel { layer: l1, hold: 0 }, Cel { layer: l2, hold: 0 }, Cel { layer: l3, hold: 0 }],
+            };
+            clip.loop_mode = ClipLoopMode::Loop;
+        }
+        assert!(tl.resize_clip(cid, 9));
+        let clip = tl.clip(cid).unwrap();
+        assert_eq!(clip.cel_at(0).map(|c| c.1.layer), Some(l1));
+        assert_eq!(clip.cel_at(3).map(|c| c.1.layer), Some(l1));
+        assert_eq!(clip.cel_at(4).map(|c| c.1.layer), Some(l2));
+        assert_eq!(clip.cel_at(5).map(|c| c.1.layer), Some(l3));
+
+        tl.clip_mut(cid).unwrap().loop_mode = ClipLoopMode::PingPong;
+        let clip = tl.clip(cid).unwrap();
+        // Ping-pong of 3 frames (0,1,2): 0,1,2,1,0,1,2
+        assert_eq!(clip.cel_at(0).map(|c| c.1.layer), Some(l1));
+        assert_eq!(clip.cel_at(1).map(|c| c.1.layer), Some(l2));
+        assert_eq!(clip.cel_at(2).map(|c| c.1.layer), Some(l3));
+        assert_eq!(clip.cel_at(3).map(|c| c.1.layer), Some(l2));
+        assert_eq!(clip.cel_at(4).map(|c| c.1.layer), Some(l1));
+
+        // 3. Reverse clip reverses cels and mirrors keyframes
+        tl.clip_mut(cid).unwrap().keyframes.set_transform(0, orig, None);
+        tl.clip_mut(cid).unwrap().keyframes.set_transform(8, Transform2D::default(), None);
+        assert!(tl.reverse_clip(cid));
+        let clip = tl.clip(cid).unwrap();
+        if let ClipKind::Cel { cels } = &clip.kind {
+            assert_eq!(cels[0].layer, l3);
+            assert_eq!(cels[2].layer, l1);
+        }
+        assert!((clip.keyframes.evaluate_transform(8.0).position[0] - 25.0).abs() < 1e-3);
+
+        // 4. Trim left keeps end frame fixed; Fill duration expands to timeline end
+        assert!(tl.trim_clip_left(cid, 3));
+        let clip = tl.clip(cid).unwrap();
+        assert_eq!(clip.start_frame, 3);
+        assert_eq!(clip.duration_frames, 6);
+        assert!(tl.fill_clip_duration(cid));
+        assert_eq!(tl.clip(cid).unwrap().end_frame(), tl.duration_frames);
+
+        // 5. Keyframe move & adjacent jump
+        assert!(tl.clip_mut(cid).unwrap().keyframes.move_transform(8, 12));
+        assert_eq!(tl.clip(cid).unwrap().keyframes.adjacent_keyframe(0, 1), Some(12));
+        assert_eq!(tl.clip(cid).unwrap().keyframes.adjacent_keyframe(20, -1), Some(12));
+
+        // 6. Track grouping & ungrouping
+        let t2 = tl.add_track(Some("Track 2"), false);
+        let gid = tl.group_tracks(&[tid, t2], Some("Group A")).unwrap();
+        assert_eq!(tl.track(tid).unwrap().parent_group, Some(gid));
+        assert!(tl.ungroup_track(gid));
+        assert!(tl.track(gid).is_none());
+        assert_eq!(tl.track(tid).unwrap().parent_group, None);
+
+        // 7. Timeline Markers CRUD & repair
+        let m1 = tl.add_marker(15, Some("Beat 1"), None);
+        let m2 = tl.add_marker(5, Some("Intro"), Some(0xFF00_FF00));
+        assert_eq!(tl.markers.len(), 2);
+        assert_eq!(tl.markers[0].id, m2); // sorted by frame
+        assert!(tl.move_marker(m1, 25));
+        assert_eq!(tl.markers[1].frame, 25);
+        assert!(tl.delete_marker(m2));
+        assert_eq!(tl.markers.len(), 1);
+
+        // 8. Scalar & Filter Perform RDP simplification
+        let op_samples: Vec<ScalarSample> =
+            (0..=10).map(|f| ScalarSample { frame: f, value: f as f32 * 0.1 }).collect();
+        let simp_op = simplify_scalar_samples(&op_samples, 0.5, 0.0, 1.0);
+        assert_eq!(simp_op.len(), 2);
+        let flt_samples: Vec<FilterSample> = (0..=10)
+            .map(|f| FilterSample {
+                frame: f,
+                filter: LiveFilterState { gaussian_blur: f as f32 * 2.0, ..Default::default() },
+            })
+            .collect();
+        let simp_flt = simplify_filter_samples(&flt_samples, 0.5);
+        assert_eq!(simp_flt.len(), 2);
     }
 }
