@@ -269,19 +269,18 @@ private fun LiveKeyframeAdjustmentsContent(
         )
     }
 
-    MenuGroup(
-        listOfNotNull(
-            "Reset Live Filters at F${tl.playhead + 1u}" to {
-                pushFilter(io.github.artcraftandroid.procraft.core.TimelineLiveFilterInfo(0f, 0f, 1f, 0f, 0f, 0f), done = true)
-            },
-            tl.activeTrackId?.let { tid ->
-                "Track Layer Effects (Outline / Shadow / Glow)" to {
-                    vm.closePanels()
-                    vm.trackOptionsTrackId = tid
-                }
-            },
-        ),
-    ) { (label, action) ->
+    val fxActions: List<Pair<String, () -> Unit>> = listOfNotNull(
+        "Reset Live Filters at F${tl.playhead + 1u}" to {
+            pushFilter(io.github.artcraftandroid.procraft.core.TimelineLiveFilterInfo(0f, 0f, 1f, 0f, 0f, 0f), done = true)
+        },
+        tl.activeTrackId?.let { tid ->
+            "Track Layer Effects (Outline / Shadow / Glow)" to {
+                vm.closePanels()
+                vm.trackOptionsTrackId = tid
+            }
+        },
+    )
+    MenuGroup(fxActions) { (label, action) ->
         MenuRow(label, action)
     }
 }
