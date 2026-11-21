@@ -2905,6 +2905,26 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Saves the open artwork and goes back to the gallery. */
     fun closeArtwork() {
+        stopPlaying()
+        if (performRecording) cancelPerformRecording()
+        stageGizmoActive = false
+        dreamsMode = DreamsWorkMode.DRAW_PAINT
+        movieSettingsOpen = false
+        playheadActionMenuOpen = false
+        addTrackMenuOpen = false
+        trackOptionsTrackId = null
+        liveFilterPopoverOpen = false
+        editingKeyframe = null
+        selectedClipIds = emptySet()
+        hasRecentPerformTake = false
+        lastPerformCommitRev = null
+        recordedPerformSamples.clear()
+        recordedPerformDeforms.clear()
+        recordedPerformOpacities.clear()
+        recordedPerformFilters.clear()
+        frameThumbJob?.cancel()
+        frameThumbJob = null
+        frameThumbnails.clear()
         requestedVideoFrame = null
         videoPreviewJob?.cancel()
         videoPreviewJob = null
@@ -8598,6 +8618,11 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             movieSettingsOpen = false
             playheadActionMenuOpen = false
             addTrackMenuOpen = false
+            trackOptionsTrackId = null
+            liveFilterPopoverOpen = false
+            stageGizmoActive = false
+            dreamsMode = DreamsWorkMode.DRAW_PAINT
+            selectedClipIds = emptySet()
             editingKeyframe = null
             return
         }
@@ -9120,9 +9145,13 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         val endLimit = tl.workArea?.end?.toInt()?.coerceIn(0, duration - 1) ?: (duration - 1)
         performPlayJob?.cancel()
         performPlayJob = viewModelScope.launch {
-            while (performRecording) {
-                kotlinx.coroutines.delay(1000L / fps)
-                if (!performRecording) break
+            var tick = 0L
+            val epoch = android.os.SystemClock.elapsedRealtimeNanos()
+            while (performRecording && session === s) {
+                val deadline = epoch + (++tick * 1_000_000_000L) / fps
+                val wait = deadline - android.os.SystemClock.elapsedRealtimeNanos()
+                if (wait > 0) kotlinx.coroutines.delay((wait + 999_999L) / 1_000_000L)
+                if (!performRecording || session !== s) break
                 val curr = timeline?.playhead?.toInt() ?: performStartFrame.toInt()
                 val next = curr + 1
                 if (next > endLimit) {
@@ -9196,6 +9225,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                     }
                 }
                 timeline = s.timelineState()
+                syncVideoClipsAt(next)
             }
         }
     }
@@ -9972,7 +10002,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                         audioPlayer.startPlayback(samples, 0, until * 2, reverse = true)
                     }
                 }
-                var at = (start - frames.first()).toInt()
+                var at = frames.indexOf(start).coerceAtLeast(0)
                 var direction = 1
                 var tick = 0L
                 val epoch = android.os.SystemClock.elapsedRealtimeNanos()

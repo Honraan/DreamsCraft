@@ -210,7 +210,7 @@ jobs:
   release:
     name: Publish GitHub Release
     needs: [apk, desktop]
-    if: ${{ !cancelled() && needs.apk.result == 'success' && needs.desktop.result == 'success' && (github.ref_type == 'tag' || inputs.publish_release != false) }}
+    if: ${{ !cancelled() && needs.apk.result == 'success' && needs.desktop.result == 'success' && (github.ref_type == 'tag' || inputs.publish_release == true || inputs.publish_release == 'true') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write

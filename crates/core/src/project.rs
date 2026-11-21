@@ -579,6 +579,9 @@ impl CanvasSession {
     pub(crate) fn keep_saved(self: Arc<Self>, dir: String, every: std::time::Duration, again: std::time::Duration) {
         let mine = {
             let mut saved = self.shared.saving.lock().unwrap_or_else(|e| e.into_inner());
+            if saved.dir.as_os_str().is_empty() {
+                saved.dir = PathBuf::from(&dir);
+            }
             saved.autosave = saved.autosave.wrapping_add(1);
             saved.autosave
         };

@@ -597,10 +597,74 @@ mod tests {
         found.sort();
         assert_eq!(found, wanted, "{REWRITE}");
         let session = crate::CanvasSession::new(32, 32);
-        let without_preview = |mut f: BrushFile| {
-            f.thumbnail = None;
-            f
+        let decode_png = |bytes: &[u8]| -> Option<(u32, u32, Vec<u8>)> {
+            let mut dec = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().ok()?;
+            let mut buf = vec![0u8; dec.output_buffer_size()?];
+            let info = dec.next_frame(&mut buf).ok()?;
+            buf.truncate(info.buffer_size());
+            Some((info.width, info.height, buf))
         };
+        let texture_matches = |a: &procraft_engine::brushfile::Texture, b: &procraft_engine::brushfile::Texture| {
+            if a == b {
+                return true;
+            }
+            let (
+                procraft_engine::brushfile::Texture::Image { bytes: ba, inverted: ia },
+                procraft_engine::brushfile::Texture::Image { bytes: bb, inverted: ib },
+            ) = (a, b)
+            else {
+                return false;
+            };
+            if ia != ib {
+                return false;
+            }
+            let (Some((wa, ha, pa)), Some((wb, hb, pb))) = (decode_png(ba), decode_png(bb)) else {
+                return false;
+            };
+            if wa != wb || ha != hb || pa.len() != pb.len() {
+                return false;
+            }
+            let mut off = 0usize;
+            for (&x, &y) in pa.iter().zip(&pb) {
+                let d = x.abs_diff(y);
+                if d > 1 {
+                    return false;
+                }
+                off += usize::from(d == 1);
+            }
+            // Platform libm sin/cos/powf rounding at exact 0.5 boundaries can flip isolated pixels by 1/255.
+            off <= 8
+        };
+        fn brush_matches(
+            a: &BrushFile,
+            b: &BrushFile,
+            tex_eq: &dyn Fn(&procraft_engine::brushfile::Texture, &procraft_engine::brushfile::Texture) -> bool,
+        ) -> bool {
+            let strip = |mut f: BrushFile| {
+                f.thumbnail = None;
+                f.shape = procraft_engine::brushfile::Texture::None;
+                f.grain = procraft_engine::brushfile::Texture::None;
+                f.metallic = procraft_engine::brushfile::Texture::None;
+                f.roughness = procraft_engine::brushfile::Texture::None;
+                f.secondary = None;
+                f
+            };
+            if strip(a.clone()) != strip(b.clone()) {
+                return false;
+            }
+            if !tex_eq(&a.shape, &b.shape)
+                || !tex_eq(&a.grain, &b.grain)
+                || !tex_eq(&a.metallic, &b.metallic)
+                || !tex_eq(&a.roughness, &b.roughness)
+            {
+                return false;
+            }
+            match (&a.secondary, &b.secondary) {
+                (None, None) => true,
+                (Some(sa), Some(sb)) => brush_matches(sa, sb, tex_eq),
+                _ => false,
+            }
+        }
         let mut brushes = 0;
         for (name, first, count) in sets {
             let kept = std::fs::read(legacy_folder().join(format!("{name}.brushset"))).unwrap();
@@ -610,9 +674,10 @@ mod tests {
             assert_eq!(kept_name, name, "{REWRITE}");
             assert_eq!(kept.len(), count, "{name}: {REWRITE}");
             assert!(kept.iter().all(|f| f.thumbnail.is_some()), "{name}: each with its preview");
-            let kept: Vec<BrushFile> = kept.into_iter().map(without_preview).collect();
-            let now: Vec<BrushFile> = now.into_iter().map(without_preview).collect();
-            assert!(kept == now, "{name}'s brushes have changed: {REWRITE}");
+            assert!(
+                kept.iter().zip(&now).all(|(a, b)| brush_matches(a, b, &texture_matches)),
+                "{name}'s brushes have changed: {REWRITE}"
+            );
             // ours alone: no maker, and no image another app's file would name
             for f in kept.iter().flat_map(|f| std::iter::once(f).chain(f.secondary.as_deref())) {
                 assert!(f.author.is_empty() && f.author_picture.is_none() && f.signature.is_none(), "{}", f.name);

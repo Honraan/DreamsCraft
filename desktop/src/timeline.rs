@@ -47,17 +47,19 @@ pub struct DreamsTimelineDock {
     px_per_frame: f32,
     scroll_x: f32,
     dock_height: f32,
+    drag_clip: Option<(u64, u32, f32)>,
 }
 
 impl Default for DreamsTimelineDock {
     fn default() -> Self {
-        Self { playing: None, px_per_frame: 14.0, scroll_x: 0.0, dock_height: 220.0 }
+        Self { playing: None, px_per_frame: 14.0, scroll_x: 0.0, dock_height: 220.0, drag_clip: None }
     }
 }
 
 impl DreamsTimelineDock {
     /// Stops any active playback cleanly (when leaving the canvas or opening a full-screen dialog).
     pub fn reset(&mut self, session: &CanvasSession) {
+        self.drag_clip = None;
         if self.playing.take().is_some() {
             session.set_play_frame(None);
         }
@@ -259,19 +261,21 @@ impl DreamsTimelineDock {
             if pill(ui, &mut x, cy, "Fill", PILL_BG.value(), INK.value(), "dt_fill") {
                 let _ = session.timeline_fill_clip_duration(cid);
             }
-            let active_loop = active_clip(tl).map_or(TimelineClipLoopMode::None, |c| c.loop_mode);
-            let loop_label = match active_loop {
-                TimelineClipLoopMode::None => "Once",
-                TimelineClipLoopMode::Loop => "Loop ⟳",
-                TimelineClipLoopMode::PingPong => "PingPong ⇄",
-            };
-            if pill(ui, &mut x, cy, loop_label, PILL_BG.value(), KEY_GOLD, "dt_loop") {
-                let next = match active_loop {
-                    TimelineClipLoopMode::None => TimelineClipLoopMode::Loop,
-                    TimelineClipLoopMode::Loop => TimelineClipLoopMode::PingPong,
-                    TimelineClipLoopMode::PingPong => TimelineClipLoopMode::None,
+            if let Some(active_loop) = active_clip(tl).filter(|c| c.kind == TimelineClipKind::Cel).map(|c| c.loop_mode)
+            {
+                let loop_label = match active_loop {
+                    TimelineClipLoopMode::None => "Once",
+                    TimelineClipLoopMode::Loop => "Loop ⟳",
+                    TimelineClipLoopMode::PingPong => "PingPong ⇄",
                 };
-                let _ = session.timeline_set_clip_loop_mode(cid, next);
+                if pill(ui, &mut x, cy, loop_label, PILL_BG.value(), KEY_GOLD, "dt_loop") {
+                    let next = match active_loop {
+                        TimelineClipLoopMode::None => TimelineClipLoopMode::Loop,
+                        TimelineClipLoopMode::Loop => TimelineClipLoopMode::PingPong,
+                        TimelineClipLoopMode::PingPong => TimelineClipLoopMode::None,
+                    };
+                    let _ = session.timeline_set_clip_loop_mode(cid, next);
+                }
             }
             if pill(ui, &mut x, cy, "Rev", PILL_BG.value(), INK.value(), "dt_rev") {
                 let _ = session.timeline_reverse_clip(cid);
@@ -594,14 +598,33 @@ impl DreamsTimelineDock {
                 ui.interact(cr.intersect(l_rect), ui.scope_id().with(("dt_clip", clip.id)), Sense::click_and_drag());
             if cresp.clicked() {
                 let _ = session.timeline_select_clip(clip.id);
-            } else if cresp.dragged() {
-                let dx_frames = (cresp.drag_delta().x / self.px_per_frame).round() as i32;
-                if dx_frames != 0 {
-                    let next_start = (clip.start_frame as i32 + dx_frames).max(0) as u32;
+            }
+            if cresp.drag_started() {
+                self.drag_clip = Some((clip.id, clip.start_frame, 0.0));
+            }
+            if cresp.dragged() {
+                let (origin, accum) = match self.drag_clip {
+                    Some((id, origin, prev)) if id == clip.id => (origin, prev + cresp.drag_delta().x),
+                    _ => (clip.start_frame, cresp.drag_delta().x),
+                };
+                self.drag_clip = Some((clip.id, origin, accum));
+                let dx_frames = (accum / self.px_per_frame.max(1.0)).round() as i32;
+                let next_start = (origin as i32 + dx_frames).max(0) as u32;
+                if next_start != clip.start_frame {
                     let _ = session.timeline_move_clip(clip.id, next_start, None, false);
                 }
             } else if cresp.drag_stopped() {
-                let _ = session.timeline_move_clip(clip.id, clip.start_frame, None, true);
+                let final_start = match self.drag_clip.take() {
+                    Some((id, origin, accum)) if id == clip.id => {
+                        let dx_frames = (accum / self.px_per_frame.max(1.0)).round() as i32;
+                        (origin as i32 + dx_frames).max(0) as u32
+                    }
+                    other => {
+                        self.drag_clip = other;
+                        clip.start_frame
+                    }
+                };
+                let _ = session.timeline_move_clip(clip.id, final_start, None, true);
             }
         }
     }

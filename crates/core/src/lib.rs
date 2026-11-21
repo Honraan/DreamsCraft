@@ -947,7 +947,9 @@ impl State {
         self.end_transform(true);
         self.end_adjustment(true);
         let name = self.pending_name.take();
-        if let (Some(before), Some(canvas)) = (self.pending_doc.take(), self.canvas.as_mut()) {
+        if let (Some(before), Some(canvas)) = (self.pending_doc.take(), self.canvas.as_mut())
+            && before != self.doc
+        {
             if let Some(name) = name {
                 canvas.name_next_step(&name);
             }

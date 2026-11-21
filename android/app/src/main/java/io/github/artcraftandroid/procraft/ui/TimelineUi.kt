@@ -2592,7 +2592,7 @@ private fun TrackLaneRow(
                                     vm.moveTimelineClip(clip.id, snapped, null, done = true)
                                 },
                                 onDragCancel = {
-                                    vm.moveTimelineClip(clip.id, dragOrigin, null, done = false)
+                                    vm.moveTimelineClip(clip.id, dragOrigin, null, done = true)
                                 },
                             )
                         },
@@ -2804,7 +2804,7 @@ private fun TrackLaneRow(
                                             vm.trimTimelineClipLeft(clip.id, nextStart, done = true)
                                         },
                                         onDragCancel = {
-                                            vm.trimTimelineClipLeft(clip.id, trimOrigin, done = false)
+                                            vm.trimTimelineClipLeft(clip.id, trimOrigin, done = true)
                                         },
                                     )
                                 },
@@ -2848,7 +2848,7 @@ private fun TrackLaneRow(
                                         vm.resizeTimelineClip(clip.id, nextDur, done = true)
                                     },
                                     onDragCancel = {
-                                        vm.resizeTimelineClip(clip.id, resizeOrigin, done = false)
+                                        vm.resizeTimelineClip(clip.id, resizeOrigin, done = true)
                                     },
                                 )
                             },
@@ -3053,7 +3053,7 @@ private fun KeyframeDiamond(
                             },
                             onDragCancel = {
                                 if (lastSent != dragOrigin) {
-                                    latestOnMove?.invoke(lastSent, dragOrigin, false)
+                                    latestOnMove?.invoke(lastSent, dragOrigin, true)
                                 }
                             },
                         )
@@ -3484,8 +3484,10 @@ private fun BoxScope.StageKeyTransformOverlay(
                                 if (vm.dreamsMode == DreamsWorkMode.PERFORM && !vm.performRecording) return@detectDragGestures
                                 val delta = canvasDeltaFromScreen(latestViewMatrix, drag.x, drag.y)
                                 val t = liveTransform
-                                val du = (delta.x * cos(t.rotation) + delta.y * sin(t.rotation)) / (stageCanvasW * t.scaleX)
-                                val dv = (delta.y * cos(t.rotation) - delta.x * sin(t.rotation)) / (stageCanvasH * t.scaleY)
+                                val safeSx = if (abs(t.scaleX) < 0.01f) (if (t.scaleX < 0f) -0.01f else 0.01f) else t.scaleX
+                                val safeSy = if (abs(t.scaleY) < 0.01f) (if (t.scaleY < 0f) -0.01f else 0.01f) else t.scaleY
+                                val du = (delta.x * cos(t.rotation) + delta.y * sin(t.rotation)) / (stageCanvasW * safeSx)
+                                val dv = (delta.y * cos(t.rotation) - delta.x * sin(t.rotation)) / (stageCanvasH * safeSy)
                                 val info = if (isDistort) {
                                     val next = distortCorners.toMutableList()
                                     val cur = next[idx]
@@ -4688,10 +4690,28 @@ private fun BoxScope.LiveFilterPopover(
     val isCam = vm.stageGizmoMode == StageGizmoSubMode.CAMERA
     val isPerform = vm.dreamsMode == DreamsWorkMode.PERFORM
     val baseFilter = if (isCam) tl.cameraFilter else tl.activeEvaluatedFilter
-    var filter by remember(activeClipId, isCam, tl.playhead, baseFilter) { mutableStateOf(baseFilter) }
-    var opacity by remember(activeClipId, tl.playhead, tl.activeEvaluatedOpacity) { mutableFloatStateOf(tl.activeEvaluatedOpacity) }
+    var filter by remember(activeClipId, isCam) { mutableStateOf(baseFilter) }
+    var opacity by remember(activeClipId) { mutableFloatStateOf(tl.activeEvaluatedOpacity) }
 
     var sliderTakeStarted by remember(activeClipId, isPerform) { mutableStateOf(false) }
+
+    LaunchedEffect(activeClipId, isCam, tl.playhead, baseFilter, sliderTakeStarted, vm.performRecording) {
+        if (!sliderTakeStarted && !vm.performRecording) {
+            filter = baseFilter
+        }
+    }
+    LaunchedEffect(activeClipId, tl.playhead, tl.activeEvaluatedOpacity, sliderTakeStarted, vm.performRecording) {
+        if (!sliderTakeStarted && !vm.performRecording) {
+            opacity = tl.activeEvaluatedOpacity
+        }
+    }
+    androidx.compose.runtime.DisposableEffect(activeClipId, isPerform) {
+        onDispose {
+            if (sliderTakeStarted && vm.performRecording) {
+                vm.finishPerformRecording()
+            }
+        }
+    }
 
     fun pushOpacity(next: Float, done: Boolean) {
         opacity = next
@@ -5165,19 +5185,21 @@ private fun ClipContextMenuCard(
             ) {
                 Text("Fill Duration", color = DreamsInk, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
             }
-            Box(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(if (clip.loopMode != TimelineClipLoopMode.NONE) KeyframeGold.copy(alpha = 0.22f) else DreamsPillBg)
-                    .clickable { vm.setClipLoopMode(clip.id, nextLoopMode) }
-                    .padding(horizontal = 8.dp, vertical = 3.dp),
-            ) {
-                Text(
-                    loopLabel,
-                    color = if (clip.loopMode != TimelineClipLoopMode.NONE) KeyframeGold else DreamsInk,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.SemiBold,
-                )
+            if (clip.kind == TimelineClipKind.CEL) {
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(if (clip.loopMode != TimelineClipLoopMode.NONE) KeyframeGold.copy(alpha = 0.22f) else DreamsPillBg)
+                        .clickable { vm.setClipLoopMode(clip.id, nextLoopMode) }
+                        .padding(horizontal = 8.dp, vertical = 3.dp),
+                ) {
+                    Text(
+                        loopLabel,
+                        color = if (clip.loopMode != TimelineClipLoopMode.NONE) KeyframeGold else DreamsInk,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
             }
             Box(
                 modifier = Modifier
@@ -5271,6 +5293,7 @@ private fun ClipContextMenuCard(
             val curPanInit = clip.panKeyframes.lastOrNull { it.frame <= tl.playhead }?.scalar ?: 0f
             var vol by remember(clip.id, tl.playhead, curVolInit) { mutableFloatStateOf(curVolInit) }
             var pan by remember(clip.id, tl.playhead, curPanInit) { mutableFloatStateOf(curPanInit) }
+            val canFade = clip.durationFrames > 1u
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -5313,30 +5336,33 @@ private fun ClipContextMenuCard(
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(8.dp))
-                        .background(AudioGreen.copy(alpha = 0.20f))
-                        .clickable {
+                        .background(AudioGreen.copy(alpha = if (canFade) 0.20f else 0.08f))
+                        .clickable(enabled = canFade) {
                             val s0 = clip.startFrame.toInt()
-                            val fadeLen = (tl.fps.toInt().coerceAtLeast(6)).coerceAtMost((clip.durationFrames.toInt() - 1).coerceAtLeast(1))
+                            val maxFade = (clip.durationFrames.toInt() - 1).coerceAtLeast(1)
+                            val fadeLen = tl.fps.toInt().coerceAtLeast(6).coerceAtMost(maxFade)
                             vm.setAudioVolumeKeyframe(clip.id, s0, 0f, done = false)
                             vm.setAudioVolumeKeyframe(clip.id, s0 + fadeLen, 1f, done = true)
                         }
                         .padding(horizontal = 8.dp, vertical = 5.dp),
                 ) {
-                    Text("Fade In", color = AudioGreen, fontSize = 10.5.sp, fontWeight = FontWeight.Bold)
+                    Text("Fade In", color = if (canFade) AudioGreen else DreamsDimInk, fontSize = 10.5.sp, fontWeight = FontWeight.Bold)
                 }
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(8.dp))
-                        .background(AudioGreen.copy(alpha = 0.20f))
-                        .clickable {
+                        .background(AudioGreen.copy(alpha = if (canFade) 0.20f else 0.08f))
+                        .clickable(enabled = canFade) {
+                            val s0 = clip.startFrame.toInt()
                             val endF = (clip.startFrame + clip.durationFrames).toInt() - 1
-                            val fadeLen = (tl.fps.toInt().coerceAtLeast(6)).coerceAtMost((clip.durationFrames.toInt() - 1).coerceAtLeast(1))
-                            vm.setAudioVolumeKeyframe(clip.id, (endF - fadeLen).coerceAtLeast(clip.startFrame.toInt()), 1f, done = false)
-                            vm.setAudioVolumeKeyframe(clip.id, endF.coerceAtLeast(0), 0f, done = true)
+                            val maxFade = (clip.durationFrames.toInt() - 1).coerceAtLeast(1)
+                            val fadeLen = tl.fps.toInt().coerceAtLeast(6).coerceAtMost(maxFade)
+                            vm.setAudioVolumeKeyframe(clip.id, (endF - fadeLen).coerceAtLeast(s0), 1f, done = false)
+                            vm.setAudioVolumeKeyframe(clip.id, endF.coerceAtLeast(s0), 0f, done = true)
                         }
                         .padding(horizontal = 8.dp, vertical = 5.dp),
                 ) {
-                    Text("Fade Out", color = AudioGreen, fontSize = 10.5.sp, fontWeight = FontWeight.Bold)
+                    Text("Fade Out", color = if (canFade) AudioGreen else DreamsDimInk, fontSize = 10.5.sp, fontWeight = FontWeight.Bold)
                 }
             }
         }

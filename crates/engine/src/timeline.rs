@@ -1040,7 +1040,7 @@ fn eval_keyframes<T: Copy>(keys: &[Keyframe<T>], frame: f32, default: T, lerp: i
     for pair in keys.windows(2) {
         let (Some(a), Some(b)) = (pair.first(), pair.get(1)) else { continue };
         let (fa, fb) = (a.frame as f32, b.frame as f32);
-        if frame >= fa && frame <= fb {
+        if frame >= fa && frame < fb {
             let span = (fb - fa).max(1e-6);
             let raw_t = ((frame - fa) / span).clamp(0.0, 1.0);
             let eased_t = a.easing.sample(raw_t);
@@ -2503,6 +2503,7 @@ impl Timeline {
         }
         let target_dur = new_duration_frames.clamp(1, MAX_TIMELINE_DURATION);
         let Some(clip) = self.clip_mut(clip_id) else { return false };
+        let old_dur = clip.effective_duration();
         let loop_mode = clip.loop_mode;
         match &mut clip.kind {
             ClipKind::Cel { cels } => {
@@ -2532,6 +2533,9 @@ impl Timeline {
             | ClipKind::Text { .. } => {
                 clip.duration_frames = target_dur;
             }
+        }
+        if clip.effective_duration() == old_dur {
+            return false;
         }
         let end = clip.end_frame();
         self.duration_frames = self.duration_frames.max(end).min(MAX_TIMELINE_DURATION);
@@ -2572,6 +2576,9 @@ impl Timeline {
                     if let Some(first) = cels.first_mut() {
                         let next_hold = first.hold.saturating_add(grow).min(600);
                         let applied = next_hold.saturating_sub(first.hold);
+                        if applied == 0 {
+                            return false;
+                        }
                         first.hold = next_hold;
                         clip.start_frame = old_start.saturating_sub(applied);
                     }
@@ -2654,6 +2661,7 @@ impl Timeline {
             && cels.len() > 1
         {
             cels.reverse();
+            clip.loop_offset = 0;
             changed = true;
         }
         if !clip.keyframes.is_empty() {

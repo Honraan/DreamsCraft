@@ -194,18 +194,41 @@ private fun LiveKeyframeAdjustmentsContent(
     val isCam = vm.stageGizmoMode == io.github.artcraftandroid.procraft.canvas.StageGizmoSubMode.CAMERA
     val isPerform = vm.dreamsMode == io.github.artcraftandroid.procraft.canvas.DreamsWorkMode.PERFORM
     val baseFilter = if (isCam) tl.cameraFilter else tl.activeEvaluatedFilter
-    var filter by remember(activeClipId, isCam, tl.playhead, baseFilter) { mutableStateOf(baseFilter) }
-    var opacity by remember(activeClipId, tl.playhead, tl.activeEvaluatedOpacity) { mutableStateOf(tl.activeEvaluatedOpacity) }
+    var filter by remember(activeClipId, isCam) { mutableStateOf(baseFilter) }
+    var opacity by remember(activeClipId) { mutableStateOf(tl.activeEvaluatedOpacity) }
+    var sliderTakeStarted by remember(activeClipId, isPerform) { mutableStateOf(false) }
+
+    androidx.compose.runtime.LaunchedEffect(activeClipId, isCam, tl.playhead, baseFilter, sliderTakeStarted, vm.performRecording) {
+        if (!sliderTakeStarted && !vm.performRecording) {
+            filter = baseFilter
+        }
+    }
+    androidx.compose.runtime.LaunchedEffect(activeClipId, tl.playhead, tl.activeEvaluatedOpacity, sliderTakeStarted, vm.performRecording) {
+        if (!sliderTakeStarted && !vm.performRecording) {
+            opacity = tl.activeEvaluatedOpacity
+        }
+    }
+    androidx.compose.runtime.DisposableEffect(activeClipId, isPerform) {
+        onDispose {
+            if (sliderTakeStarted && vm.performRecording) {
+                vm.finishPerformRecording()
+            }
+        }
+    }
 
     fun pushOpacity(next: Float, done: Boolean) {
         opacity = next
         if (activeClipId == null) return
         if (isPerform) {
             if (!done) {
-                if (!vm.performRecording) vm.beginPerformOpacity(next)
+                if (!sliderTakeStarted) {
+                    sliderTakeStarted = true
+                    vm.beginPerformOpacity(next)
+                }
                 vm.recordPerformOpacity(next)
-            } else if (vm.performRecording) {
-                vm.finishPerformRecording()
+            } else {
+                sliderTakeStarted = false
+                if (vm.performRecording) vm.finishPerformRecording()
             }
         } else {
             vm.setClipOpacityKeyframe(activeClipId, tl.playhead.toInt(), next, done)
@@ -219,10 +242,14 @@ private fun LiveKeyframeAdjustmentsContent(
         } else if (activeClipId != null) {
             if (isPerform) {
                 if (!done) {
-                    if (!vm.performRecording) vm.beginPerformFilter(next)
+                    if (!sliderTakeStarted) {
+                        sliderTakeStarted = true
+                        vm.beginPerformFilter(next)
+                    }
                     vm.recordPerformFilter(next)
-                } else if (vm.performRecording) {
-                    vm.finishPerformRecording()
+                } else {
+                    sliderTakeStarted = false
+                    if (vm.performRecording) vm.finishPerformRecording()
                 }
             } else {
                 vm.setClipFilterKeyframe(activeClipId, tl.playhead.toInt(), next, done)

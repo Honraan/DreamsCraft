@@ -7035,6 +7035,9 @@ impl Canvas {
                         continue;
                     }
                     let Some(meta) = doc.layer(eval.layer) else { continue };
+                    if !meta.visible {
+                        continue;
+                    }
                     let candidates: Vec<(LayerId, f32)> = if meta.kind == LayerKind::Group {
                         doc.members(Some(eval.layer))
                             .into_iter()
