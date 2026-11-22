@@ -5242,6 +5242,93 @@ fn the_canvas_flips_on_the_gpu_as_on_the_cpu_and_undoes() {
     assert!(layers(&s) == flipped);
 }
 
+/// Canvas > Flip takes the drawing guide with the picture: a symmetry axis off the middle is
+/// mirrored too, so what was drawn about it is still mirrored about it, and the next stroke's copy
+/// lands mirrored about it too; undone and redone with the layers.
+#[test]
+fn a_flip_takes_the_drawing_guide_with_the_picture() {
+    use crate::guide::{GuideType, SymmetryType};
+    let Some(s) = session(100, 100) else { return };
+    s.set_brush_size(0.2);
+    s.set_guide_on(true);
+    s.set_guide_kind(GuideType::Symmetry);
+    s.set_guide_symmetry(SymmetryType::Vertical, false);
+    s.set_guide_assisted(true);
+    // the axis moved to x = 70
+    {
+        let mut st = s.shared.lock();
+        st.doc.guide.centre = [70.0, 50.0];
+    }
+    let line = |s: &CanvasSession, from: (f32, f32), to: (f32, f32)| {
+        let at = |i: usize| {
+            let t = i as f32 / 20.0;
+            sample(from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t, i as f64 * 8.0)
+        };
+        s.stroke_begin(PointerKind::Finger, vec![at(0)]);
+        s.stroke_add((1..=20).map(at).collect());
+        s.stroke_end(vec![]);
+    };
+    line(&s, (50.0, 20.0), (62.0, 80.0));
+    let composite = |s: &CanvasSession| -> Vec<u8> {
+        let _ = pixel(s, 0, 0);
+        let mut guard = s.shared.lock();
+        let st = &mut *guard;
+        st.canvas.as_mut().unwrap().read_composite(st.gpu.as_ref().unwrap()).unwrap()
+    };
+    // the most a pixel and its mirror about the axis at `axis` (canvas pixels) differ, and how
+    // many pixels were painted
+    let about = |px: &[u8], axis: u32| -> (u8, usize) {
+        let mut most = 0;
+        let mut painted = 0;
+        for y in 0..100u32 {
+            for x in 0..100u32 {
+                let Some(m) = (2 * axis).checked_sub(x + 1).filter(|m| *m < 100) else { continue };
+                let (i, j) = (((y * 100 + x) * 4) as usize, ((y * 100 + m) * 4) as usize);
+                most = most.max((0..4).map(|k| px[i + k].abs_diff(px[j + k])).max().unwrap_or(0));
+                painted += usize::from(px[i] < 128);
+            }
+        }
+        (most, painted)
+    };
+    let drawn = composite(&s);
+    let (off, painted) = about(&drawn, 70);
+    eprintln!("drawn: {painted} pixels, mirrored about x = 70 to within {off}");
+    assert!(painted > 100 && off <= 2, "{off} {painted}");
+    s.flip_canvas(true);
+    assert_eq!(s.shared.lock().doc.guide.centre, [30.0, 50.0], "the axis goes with the picture");
+    let flipped = composite(&s);
+    let (off, painted) = about(&flipped, 30);
+    eprintln!("flipped: {painted} pixels, mirrored about x = 30 to within {off}");
+    assert!(painted > 100 && off <= 2, "{off} {painted}");
+    assert!(about(&flipped, 70).0 > 200, "and not about where the axis was");
+    // a stroke drawn after the flip: its copy lands mirrored about the axis where it now shows, and
+    // the picture stays mirrored about it
+    line(&s, (10.0, 40.0), (20.0, 60.0));
+    let (off, painted) = about(&composite(&s), 30);
+    eprintln!("drawn again: {painted} pixels, mirrored about x = 30 to within {off}");
+    assert!(off <= 2, "{off}");
+    // undone (the stroke, the flip), the guide is back where it was with the picture;
+    // redone, mirrored again
+    for _ in 0..3 {
+        if s.shared.lock().doc.guide.centre != [70.0, 50.0] {
+            assert!(s.undo().is_some());
+        }
+    }
+    assert_eq!(s.shared.lock().doc.guide.centre, [70.0, 50.0]);
+    assert!(composite(&s) == drawn, "undone to the picture before the flip, not further");
+    s.redo();
+    assert_eq!(s.shared.lock().doc.guide.centre, [30.0, 50.0]);
+    // top to bottom: the axis's turn mirrored (it still runs top to bottom), its centre's height
+    // mirrored
+    s.shared.lock().doc.guide.centre = [30.0, 20.0];
+    s.flip_canvas(false);
+    let g = s.shared.lock().doc.guide.clone();
+    assert_eq!(g.centre, [30.0, 80.0]);
+    assert!((g.angle.abs() - std::f32::consts::PI).abs() < 1e-6, "{}", g.angle);
+    let (off, _) = about(&composite(&s), 30);
+    assert!(off <= 2, "{off}");
+}
+
 #[test]
 fn a_crop_by_whole_pixels_copies_the_layers_as_the_cpu_would() {
     let Some(s) = session(300, 300) else { return };

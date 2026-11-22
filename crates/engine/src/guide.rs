@@ -250,6 +250,22 @@ impl Guide {
         self.looks.get(self.kind as usize).copied().unwrap_or(STARTS[0])
     }
 
+    /// The guide as it goes with a `w` × `h` canvas mirrored left to right (`horizontal`) or top
+    /// to bottom: its centre and vanishing points mirrored, and its turn too (the handle straight
+    /// up from the centre, unturned, mirrored), so it keeps its place on the picture.
+    pub fn mirror(&mut self, w: f32, h: f32, horizontal: bool) {
+        let flip = |[x, y]: [f32; 2]| if horizontal { [w - x, y] } else { [x, h - y] };
+        self.centre = flip(self.centre);
+        for v in &mut self.vanishing {
+            *v = flip(*v);
+        }
+        // the handle's way out, (sin a, -cos a), mirrored: (-sin a, -cos a) left to right, (sin a, cos a)
+        // top to bottom
+        let turned = if horizontal { -self.angle } else { PI - self.angle };
+        // within a turn either way of upright, as an archive's guide is read
+        self.angle = (turned + PI).rem_euclid(TAU) - PI;
+    }
+
     fn centre(&self) -> Vec2 {
         Vec2::new(self.centre[0], self.centre[1])
     }
@@ -449,6 +465,79 @@ mod tests {
 
     fn on(kind: GuideKind) -> Guide {
         Guide { on: true, kind, assisted: true, ..Guide::new(200, 100) }
+    }
+
+    #[test]
+    fn a_mirrored_guide_mirrors_its_copies_and_lines() {
+        let (w, h) = (200.0, 100.0);
+        let flip =
+            |p: Vec2, horizontal: bool| if horizontal { Vec2::new(w - p.x, p.y) } else { Vec2::new(p.x, h - p.y) };
+        let near = |a: Vec2, b: Vec2| (a - b).length() < 1e-3;
+        let p = Vec2::new(130.0, 30.0);
+        for symmetry in [SymmetryKind::Vertical, SymmetryKind::Horizontal, SymmetryKind::Quadrant, SymmetryKind::Radial]
+        {
+            for rotational in [false, true] {
+                for horizontal in [true, false] {
+                    let g = Guide {
+                        symmetry,
+                        rotational,
+                        centre: [70.0, 40.0],
+                        angle: 0.3,
+                        vanishing: vec![[10.0, 20.0]],
+                        ..on(GuideKind::Symmetry)
+                    };
+                    let mut m = g.clone();
+                    m.mirror(w, h, horizontal);
+                    assert!((-PI..PI).contains(&m.angle), "{}", m.angle);
+                    assert_eq!(m.vanishing, vec![if horizontal { [190.0, 20.0] } else { [10.0, 80.0] }]);
+                    // each copy of the mirrored point is a mirrored copy of the point
+                    let (before, after) = (g.copies(p), m.copies(flip(p, horizontal)));
+                    assert_eq!(before.len(), after.len());
+                    for (q, ..) in &before {
+                        assert!(
+                            after.iter().any(|(r, ..)| near(*r, flip(*q, horizontal))),
+                            "{symmetry:?} {rotational} {horizontal}: {q:?} not in {after:?}"
+                        );
+                    }
+                    // and its lines are the mirrored lines
+                    for (a, b) in g.lines(200, 100) {
+                        let (fa, fb) = (flip(a, horizontal), flip(b, horizontal));
+                        assert!(
+                            m.lines(200, 100)
+                                .iter()
+                                .any(|&(c, d)| (near(c, fa) && near(d, fb)) || (near(c, fb) && near(d, fa))),
+                            "{symmetry:?} {horizontal}: line {a:?}-{b:?}"
+                        );
+                    }
+                    // mirrored back, as it was
+                    m.mirror(w, h, horizontal);
+                    assert!(near(m.centre(), g.centre()) && (m.angle - g.angle).abs() < 1e-5, "{m:?}");
+                }
+            }
+        }
+        // the grids' and perspective's lines too
+        for kind in [GuideKind::Grid, GuideKind::Isometric, GuideKind::Perspective] {
+            for horizontal in [true, false] {
+                let g = Guide {
+                    centre: [70.0, 40.0],
+                    angle: 0.3,
+                    vanishing: vec![[60.0, 45.0], [180.0, 35.0]],
+                    ..on(kind)
+                };
+                let mut m = g.clone();
+                m.mirror(w, h, horizontal);
+                let (before, after) = (g.lines(200, 100), m.lines(200, 100));
+                assert_eq!(before.len(), after.len(), "{kind:?}");
+                let close = |a: Vec2, b: Vec2| (a - b).length() < 0.05;
+                for (a, b) in before {
+                    let (fa, fb) = (flip(a, horizontal), flip(b, horizontal));
+                    assert!(
+                        after.iter().any(|&(c, d)| (close(c, fa) && close(d, fb)) || (close(c, fb) && close(d, fa))),
+                        "{kind:?} {horizontal}: line {a:?}-{b:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
