@@ -56,6 +56,60 @@ pub fn artwork_plays(dir: String) -> bool {
     file.is_some_and(|f| f.document.animation.is_some() || f.model.is_some())
 }
 
+/// The longest side Preview's picture of an artwork is ever made at, pixels: past a screen's, it
+/// would show nothing more.
+pub const PREVIEW_SIDE_MOST: u32 = 4096;
+
+/// The longest side to make Preview's picture of an artwork shown `width` × `height` (as the
+/// gallery shows it, turned) at, for a `box_width` × `box_height` screen (pixels): as large as it
+/// shows fitted there, so each of the screen's pixels has one of its own; never larger than the
+/// artwork, nor than [`PREVIEW_SIDE_MOST`].
+#[uniffi::export]
+pub fn preview_side(width: u32, height: u32, box_width: u32, box_height: u32) -> u32 {
+    let (w, h) = (f64::from(width.max(1)), f64::from(height.max(1)));
+    let fit = (f64::from(box_width.max(1)) / w).min(f64::from(box_height.max(1)) / h);
+    let side = (w.max(h) * fit).ceil().min(f64::from(u32::MAX)) as u32;
+    side.clamp(1, width.max(height).clamp(1, PREVIEW_SIDE_MOST))
+}
+
+/// The artwork in `dir` as Preview shows it: the whole picture fitted to `max_side` pixels (see
+/// [`preview_side`]), as its gallery thumbnail is made (its private layers left out, turned and in
+/// its colours as the gallery shows it, its profile carried), as a PNG; none if it can't be opened
+/// or drawn. Slow: the artwork is opened and drawn whole (on the GPU), then let go at once.
+#[uniffi::export]
+pub fn artwork_preview_png(dir: String, max_side: u32) -> Option<Vec<u8>> {
+    let session = CanvasSession::open(dir).ok()?;
+    let made = session.preview_png(max_side);
+    session.release_canvas();
+    made
+}
+
+impl CanvasSession {
+    /// The picture [`artwork_preview_png`] makes, of this artwork opened for it.
+    fn preview_png(&self, max_side: u32) -> Option<Vec<u8>> {
+        // on the app's own device (made now if the app has none yet), not one of its own
+        crate::device::warm_gpu();
+        if !self.prepare_offscreen() {
+            return None;
+        }
+        let (pending, icc, proof, turns) = {
+            let mut guard = self.shared.lock();
+            let st = &mut *guard;
+            let private = st.doc.private_layers();
+            let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else { return None };
+            canvas.render_finished(gpu, &mut st.doc);
+            let pending = canvas.start_composite_thumbnail_without(gpu, &mut st.doc, max_side.max(1), &private);
+            (pending, st.doc.picture_icc(), proof_table(&st.doc), st.turns)
+        };
+        let t = pending.pixels().ok()?;
+        let (w, h, mut rgba) = turned(t.width, t.height, straight_alpha(&t.rgba), turns);
+        if let Some(table) = proof {
+            table.apply_rgba(&mut rgba, false);
+        }
+        png_bytes(w, h, &rgba, &icc).ok()
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ArtworkFile {
     format: String,

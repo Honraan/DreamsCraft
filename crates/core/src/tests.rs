@@ -9041,6 +9041,127 @@ fn a_held_frame_splits_where_it_is_chosen_and_loses_a_place_on_delete() {
     assert_eq!(s.frame_hold(first), 3);
 }
 
+/// Preview's picture is made as large as it shows fitted on the screen: each screen pixel has one
+/// of the artwork's (where the artwork has as many), never more than the screen shows (memory).
+#[test]
+fn preview_s_picture_has_a_pixel_for_each_of_the_screen_s() {
+    use crate::project::{PREVIEW_SIDE_MOST, THUMBNAIL_SIDE, preview_side};
+    let screens = [(2560u32, 1600u32), (1600, 2560), (2000, 1200), (1180, 820), (3000, 2000)];
+    let canvases = [
+        (7087u32, 9449u32),
+        (2048, 2048),
+        (4096, 1024),
+        (1200, 9000),
+        (2560, 1600),
+        (16384, 16384),
+        (500, 400),
+        (3, 7000),
+    ];
+    for (bw, bh) in screens {
+        for (w, h) in canvases {
+            let side = preview_side(w, h, bw, bh);
+            let long = w.max(h);
+            // the picture made: the artwork scaled to `side` on its longest side
+            let scale = f64::from(side) / f64::from(long);
+            let (pw, ph) = (f64::from(w) * scale, f64::from(h) * scale);
+            // shown fitted on the screen: its pixels to the screen's
+            let fit = (f64::from(bw) / f64::from(w)).min(f64::from(bh) / f64::from(h));
+            let per_screen_pixel = scale / fit;
+            let thumbnail = f64::from(THUMBNAIL_SIDE.min(long)) / f64::from(long) / fit;
+            let bytes = (pw.round() * ph.round() * 4.0) as u64;
+            eprintln!(
+                "{w}x{h} on {bw}x{bh}: side {side}, {per_screen_pixel:.3} picture pixels a screen pixel (the thumbnail \
+                 {thumbnail:.3}), {:.1} MB",
+                bytes as f64 / 1e6
+            );
+            assert!(side <= long && side <= PREVIEW_SIDE_MOST);
+            if long <= PREVIEW_SIDE_MOST && f64::from(long) >= f64::from(w.max(h)) * fit {
+                // an artwork with as many pixels as the screen shows of it: one a screen pixel
+                // at least, and not two
+                assert!((1.0..2.0).contains(&per_screen_pixel), "{w}x{h} on {bw}x{bh}: {per_screen_pixel}");
+            }
+            // never more pixels than the screen has (plus the rounding up of a row)
+            assert!(bytes <= u64::from(bw + 1) * u64::from(bh + 1) * 4, "{w}x{h} on {bw}x{bh}: {bytes} bytes");
+        }
+    }
+    // a small artwork is never enlarged; a huge one is made screen size, not its own
+    assert_eq!(preview_side(500, 400, 2560, 1600), 500);
+    assert_eq!(preview_side(7087, 9449, 2560, 1600), 1600);
+    assert_eq!(preview_side(0, 0, 0, 0), 1);
+}
+
+/// Gallery > Select > Preview shows the artwork itself, as sharp as the screen: the picture made
+/// for it is screen size (the gallery thumbnail is 512 pixels, enlarged to fill a screen),
+/// without the private layers, as the thumbnail is.
+#[test]
+fn preview_shows_the_artwork_at_screen_size_not_its_thumbnail() {
+    let Some(s) = session(1200, 1200) else { return };
+    no_streamline(&s);
+    s.set_brush_size(0.03);
+    s.set_color(0.0, 0.0, 0.0);
+    // fine lines a few pixels apart, which a 512 thumbnail blurs together
+    for k in 0..12 {
+        let x = 300.0 + k as f32 * 6.0;
+        s.stroke_begin(PointerKind::Finger, vec![sample(x, 200.0, 0.0)]);
+        s.stroke_add((1..=40).map(|i| sample(x, 200.0 + i as f32 * 20.0, f64::from(i) * 8.0)).collect());
+        s.stroke_end(vec![]);
+    }
+    // the picture as the canvas has it, fitted to 1000 pixels
+    let _ = pixel(&s, 0, 0);
+    let shown = s.canvas_thumbnail(1000).unwrap();
+    // a private layer, red: left out
+    let private = s.add_layer();
+    s.set_color(1.0, 0.0, 0.0);
+    s.stroke_begin(PointerKind::Finger, vec![sample(900.0, 300.0, 0.0)]);
+    s.stroke_add((1..=20).map(|i| sample(900.0, 300.0 + i as f32 * 20.0, f64::from(i) * 8.0)).collect());
+    s.stroke_end(vec![]);
+    let _ = pixel(&s, 0, 0);
+    assert!(s.shared.lock().doc.set_private(procraft_engine::document::LayerId(private), true));
+    let dir = std::env::temp_dir().join(format!("procraft-preview-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.to_string_lossy().into_owned();
+    s.save(path.clone()).unwrap();
+    let side = crate::project::preview_side(1200, 1200, 1600, 1000);
+    assert_eq!(side, 1000);
+    let started = std::time::Instant::now();
+    let Some(png) = crate::project::artwork_preview_png(path.clone(), side) else {
+        panic!("no preview picture");
+    };
+    let took = started.elapsed();
+    let decoded = |bytes: &[u8]| {
+        let mut reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().unwrap();
+        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+        let frame = reader.next_frame(&mut buf).unwrap();
+        buf.truncate(frame.buffer_size());
+        (frame.width, frame.height, buf)
+    };
+    let (w, h, rgba) = decoded(&png);
+    let (tw, th, thumb) = decoded(&std::fs::read(dir.join("thumbnail.png")).unwrap());
+    eprintln!("preview {w}x{h} ({} KB PNG) in {took:?}; the thumbnail {tw}x{th}", png.len() / 1024);
+    assert_eq!((w, h), (1000, 1000));
+    assert_eq!(tw, 512);
+    // the canvas's own picture at that size, pixel for pixel (the private layer left out)
+    assert_eq!((shown.width, shown.height), (w, h));
+    let off = rgba.iter().zip(&shown.rgba).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+    eprintln!("preview against the canvas at 1000 pixels: at most {off} apart");
+    assert!(off <= 2, "{off}");
+    // the lines stay apart across the row through them (dark and light alternating), in the
+    // thumbnail enlarged to the same size they run together
+    let edges = |px: &[u8], width: u32, scale: f32| {
+        let y = (500.0 * scale) as u32;
+        // along the canvas's row y = 500, x 280 to 390, a quarter pixel at a time
+        let across: Vec<u8> = (0..440)
+            .map(|i| ((280.0 + i as f32 / 4.0) * scale) as u32)
+            .map(|x| px[((y * width + x) * 4) as usize])
+            .collect();
+        across.windows(2).filter(|p| (p[0] < 128) != (p[1] < 128)).count()
+    };
+    let (sharp, blurred) = (edges(&rgba, w, 1000.0 / 1200.0), edges(&thumb, tw, 512.0 / 1200.0));
+    eprintln!("dark/light changes across the lines: preview {sharp}, thumbnail {blurred}");
+    assert!(sharp >= 20 && sharp > blurred, "{sharp} {blurred}");
+    std::fs::remove_dir_all(dir).ok();
+}
+
 #[test]
 fn a_saved_animation_can_be_drawn_with_no_window() {
     let Some(s) = session(40, 40) else { return };

@@ -1604,8 +1604,10 @@ private fun ArtworkPreview(list: List<Artwork>, version: Int, start: Int, playin
     var controls by remember { mutableStateOf(false) }
     val a = list.getOrNull(index) ?: return onClose()
     BackHandler(onBack = onClose)
+    // the screen's pixels Preview fills
+    var box by remember { mutableStateOf(IntSize.Zero) }
     Box(
-        Modifier.fillMaxSize().background(Color.Black).pointerInput(list) {
+        Modifier.fillMaxSize().background(Color.Black).onSizeChanged { box = it }.pointerInput(list) {
             var moved = 0f
             detectHorizontalDragGestures(
                 onDragStart = { moved = 0f },
@@ -1621,6 +1623,12 @@ private fun ArtworkPreview(list: List<Artwork>, version: Int, start: Int, playin
     ) {
         val image by produceState<ImageBitmap?>(null, a.dir.path, version) {
             value = withContext(Dispatchers.IO) { BitmapFactory.decodeFile(a.thumbnail.path)?.asImageBitmap() }
+        }
+        // the artwork itself, as large as it shows: drawn whole on a thread of its own (the
+        // thumbnail, 512 pixels, enlarged till then)
+        val sharp by produceState<ImageBitmap?>(null, a.dir.path, version, box) {
+            value = null
+            if (box.width > 0 && box.height > 0) value = withContext(Dispatchers.Default) { previewPicture(a, box) }
         }
         // an animated artwork plays as its settings say, its thumbnail showing until its frames are read
         val side = androidx.compose.ui.platform.LocalConfiguration.current.let { with(androidx.compose.ui.platform.LocalDensity.current) { maxOf(it.screenWidthDp, it.screenHeightDp).dp.roundToPx() } }
@@ -1643,7 +1651,8 @@ private fun ArtworkPreview(list: List<Artwork>, version: Int, start: Int, playin
                 step = next.step
             }
         }
-        (frame ?: image)?.let { ThumbnailImage(it, a.name, ContentScale.Fit) }
+        // (the thumbnail enlarged smoothly while the artwork is drawn, not in squares)
+        (frame ?: sharp ?: image)?.let { ThumbnailImage(it, a.name, ContentScale.Fit, smooth = it === image && previewLoads(a, box)) }
         androidx.compose.animation.AnimatedVisibility(controls, Modifier.fillMaxSize(), enter = androidx.compose.animation.fadeIn(), exit = androidx.compose.animation.fadeOut()) {
             Box(Modifier.fillMaxSize()) {
                 // a light disc with a black cross, 41 in from the top right
@@ -1660,6 +1669,32 @@ private fun ArtworkPreview(list: List<Artwork>, version: Int, start: Int, playin
             }
         }
     }
+}
+
+/** The gallery thumbnail's longest side (the shared core's project.rs): an artwork shown no larger has its thumbnail to show. */
+private const val THUMBNAIL_SIDE = 512u
+
+/** The longest side [a] is drawn at for Preview filling [box] (pixels), turned as it shows. */
+private fun previewSide(a: Artwork, box: IntSize): UInt {
+    val (w, h) = if (a.turns % 2 != 0) a.height to a.width else a.width to a.height
+    return io.github.artcraftandroid.procraft.core.previewSide(w.coerceAtLeast(1).toUInt(), h.coerceAtLeast(1).toUInt(), box.width.toUInt(), box.height.toUInt())
+}
+
+/** Whether Preview would draw [a] whole for [box]: it shows larger than its thumbnail. */
+private fun previewLoads(a: Artwork, box: IntSize): Boolean = box.width > 0 && box.height > 0 && previewSide(a, box) > THUMBNAIL_SIDE
+
+/**
+ * [a] as Preview shows it filling [box] (pixels): the whole picture at a pixel of its own a screen
+ * pixel, as its thumbnail is made (the shared core's `artwork_preview_png`), never larger than the
+ * screen. None where its thumbnail shows as much, it plays, opening it ended the app before (it
+ * isn't opened again unasked), or it can't be drawn. Slow: the artwork is opened whole, then let go.
+ */
+private fun previewPicture(a: Artwork, box: IntSize): ImageBitmap? {
+    val dir = a.dir.path
+    if (!previewLoads(a, box)) return null
+    if (io.github.artcraftandroid.procraft.core.artworkPlays(dir) || io.github.artcraftandroid.procraft.core.openingEndedApp(dir)) return null
+    val png = io.github.artcraftandroid.procraft.core.artworkPreviewPng(dir, previewSide(a, box)) ?: return null
+    return BitmapFactory.decodeByteArray(png, 0, png.size)?.asImageBitmap()
 }
 
 /** An artwork's frames as read for Preview, and how they play. */
@@ -1741,13 +1776,13 @@ private fun PreviewArrow(left: Boolean, modifier: Modifier, onClick: () -> Unit)
 private fun thumbnailFilter(image: ImageBitmap, shown: Float, density: Float) =
     if (shown >= image.width * density * 0.999f) FilterQuality.None else FilterQuality.Low
 
-/** An artwork's thumbnail fitted in its box (or filling it, by [scale]), filtered by [thumbnailFilter]. */
+/** An artwork's thumbnail fitted in its box (or filling it, by [scale]), filtered by [thumbnailFilter] (or [smooth]ly). */
 @Composable
-private fun ThumbnailImage(image: ImageBitmap, name: String, scale: ContentScale) {
+private fun ThumbnailImage(image: ImageBitmap, name: String, scale: ContentScale, smooth: Boolean = false) {
     val density = LocalDensity.current.density
     var shown by remember { mutableFloatStateOf(0f) }
     // made again when the filter changes (Image(bitmap) keeps its first)
-    val filter = thumbnailFilter(image, shown, density)
+    val filter = if (smooth) FilterQuality.Low else thumbnailFilter(image, shown, density)
     val painter = remember(image, filter) { androidx.compose.ui.graphics.painter.BitmapPainter(image, filterQuality = filter) }
     Image(
         painter,
