@@ -101,10 +101,10 @@ final class CanvasModel {
     /// The current brush's saved sizes and opacities: the side sliders' notches (0..1).
     private(set) var sizeNotches: [Float] = []
     private(set) var opacityNotches: [Float] = []
-    /// The panel beside a slider: shown while it is dragged, and kept up after it is held still.
+    /// The panel beside a slider: it comes up as the slider is dragged or held, and stays up when
+    /// the finger lifts, for its + to be tapped, until the next touch off it and the side bar, a
+    /// tap on the slider's thumb or a tap elsewhere on its track.
     var sliderPanel: SliderPanel?
-    /// The slider's panel stays up (the slider was held still) until the next touch elsewhere.
-    var sliderPanelKept = false
     private(set) var notice: Notice?
     @ObservationIgnored private var notices = 0
 
@@ -119,7 +119,14 @@ final class CanvasModel {
     @ObservationIgnored private var pickEnding = false
     /// A stroke held still and snapped to a shape; `quickShapeEditing` shows its handles.
     private(set) var quickShape: QuickShapeInfo?
-    var quickShapeEditing = false
+    /// The core's touches take the handles only while they show: a touch on one drags it.
+    var quickShapeEditing = false {
+        didSet {
+            if quickShapeEditing != oldValue {
+                session.setShapeEditing(editing: quickShapeEditing)
+            }
+        }
+    }
     /// The current layer turned a change away.
     private(set) var blocked: BlockedLayer?
     /// A stroke began on a text layer: it takes paint once rasterized.
@@ -260,6 +267,8 @@ final class CanvasModel {
     private(set) var recentBrushes: [RecentBrush] = []
     /// The library's brush swiped open to its buttons (its key), if one is.
     var swipedBrush: String?
+    /// The brushes of the shown set picked by sliding them right, by place ("set-index").
+    var pickedBrushes: [String] = []
     /// The set whose name is being edited.
     var renamingSet: Int?
     /// The brush whose name is being edited in place, from its menu (its key).
@@ -460,6 +469,7 @@ final class CanvasModel {
     /// would.
     func showSet(_ index: Int) {
         shownSet = index
+        pickedBrushes = []
         if index == Self.recentSet {
             recentBrushes = session.recentBrushes()
             return
@@ -526,6 +536,8 @@ final class CanvasModel {
     /// After a change to the library: read it again, keep it, and draw previews again (they go by
     /// place).
     func libraryChanged() {
+        // picks go by place, which may hold another brush now
+        pickedBrushes = []
         brushSets = session.brushLibrary()
         readLibraries()
         currentBrush = session.currentBrush()
@@ -549,6 +561,54 @@ final class CanvasModel {
 
     func deleteBrush(_ b: BrushInfo) {
         if session.deleteBrush(set: b.set, index: b.index) {
+            libraryChanged()
+        }
+    }
+
+    /// A brush of the shown set slid right: picked, or no longer.
+    func togglePickedBrush(_ b: BrushInfo) {
+        let key = Self.brushKey(b)
+        if let i = pickedBrushes.firstIndex(of: key) {
+            pickedBrushes.remove(at: i)
+        } else {
+            pickedBrushes.append(key)
+        }
+    }
+
+    /// A picked brush's place ("set-index").
+    private func pickedPlace(_ key: String) -> (set: UInt32, index: UInt32)? {
+        let parts = key.split(separator: "-").compactMap { UInt32($0) }
+        guard parts.count == 2 else { return nil }
+        return (parts[0], parts[1])
+    }
+
+    /// One brush is picked, in the current brush's set (which counts as picked): two, so Combine
+    /// shows beside Delete.
+    var canCombinePicked: Bool {
+        guard let c = currentBrush, pickedBrushes.count == 1, let p = pickedBrushes.first.flatMap(pickedPlace) else { return false }
+        return p.set == c.set
+    }
+
+    /// The picked brush becomes the current brush's second; a tool on either has the pair. Either
+    /// a pair already: said so, nothing done.
+    func combinePicked() {
+        guard let c = currentBrush, pickedBrushes.count == 1, let p = pickedBrushes.first.flatMap(pickedPlace) else { return }
+        if let refusal = session.combineRefusal(set: c.set, first: c.index, second: p.index) {
+            showNotice(refusal)
+            return
+        }
+        pickedBrushes = []
+        if session.combineBrushes(set: c.set, first: c.index, second: p.index) {
+            libraryChanged()
+        }
+    }
+
+    /// The picked brushes deleted, from the last up so the places of the rest hold.
+    func deletePickedBrushes() {
+        let places = pickedBrushes.compactMap(pickedPlace).sorted { $0.index > $1.index }
+        pickedBrushes = []
+        let deleted = places.filter { session.deleteBrush(set: $0.set, index: $0.index) }
+        if !deleted.isEmpty {
             libraryChanged()
         }
     }
@@ -837,7 +897,7 @@ final class CanvasModel {
             let read = bytes.flatMap { readBrushes(bytes: $0, fileName: name) }
             // plugins' brush engines make theirs of the file here too, off the main thread
             if let read {
-                session.makeEngineBrushes(read: read)
+                session.makeEngineBrushes(read: read, reading: nil)
             }
             then?()
             DispatchQueue.main.async {
@@ -874,7 +934,7 @@ final class CanvasModel {
             // the name it came with, after what kept it apart
             let name = String(file.lastPathComponent.dropFirst(37))
             if let bytes = try? Data(contentsOf: file), let read = readBrushes(bytes: bytes, fileName: name) {
-                session.makeEngineBrushes(read: read)
+                session.makeEngineBrushes(read: read, reading: nil)
                 _ = session.addBrushesRead(read: read, shown: 0)
             }
             try? manager.removeItem(at: file)
@@ -1033,7 +1093,6 @@ final class CanvasModel {
     func closePopovers() {
         closePanels()
         sliderPanel = nil
-        sliderPanelKept = false
         layerChoice = nil
         copyPasteOpen = false
     }
@@ -1069,7 +1128,13 @@ final class CanvasModel {
     /// `button` pressed: the modes it leaves behind end first (keeping what they made), as the
     /// core says; true if it goes on to do what it does.
     private func switchModes(_ button: ModeButton) -> Bool {
-        let change = modeSwitch(button: button, open: openModes())
+        let open = openModes()
+        let change = modeSwitch(button: button, open: open)
+        // the Selection button closing the selection tool lets go of the selection too (with
+        // Color Fill, the fill as it closes does)
+        if modeSwitchDeselects(button: button, open: open, colourFill: selection.colorFill) {
+            selection.clear()
+        }
         if change.end.quickshape { endQuickShape() }
         if change.end.filling { drop.endBand() }
         if change.end.recolor { endRecolor() }
@@ -1973,6 +2038,9 @@ final class CanvasModel {
 
     /// A touch is coming down on an idle canvas: the touches take the settings as they are now.
     func prepareTouches() {
+        // a slider's panel goes with a touch off it and the side bar; the touch goes on to do what
+        // it does here (a stroke is drawn)
+        sliderPanel = nil
         session.setTouchSettings(settings: Gestures.shared.touchSettings())
         // the companion's Zoom or Move: a lone press zooms or moves the canvas
         session.setTouchCompanion(mode: companionMode)
