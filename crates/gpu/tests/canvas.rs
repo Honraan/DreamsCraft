@@ -351,6 +351,7 @@ fn draws_to_a_target_through_the_view() {
             lut: None,
             crisp_from: f32::INFINITY,
             look: None,
+            traced: false,
         }),
     );
     let px = read(&gpu, &target, 200, 100);
@@ -400,6 +401,7 @@ fn zoomed_in_to_its_mark_the_canvas_shows_each_pixel_as_a_square() {
                 lut: None,
                 crisp_from,
                 look: None,
+                traced: false,
             }),
         );
         let px = read(&gpu, &target, 100, 100);
@@ -459,6 +461,7 @@ fn the_surround_grid_is_fixed_to_the_target() {
             lut: None,
             crisp_from: f32::INFINITY,
             look: None,
+            traced: false,
         }),
     );
     let px = read(&gpu, &target, 100, 100);
@@ -492,6 +495,7 @@ fn the_surround_grid_is_fixed_to_the_target() {
             lut: None,
             crisp_from: f32::INFINITY,
             look: None,
+            traced: false,
         }),
     );
     let px = read(&gpu, &target, 100, 100);
@@ -543,6 +547,7 @@ fn a_frosted_region_shows_what_is_behind_it_blurred() {
             lut: None,
             crisp_from: f32::INFINITY,
             look: None,
+            traced: false,
         }),
     );
     let px = read(&gpu, &target, 400, 100);
@@ -605,6 +610,7 @@ fn the_glass_is_blurred_again_only_when_what_it_shows_changes() {
                 lut: None,
                 crisp_from: f32::INFINITY,
                 look: None,
+                traced: false,
             }),
         );
     };
@@ -694,6 +700,7 @@ fn frosted_edge(gpu: &Gpu, regions: &[[f32; 6]], windows: &[[f32; 6]]) -> Vec<u8
             lut: None,
             crisp_from: f32::INFINITY,
             look: None,
+            traced: false,
         }),
     );
     read(gpu, &target, 400, 100)
@@ -760,6 +767,7 @@ fn a_window_in_the_glass_shows_a_slanted_edge_without_steps() {
             lut: None,
             crisp_from: f32::INFINITY,
             look: None,
+            traced: false,
         }),
     );
     let px = read(&gpu, &target, 400, 200);
@@ -806,6 +814,7 @@ fn shown_on_black(gpu: &Gpu, view: &View) -> Vec<u8> {
             lut: None,
             crisp_from: f32::INFINITY,
             look: None,
+            traced: false,
         }),
     );
     read(gpu, &target, 400, 200)
@@ -890,6 +899,7 @@ fn glass_cost() {
                         lut: None,
                         crisp_from: f32::INFINITY,
                         look: None,
+                        traced: false,
                     }),
                 );
                 gpu.flush();
@@ -948,6 +958,7 @@ fn the_canvas_is_shown_in_the_targets_colour_space() {
             lut: None,
             crisp_from: f32::INFINITY,
             look: None,
+            traced: false,
         }),
     );
     let px = read(&gpu, &target, 10, 10);
@@ -1002,6 +1013,7 @@ fn a_colour_table_moves_the_canvas_colours() {
             lut: Some(&lut),
             crisp_from: f32::INFINITY,
             look: None,
+            traced: false,
         }),
     );
     let px = read(&gpu, &target, 10, 10);
@@ -1074,6 +1086,7 @@ fn the_predicted_tail_shows_but_never_paints() {
                 lut: None,
                 crisp_from: f32::INFINITY,
                 look: None,
+                traced: false,
             }),
         );
         read(&gpu, &target, 100, 100)
@@ -1134,6 +1147,7 @@ fn a_predicted_tail_shows_a_tiny_stamp_as_strong_as_the_stamp_that_replaces_it()
                     lut: None,
                     crisp_from: f32::INFINITY,
                     look: None,
+                    traced: false,
                 }),
             );
             let px = read(&gpu, &target, 100, 100);
@@ -1424,6 +1438,7 @@ fn a_selection_keeps_paint_inside_and_stripes_the_rest() {
             lut: None,
             crisp_from: f32::INFINITY,
             look: None,
+            traced: false,
         }),
     );
     let shown = read(&gpu, &texture, 64, 64);
@@ -1477,6 +1492,7 @@ fn a_feathered_selection_shows_a_line_where_it_fades_to_a_tenth() {
                 lut: None,
                 crisp_from: f32::INFINITY,
                 look: None,
+                traced: false,
             }),
         );
         let px = read(&gpu, &texture, 64, 64);
@@ -4388,6 +4404,7 @@ fn a_shape_at_its_own_size_lays_as_the_brush_images_do_where_they_hold_enough() 
                 lut: None,
                 crisp_from: f32::INFINITY,
                 look: None,
+                traced: false,
             }),
         );
         let px = read(&gpu, &target, w, h);
@@ -4478,6 +4495,7 @@ fn a_predicted_tail_shows_a_shape_at_its_own_size() {
             lut: None,
             crisp_from: f32::INFINITY,
             look: None,
+            traced: false,
         }),
     );
     let px = read(&gpu, &target, w, h);
@@ -5008,6 +5026,7 @@ fn the_grey_view_shows_each_colour_as_the_grey_of_its_luminance() {
                     lut: None,
                     crisp_from: f32::INFINITY,
                     look: grey.then_some(procraft_gpu::GREY_LOOK),
+                    traced: false,
                 }),
             );
             pixel(&read(&gpu, &target, 10, 10), 10, 5, 5)
@@ -5064,6 +5083,7 @@ fn a_look_shows_the_canvas_through_its_matrix_on_the_screen_alone() {
                 lut: None,
                 crisp_from: f32::INFINITY,
                 look,
+                traced: false,
             }),
         );
         pixel(&read(&gpu, &target, 10, 10), 10, 5, 5)
@@ -5715,6 +5735,7 @@ fn shown_on<'a>(
         lut: None,
         crisp_from: f32::INFINITY,
         look,
+        traced: true,
     }
 }
 
@@ -5834,6 +5855,194 @@ fn a_view_look_costs_a_frame_little_more_than_none() {
     assert!(grey <= none * 1.5 + 1.0, "{grey:.3} ms with a look, {none:.3} without");
 }
 
+/// Whether each channel of `a` is within `by` of `b`'s.
+fn within(a: [u8; 4], b: [u8; 4], by: u8) -> bool {
+    a.iter().zip(b).all(|(a, b)| a.abs_diff(b) <= by)
+}
+
+/// Traced, the screen shows the layers but the current one faded toward the background by the
+/// dim, and the current one as it is: what is read from the canvas stays as it is, and with no dim
+/// the screen is again, byte for byte, as it was. Only while traced does the canvas hold a texture
+/// more.
+#[test]
+fn traced_the_layers_but_the_current_one_show_dimmed_on_the_screen_alone() {
+    let Some(gpu) = gpu() else { return };
+    let _check = NoErrors(&gpu);
+    let (side, format) = (32u32, wgpu::TextureFormat::Rgba8Unorm);
+    let (target, view) = window_target(&gpu, (side, side), format);
+    let to_screen = View::fit((side, side), (side, side)).to_screen();
+    let mut doc = Document::new(side, side);
+    doc.background = [1.0; 3];
+    let mut canvas = Canvas::new(&gpu, &doc).unwrap();
+    let under = doc.current();
+    let over = doc.add_layer();
+    // a red dot on the layer below, a blue one beside it on the layer above, which is current
+    for (layer, colour, x) in [(under, [1.0, 0.0, 0.0], 8.0), (over, [0.0, 0.0, 1.0], 24.0)] {
+        canvas.begin_stroke(layer, StrokeStyle::new(StrokeTool::Paint, colour, 1.0));
+        canvas.add_stamps(&[dot(Vec2::new(x, 16.0), 6.0)]);
+        canvas.end_stroke();
+    }
+    assert!(doc.set_current(over));
+    let shown = |canvas: &mut Canvas, doc: &mut Document| {
+        canvas.render(&gpu, doc, Some(shown_on(&view, format, (side, side), to_screen, None)));
+        read(&gpu, &target, side, side)
+    };
+    let at = |px: &[u8], x: u32, y: u32| pixel(px, side, x, y);
+    let plain = shown(&mut canvas, &mut doc);
+    let textures = canvas.textures().len();
+    assert_eq!((at(&plain, 8, 16), at(&plain, 24, 16)), ([255, 0, 0, 255], [0, 0, 255, 255]));
+    assert!(!canvas.traced());
+
+    // half dimmed: the red halfway to white, the blue as it is, the white as it is
+    canvas.set_dim_others(0.5);
+    let traced = shown(&mut canvas, &mut doc);
+    assert!(within(at(&traced, 8, 16), [255, 128, 128, 255], 2), "{:?}", at(&traced, 8, 16));
+    assert_eq!(at(&traced, 24, 16), [0, 0, 255, 255]);
+    assert_eq!(at(&traced, 2, 2), [255, 255, 255, 255]);
+    assert!(canvas.traced());
+    // a target that isn't the window's own view (a loupe, a second display) shows it as it is
+    let plain_target = Target { traced: false, ..shown_on(&view, format, (side, side), to_screen, None) };
+    canvas.render(&gpu, &mut doc, Some(plain_target));
+    assert!(read(&gpu, &target, side, side) == plain);
+    assert_eq!(canvas.textures().len(), textures + 1);
+    // what is read is the canvas as it is
+    let composite = canvas.read_composite(&gpu).unwrap();
+    assert_eq!((pixel(&composite, side, 8, 16), pixel(&composite, side, 24, 16)), ([255, 0, 0, 255], [0, 0, 255, 255]));
+    // the other layer current: the red as it is, the blue halfway to white
+    assert!(doc.set_current(under));
+    let other = shown(&mut canvas, &mut doc);
+    assert_eq!(at(&other, 8, 16), [255, 0, 0, 255]);
+    assert!(within(at(&other, 24, 16), [128, 128, 255, 255], 2), "{:?}", at(&other, 24, 16));
+    // dimmed all the way, the others show not at all
+    canvas.set_dim_others(1.0);
+    let alone = shown(&mut canvas, &mut doc);
+    assert_eq!((at(&alone, 8, 16), at(&alone, 24, 16)), ([255, 0, 0, 255], [255, 255, 255, 255]));
+
+    // no dim: as it was, byte for byte, and the texture let go
+    assert!(doc.set_current(over));
+    canvas.set_dim_others(0.0);
+    assert!(shown(&mut canvas, &mut doc) == plain);
+    assert!(!canvas.traced());
+    assert_eq!(canvas.textures().len(), textures);
+    // nor is a dim that isn't a number one
+    canvas.set_dim_others(f32::NAN);
+    assert!(shown(&mut canvas, &mut doc) == plain);
+
+    // a stroke being drawn on the current layer shows as it is too
+    canvas.set_dim_others(0.5);
+    canvas.begin_stroke(over, StrokeStyle::new(StrokeTool::Paint, [0.0, 1.0, 0.0], 1.0));
+    canvas.add_stamps(&[dot(Vec2::new(16.0, 4.0), 3.0)]);
+    let drawing = shown(&mut canvas, &mut doc);
+    assert_eq!(at(&drawing, 16, 4), [0, 255, 0, 255]);
+    canvas.end_stroke();
+    // the current layer hidden: it shows nowhere
+    assert!(doc.set_visible(over, false));
+    canvas.invalidate();
+    let hidden = shown(&mut canvas, &mut doc);
+    assert_eq!((at(&hidden, 24, 16), at(&hidden, 16, 4)), ([255, 255, 255, 255], [255, 255, 255, 255]));
+    assert!(within(at(&hidden, 8, 16), [255, 128, 128, 255], 2), "{:?}", at(&hidden, 8, 16));
+}
+
+/// Traced, the current layer shows over the layers above it too: a blue dot under a red layer
+/// covering everything shows blue, the red round it dimmed, while the canvas read is all red.
+#[test]
+fn traced_the_current_layer_shows_over_the_layers_above_it() {
+    let Some(gpu) = gpu() else { return };
+    let _check = NoErrors(&gpu);
+    let (side, format) = (16u32, wgpu::TextureFormat::Rgba8Unorm);
+    let (target, view) = window_target(&gpu, (side, side), format);
+    let to_screen = View::fit((side, side), (side, side)).to_screen();
+    let mut doc = Document::new(side, side);
+    doc.background = [1.0; 3];
+    let mut canvas = Canvas::new(&gpu, &doc).unwrap();
+    let under = doc.current();
+    let over = doc.add_layer();
+    for (layer, colour, radius) in [(under, [0.0, 0.0, 1.0], 4.0), (over, [1.0, 0.0, 0.0], 600.0)] {
+        canvas.begin_stroke(layer, StrokeStyle::new(StrokeTool::Paint, colour, 1.0));
+        canvas.add_stamps(&[dot(Vec2::new(8.0, 8.0), radius)]);
+        canvas.end_stroke();
+    }
+    assert!(doc.set_current(under));
+    canvas.set_dim_others(0.6);
+    canvas.render(&gpu, &mut doc, Some(shown_on(&view, format, (side, side), to_screen, None)));
+    let shown = read(&gpu, &target, side, side);
+    assert_eq!(pixel(&shown, side, 8, 8), [0, 0, 255, 255]);
+    // 40% of the red over white
+    assert!(within(pixel(&shown, side, 1, 1), [255, 153, 153, 255], 2), "{:?}", pixel(&shown, side, 1, 1));
+    let composite = canvas.read_composite(&gpu).unwrap();
+    assert_eq!((pixel(&composite, side, 8, 8), pixel(&composite, side, 1, 1)), ([255, 0, 0, 255], [255, 0, 0, 255]));
+}
+
+/// What tracing costs a frame against none, on a canvas of a tablet's size in its window, waiting
+/// for the GPU each time: a stroke drawn across it on the current layer (its live part composited,
+/// and traced, each frame), and the whole canvas again (as when another layer becomes current).
+/// The two canvases take turns frame by frame, each timed by its quickest; printed, and a traced
+/// frame at most half again as long (and a little).
+#[test]
+fn a_traced_frame_costs_little_more_than_a_plain_one() {
+    let Some(gpu) = gpu() else { return };
+    let _check = NoErrors(&gpu);
+    let (size, format) = ((1280u32, 800u32), wgpu::TextureFormat::Rgba8Unorm);
+    let (_texture, view) = window_target(&gpu, size, format);
+    let (w, h) = (2048, 1536);
+    let to_screen = View::fit((w, h), size).to_screen();
+    let mut canvases: Vec<(Document, Canvas)> = [0.0, 0.7]
+        .into_iter()
+        .map(|dim| {
+            let mut doc = Document::new(w, h);
+            let mut canvas = Canvas::new(&gpu, &doc).unwrap();
+            let under = doc.current();
+            canvas.begin_stroke(under, StrokeStyle::new(StrokeTool::Paint, [0.8, 0.3, 0.1], 1.0));
+            canvas.add_stamps(&[dot(Vec2::new(1024.0, 768.0), 500.0)]);
+            canvas.end_stroke();
+            doc.add_layer();
+            canvas.set_dim_others(dim);
+            canvas.render(&gpu, &mut doc, Some(shown_on(&view, format, size, to_screen, None)));
+            gpu.flush();
+            canvas.begin_stroke(doc.current(), style(StrokeTool::Paint, 1.0));
+            (doc, canvas)
+        })
+        .collect();
+    let mut drawing = [Vec::new(), Vec::new()];
+    let mut whole = [Vec::new(), Vec::new()];
+    for k in 0..45 {
+        let stamps: Vec<Stamp> =
+            (0..4).map(|j| dot(Vec2::new(150.0 + (k * 4 + j) as f32 * 9.0, 760.0), 40.0)).collect();
+        for ((doc, canvas), times) in canvases.iter_mut().zip(drawing.iter_mut()) {
+            canvas.add_stamps(&stamps);
+            let t = std::time::Instant::now();
+            canvas.render(&gpu, doc, Some(shown_on(&view, format, size, to_screen, None)));
+            gpu.flush();
+            times.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+    for (doc, canvas) in &mut canvases {
+        canvas.end_stroke();
+        canvas.render(&gpu, doc, Some(shown_on(&view, format, size, to_screen, None)));
+    }
+    assert!(canvases[1].1.traced() && !canvases[0].1.traced());
+    for _ in 0..45 {
+        for ((doc, canvas), times) in canvases.iter_mut().zip(whole.iter_mut()) {
+            canvas.invalidate();
+            let t = std::time::Instant::now();
+            canvas.render(&gpu, doc, Some(shown_on(&view, format, size, to_screen, None)));
+            gpu.flush();
+            times.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+    let [plain_drawing, traced_drawing] = drawing.map(quickest_ms);
+    let [plain_whole, traced_whole] = whole.map(quickest_ms);
+    println!(
+        "a frame drawing: plain {plain_drawing:.3} ms, traced {traced_drawing:.3} ms; the whole canvas again: \
+         plain {plain_whole:.3} ms, traced {traced_whole:.3} ms"
+    );
+    assert!(
+        traced_drawing <= plain_drawing * 1.5 + 2.0,
+        "drawing: {traced_drawing:.3} ms traced, {plain_drawing:.3} plain"
+    );
+    assert!(traced_whole <= plain_whole * 1.5 + 2.0, "whole: {traced_whole:.3} ms traced, {plain_whole:.3} plain");
+}
+
 /// How much of canvas point `p` a veil covers when every pixel is tested against its hole
 /// (`hole`, canvas pixels), the hole's edge smoothed over `across` canvas pixels: as the veil's
 /// shader works it out in a cell the edge passes near.
@@ -5926,6 +6135,7 @@ fn a_veil_drawn_a_cell_at_a_time_shows_its_hole_as_testing_every_pixel_does() {
                 lut: None,
                 crisp_from: f32::INFINITY,
                 look: None,
+                traced: false,
             }),
         );
         let px = read(&gpu, &target, size, size);

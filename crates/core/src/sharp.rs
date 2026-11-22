@@ -219,10 +219,11 @@ impl State {
 
     /// Whether plugins' layers would show sharper through `to_screen` now: zoomed in, one of them
     /// showing, nothing under way that the canvas shows as it goes, and the artwork composited as
-    /// it plainly is (its background shown, no animation's frames).
+    /// it plainly is (its background shown, no animation's frames, no layers dimmed).
     fn sharp_wanted(&self, to_screen: Affine) -> bool {
         let plain = self.doc.background_visible
             && self.doc.animation.is_none()
+            && self.plugin_dim <= 0.0
             && self.stroke.is_none()
             && self.recording.is_none()
             && self.shape.is_none()

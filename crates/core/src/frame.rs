@@ -58,6 +58,7 @@ impl State {
                 // the second display's own density isn't known: crisp once a pixel covers more
                 crisp_from: 1.0,
                 look: None,
+                traced: false,
             }),
         );
     }
@@ -177,6 +178,8 @@ impl State {
         {
             // the paper the plugins give, which a canvas made since hasn't taken yet
             canvas.set_paper(gpu, self.plugin_paper.as_ref());
+            // and how much they dim the layers but the current one, likewise
+            canvas.set_dim_others(self.plugin_dim);
             // and the picture round it, likewise
             crate::surround::put_on(canvas, gpu, self.surround_picture.as_deref());
             let s = self.display_scale;
@@ -225,6 +228,7 @@ impl State {
                     lut,
                     crisp_from: self.display_scale,
                     look: shown_look,
+                    traced: true,
                 }),
             );
             // caches still being remade: another frame soon, and the artwork isn't shown yet

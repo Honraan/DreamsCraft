@@ -747,6 +747,9 @@ pub(crate) struct State {
     /// The look the plugins on the view look's hook show the canvas through (the window's view
     /// only), as they said when the session last took them up.
     pub(crate) plugin_look: Option<ViewLook>,
+    /// How much the plugins on the dimming hook dim the layers but the current one (the window's
+    /// view only, 0 to 1), as they said then.
+    pub(crate) plugin_dim: f32,
     /// The paper a plugin on the paper's hook gives, as it said then.
     pub(crate) plugin_paper: Option<procraft_gpu::CanvasPaper>,
     /// The tile of the picture a plugin's paper is, made again only as its file changes.
@@ -2174,6 +2177,7 @@ impl CanvasSession {
             interface_size: 1.0,
             grey_view: false,
             plugin_look: None,
+            plugin_dim: 0.0,
             plugin_paper: None,
             paper_picture: None,
             plugin_surround: None,

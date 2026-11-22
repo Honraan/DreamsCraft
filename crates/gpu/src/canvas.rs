@@ -552,6 +552,10 @@ pub struct Target<'a> {
     /// alone: the target's view only, never what is read or recorded from the canvas. None: as
     /// they are.
     pub look: Option<ViewLook>,
+    /// Whether it shows the canvas traced while the layers but the current one are dimmed
+    /// ([`Canvas::set_dim_others`]): the window's own view does; a second display or a loupe shows
+    /// the canvas as it is.
+    pub traced: bool,
 }
 
 /// A look a target shows the canvas through ([`Target::look`]): rows red, green and blue, each
@@ -1535,6 +1539,38 @@ struct Sharp {
     rect: [f32; 4],
     _texture: wgpu::Texture,
     bind: wgpu::BindGroup,
+}
+
+/// What the screen shows while the layers but the current one are dimmed (see
+/// [`Canvas::set_dim_others`]): the composite faded toward the background, the current layer
+/// drawn over that as it is. Made only while they are; the composite itself, which everything read
+/// from the canvas reads, stays as it is.
+struct Trace {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    /// It as shown, smoothed or crisp, as the composite's are.
+    display_bind: wgpu::BindGroup,
+    crisp_bind: wgpu::BindGroup,
+    /// The dim and the layer it was drawn for, whole: drawn whole again when either changes.
+    shows: Option<(f32, LayerId)>,
+}
+
+impl Trace {
+    fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, width: u32, height: u32) -> Trace {
+        let texture = texture(device, "trace", width, height, LAYER_FORMAT);
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = |label: &str, mag_filter: wgpu::FilterMode| {
+            device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some(label),
+                mag_filter,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            })
+        };
+        let display_bind = sampled_bind(device, layout, &view, &sampler("trace", wgpu::FilterMode::Linear));
+        let crisp_bind = sampled_bind(device, layout, &view, &sampler("trace crisp", wgpu::FilterMode::Nearest));
+        Trace { texture, view, display_bind, crisp_bind, shows: None }
+    }
 }
 
 /// An encoded colour moved by a linear-light matrix (clipped), as the display shader does.
@@ -3147,6 +3183,10 @@ pub struct Canvas {
     /// The picture as shown: smoothed between its pixels, or each a square ([`Target::crisp_from`]).
     display_bind: wgpu::BindGroup,
     crisp_bind: wgpu::BindGroup,
+    /// How much the layers but the current one are dimmed on the screen (0 to 1; 0 not at all, see
+    /// [`Canvas::set_dim_others`]), and what the screen shows while they are.
+    dim_others: f32,
+    trace: Option<Trace>,
     /// The table that leaves colours as they are, bound when a target has none.
     identity_lut: wgpu::BindGroup,
     uniform_buffer: wgpu::Buffer,
@@ -3615,6 +3655,8 @@ impl Canvas {
             stroke_bind,
             display_bind,
             crisp_bind,
+            dim_others: 0.0,
+            trace: None,
             identity_lut,
             uniform_buffer,
             uniform_bind,
@@ -3793,6 +3835,8 @@ impl Canvas {
         self.groups.clear();
         self.clip_group.let_go();
         self.clip_group_second.let_go();
+        // what the screen shows while traced: drawn whole again at the next render
+        self.trace = None;
     }
 
     /// Lets go of the shape and grain images until something wants them again (a canvas left
@@ -5225,8 +5269,9 @@ impl Canvas {
         self.invalidate();
     }
 
-    /// Keeps the composite inside `rect` as it is now (copied at once, before any work still
-    /// queued), to show over the canvas but for a hole given each frame ([`Canvas::veil_hole`]),
+    /// Keeps the composite inside `rect` as it is now (as the screen shows it while traced; copied
+    /// at once, before any work still queued), to show over the canvas but for a hole given each
+    /// frame ([`Canvas::veil_hole`]),
     /// until [`Canvas::veil_end`]: a change queued after this then shows only through the hole.
     /// Kept at `scale` target pixels to a canvas pixel where that is under one (box-filtered), so
     /// a large canvas zoomed out keeps no more than the screen shows. A veil already kept goes;
@@ -5244,16 +5289,16 @@ impl Canvas {
         let (w, h) = (fit(rw), fit(rh));
         let texture = texture(device, "veil", w, h, LAYER_FORMAT);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("veil") });
+        let (shown, shown_view) = match &self.trace {
+            Some(t) => (&t.texture, &t.view),
+            None => (&self.composite, &self.composite_view),
+        };
         if (w, h) == (rw, rh) {
-            encoder.copy_texture_to_texture(
-                copy_at(&self.composite, rect.x0, rect.y0),
-                copy_at(&texture, 0, 0),
-                extent(rw, rh),
-            );
+            encoder.copy_texture_to_texture(copy_at(shown, rect.x0, rect.y0), copy_at(&texture, 0, 0), extent(rw, rh));
         } else {
             // box-filtered down, as a thumbnail is
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let bind = sampled_bind(device, &self.pipelines.sampled_layout, &self.composite_view, &self.sampler);
+            let bind = sampled_bind(device, &self.pipelines.sampled_layout, shown_view, &self.sampler);
             let mut data = UniformData::default();
             let (cw, ch) = (self.width.max(1) as f32, self.height.max(1) as f32);
             let (fw, fh) = (rw as f32, rh as f32);
@@ -5786,6 +5831,146 @@ impl Canvas {
         self.paper = paper.cloned();
         // the background and what strokes are shown with, again
         self.invalidate();
+    }
+
+    /// Trace view: the layers but the current one dimmed by `dim` (0 to 1) on the screen alone.
+    /// The screen shows the canvas faded that far toward its background (the paper's colour and
+    /// depth too), and the current layer (a mask's layer, while the mask is current) over that as
+    /// it is on its own: its opacity, blend mode, mask, clipping and any stroke or fill shown on
+    /// it. Not while Animation Assist is on, whose onion skins show the frames round the current
+    /// one. What is read, saved, exported, recorded or picked from the canvas is as it is. 0, or
+    /// one that isn't a number: none dimmed.
+    pub fn set_dim_others(&mut self, dim: f32) {
+        self.dim_others = if dim.is_finite() { dim.clamp(0.0, 1.0) } else { 0.0 };
+    }
+
+    /// How much the layers but the current one are dimmed on the screen (see
+    /// [`Canvas::set_dim_others`]).
+    pub fn dim_others(&self) -> f32 {
+        self.dim_others
+    }
+
+    /// Whether the screen shows the canvas traced now (see [`Canvas::set_dim_others`]): what it
+    /// was last rendered with.
+    pub fn traced(&self) -> bool {
+        self.trace.as_ref().is_some_and(|t| t.shows.is_some())
+    }
+
+    /// The dim and the layer shown as it is while the canvas is traced, as `doc` is now.
+    fn tracing(&self, doc: &Document) -> Option<(f32, LayerId)> {
+        if self.dim_others <= 0.0 || doc.animation.is_some() {
+            return None;
+        }
+        let mut id = doc.current();
+        let layer = doc.layer(id)?;
+        if layer.kind == LayerKind::Mask {
+            id = layer.parent?;
+        }
+        Some((self.dim_others, id))
+    }
+
+    /// Draws what the screen shows while the canvas is traced within `rect` (all of it when what
+    /// it traces changed): the background, the composite over it at what the dim leaves, then the
+    /// layer shown as it is, if it shows. Lets its picture go while not traced.
+    fn draw_trace(
+        &mut self,
+        device: &wgpu::Device,
+        doc: &Document,
+        encoder: &mut wgpu::CommandEncoder,
+        uniforms: &mut UniformData,
+        rect: IRect,
+    ) {
+        let Some(shows) = self.tracing(doc) else {
+            self.trace = None;
+            return;
+        };
+        let (dim, id) = shows;
+        let trace = match self.trace.take() {
+            Some(t) => t,
+            None => Trace::new(device, &self.pipelines.sampled_layout, self.width, self.height),
+        };
+        let rect = if trace.shows == Some(shows) { rect.intersect(self.full()) } else { self.full() };
+        if !rect.is_empty() {
+            {
+                let offset = uniforms.push(&self.background_uniform(doc));
+                let mut pass = render_pass(encoder, "trace background", &trace.view, wgpu::LoadOp::Load);
+                scissor(&mut pass, rect);
+                pass.set_pipeline(&self.pipelines.solid);
+                pass.set_bind_group(0, &self.stroke_bind, &[]);
+                pass.set_bind_group(1, &self.uniform_bind, &[offset]);
+                pass.draw(0..3, 0..1);
+            }
+            let stack = Stack {
+                first: (&trace.texture, &trace.view),
+                second: Second::OnDemand(&self.composite_second, device),
+            };
+            let mut current = 0;
+            let faded = LayerUniform {
+                opacity: 1.0 - dim,
+                blend: BlendMode::Normal.id(),
+                tint: Look::PLAIN.tint,
+                ..Default::default()
+            };
+            let composite = &self.composite_view;
+            let normal = BlendMode::Normal;
+            self.draw_onto(
+                device,
+                encoder,
+                uniforms,
+                rect,
+                composite,
+                None,
+                &self.stroke_view,
+                faded,
+                normal,
+                &stack,
+                &mut current,
+            );
+            // the layer as it is, if it shows (it and the groups it is in shown, none other alone)
+            if let Some(layer) = doc.layer(id).filter(|_| doc.shows(id) && !doc.soloed_out(id)) {
+                match layer.kind {
+                    LayerKind::Paint => self.composite_layer(
+                        device,
+                        doc,
+                        encoder,
+                        uniforms,
+                        rect,
+                        layer,
+                        Look::PLAIN,
+                        CLIP_NONE,
+                        &stack,
+                        &mut current,
+                    ),
+                    LayerKind::Group if layer.opacity > 0.0 => {
+                        if let Some(view) = self.composite_group(device, doc, encoder, uniforms, rect, id) {
+                            let uniform = LayerUniform {
+                                opacity: layer.opacity.clamp(0.0, 1.0),
+                                blend: layer.blend.id(),
+                                tint: Look::PLAIN.tint,
+                                ..Default::default()
+                            };
+                            let blank = &self.stroke_view;
+                            self.draw_onto(
+                                device,
+                                encoder,
+                                uniforms,
+                                rect,
+                                view,
+                                None,
+                                blank,
+                                uniform,
+                                layer.blend,
+                                &stack,
+                                &mut current,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            stack.settle(encoder, rect, current);
+        }
+        self.trace = Some(Trace { shows: Some(shows), ..trace });
     }
 
     /// The paper as a stroke's and the background's uniform take it ([`LayerUniform::paper`]).
@@ -7656,6 +7841,12 @@ impl Canvas {
                 self.frost_stale = self.frost_stale.union(dirty);
             }
             self.dirty = IRect::EMPTY;
+            // and what the screen shows of it while traced
+            let was = self.trace.as_ref().and_then(|t| t.shows);
+            self.draw_trace(device, doc, &mut encoder, &mut uniforms, dirty);
+            if self.trace.as_ref().and_then(|t| t.shows) != was {
+                self.frost_stale = self.full();
+            }
         }
 
         // the veil's rectangle, the colour round the canvas and its hole, for its shader
@@ -10718,7 +10909,12 @@ impl Canvas {
         pass.set_pipeline(pipeline);
         // a little short of the mark still counts, for a zoom that lands just under it
         let crisp = target.to_screen.scale_factor() >= target.crisp_from * 0.999;
-        pass.set_bind_group(0, if crisp { &self.crisp_bind } else { &self.display_bind }, &[]);
+        // what it shows: the composite, or while traced what the screen shows of it
+        let (smooth_bind, crisp_bind) = match self.trace.as_ref().filter(|_| target.traced) {
+            Some(t) => (&t.display_bind, &t.crisp_bind),
+            None => (&self.display_bind, &self.crisp_bind),
+        };
+        pass.set_bind_group(0, if crisp { crisp_bind } else { smooth_bind }, &[]);
         pass.set_bind_group(1, &self.uniform_bind, &[offset]);
         pass.set_bind_group(2, target.lut.map_or(&self.identity_lut, |l| &l.bind), &[]);
         pass.draw(0..6, 0..1);
@@ -10990,6 +11186,7 @@ impl Canvas {
             lut: None,
             crisp_from: f32::INFINITY,
             look: None,
+            traced: false,
         };
         let k = self.frost_ready(&gpu.device, &mut encoder, &mut uniforms, &target, backdrop, Some(scene));
         if let (Some(small), Some(frost)) = (self.backdrop.as_ref(), self.screen.frost.get(&target.format)) {
@@ -11126,7 +11323,8 @@ impl Canvas {
         } else {
             let mut pass = render_pass(encoder, "backdrop scene", &small.views[0], wgpu::LoadOp::Clear(clear));
             pass.set_pipeline(display);
-            pass.set_bind_group(0, &self.display_bind, &[]);
+            let shown = self.trace.as_ref().filter(|_| target.traced);
+            pass.set_bind_group(0, shown.map_or(&self.display_bind, |t| &t.display_bind), &[]);
             pass.set_bind_group(1, &self.uniform_bind, &[offset]);
             pass.set_bind_group(2, target.lut.map_or(&self.identity_lut, |l| &l.bind), &[]);
             pass.draw(0..6, 0..1);
@@ -12004,6 +12202,7 @@ impl Canvas {
         all.extend(self.tip_backup.as_ref());
         all.extend(self.fragments.textures());
         all.extend(self.composite_second.made());
+        all.extend(self.trace.as_ref().map(|t| &t.texture));
         all.extend(self.scratch.made());
         all.extend(self.second_stroke.made());
         all.extend(self.groups.iter().flat_map(|(pair, _)| pair));

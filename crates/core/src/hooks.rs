@@ -743,6 +743,15 @@ impl Hooks {
         })
     }
 
+    /// The dimming hook (interface 13): how much the layers but the current one are dimmed on the
+    /// screen alone, the most any plugin on it says (0 for none).
+    pub(crate) fn view_dim_others(&self) -> f32 {
+        if !self.has(Hook::ViewDimOthers) {
+            return 0.0;
+        }
+        self.through(Hook::ViewDimOthers, 0.0_f32, |running, most| Ok(most.max(running.view_dim_others()?)))
+    }
+
     /// The colour panel's hook (interface 12): whether a plugin on it says the panel does `part` of
     /// what it may ([`COLOUR_STEPS`], [`COLOUR_BEFORE`]).
     pub(crate) fn colour_panel(&self, part: i32) -> bool {
@@ -1133,6 +1142,7 @@ impl CanvasSession {
         // how the plugins have the window show the canvas, and the paper they give, asked now
         // rather than as it is drawn
         let look = hooks.view_look();
+        let dim = hooks.view_dim_others();
         // the colour round the canvas and the picture there, read again only as it changes
         let surround =
             hooks.interface_colour(SURROUND_ROLE).map(|rgb| [16, 8, 0].map(|s| ((rgb >> s) & 0xFF) as f32 / 255.0));
@@ -1166,6 +1176,10 @@ impl CanvasSession {
         let mut changed = false;
         if st.plugin_look != look {
             st.plugin_look = look;
+            changed = true;
+        }
+        if st.plugin_dim != dim {
+            st.plugin_dim = dim;
             changed = true;
         }
         if st.plugin_surround != surround {
@@ -1780,6 +1794,40 @@ pub(crate) mod tests {
     fn slider_looking(body: &str) -> Running {
         let text = format!(r#"(module (func (export "procraft_slider_look") (param i32) (result f32) {body}))"#);
         Running::start(&wat::parse_str(text).unwrap(), &[]).unwrap()
+    }
+
+    /// A plugin on the dimming hook answering `body` (WAT).
+    fn dimming(body: &str) -> Running {
+        let text = format!(r#"(module (func (export "procraft_view_dim_others") (result f32) {body}))"#);
+        Running::start(&wat::parse_str(text).unwrap(), &[]).unwrap()
+    }
+
+    #[test]
+    fn the_layers_are_dimmed_as_much_as_the_most_any_plugin_on_the_dimming_hook_says() {
+        let hooks = Hooks::default();
+        assert_eq!(hooks.view_dim_others(), 0.0, "none on");
+        hooks.put_on("a".to_owned(), dimming("(f32.const 0.3)"), &[Hook::ViewDimOthers]);
+        assert_eq!(hooks.view_dim_others(), 0.3);
+        hooks.put_on("b".to_owned(), dimming("(f32.const 0.7)"), &[Hook::ViewDimOthers]);
+        assert_eq!(hooks.view_dim_others(), 0.7);
+        hooks.take_off("b");
+        assert_eq!(hooks.view_dim_others(), 0.3);
+        // asked as the plugins change: quick
+        let t = Instant::now();
+        for _ in 0..10_000 {
+            std::hint::black_box(hooks.view_dim_others());
+        }
+        let each = t.elapsed() / 10_000;
+        println!("the dimming hook asked in {each:?}");
+        assert!(each < std::time::Duration::from_micros(200), "{each:?}");
+        // past 0 to 1, not a number, or a trap: it stops, and goes off its hook
+        for odd in ["(f32.const 1.5)", "(f32.const -0.1)", "(f32.div (f32.const 0) (f32.const 0))", "unreachable"] {
+            let hooks = Hooks::default();
+            hooks.put_on("odd".to_owned(), dimming(odd), &[Hook::ViewDimOthers]);
+            assert_eq!(hooks.view_dim_others(), 0.0, "{odd}");
+            assert!(!hooks.listens(Hook::ViewDimOthers), "{odd}");
+            assert_eq!(hooks.take_stopped().len(), 1, "{odd}");
+        }
     }
 
     #[test]

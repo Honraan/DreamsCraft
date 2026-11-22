@@ -615,6 +615,9 @@ impl CanvasSession {
         {
             c.invalidate();
             self.shared.frame(st);
+        } else if ok && st.plugin_dim > 0.0 {
+            // the layers but this one dimmed now
+            self.shared.frame(st);
         }
         ok
     }

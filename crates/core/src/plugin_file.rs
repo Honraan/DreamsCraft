@@ -23,7 +23,7 @@ const MANIFEST: &str = "craft-extension.json";
 /// The manifest format read here: a newer one may mean anything, so it is refused.
 const SCHEMA: u64 = 1;
 /// What a plugin's code is written to, see [`crate::plugin_run`]: a newer one is refused too.
-const INTERFACE: u32 = 12;
+const INTERFACE: u32 = 13;
 /// What ids of our own start with: no file may claim one.
 const OWN_PREFIX: &str = "procraft.";
 /// The file, its entries, one entry, all of them unpacked, and the manifest, in bytes.
@@ -2314,7 +2314,7 @@ pub(crate) mod tests {
         };
         // a hook or an interface this app doesn't have is for a newer one
         assert_eq!(of("/hooks", json!(["position", "layers"])), Refusal::Newer);
-        assert_eq!(of("/compat/procraft/interface", json!(13)), Refusal::Newer);
+        assert_eq!(of("/compat/procraft/interface", json!(14)), Refusal::Newer);
         assert_eq!(of("/hooks", json!([])), Refusal::Described);
         assert_eq!(of("/hooks", json!(["position", "position"])), Refusal::Described);
         assert_eq!(of("/compat/procraft", json!({ "min_app": "0.0.1" })), Refusal::Described);
@@ -2325,9 +2325,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn plugins_written_to_every_interface_so_far_still_load_and_the_stroke_fill_hook_needs_its_function() {
+    fn plugins_written_to_every_interface_so_far_still_load_and_a_new_hook_needs_its_function() {
         let module = a_module();
-        for interface in 1..=12 {
+        for interface in 1..=13 {
             let manifest = with(coded("org.example.plugin", &module), "/compat/procraft/interface", json!(interface));
             assert!(read_package(&a_coded_file(&manifest, &module)).is_ok(), "interface {interface}");
         }
@@ -2339,6 +2339,13 @@ pub(crate) mod tests {
         let package = fill(&wat::parse_str(fills).unwrap()).unwrap();
         assert_eq!(package.manifest.hooks, [Hook::StrokeFill]);
         assert!(fill(&module).is_err(), "a module without the hook's function");
+        let dim = |module: &[u8]| {
+            let manifest = with(coded("org.example.dim", module), "/hooks", json!(["view_dim_others"]));
+            read_package(&a_coded_file(&with(manifest, "/compat/procraft/interface", json!(13)), module))
+        };
+        let dims = r#"(module (func (export "procraft_view_dim_others") (result f32) (f32.const 0.7)))"#;
+        assert_eq!(dim(&wat::parse_str(dims).unwrap()).unwrap().manifest.hooks, [Hook::ViewDimOthers]);
+        assert!(dim(&module).is_err(), "a module without the dimming hook's function");
     }
 
     #[test]

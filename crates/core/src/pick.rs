@@ -64,6 +64,7 @@ impl CanvasSession {
                 lut: None,
                 crisp_from: st.display_scale,
                 look: None,
+                traced: false,
             }),
         );
         let pixels = read_texture(gpu, &texture, side, side).ok()?;

@@ -4310,6 +4310,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    const TRACE_VIEW: &str = "io.github.artcraftandroid.trace-view";
+
+    #[test]
+    fn trace_view_shows_the_layer_alone_or_the_others_dimmed_from_its_keys_its_choice_or_its_row() {
+        let dir = store("bundled-trace-view");
+        let plugins = app_at(&dir);
+        let s = viewed();
+        s.use_plugins(Arc::clone(&plugins));
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-6;
+        let dim = |plugins: &Plugins| plugins.hooks().view_dim_others();
+        // as it comes, off: nothing dimmed, and its keys no one's
+        assert!(!card(&plugins, TRACE_VIEW).on);
+        assert_eq!((dim(&plugins), s.shared.lock().plugin_dim), (0.0, 0.0));
+        assert_eq!(press(&plugins, "alt+t"), None);
+        assert!(plugins.set_on(TRACE_VIEW.to_owned(), true));
+        // on, Normal as it starts: nothing dimmed; a row in the Layers panel, a choice in the Canvas tab
+        assert_eq!(dim(&plugins), 0.0);
+        let rows: Vec<String> = plugins.actions_in(PluginPlace::Layers).into_iter().map(|a| a.key).collect();
+        assert_eq!(rows, [format!("{TRACE_VIEW}.views")]);
+        let keys = |controls: Vec<PluginControl>| controls.iter().map(|c| c.key().to_owned()).collect::<Vec<_>>();
+        assert_eq!(keys(plugins.controls_in(PluginPlace::Canvas)), [format!("{TRACE_VIEW}.view")]);
+        // Alt+T: Trace, the others dimmed 70%, on the screen alone
+        let trace = format!("{TRACE_VIEW}.trace");
+        assert_eq!(press(&plugins, "alt+t"), Some(PluginPressed::Action { key: trace.clone() }));
+        assert!(plugins.run_action(trace.clone(), Arc::clone(&s)));
+        assert!(near(dim(&plugins), 0.7));
+        s.use_plugins(Arc::clone(&plugins));
+        assert!(near(s.shared.lock().plugin_dim, 0.7));
+        // Alt+S: Solo, the others not shown at all; again: Normal
+        let solo = format!("{TRACE_VIEW}.solo");
+        assert_eq!(press(&plugins, "alt+s"), Some(PluginPressed::Action { key: solo.clone() }));
+        assert!(plugins.run_action(solo.clone(), Arc::clone(&s)));
+        assert_eq!(dim(&plugins), 1.0);
+        assert!(plugins.run_action(solo, Arc::clone(&s)));
+        assert_eq!(dim(&plugins), 0.0);
+        // asked as the plugins change: quick
+        assert!(plugins.run_action(trace, Arc::clone(&s)));
+        let hooks = plugins.hooks();
+        let t = std::time::Instant::now();
+        for _ in 0..1000 {
+            assert!(hooks.view_dim_others() > 0.0);
+        }
+        let asked = t.elapsed() / 1000;
+        println!("the dimming hook asked in {asked:?}");
+        assert!(asked < std::time::Duration::from_micros(200), "{asked:?}");
+        // the choice in the Canvas tab, and Trace's dim from its slider
+        assert!(plugins.set_slider(format!("{TRACE_VIEW}.view"), 0.0).is_some());
+        assert_eq!(dim(&plugins), 0.0);
+        assert!(plugins.set_slider(format!("{TRACE_VIEW}.view"), 2.0).is_some());
+        assert!(plugins.set_slider(format!("{TRACE_VIEW}.dim"), 0.4).is_some());
+        assert!(near(dim(&plugins), 0.4));
+        // the plugin off: nothing dimmed
+        assert!(plugins.set_on(TRACE_VIEW.to_owned(), false));
+        assert_eq!(dim(&plugins), 0.0);
+        s.use_plugins(Arc::clone(&plugins));
+        assert_eq!(s.shared.lock().plugin_dim, 0.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     const LASSO_FILL: &str = "io.github.artcraftandroid.lasso-fill";
 
     #[test]

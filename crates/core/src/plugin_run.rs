@@ -71,6 +71,8 @@
 //! - `procraft_view_look(entry: i32) -> f32`: for the hook `view_look` (interface 8), entry 0 to 11
 //!   of a matrix the canvas's colours go through on the screen alone, in linear light: rows red,
 //!   green and blue, each three weights and what is added.
+//! - `procraft_view_dim_others() -> f32`: for the hook `view_dim_others` (interface 13), how much
+//!   the layers but the current one are dimmed on the screen alone, 0 (not at all) to 1.
 //! - For the hook `paper` (interface 8): `procraft_paper(side: i32) -> i32` answers where the
 //!   paper's tile is in its memory, `side` x `side` bytes, each how high the paper stands (0 for
 //!   none now); `procraft_paper_look(what: i32) -> f32` how strongly its hollows take paint away
@@ -273,6 +275,7 @@ const HIDE_NOTICE: &str = "procraft_hide_notice";
 const FLOATING_PANEL: &str = "procraft_floating_panel";
 const GESTURE_LOCK: &str = "procraft_gesture_lock";
 const VIEW_LOOK: &str = "procraft_view_look";
+const VIEW_DIM_OTHERS: &str = "procraft_view_dim_others";
 const PAPER: &str = "procraft_paper";
 const PAPER_LOOK: &str = "procraft_paper_look";
 const PAPER_COLOUR: &str = "procraft_paper_colour";
@@ -467,6 +470,8 @@ pub(crate) enum Hook {
     /// What the colour panel does besides: its sliders' steps, its swatch's colour before
     /// (interface 12).
     ColourPanel,
+    /// How much the layers but the current one are dimmed on the screen alone (interface 13).
+    ViewDimOthers,
 }
 
 impl Hook {
@@ -508,6 +513,7 @@ impl Hook {
             "slider_look" => Some(Hook::SliderLook),
             "stroke_fill" => Some(Hook::StrokeFill),
             "colour_panel" => Some(Hook::ColourPanel),
+            "view_dim_others" => Some(Hook::ViewDimOthers),
             _ => None,
         }
     }
@@ -553,6 +559,7 @@ impl Hook {
             Hook::SliderLook => "This plugin can change how the side bar's sliders look.",
             Hook::StrokeFill => "This plugin can make your strokes fill what they go round.",
             Hook::ColourPanel => "This plugin can change how the colour panel's sliders and swatch work.",
+            Hook::ViewDimOthers => "This plugin can dim the layers but the one you're on, on the screen alone.",
         }
     }
 
@@ -597,6 +604,7 @@ impl Hook {
             Hook::SliderLook => exports(module, SLIDER_LOOK, &[ValType::I32], &[ValType::F32]),
             Hook::StrokeFill => exports(module, STROKE_FILL, &[ValType::I32, ValType::I32], &[ValType::I32]),
             Hook::ColourPanel => exports(module, COLOUR_PANEL, &[ValType::I32], &[ValType::I32]),
+            Hook::ViewDimOthers => exports(module, VIEW_DIM_OTHERS, &[], &[ValType::F32]),
             Hook::OpacityTogether => exports(module, OPACITY_TOGETHER, &[], &[ValType::I32]),
             Hook::RandomiseBrush => exports(module, RANDOMISE, &[ValType::I32, ValType::I32], &[ValType::F32]),
             Hook::ColourTriangle => exports(module, COLOUR_TRIANGLE, &[], &[ValType::I32]),
@@ -1097,6 +1105,7 @@ pub(crate) struct Running {
     slider_look: Option<TypedFunc<i32, f32>>,
     stroke_fill: Option<TypedFunc<(i32, i32), i32>>,
     colour_panel: Option<TypedFunc<i32, i32>>,
+    view_dim_others: Option<TypedFunc<(), f32>>,
     curve: Option<CurveCalls>,
     stroke_sound: Option<SoundCall>,
     sound_prepare: Option<TypedFunc<i32, i32>>,
@@ -1258,6 +1267,7 @@ impl Running {
             let slider_look = instance.get_typed_func(&store, SLIDER_LOOK).ok();
             let stroke_fill = instance.get_typed_func(&store, STROKE_FILL).ok();
             let colour_panel = instance.get_typed_func(&store, COLOUR_PANEL).ok();
+            let view_dim_others = instance.get_typed_func(&store, VIEW_DIM_OTHERS).ok();
             let curve = (|| {
                 Some(CurveCalls {
                     begin: instance.get_typed_func(&store, CURVE_BEGIN).ok()?,
@@ -1371,6 +1381,7 @@ impl Running {
                 slider_look,
                 stroke_fill,
                 colour_panel,
+                view_dim_others,
                 curve,
                 stroke_sound,
                 sound_prepare,
@@ -2547,6 +2558,18 @@ impl Running {
             _ if said < 0.0 => Ok(None),
             _ => Ok(Some(said)),
         }
+    }
+
+    /// How much it says the layers but the current one are dimmed on the screen alone, 0 to 1 (0
+    /// for a module without the call). One past that, or not a number, stops it.
+    pub(crate) fn view_dim_others(&mut self) -> Result<f32, Stop> {
+        let Running { store, view_dim_others, .. } = self;
+        let Some(view_dim_others) = view_dim_others else { return Ok(0.0) };
+        let said = guarded(|| {
+            store.set_fuel(SAMPLE_FUEL).map_err(|_| Stop::Damaged)?;
+            view_dim_others.call(&mut *store, ()).map_err(|e| stop_of(&e))
+        })?;
+        if (0.0..=1.0).contains(&said) { Ok(said) } else { Err(Stop::Nonsense) }
     }
 
     /// Whether it says the colour panel does `part` of what it may (not 0 for yes).

@@ -28,7 +28,7 @@ action beside a filter, `colour-triangle` is a picker, `vector-layers` adds laye
 `layer-tools` and `colordrop-tools` each answer several hooks, one for each of their switches,
 `colour-triangle`'s picture draws its hue ring as its switch says and its [menu](#a-menu-of-its-own)
 switches its shape, and `floating-panels` lets panels float in windows of their own. `rotation-reset`
-has an action and two switches in the Canvas tab, `value-check` a switch there with a key of its own,
+has an action and two switches in the Canvas tab, `value-check` a switch there with a key of its own, `trace-view` a choice there, a row in the Layers panel and keys for its actions,
 `paper` controls kept with each artwork, `reference-windows` a single slider, and `finger-pressure`
 gives a finger a pressure on the `pressure` hook, and `coloured-previews` tints the brush library's
 strokes on the `brush_preview_colour` hook. `colour-labels` keeps a mark with each layer from an
@@ -505,6 +505,30 @@ them all.
 
 The Value check plugin the app comes with answers each colour as the grey of its luminance (each row
 `0.2126, 0.7152, 0.0722, 0`), its greys spread from a middle grey as far as its Contrast says.
+
+### `view_dim_others`
+
+How much the layers but the current one are dimmed on the screen alone (interface 13):
+
+```
+procraft_view_dim_others() -> f32
+```
+
+It answers 0 (none dimmed) to 1. While it's above 0, the screen shows the canvas faded that far
+toward its background (the paper's colour and depth with it), and the current layer over that as it
+is on its own: its opacity, blend mode, mask and clipping, and any stroke or fill shown on it as
+it's drawn. While a layer's mask is current, it's the layer. A current layer that's hidden, in a
+hidden group or left out while another is shown alone shows nowhere. At 1 the current layer shows
+on the background alone. Nothing read, saved, exported, recorded or picked from the canvas changes,
+nor the eyedropper's loupe; the screen alone takes a picture the canvas's size more while it is. Not
+while Animation Assist is on, whose onion skins show the frames round the current one already, and
+plugins' layers aren't drawn sharp meanwhile. An answer that isn't a number, or is past 0 to 1,
+stops the plugin. The app asks as the plugins change, not as it draws. With several plugins on this
+hook, the most any says.
+
+The Trace view plugin the app comes with has a Layer view of Normal (none dimmed), Solo (all the way)
+and Trace (as far as its slider says, 70% as it starts), chosen in the Canvas tab or from its row in
+the Layers panel, whose panel holds both; Alt+S and Alt+T toggle Solo and Trace.
 
 ### `paper`
 
@@ -1924,9 +1948,9 @@ tab, interface 9 the `pressure` hook, interface 10 the `gesture_lock` hook's fit
 hooks, layers' marks (`layer_mark`, `set_layer_mark`) and panels' rows of colours, and interface 11
 the recent colours and brushes (`recent_colour`, `recent_brush`, `current_brush`, `choose_brush`),
 actions at the pen, panels' rows of brushes and rings, the `interface_colour` hook's surround, the
-`surround_picture` and `slider_look` hooks and `file` controls of pictures, and interface 12 the `stroke_fill` hook,
+`surround_picture` and `slider_look` hooks and `file` controls of pictures, interface 12 the `stroke_fill` hook,
 the `paper` hook's tooth and picture, actions in the Layers panel, `set_control` and the
-`colour_panel` hook. What comes under a switch at the top of the list, taking the place of other plugins, a menu of
+`colour_panel` hook, and interface 13 the `view_dim_others` hook. What comes under a switch at the top of the list, taking the place of other plugins, a menu of
 its own, and controls in the Canvas tab, on a key or kept with each artwork need no newer
 interface: an older app shows every control, leaves the others where they are, shows no menu and
 keeps every control with the plugin. What a
