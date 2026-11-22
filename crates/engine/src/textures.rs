@@ -722,6 +722,39 @@ pub fn halftone_shape_at(
     })
 }
 
+/// How much of its square the hard round tip's picture fills across: as much as the stock hard
+/// tip's ink does (its rows and columns measured, 64 bands of each: 0.796 across the middle, 0.797
+/// by the ink they hold). A stamp's shape fills its quad, which reaches a little past the stamp,
+/// so a stroke with it is as wide as the stock tip's; the round tip drawn by its hardness fills its
+/// stamp alone, and stands in at a share a little bigger ([`crate::brushfile::ROUND_TIP_SHARE`]).
+pub const HARD_ROUND_SHARE: f32 = 0.797;
+
+/// The hard round tip as a picture `side` pixels square: a disc [`HARD_ROUND_SHARE`] of its square
+/// across, its edge a texel wide at any side. Read through its smaller levels as a stamp reads a
+/// shape, its edge is about a canvas pixel and a half wide at every size the picture covers, as a
+/// stock hard tip's is, where the round tip drawn by its hardness is crisper small and softer big.
+pub fn hard_round_at(side: usize) -> Vec<u8> {
+    let radius = HARD_ROUND_SHARE / 2.0;
+    field(side, |x, y| ((radius - (x - 0.5).hypot(y - 0.5)) * side as f32 + 0.5).clamp(0.0, 1.0))
+}
+
+/// How far out the small point's dot paints half (a share of its square's side): where the stock
+/// small point's ink, as its rows measure it (64 bands, averaged down to 256 square), puts it.
+pub const POINT_RADIUS: f32 = 0.135;
+
+/// How soft the small point's edge is: the spread of the blur across it, a share of its square's
+/// side. It falls from nine tenths to a tenth over 2.56 times this (5.4% of a stamp's square), as
+/// far as the stock small point's edge was measured to at every size from 20 to 1000 pixels.
+pub const POINT_BLUR: f32 = 0.0213;
+
+/// The small point as a picture `side` pixels square: a dot [`POINT_RADIUS`] of the side out, its
+/// edge blurred over [`POINT_BLUR`] of it (a Gaussian's), as wide, as soft and holding as much ink
+/// as the stock small point measures. Soft all through, so no bigger picture shows more.
+pub fn point_at(side: usize) -> Vec<u8> {
+    let spread = POINT_BLUR * std::f32::consts::SQRT_2;
+    field(side, |x, y| 0.5 * (1.0 - crate::krita::erf(((x - 0.5).hypot(y - 0.5) - POINT_RADIUS) / spread)))
+}
+
 /// `pixels`, a shape, stretched across and down so that the bands of its rows and columns holding
 /// ink span as many as `rows` and `cols` (a stock tip's, as [`stock_shape_rows`] gives them) say
 /// theirs do, and lie where theirs lie: a stand-in as wide and tall as the tip it stands for. Only
@@ -3818,5 +3851,56 @@ mod tests {
         }
         // coarse marks are those of the size brushes hold, read between texels
         assert_eq!(marks_at(24, 1024), upsampled(&marks(24), TEXTURE_SIZE, 1024));
+    }
+
+    /// Each of 64 bands of `pixels`' rows' mean value (a `side` square), as the stock tables measure
+    /// a stock shape's at 256 square.
+    fn row_bands(pixels: &[u8], side: usize) -> Vec<i32> {
+        let per = side / 64;
+        pixels
+            .chunks(per * side)
+            .map(|band| (band.iter().map(|&v| f64::from(v)).sum::<f64>() / band.len() as f64).round() as i32)
+            .collect()
+    }
+
+    /// The hard round tip's picture and the small point's hold the ink their stock tips do, band by
+    /// band down their rows and in all: as big, and their edges as soft, as those are. At 256, as
+    /// the stock tips were measured, and the hard round's big picture averaged down to that.
+    #[test]
+    fn the_hard_round_and_the_point_hold_their_stock_tips_ink() {
+        // (the stock tips' keys: the hard round and the small point)
+        let pictures = [
+            (0xe114_279e_198b_3aec_u64, hard_round_at(TEXTURE_SIZE), 6),
+            (0x79d5_ed1a_9f14_cee3, point_at(TEXTURE_SIZE), 2),
+        ];
+        for (key, pixels, most_apart) in pictures {
+            let stock: Vec<i32> =
+                stock_tones(crate::stock_tones::STOCK_SHAPE_ROWS, key).unwrap().map(i32::from).to_vec();
+            let ours = row_bands(&pixels, TEXTURE_SIZE);
+            let apart = ours.iter().zip(&stock).map(|(a, b)| (a - b).abs()).max().unwrap();
+            let ink = |bands: &[i32]| f64::from(bands.iter().sum::<i32>()) / 64.0 / 255.0;
+            eprintln!(
+                "{key:016x}: bands at most {apart} levels apart; ink {:.4}, the stock tip's {:.4}",
+                ink(&ours),
+                ink(&stock)
+            );
+            assert!(apart <= most_apart, "{key:016x}: {ours:?} against {stock:?}");
+            assert!((ink(&ours) / ink(&stock) - 1.0).abs() < 0.02, "{key:016x}");
+            // no ink within 4 texels of its edges
+            let inside = |i: usize| (4..TEXTURE_SIZE - 4).contains(&i);
+            assert!(
+                pixels
+                    .iter()
+                    .enumerate()
+                    .all(|(k, &v)| v == 0 || (inside(k % TEXTURE_SIZE) && inside(k / TEXTURE_SIZE)))
+            );
+        }
+        // the hard round's edge a texel wide at every side: four times the texels round it at 1024
+        // as at 256, not sixteen
+        let (small, big) = (hard_round_at(TEXTURE_SIZE), hard_round_at(1024));
+        let edge = |pixels: &[u8]| pixels.iter().filter(|&&v| v > 25 && v < 230).count();
+        let (texels_small, texels_big) = (edge(&small), edge(&big));
+        eprintln!("hard round edge texels (a tenth to nine tenths): {texels_small} at 256, {texels_big} at 1024");
+        assert!(texels_big <= texels_small * 5 && texels_big >= texels_small * 3, "{texels_small} {texels_big}");
     }
 }

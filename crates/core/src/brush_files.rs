@@ -2454,7 +2454,7 @@ fn halftone_lattice(name: &str) -> Option<[(f32, f32); 2]> {
 }
 
 /// Our stand-in for the stock shape `name`: our nearest shape, or the round tip at a hardness, or
-/// (blank) the whole square.
+/// a small soft dot, or (blank) the whole square.
 fn stock_stand_in(name: &str) -> Pick {
     let n = name.to_lowercase();
     let has = |words: &[&str]| words.iter().any(|w| names(&n, w));
@@ -2470,6 +2470,9 @@ fn stock_stand_in(name: &str) -> Pick {
     } else if has(&["oval"]) {
         // a flat oval, not the round tip (as wide as its tones say, where they were measured)
         Pick::Ours(Some(shape::SLIM_OVAL))
+    } else if says(&["point"]) {
+        // a small soft dot in the middle of the square, not a square of grain
+        Pick::Point
     } else if has(&["medium-hard", "medium hard", "mediumhard"]) {
         Pick::Round(0.75)
     } else if says(&["hard", "pen", "solid", "round"]) && !has(&["soft", "ink", "rect", "glow"]) {
@@ -3498,10 +3501,19 @@ mod tests {
 
     #[test]
     fn stock_names_find_our_nearest() {
+        // a hard tip: our disc as its picture; a medium one, the round tip by its hardness
+        let (image, source, hardness) = shape_for(&Texture::Stock { name: "Brush-Hard.png".into(), inverted: false });
+        assert_eq!((image, hardness), (None, Some(0.95)));
+        assert!(*source.unwrap().pixels == textures::hard_round_at(TEXTURE_SIZE));
         assert_eq!(
-            shape_for(&Texture::Stock { name: "Brush-Hard.png".into(), inverted: false }),
-            (None, None, Some(0.95))
+            shape_for(&Texture::Stock { name: "Brush-Medium.png".into(), inverted: false }),
+            (None, None, Some(0.5))
         );
+        // the small point: our soft dot, not a square of grain
+        let (image, source, hardness) =
+            shape_for(&Texture::Stock { name: "Brush-Small-Point.png".into(), inverted: false });
+        assert_eq!((image, hardness), (None, None));
+        assert!(*source.unwrap().pixels == textures::point_at(TEXTURE_SIZE));
         assert_eq!(shape_for(&Texture::Stock { name: "Soft.png".into(), inverted: false }).0, Some(shape::SOFT_ROUND));
         let ultra = Texture::Stock { name: "Ultra-Soft.jpg".into(), inverted: false };
         assert_eq!(shape_for(&ultra).0, Some(shape::ULTRA_SOFT_ROUND));

@@ -955,7 +955,7 @@ fn faded_half(fade: f32) -> f32 {
 }
 
 /// The error function, to within about 1e-7 (Abramowitz and Stegun's 7.1.26).
-fn erf(x: f32) -> f32 {
+pub(crate) fn erf(x: f32) -> f32 {
     let t = 1.0 / (1.0 + 0.327_591_1 * x.abs());
     let poly = t * (0.254_829_6 + t * (-0.284_496_7 + t * (1.421_413_8 + t * (-1.453_152 + t * 1.061_405_4))));
     let e = 1.0 - poly * (-x * x).exp();

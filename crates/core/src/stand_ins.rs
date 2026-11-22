@@ -12,7 +12,20 @@ use procraft_engine::textures::{self, TEXTURE_SIZE, shape};
 pub(crate) fn drawn_shape(s: &StandIn) -> (Option<u32>, Option<Source>, Option<f32>) {
     let (key, inverted) = (s.key, s.inverted);
     let i = match s.pick {
+        // a hard tip: a disc of ours as its picture, its edge read through its levels as a stock
+        // tip's is (a big picture too, as big as the stock tip, for a big stamp)
+        Pick::Round(hardness) if hardness >= HARD_ROUND && crisp(key, inverted) => {
+            let most = textures::stock_shape_side(key).map_or(HARD_ROUND_SIDE, |side| sharpest(Some(side)));
+            let disc = drawn(SHAPE, s, most, |side| Some(textures::hard_round_at(side)));
+            return (None, Some(disc), Some(hardness));
+        }
         Pick::Round(hardness) => return (None, None, Some(hardness)),
+        // the small point: our soft dot, as big and as soft as the stock one measures (soft all
+        // through, so no big picture)
+        Pick::Point => {
+            let dot = drawn(SHAPE, s, TEXTURE_SIZE, |side| Some(emptied_border(textures::point_at(side), side)));
+            return (None, Some(dot), None);
+        }
         // a plain image: the stamp's whole square (nothing, inverted)
         Pick::Blank => {
             let fill = if inverted { 0 } else { 255 };
@@ -91,6 +104,23 @@ pub(crate) fn drawn_shape(s: &StandIn) -> (Option<u32>, Option<Source>, Option<f
     (Some(i), Some(retoned), None)
 }
 
+/// The least hardness a round tip standing in for a stock one is drawn as a picture at (see
+/// [`drawn_shape`]): the hard tip's (a medium one keeps its falloff by its hardness).
+const HARD_ROUND: f32 = 0.9;
+
+/// The side of the big picture of a hard tip whose stock image's side isn't known: the stock hard
+/// tip's.
+const HARD_ROUND_SIDE: usize = 1024;
+
+/// Whether the stock tip under `key` is crisp, as the stock hard tip is: its measured tones go
+/// from none to full with one between, or weren't measured (a tip whose name says it is hard, and
+/// nothing else known of it). A softer one, a photo of a round with a blurred rim, keeps the round
+/// tip drawn by its hardness.
+fn crisp(key: u64, inverted: bool) -> bool {
+    textures::stock_shape_tones_of(key, inverted)
+        .is_none_or(|tones| tones.iter().filter(|&&v| v > 0 && v < 255).count() <= 1)
+}
+
 /// How far in from its edges (a share of its side) a stand-in shape holds no faint ink: a stock
 /// tip's outer rows and columns are empty, and a faint one there (a level or two, where its tones
 /// put the faintest of it) adds up under the many stamps a wet stroke lays into a line beside it.
@@ -144,6 +174,7 @@ fn drawn(
         Pick::Blank => [2, 0, 0, 0],
         Pick::Ours(i) => [3, i.unwrap_or(u32::MAX), 0, 0],
         Pick::Halftone([(a, b), (c, d)]) => [a.to_bits(), b.to_bits(), c.to_bits(), d.to_bits()],
+        Pick::Point => [4, 0, 0, 0],
     };
     let key: DrawnKey = (kind, s.key, s.inverted, pick);
     // its id: FNV-1a of what it is drawn from

@@ -91,6 +91,8 @@ pub enum Pick {
     /// Round dots on a lattice (its two sets of rows as their cycles across and down the tile), each
     /// as big as the stock tip's ink there.
     Halftone([(f32, f32); 2]),
+    /// A small soft dot in the middle of the stamp's square (see [`crate::textures::point_at`]).
+    Point,
 }
 
 /// Canvas pixels a stamp's square is across at the most size, for each 1 of the file's `maxSize`.

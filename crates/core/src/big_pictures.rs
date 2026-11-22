@@ -1029,7 +1029,12 @@ mod tests {
     /// One stamp of `brush` in white at full size (`diameter` pixels across, its least and most
     /// sizes), in the middle of a canvas [`CANVAS`] square, its pictures as brushes hold them or
     /// (`big`) the big ones: the layer's alpha (0..1), row by row; none without a GPU.
-    fn one_stamp(mut brush: Brush, diameter: f32, big: bool) -> Option<Vec<f32>> {
+    fn one_stamp(brush: Brush, diameter: f32, big: bool) -> Option<Vec<f32>> {
+        one_stamp_at(brush, diameter, big, (0.0, 0.0))
+    }
+
+    /// [`one_stamp`] with its middle `offset` canvas pixels from the canvas's.
+    fn one_stamp_at(mut brush: Brush, diameter: f32, big: bool, offset: (f32, f32)) -> Option<Vec<f32>> {
         let gpu = procraft_gpu::Gpu::headless().ok()?;
         let side = CANVAS as u32;
         let s = CanvasSession::new(side, side);
@@ -1051,8 +1056,8 @@ mod tests {
         s.set_color(1.0, 1.0, 1.0);
         OFF.with(|off| off.set(!big));
         let middle = side as f32 / 2.0;
-        let at =
-            PenSample { x: middle, y: middle, pressure: 1.0, tilt: 0.0, orientation: 0.0, time_ms: 0.0, roll: 0.0 };
+        let (x, y) = (middle + offset.0, middle + offset.1);
+        let at = PenSample { x, y, pressure: 1.0, tilt: 0.0, orientation: 0.0, time_ms: 0.0, roll: 0.0 };
         s.stroke_begin(PointerKind::Finger, vec![at]);
         s.stroke_end(vec![]);
         OFF.with(|off| off.set(false));
@@ -1298,6 +1303,131 @@ mod tests {
         ramps.get(ramps.len() / 2).copied().unwrap_or(f32::NAN)
     }
 
+    /// The stock brushes' stand-in for the stock shape under `key` (the first brush's that stands in
+    /// for it) and a brush drawing with it alone; none if no brush does.
+    fn stand_in_brush(key: u64) -> Option<(procraft_engine::brushfile::StandIn, Brush)> {
+        let stand_in =
+            crate::stock_brushes::SETS.iter().flat_map(|s| s.brushes).find_map(|b| b.shape.filter(|s| s.key == key))?;
+        let (image, source, hardness) =
+            crate::brush_files::shape_for(&procraft_engine::brushfile::Texture::Drawn(stand_in));
+        let mut brush = Brush { name: "Ramp".to_owned(), ..Brush::round_pen() };
+        brush.shape.image = image;
+        brush.shape.source = source;
+        if let Some(h) = hardness {
+            brush.hardness = h;
+        }
+        Some((stand_in, brush))
+    }
+
+    /// One stamp of `brush` (as [`one_stamp`], its big pictures read) whose square is `square`
+    /// canvas pixels: a round tip as big a share of it as a stock tip is.
+    fn square_stamp(brush: &Brush, square: f32) -> Option<Vec<f32>> {
+        square_stamp_at(brush, square, (0.0, 0.0))
+    }
+
+    /// [`square_stamp`] with its middle `offset` canvas pixels from the canvas's.
+    fn square_stamp_at(brush: &Brush, square: f32, offset: (f32, f32)) -> Option<Vec<f32>> {
+        let d = if brush.round_tip() { square * procraft_engine::brushfile::ROUND_TIP_SHARE } else { square };
+        one_stamp_at(brush.clone(), d, true, offset)
+    }
+
+    /// The edge of `brush`'s stamp whose square is `square` canvas pixels: its ramp from a tenth
+    /// to nine tenths ([`edge_ramp`]) as its middle lies on a pixel's corner, its edge's middle and
+    /// between (a stamp a few pixels across shows them differently, by up to half a pixel), on
+    /// average, at the least and at the most; the same by its slope ([`edge_slope_ramp`]) on
+    /// average; and how far across it is at half ([`across_at_half`]). None without a GPU.
+    fn edge_of(brush: &Brush, square: f32) -> Option<Edge> {
+        let mut edge = Edge { ramp: 0.0, least: f32::MAX, most: 0.0, slope: 0.0, across: 0.0 };
+        let offsets = [(0.0, 0.0), (0.5, 0.0), (0.0, 0.5), (0.5, 0.5)];
+        for offset in offsets {
+            let alpha = square_stamp_at(brush, square, offset)?;
+            let ramp = edge_ramp(&alpha);
+            (edge.least, edge.most) = (edge.least.min(ramp), edge.most.max(ramp));
+            edge.ramp += ramp / offsets.len() as f32;
+            edge.slope += edge_slope_ramp(&alpha) / offsets.len() as f32;
+            edge.across += across_at_half(&alpha) / offsets.len() as f32;
+        }
+        Some(edge)
+    }
+
+    /// What [`edge_of`] finds of a stamp's edge, canvas pixels.
+    #[derive(Debug)]
+    struct Edge {
+        ramp: f32,
+        least: f32,
+        most: f32,
+        slope: f32,
+        across: f32,
+    }
+
+    /// How far across `alpha`'s stamp (a canvas [`CANVAS`] square) is where it paints half its
+    /// fullest: the side of a disc as big.
+    fn across_at_half(alpha: &[f32]) -> f32 {
+        let top = alpha.iter().copied().fold(0.0f32, f32::max).max(1e-6);
+        let inked = alpha.iter().filter(|&&v| v >= 0.5 * top).count();
+        2.0 * (inked as f32 / std::f32::consts::PI).sqrt()
+    }
+
+    /// The stock hard round tip's key (what 17 of the brushes the app comes with stand in for).
+    const HARD_TIP: u64 = 0xe114_279e_198b_3aec;
+
+    /// The stock small point's key (a pen's and a pencil's).
+    const SMALL_POINT: u64 = 0x79d5_ed1a_9f14_cee3;
+
+    /// How far a stamp's quad reaches past its square each way (canvas pixels; `stamp.wgsl`): a
+    /// shape's picture fills the quad.
+    const QUAD_REACH: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+    /// The stand-in for the stock hard round tip: our disc, read as a stamp reads a picture, its edge
+    /// from a tenth to nine tenths about a pixel and a half at every size, as the stock tip's
+    /// measures (1.57, 1.51, 1.42 and 1.55 pixels at 20, 60, 300 and 1000 across), where the round
+    /// tip drawn by its hardness gave 0.56, 1.01, 3.91 and 12.4; and as wide as the stock tip's
+    /// stamp, its disc as much of its quad as the stock tip's is of its square.
+    #[test]
+    fn a_hard_tip_s_edge_is_a_pixel_and_a_half_at_every_size() {
+        let (_, brush) = stand_in_brush(HARD_TIP).unwrap();
+        assert!(!brush.round_tip());
+        let mut found = Vec::new();
+        for (square, stock) in [(20.0, 1.57), (60.0, 1.51), (300.0, 1.42), (1000.0, 1.55)] {
+            let Some(e) = edge_of(&brush, square) else { return };
+            let stamp = textures::HARD_ROUND_SHARE * (square + 2.0 * QUAD_REACH);
+            eprintln!(
+                "hard tip {square} px: edge {:.2} px ({:.2} to {:.2}; {:.2} by slope; stock {stock}), {:.2} px across at half (stock stamp {stamp:.2})",
+                e.ramp, e.least, e.most, e.slope, e.across
+            );
+            found.push((square, e, stamp));
+        }
+        assert!(found.iter().all(|(_, e, _)| (1.1..=2.0).contains(&e.ramp)), "{found:?}");
+        assert!(found.iter().all(|(_, e, stamp)| (e.across - stamp).abs() < 0.75), "{found:?}");
+    }
+
+    /// The stand-in for the stock small point: our soft dot, its edge as wide as the stock point's
+    /// at every size, within a tenth (3.82, 5.71, 16.44 and 54.36 pixels at 60, 100, 300 and 1000
+    /// across; at 20, 1.70, within a third: the dot is 6 pixels across there, and its edge shows by
+    /// a third differently as it lies between pixels), where the square of grain it fell to gave
+    /// 13.4 at 100 and 130 at 1000; and it paints as much as the stock point holds (0.059 of its
+    /// square), not the grain's square.
+    #[test]
+    fn the_small_point_s_edge_is_the_stock_point_s() {
+        let (stand_in, brush) = stand_in_brush(SMALL_POINT).unwrap();
+        assert_eq!(stand_in.pick, procraft_engine::brushfile::Pick::Point);
+        let mut found = Vec::new();
+        for (square, stock, within) in
+            [(20.0, 1.70, 0.33), (60.0, 3.82, 0.1), (100.0, 5.71, 0.1), (300.0, 16.44, 0.1), (1000.0, 54.36, 0.1)]
+        {
+            let (Some(e), Some(alpha)) = (edge_of(&brush, square), square_stamp(&brush, square)) else { return };
+            // its paint over its square's
+            let ink = alpha.iter().map(|&v| f64::from(v)).sum::<f64>() / f64::from(square + 2.0 * QUAD_REACH).powi(2);
+            eprintln!(
+                "small point {square} px: edge {:.2} px ({:.2} to {:.2}; {:.2} by slope; stock {stock}), paint {ink:.4} of its square",
+                e.ramp, e.least, e.most, e.slope
+            );
+            found.push((square, e.ramp / stock, within, ink));
+        }
+        assert!(found.iter().all(|f| (f.1 - 1.0).abs() <= f.2), "{found:?}");
+        assert!(found.iter().all(|f| (f.3 / 0.0592 - 1.0).abs() < 0.08), "{found:?}");
+    }
+
     /// The edge ramps of one stamp of the stock shapes `RAMP_KEYS` names (their keys, in hex,
     /// commas between) at a few sizes (`RAMP_SIZES`: the square a stamp of the stock image fills, canvas pixels;
     /// a round tip as big a share of it as the stock tip is), its grain off: what the pictures our
@@ -1316,32 +1446,15 @@ mod tests {
             .filter_map(|v| v.trim().parse().ok())
             .collect();
         for key in keys {
-            let Some(stand_in) = crate::stock_brushes::SETS
-                .iter()
-                .flat_map(|s| s.brushes)
-                .find_map(|b| b.shape.filter(|s| s.key == key))
-            else {
+            let Some((stand_in, brush)) = stand_in_brush(key) else {
                 eprintln!("{key:016x}: none");
                 continue;
             };
-            let (image, source, hardness) =
-                crate::brush_files::shape_for(&procraft_engine::brushfile::Texture::Drawn(stand_in));
-            let mut brush = Brush { name: "Ramp".to_owned(), ..Brush::round_pen() };
-            brush.shape.image = image;
-            brush.shape.source = source;
-            if let Some(h) = hardness {
-                brush.hardness = h;
-            }
-            let round = brush.round_tip();
             let ramps: Vec<String> = sizes
                 .iter()
-                .map(|&d| {
-                    let d = if round { d * procraft_engine::brushfile::ROUND_TIP_SHARE } else { d };
-                    one_stamp(brush.clone(), d, true)
-                        .map_or("-".to_owned(), |a| format!("{:.2}/{:.2}", edge_ramp(&a), edge_slope_ramp(&a)))
-                })
+                .map(|&d| edge_of(&brush, d).map_or("-".to_owned(), |e| format!("{:.2}/{:.2}", e.ramp, e.slope)))
                 .collect();
-            eprintln!("{key:016x} {:?}: {}", stand_in.pick, ramps.join("\t"));
+            eprintln!("{key:016x} {:?}: {}", stand_in.pick, ramps.join("	"));
         }
     }
 }
