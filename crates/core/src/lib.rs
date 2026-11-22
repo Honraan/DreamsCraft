@@ -117,6 +117,7 @@ mod text_runs;
 mod timelapse;
 mod touch;
 mod transform;
+mod turn;
 mod tween;
 mod view_look;
 #[cfg(target_os = "android")]
