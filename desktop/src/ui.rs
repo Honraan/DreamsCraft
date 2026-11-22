@@ -923,6 +923,8 @@ impl Interface {
         // Classic as the plugins on now draw it
         if self.colours.floating.is_some() {
             self.colours.set_triangle(self.prefs.plugins.colour_triangle());
+            self.colours.steps = self.prefs.plugins.colour_steps();
+            self.colours.before_shown = self.prefs.plugins.colour_before();
             let picker = self.prefs.plugins.picker_on().then(|| (Arc::clone(&self.prefs.plugins), Arc::clone(session)));
             self.colours.set_picker(picker);
         }
@@ -2599,6 +2601,8 @@ impl Interface {
     ) -> Rect {
         let Some(pick) = self.background_pick.as_mut() else { return Rect::NOTHING };
         self.colours.set_triangle(self.prefs.plugins.colour_triangle());
+        self.colours.steps = self.prefs.plugins.colour_steps();
+        self.colours.before_shown = self.prefs.plugins.colour_before();
         let picker = self.prefs.plugins.picker_on().then(|| (Arc::clone(&self.prefs.plugins), Arc::clone(session)));
         self.colours.set_picker(picker);
         let brush = std::mem::replace(&mut self.colours.hsv, pick.hsv);
@@ -2693,6 +2697,8 @@ impl Interface {
             Popover::Colour => {
                 self.colours.set_classic_menu(self.prefs.plugins.menu_choices(procraft_core::PluginMenuPlace::Classic));
                 self.colours.set_triangle(self.prefs.plugins.colour_triangle());
+                self.colours.steps = self.prefs.plugins.colour_steps();
+                self.colours.before_shown = self.prefs.plugins.colour_before();
                 let picker =
                     self.prefs.plugins.picker_on().then(|| (Arc::clone(&self.prefs.plugins), Arc::clone(session)));
                 self.colours.set_picker(picker);
