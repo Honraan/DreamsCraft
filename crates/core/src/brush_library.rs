@@ -1546,11 +1546,11 @@ impl CanvasSession {
             drop(st);
             crate::brush_pictures::forget_unnamed(&dir.join(crate::brush_pictures::FOLDER), &libraries);
         }
-        // the tools' brushes ready by the first stroke, their big pictures too, and every other
-        // brush's big pictures made ahead
+        // the tools' brushes ready by the first stroke, their big pictures too where they are kept
+        // (none is made for a brush not chosen)
         let mut st = self.shared.lock();
         st.warm_tools_brushes();
-        st.big_pictures_ahead(&dir);
+        st.big_pictures_kept(&dir);
         // the sets of brushes plugins on come with, now the library is open
         st.brushes_dir = Some(dir);
         drop(st);

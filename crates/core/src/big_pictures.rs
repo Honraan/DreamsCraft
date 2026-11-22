@@ -1,12 +1,14 @@
 //! Our shapes and grains as big pictures, for a stamp or a grain's tile bigger than brushes hold
 //! them ([`TEXTURE_SIZE`]). Each has one size of its own: the stock image's it stands in for (the
-//! power of two nearest it, up to [`SHARPEST`]), or [`SHARPEST`] for one of ours. Made once,
-//! ahead, on a thread of their own, and kept in files beside the brush library under a key of the
-//! code that draws them ([`KEY`]: a build that draws them differently makes them again). A brush
-//! chosen reads its pictures in, and a stamp past [`TEXTURE_SIZE`] reads its picture magnified or
-//! through its smaller levels, whatever its size, the GPU holding the last few. Nothing is drawn
-//! while a stroke waits: one not made yet (the first start, or the first after such a build) is
-//! made before the others, and a stroke meanwhile reads the picture brushes hold.
+//! power of two nearest it, up to [`SHARPEST`]), or [`SHARPEST`] for one of ours. Made once, when
+//! a brush that reads them is first chosen (or a brush that names them is imported), on a thread of
+//! their own, and kept in files beside the brush library under a key of the code that draws them
+//! ([`KEY`]: a build that draws them differently makes them again); none is made for brushes not
+//! chosen, so a first start does no more than the reference's loading of its chosen brush's images.
+//! A brush chosen reads its pictures in, and a stamp past [`TEXTURE_SIZE`] reads its picture
+//! magnified or through its smaller levels, whatever its size, the GPU holding the last few.
+//! Nothing is drawn while a stroke waits: one not made yet is made before any other, and a stroke
+//! meanwhile reads the picture brushes hold.
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -146,14 +148,24 @@ pub(crate) fn reached_by(brush: &Brush) -> Vec<Big> {
 }
 
 impl crate::State {
-    /// The big pictures kept in the folder beside the library in `dir` from now on: the tools'
-    /// brushes' read in (made before any other, on a first start), and every other brush's in the
-    /// library made ahead.
-    pub(crate) fn big_pictures_ahead(&self, dir: &Path) {
+    /// The big pictures kept in the folder beside the library in `dir` from now on, and the tools'
+    /// brushes' read in from there where they are kept: none is made here (a brush's are made when
+    /// it is chosen, or when a stroke of it first wants one).
+    pub(crate) fn big_pictures_kept(&self, dir: &Path) {
         use_folder(dir);
         let tools = [crate::ToolKind::Paint, crate::ToolKind::Erase, crate::ToolKind::Smudge].map(|t| self.brush(t));
-        load(tools.into_iter().flat_map(reached_by).collect());
-        make_ahead(self.library.iter().flat_map(|set| &set.brushes).flat_map(reached_by).collect());
+        load(tools.into_iter().flat_map(reached_by).collect(), false);
+    }
+}
+
+impl crate::CanvasSession {
+    /// The sides of the big pictures the brush at `set`, `index` in the library reads at its most
+    /// size (and its second's); none for one that reads none, or isn't there. For tests.
+    #[doc(hidden)]
+    pub fn big_picture_sides(&self, set: u32, index: u32) -> Vec<u32> {
+        let st = self.shared.lock();
+        let brush = st.library.get(set as usize).and_then(|s| s.brushes.get(index as usize));
+        brush.map(|b| reached_by(b).iter().map(|big| big.side).collect()).unwrap_or_default()
     }
 }
 
@@ -293,9 +305,9 @@ pub(crate) fn ready(big: &Big) -> Option<Picture> {
     None
 }
 
-/// A brush chosen: its big pictures (`bigs`) read into memory off this thread, and those not made
-/// yet made before any other.
-pub(crate) fn load(bigs: Vec<Big>) {
+/// A brush chosen: its big pictures (`bigs`) read into memory off this thread, and (`make`) those
+/// not made yet made before any other.
+pub(crate) fn load(bigs: Vec<Big>, make: bool) {
     if bigs.is_empty() || at_once() {
         return;
     }
@@ -317,7 +329,9 @@ pub(crate) fn load(bigs: Vec<Big>) {
                 None => unmade.push(big),
             }
         }
-        ask(&reader, &unmade, true);
+        if make {
+            ask(&reader, &unmade, true);
+        }
     };
     let thread = std::thread::Builder::new().name("procraft-big-pictures-read".to_owned());
     if let Err(e) = thread.spawn(read_them) {
@@ -325,7 +339,8 @@ pub(crate) fn load(bigs: Vec<Big>) {
     }
 }
 
-/// Makes `bigs` (those not kept already) on a thread of their own, after any wanted first.
+/// Makes `bigs` (those not kept already) on a thread of their own, after any wanted first: an
+/// imported brush's.
 pub(crate) fn make_ahead(bigs: Vec<Big>) {
     let shared = shared();
     if shared.lock().folder.is_none() || at_once() {
@@ -437,6 +452,13 @@ fn make_waiting(shared: &Shared) {
         if store.wanted.remove(&big.id)
             && let Some(picture) = picture
         {
+            // (told, so that a chosen brush's pictures can be seen coming before the others)
+            log::info!(
+                "a chosen brush's big picture ready ({} a side) {} ms in, {} others waiting",
+                picture.side,
+                started.elapsed().as_millis(),
+                store.waiting.len()
+            );
             hold(&mut store, big.id, picture);
         }
         shared.changed.notify_all();
@@ -973,6 +995,37 @@ mod tests {
             most = (most.0.max(held), most.1.max(shapes), most.2.max(grains));
         }
         assert!(most.0 <= HELD_BYTES && most.1 <= 3 && most.2 <= 3, "{most:?}");
+        drop(_aside);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Opening the library makes no big pictures, as the reference loads a brush's images only when
+    /// it is chosen: none waits to be made and none is kept. Choosing a brush that reads them makes
+    /// its own, and only those, kept in their files.
+    #[test]
+    fn opening_the_library_makes_none_and_choosing_a_brush_makes_its_own() {
+        let _aside = Aside::on();
+        let dir = folder("on-demand");
+        let s = CanvasSession::new(64, 64);
+        s.shared.lock().big_pictures_kept(&dir);
+        let kept = || std::fs::read_dir(dir.join(format!("{FOLDER}{KEY}"))).map_or(0, Iterator::count);
+        assert_eq!((big_pictures_left(), kept()), (0, 0));
+        let ((set, index), brush, bigs) = big_brushes().into_iter().next().unwrap();
+        let ids: HashSet<u64> = bigs.iter().map(|b| b.id).collect();
+        let started = Instant::now();
+        assert!(s.select_brush(set, index));
+        while ids.iter().any(|id| !shared().lock().held.iter().any(|(held, _)| held == id)) {
+            assert!(started.elapsed() < Duration::from_secs(300), "not made");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        eprintln!(
+            "{}: its {} big pictures made {} ms after it was chosen",
+            brush.name,
+            ids.len(),
+            started.elapsed().as_millis()
+        );
+        assert!(wait_for_big_pictures(Duration::from_secs(60)));
+        assert_eq!(kept(), ids.len());
         drop(_aside);
         let _ = std::fs::remove_dir_all(&dir);
     }

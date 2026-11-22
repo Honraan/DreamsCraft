@@ -938,18 +938,20 @@ pub fn retoned_shape(pixels: &[u8], tones: &[u8], shares: &[f32]) -> Vec<u8> {
     let n = pixels.len().isqrt();
     let img: Vec<f32> = pixels.iter().map(|&v| f32::from(v) / 255.0).collect();
     // as deep at every side (bigger than [`TEXTURE_SIZE`], blurred as far by a window carried along
-    // each row, whose cost doesn't grow with it), summed as each is made
+    // each row, whose cost doesn't grow with it), summed as each is made (a big picture's added in
+    // place, so that drawing one holds no more pictures' worth than it must)
     let mut deep = vec![0.0f32; pixels.len()];
     for r in [6, 24, 64] {
-        let depth = match n {
-            TEXTURE_SIZE => blurred(&img, r),
-            _ => wrapped_blur(&img, n, (r * n / TEXTURE_SIZE).min(n.saturating_sub(1) / 2)),
-        };
-        deep.iter_mut().zip(&depth).for_each(|(sum, d)| *sum += d);
+        if n == TEXTURE_SIZE {
+            deep.iter_mut().zip(&blurred(&img, r)).for_each(|(sum, d)| *sum += d);
+        } else {
+            wrapped_blur_adding(&img, n, (r * n / TEXTURE_SIZE).min(n.saturating_sub(1) / 2), &mut deep);
+        }
     }
     drop(img);
-    let raw: Vec<f32> =
-        pixels.iter().zip(&deep).map(|(&v, &sum)| f32::from(v) + (sum / 3.0).clamp(0.0, 1.0) * 0.999).collect();
+    // what each is ranked by, in place of how deep it lies
+    let mut raw = deep;
+    raw.iter_mut().zip(pixels).for_each(|(sum, &v)| *sum = f32::from(v) + (*sum / 3.0).clamp(0.0, 1.0) * 0.999);
     let spread: Vec<(f32, f32)> = tones.iter().zip(shares).map(|(&t, &s)| (f32::from(t) / 255.0, s)).collect();
     ranked(&raw, &spread)
 }
@@ -3129,26 +3131,39 @@ fn transposed(img: &[f32], n: usize) -> Vec<f32> {
 /// The window's sum is carried along each row, so a bigger image's wider radius costs no more.
 /// Not [`blurred`], whose exact sums the stock shapes' stand-ins are ranked by.
 fn wrapped_blur(img: &[f32], n: usize, r: usize) -> Vec<f32> {
+    let mut out = vec![0.0; n * n];
+    wrapped_blur_into(img, n, r, &mut out, |px, v| *px = v);
+    out
+}
+
+/// [`wrapped_blur`] added into `sums` (as big as `img`), with no picture's worth of its own for the
+/// blur.
+fn wrapped_blur_adding(img: &[f32], n: usize, r: usize, sums: &mut [f32]) {
+    wrapped_blur_into(img, n, r, sums, |px, v| *px += v);
+}
+
+/// [`wrapped_blur`] of `img`, each pixel of it handed to `put` with its place in `out`.
+fn wrapped_blur_into(img: &[f32], n: usize, r: usize, out: &mut [f32], put: impl Fn(&mut f32, f32)) {
     let span = (2 * r + 1) as f64;
-    let pass = |src: &[f32], across: bool| -> Vec<f32> {
+    let pass = |src: &[f32], across: bool, out: &mut [f32], put: &dyn Fn(&mut f32, f32)| {
         let at = |a: usize, b: usize| {
             let (x, y) = if across { (a % n, b) } else { (b, a % n) };
             f64::from(src.get(y * n + x).copied().unwrap_or(0.0))
         };
-        let mut out = vec![0.0; n * n];
         for b in 0..n {
             let mut sum: f64 = (0..=2 * r).map(|k| at(n - r + k, b)).sum();
             for a in 0..n {
                 let (x, y) = if across { (a, b) } else { (b, a) };
                 if let Some(px) = out.get_mut(y * n + x) {
-                    *px = (sum / span) as f32;
+                    put(px, (sum / span) as f32);
                 }
                 sum += at(a + n + r + 1, b) - at(a + n - r, b);
             }
         }
-        out
     };
-    pass(&pass(img, true), false)
+    let mut across = vec![0.0; n * n];
+    pass(img, true, &mut across, &|px, v| *px = v);
+    pass(&across, false, out, &put);
 }
 
 /// The image at (`u`, `v`) (pixel corners at whole numbers), bilinear, wrapping round.
@@ -3851,6 +3866,37 @@ mod tests {
         }
         // coarse marks are those of the size brushes hold, read between texels
         assert_eq!(marks_at(24, 1024), upsampled(&marks(24), TEXTURE_SIZE, 1024));
+    }
+
+    /// [`retoned_shape`] as first written (each blur and what it ranks by a picture's worth of its
+    /// own): what it must match bit for bit.
+    fn retoned_shape_as_first(pixels: &[u8], tones: &[u8], shares: &[f32]) -> Vec<u8> {
+        let n = pixels.len().isqrt();
+        let img: Vec<f32> = pixels.iter().map(|&v| f32::from(v) / 255.0).collect();
+        let mut deep = vec![0.0f32; pixels.len()];
+        for r in [6, 24, 64] {
+            let depth = match n {
+                TEXTURE_SIZE => blurred(&img, r),
+                _ => wrapped_blur(&img, n, (r * n / TEXTURE_SIZE).min(n.saturating_sub(1) / 2)),
+            };
+            deep.iter_mut().zip(&depth).for_each(|(sum, d)| *sum += d);
+        }
+        let raw: Vec<f32> =
+            pixels.iter().zip(&deep).map(|(&v, &sum)| f32::from(v) + (sum / 3.0).clamp(0.0, 1.0) * 0.999).collect();
+        let spread: Vec<(f32, f32)> = tones.iter().zip(shares).map(|(&t, &s)| (f32::from(t) / 255.0, s)).collect();
+        ranked(&raw, &spread)
+    }
+
+    /// A shape retoned with its blurs added in place is the one retoned as first written, pixel for
+    /// pixel, at the size brushes hold and big.
+    #[test]
+    fn a_shape_retoned_in_less_memory_is_the_same() {
+        let tones = [0, 0, 0, 0, 0, 0, 3, 17, 73, 188, 253, 255, 255, 255, 255, 255, 255];
+        for (index, side) in [(shape::LEAF, TEXTURE_SIZE), (shape::BLOCK, 512), (shape::STAR, 1024)] {
+            let pixels = shape_at(index, side).unwrap();
+            let now = retoned_shape(&pixels, &tones, &SHAPE_TONE_SHARES);
+            assert!(now == retoned_shape_as_first(&pixels, &tones, &SHAPE_TONE_SHARES), "{index} at {side}");
+        }
     }
 
     /// Each of 64 bands of `pixels`' rows' mean value (a `side` square), as the stock tables measure

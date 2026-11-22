@@ -257,8 +257,8 @@ impl CanvasSession {
                 }
                 let mut st = self.shared.lock();
                 brushes.iter_mut().for_each(|b| st.grain_store.take(b));
-                // the big pictures of the stock images they name, made ahead
-                crate::big_pictures::make_ahead(brushes.iter().flat_map(crate::big_pictures::reached_by).collect());
+                // (the big pictures of the stock images a set's brushes name are made as each is
+                // chosen, not all of them now)
                 let name = if name.trim().is_empty() { IMPORTED.to_owned() } else { name.trim().to_owned() };
                 let origins = vec![None; brushes.len()];
                 st.library.insert(0, LibrarySet { name, brushes, origins, icon: crate::brush_library::IMPORTED_ICON });

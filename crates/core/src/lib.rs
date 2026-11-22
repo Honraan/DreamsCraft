@@ -1169,7 +1169,7 @@ impl State {
     /// them (see `big_pictures.rs`).
     pub(crate) fn load_brush_pictures(&mut self) {
         let brush = self.brush(self.tool);
-        crate::big_pictures::load(crate::big_pictures::reached_by(brush));
+        crate::big_pictures::load(crate::big_pictures::reached_by(brush), true);
         let fulls: Vec<procraft_engine::brush::FullGrain> = std::iter::once(brush)
             .chain(brush.secondary.as_deref())
             .flat_map(|b| [b.grain_file_now().and_then(|f| f.full.as_ref()), b.shape_file_now().map(|f| &f.full)])

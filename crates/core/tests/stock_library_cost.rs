@@ -1,6 +1,6 @@
 //! The brushes the app comes with are made quickly and hold little: their shapes' and grains'
-//! stand-ins are drawn only when a brush wants them, and their big pictures only once a library is
-//! open, on a thread of their own, so making the library draws none. (A test of its own, as it counts every allocation the program
+//! stand-ins are drawn only when a brush wants them, and their big pictures only when a brush
+//! that reads them is chosen, on a thread of their own, so making the library draws none. (A test of its own, as it counts every allocation the program
 //! makes.)
 
 #[global_allocator]
