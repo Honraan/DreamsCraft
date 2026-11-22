@@ -5530,6 +5530,63 @@ fn ring_under_an_empty_layer(s: &CanvasSession) -> u64 {
     bottom
 }
 
+/// While the selection tool is open, the paths of the shapes joined to the selection show dashed
+/// (canvas pixels: a rectangle's four corners, an ellipse's 128 points), those taken away too;
+/// inverting and feathering keep them; an undo, closing the tool or deselecting takes them away.
+/// The feather's line shows from a drag of its slider until it is let go.
+#[test]
+fn the_shapes_joined_while_the_tool_is_open_show_their_paths() {
+    use crate::SelectionJoin;
+    let Some(s) = session(100, 100) else { return };
+    let how = crate::touch::SelectTouch {
+        kind: crate::touch::SelectKind::Rectangle,
+        join: SelectionJoin::Add,
+        threshold: 0.5,
+    };
+    s.set_touch_selecting(Some(how));
+    let near = |a: &[f32], b: &[f32]| a.len() == b.len() && a.iter().zip(b).all(|(p, q)| (p - q).abs() < 0.01);
+    s.select_shape(false, 10.0, 10.0, 40.0, 40.0, SelectionJoin::Add);
+    let paths = s.selection_outlines();
+    assert_eq!(paths.len(), 1);
+    assert!(near(&paths[0], &[10.0, 10.0, 40.0, 10.0, 40.0, 40.0, 10.0, 40.0]), "{:?}", paths[0]);
+    s.select_shape(true, 50.0, 50.0, 90.0, 90.0, SelectionJoin::Add);
+    s.select_shape(false, 20.0, 20.0, 30.0, 30.0, SelectionJoin::Remove);
+    let lengths: Vec<usize> = s.selection_outlines().iter().map(Vec::len).collect();
+    assert_eq!(lengths, vec![8, 256, 8]);
+    // inverted and feathered: kept; the feather's line from a drag until let go
+    s.select_invert();
+    s.select_feather(0.1);
+    assert!(s.shared.lock().feather_edge);
+    s.select_feather_let_go();
+    assert!(!s.shared.lock().feather_edge);
+    s.select_feather(0.2);
+    s.select_feather_done();
+    assert!(!s.shared.lock().feather_edge);
+    assert_eq!(s.selection_outlines().len(), 3);
+    // undone: what is selected is the history's, the paths go
+    s.undo();
+    assert!(s.selection_outlines().is_empty());
+    // closing the tool takes them away; open again, deselecting does
+    s.select_shape(false, 10.0, 10.0, 40.0, 40.0, SelectionJoin::Add);
+    assert_eq!(s.selection_outlines().len(), 1);
+    s.set_touch_selecting(None);
+    assert!(s.selection_outlines().is_empty());
+    s.set_touch_selecting(Some(how));
+    s.select_shape(false, 60.0, 10.0, 90.0, 40.0, SelectionJoin::Add);
+    assert_eq!(s.selection_outlines().len(), 1);
+    s.select_none();
+    assert!(s.selection_outlines().is_empty());
+    // closed as the apps close it (before their touches are told): gone, and not back when it opens
+    s.select_shape(false, 60.0, 10.0, 90.0, 40.0, SelectionJoin::Add);
+    assert_eq!(s.selection_outlines().len(), 1);
+    s.select_feather(0.1);
+    assert!(s.shared.lock().feather_edge);
+    s.close_selection_tool(false);
+    assert!(s.selection_outlines().is_empty());
+    assert!(!s.shared.lock().feather_edge, "the feather's line goes with the tool");
+    assert!(s.has_selection());
+}
+
 /// Whether the selection takes canvas pixel (`x`, `y`).
 fn selected(s: &CanvasSession, x: usize, y: usize) -> bool {
     s.shared.lock().selection.as_ref().is_some_and(|m| m.data.get(y * m.width as usize + x).is_some_and(|&v| v > 127))
@@ -5859,6 +5916,8 @@ fn color_fill_shows_exactly_the_fill_it_makes_on_an_alpha_locked_faded_layer() {
     s.set_color(1.0, 0.1, 0.0);
     s.select_shape(false, 30.0, 5.0, 95.0, 70.0, SelectionJoin::Add);
     s.select_feather(0.02);
+    // (its slider let go, as the apps do: the line where it fades out goes)
+    s.select_feather_let_go();
     s.set_selection_display(SelectionDisplay::ColourFill);
     let shown = frame_of(&s, 100);
     assert!(s.close_selection_tool(true));
@@ -20078,6 +20137,39 @@ fn a_vector_layer_is_saved_with_its_items_beside_its_pixels_and_opens_again() {
     assert!(!data.exists(), "not made up anew");
     assert!(folder.join("layers").join(format!("{vector}.png")).exists());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Kept selections: each save adds one (the newest last, named by its place, oldest first); a row
+/// slid left and deleted takes its selection out and the rest close up; loading one by its place
+/// makes it the selection.
+#[test]
+fn kept_selections_delete_by_place_and_the_rest_close_up() {
+    use crate::SelectionJoin;
+    let Some(s) = session(100, 100) else { return };
+    let mask = |s: &CanvasSession| s.shared.lock().selection.clone().map(|m| m.data);
+    let mut kept = Vec::new();
+    for (i, (x0, x1)) in [(0.0, 20.0), (30.0, 50.0), (60.0, 90.0)].into_iter().enumerate() {
+        s.select_none();
+        s.select_shape(false, x0, 0.0, x1, 100.0, SelectionJoin::Add);
+        kept.push(mask(&s));
+        assert_eq!(s.save_selection(), i as u32 + 1);
+    }
+    assert_eq!(s.saved_selection_count(), 3);
+    // the middle one deleted: two left, the third now second
+    s.delete_saved_selection(1);
+    assert_eq!(s.saved_selection_count(), 2);
+    assert!(s.load_selection(1));
+    assert_eq!(mask(&s), kept[2]);
+    assert!(s.load_selection(0));
+    assert_eq!(mask(&s), kept[0]);
+    // past the last: nothing deleted, nothing loaded
+    s.delete_saved_selection(7);
+    assert_eq!(s.saved_selection_count(), 2);
+    assert!(!s.load_selection(2));
+    // each deleted in turn, from the top of the list (the newest) down
+    s.delete_saved_selection(1);
+    s.delete_saved_selection(0);
+    assert_eq!(s.saved_selection_count(), 0);
 }
 
 /// The library's first brush (set, place) `wanted` says yes to.
