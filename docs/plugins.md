@@ -46,6 +46,7 @@ A folder under `plugins/` holding a `craft-extension.json`, and for each thing i
 - For code, a Rust crate. Any language that builds to a plain WebAssembly module will do, but
   `tools/pack_plugin.py` builds Rust.
 - For a filter, a `filter.wgsl`; for several, a `filters/<key>.wgsl` for each.
+- For brushes, a `brushes.brushset` (see [Brushes it comes with](#brushes-it-comes-with)).
 
 `craft-extension.json` describes it. `tools/pack_plugin.py` lists the code in it for you.
 
@@ -69,7 +70,7 @@ A folder under `plugins/` holding a `craft-extension.json`, and for each thing i
 ```
 
 `holds` says what's in the file, and the app checks it: `"hooks"` for code, `"filter"` for a filter,
-or both. The file has to hold exactly that. The import screen tells people what each one lets the
+`"brushes"` for a set of brushes (interface 14), or more than one. The file has to hold exactly that. The import screen tells people what each one lets the
 plugin do.
 
 `hooks` lists the hooks the code uses, and only a plugin that holds `"hooks"` may have it. Code
@@ -84,8 +85,28 @@ hooks, the `view` permission and actions in the Canvas tab 8, the `pressure` hoo
 `gesture_lock` hook's fit, the `brush_preview_colour` and `layer_label` hooks, layers' marks and
 panels' rows of colours 10, the recent colours and brushes, actions at the pen, panels' rows of
 brushes and rings, the `interface_colour` hook's surround, the `surround_picture` and `slider_look`
-hooks and `file` controls of pictures 11, and the `stroke_fill` hook, the `paper` hook's tooth and
-picture, actions in the Layers panel, `set_control` and the `colour_panel` hook 12.
+hooks and `file` controls of pictures 11, the `stroke_fill` hook, the `paper` hook's tooth and
+picture, actions in the Layers panel, `set_control` and the `colour_panel` hook 12, the
+`view_dim_others` hook 13, and a set of brushes 14.
+
+### Brushes it comes with
+
+A plugin that holds `"brushes"` (interface 14) brings a set of brushes: `brushes.brushset` in its
+folder, a set file as the app writes one to share (Share in a set's menu), of 1 to 64 brushes. A set
+file that doesn't read is refused as the plugin is imported. The first time the plugin is on, the
+app adds the set to the brush library in use, a set of its own at the top under the name its file
+gives, as importing the file would, and writes down that it did beside the brushes: the set comes
+once, however often the plugin is turned off and on, and a set deleted stays deleted. It's added
+once the library is open, so a plugin turned on before then gives it as the library opens. A later
+version of the plugin doesn't add it again. The brushes are the library's from then on: they stay as
+they are with the plugin off or removed, and a row of the plugin's in the brush studio that a brush
+keeps (see [Rows in the brush studio](#rows-in-the-brush-studio)) does what the plugin says only
+while it's on.
+
+The Lasso fill plugin the app comes with brings Fills: the round pen filling what it goes round, plain
+and with the app's own halftone, speckle, grunge, scratch and checker grains. Its set file is written
+by the core's `write_the_fill_brushes` test (`cargo test -p procraft-core write_the_fill_brushes --
+--ignored`), and a test checks the one kept is the same, byte for byte.
 
 `id` must have at least two dotted parts, and can't start with `procraft.` or end with `.stopped`.
 `permissions` lists what code may reach when someone taps one of its actions. Leave it empty unless
@@ -192,7 +213,8 @@ to 16 (each 24 characters at most), kept with each brush:
 ```
 
 A brush starts at the first choice. The row shows under its `label` while the plugin is on; a brush
-keeps its choice under `plugin:<id>:<key>`, so it stays with the brush when the plugin is off.
+keeps its choice under `plugin:<id>:<key>`, so it stays with the brush when the plugin is off, and
+in its file when it's shared (`Plugins/Rows.txt` in the brush's folder, which other apps pass over).
 
 ### What the code is told
 
@@ -701,8 +723,9 @@ asks:
 - It fills by the non-zero winding rule, one coat: a loop drawn round twice is no darker than one
   drawn once, and both lobes of a figure eight fill.
 - It is laid as the stroke's paint is: in the colour, at the brush's opacity times the opacity
-  slider, its edges smoothed, taking the paper and the brush's grain (fixed to the canvas), inside
-  the selection and keeping the layer's alpha lock, its blend mode as the brush's. A fill with the
+  slider, its edges smoothed, taking the paper and the brush's grain (fixed to the canvas, from a
+  place of the stroke's own while the brush's grain has Offset jitter, interface 14), inside the
+  selection and keeping the layer's alpha lock, its blend mode as the brush's. A fill with the
   eraser takes away what it encloses. Each copy a symmetry makes fills too. Undo takes it back as
   one step, Lasso fill.
 - It isn't asked on the brush studio's pad, on a layer of a plugin's own, on a model or for
@@ -711,8 +734,9 @@ asks:
 An answer past 0 to 2 stops the plugin. With several plugins on this hook, the first by id that says
 a stroke fills says how it shows.
 
-The Lasso fill plugin the app comes with fills every stroke while its switch is on, and a brush's
-strokes whose Fill row says so.
+The Lasso fill plugin the app comes with fills every stroke while its switch is on (shown as its
+other switch says), and a brush's strokes whose Fill row says so (shown as its Fill shown row says),
+and brings a set of such brushes (see [Brushes it comes with](#brushes-it-comes-with)).
 
 ### `floating_panels`
 
@@ -1950,7 +1974,8 @@ the recent colours and brushes (`recent_colour`, `recent_brush`, `current_brush`
 actions at the pen, panels' rows of brushes and rings, the `interface_colour` hook's surround, the
 `surround_picture` and `slider_look` hooks and `file` controls of pictures, interface 12 the `stroke_fill` hook,
 the `paper` hook's tooth and picture, actions in the Layers panel, `set_control` and the
-`colour_panel` hook, and interface 13 the `view_dim_others` hook. What comes under a switch at the top of the list, taking the place of other plugins, a menu of
+`colour_panel` hook, interface 13 the `view_dim_others` hook, and interface 14 sets of brushes a
+plugin comes with. What comes under a switch at the top of the list, taking the place of other plugins, a menu of
 its own, and controls in the Canvas tab, on a key or kept with each artwork need no newer
 interface: an older app shows every control, leaves the others where they are, shows no menu and
 keeps every control with the plugin. What a

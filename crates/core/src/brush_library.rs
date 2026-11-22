@@ -568,6 +568,9 @@ fn remembered(slot: &std::sync::Mutex<Option<LastLibrary>>, path: &std::path::Pa
 }
 pub(crate) const CHOICES_FILE: &str = "choices.json";
 const SEEN_FILE: &str = "seen.txt";
+/// Where it is written down, beside the brushes, which plugins' sets of brushes were given to the
+/// library: an id a line.
+const PLUGIN_SETS_FILE: &str = "plugin-sets.txt";
 
 /// Puts what an earlier version kept elsewhere into folder `dir` for [`CanvasSession::open_brushes`]:
 /// the shipped brushes it had seen (`seen`, numbers joined by commas) and the brushes in use
@@ -1545,11 +1548,55 @@ impl CanvasSession {
         }
         // the tools' brushes ready by the first stroke, their big pictures too, and every other
         // brush's big pictures made ahead
-        let st = self.shared.lock();
+        let mut st = self.shared.lock();
         st.warm_tools_brushes();
         st.big_pictures_ahead(&dir);
+        // the sets of brushes plugins on come with, now the library is open
+        st.brushes_dir = Some(dir);
         drop(st);
+        self.give_plugin_sets();
         loaded
+    }
+
+    /// Gives the library in use the set of brushes of each plugin on it hasn't been given before
+    /// ([`State::plugin_sets`]), each a set of its own at the top, once the brushes are open
+    /// ([`Self::open_brushes`]): kept with the library, then written down as given beside the
+    /// brushes, so each plugin's set comes once, and one deleted stays deleted. Cut short between
+    /// the two, a set comes again rather than never.
+    pub(crate) fn give_plugin_sets(&self) {
+        let (dir, sets) = {
+            let st = self.shared.lock();
+            match &st.brushes_dir {
+                Some(dir) if !st.plugin_sets.is_empty() => (dir.clone(), st.plugin_sets.clone()),
+                _ => return,
+            }
+        };
+        let file = dir.join(PLUGIN_SETS_FILE);
+        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        let mut given: Vec<String> = text.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect();
+        let due: Vec<_> = sets.into_iter().filter(|(id, _)| !given.contains(id)).collect();
+        if due.is_empty() {
+            return;
+        }
+        for (id, set) in due {
+            // one that can't be read never will be: written down all the same
+            if self.import_brushes(set.to_vec()).is_none() {
+                log::warn!("the brushes plugin {id} comes with couldn't be added");
+            }
+            given.push(id);
+        }
+        let (library, choices) = self.files_in_use(&dir);
+        if self.save_brush_library_file(library.to_string_lossy().into_owned()) {
+            let _writing = library_writes();
+            Self::write_choices(&choices, &self.saved_brush_choices());
+        }
+        let text = given.join("\n");
+        let kept = crate::project::write_atomically(&file, |p| {
+            std::fs::write(p, &text).map_err(|e| crate::project::file_error("keeping the plugins' brushes given", e))
+        });
+        if let Err(e) = kept {
+            log::error!("{e}");
+        }
     }
 }
 

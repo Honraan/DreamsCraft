@@ -784,6 +784,10 @@ fn read_in(zip: &ZipReader<'_>, prefix: &str) -> Option<BrushFile> {
             }
         }
     };
+    // the rows plugins add to the brush studio, as the brush keeps them
+    for (key, value) in zip.read(&format!("{prefix}{PLUGIN_ROWS}")).as_deref().map(plugin_rows).unwrap_or_default() {
+        set(&key, value);
+    }
     // sizes are kept as the size the slider sets (its place to the power of its curve)
     let place = |v: Vec<f32>| v.into_iter().map(|s| s.max(0.0).powf(1.0 / SIZE_CURVE)).collect::<Vec<f32>>();
     let notches = Notches {
@@ -866,6 +870,26 @@ const SLIDERS: [(&str, &str); 3] =
     [("paintSize", "paintOpacity"), ("smudgeSize", "smudgeOpacity"), ("eraseSize", "eraseOpacity")];
 
 const AUTHOR_PICTURE: &str = "AuthorPicture/AuthorPicture.png";
+/// Where a brush's folder keeps the rows plugins add to the brush studio (`plugin:<id>:<key>`, each
+/// a choice by its place): a line each, its key, a space and its value. Other apps pass it over.
+const PLUGIN_ROWS: &str = "Plugins/Rows.txt";
+/// The most rows of plugins' a brush file keeps, and the longest key of one.
+const MOST_PLUGIN_ROWS: usize = 256;
+const MOST_PLUGIN_ROW_KEY: usize = 256;
+
+/// The plugins' rows in `text` (see [`PLUGIN_ROWS`]), as many as hold up: a key of a plugin's row,
+/// then a whole number from 0 to 255.
+fn plugin_rows(text: &[u8]) -> Vec<(String, f32)> {
+    let text = String::from_utf8_lossy(text);
+    let rows = text.lines().filter_map(|line| {
+        let (key, value) = line.trim().rsplit_once(' ')?;
+        let value: f32 = value.parse().ok()?;
+        let fits = key.starts_with("plugin:") && key.len() <= MOST_PLUGIN_ROW_KEY && !key.contains(char::is_whitespace);
+        (fits && (0.0..=255.0).contains(&value)).then(|| (key.to_owned(), value.round()))
+    });
+    rows.take(MOST_PLUGIN_ROWS).collect()
+}
+
 /// Where a brush's folder keeps the brush engine that draws it, and its data for it.
 const ENGINE_KEY: &str = "Engine/Key.txt";
 const ENGINE_DATA: &str = "Engine/Data.bin";
@@ -1124,6 +1148,12 @@ fn add_brush<W: std::io::Write>(
     if let Some(engine) = &brush.engine {
         zip.add(&format!("{prefix}{ENGINE_KEY}"), engine.engine.as_bytes());
         zip.add(&format!("{prefix}{ENGINE_DATA}"), &engine.data);
+    }
+    // the rows plugins add to the brush studio, as it keeps them
+    let rows: Vec<String> =
+        brush.extra.iter().filter(|(key, _)| key.starts_with("plugin:")).map(|(key, v)| format!("{key} {v}")).collect();
+    if !rows.is_empty() {
+        zip.add(&format!("{prefix}{PLUGIN_ROWS}"), rows.join("\n").as_bytes());
     }
     if let (Some(second), Some(pictures)) = (&brush.secondary, &pictures.secondary) {
         add_brush(zip, &format!("{prefix}{SECONDARY}"), second, author, pictures);
@@ -1407,6 +1437,36 @@ mod tests {
             again.set_setting(key, mode.unwrap());
             assert_eq!(again.setting(key), BRUSH_BEHIND as f32, "{key}");
         }
+    }
+
+    #[test]
+    fn a_brush_keeps_its_plugins_rows_through_its_file_and_odd_lines_are_left_out() {
+        let mut brush = Brush::round_pen();
+        brush.set_setting("plugin:org.example.fill:fill", 1.0);
+        brush.set_setting("plugin:org.example.sounds:sound", 7.0);
+        let pictures = Pictures {
+            shape_png: b"s",
+            grain_png: None,
+            metallic_png: None,
+            roughness_png: None,
+            thumbnail_png: b"t",
+            author_png: None,
+            signature_png: None,
+            secondary: None,
+        };
+        let back = read(&write(&brush, "", &pictures)).unwrap();
+        let mut again = Brush::round_pen();
+        for (key, value) in &back.settings {
+            again.set_setting(key, *value);
+        }
+        assert_eq!(again.setting("plugin:org.example.fill:fill"), 1.0);
+        assert_eq!(again.setting("plugin:org.example.sounds:sound"), 7.0);
+        // a brush with none writes none
+        let plain = write(&Brush::round_pen(), "", &pictures);
+        assert!(!crate::zip::ZipReader::new(&plain).unwrap().names().any(|n| n.ends_with(PLUGIN_ROWS)));
+        // lines that aren't a plugin's row, or a value past its choices, are left out
+        let text = b"plugin:a:b 3\nnot_a_row 1\nplugin:a:c 300\nplugin:a:d x\nplugin:a:e -1\n  plugin:a:f 2  \n";
+        assert_eq!(plugin_rows(text), [("plugin:a:b".to_owned(), 3.0), ("plugin:a:f".to_owned(), 2.0)]);
     }
 
     #[test]

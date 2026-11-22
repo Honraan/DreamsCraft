@@ -753,6 +753,11 @@ pub(crate) struct State {
     pub(crate) plugin_dim: f32,
     /// The paper a plugin on the paper's hook gives, as it said then.
     pub(crate) plugin_paper: Option<procraft_gpu::CanvasPaper>,
+    /// The set of brushes each plugin on holds, by its id, as the session last took them up, and
+    /// the folder the brushes were opened from (none until they are): the library is given each set
+    /// once it is open (see [`CanvasSession::give_plugin_sets`]).
+    pub(crate) plugin_sets: Vec<(String, std::sync::Arc<[u8]>)>,
+    pub(crate) brushes_dir: Option<std::path::PathBuf>,
     /// The tile of the picture a plugin's paper is, made again only as its file changes.
     pub(crate) paper_picture: Option<std::sync::Arc<paper_picture::PaperPicture>>,
     /// The colour round the canvas a plugin gives (sRGB 0..1), and the picture shown there in place
@@ -2180,6 +2185,8 @@ impl CanvasSession {
             plugin_look: None,
             plugin_dim: 0.0,
             plugin_paper: None,
+            plugin_sets: Vec::new(),
+            brushes_dir: None,
             paper_picture: None,
             plugin_surround: None,
             surround_picture: None,
@@ -2434,6 +2441,11 @@ impl CanvasSession {
         st.note_recent(st.brush_ref(tool));
         st.info.strokes = st.info.strokes.saturating_add(1);
         let seed = st.strokes.wrapping_mul(0x9e37_79b9);
+        // a fill whose brush starts its grain somewhere new each stroke (Offset jitter) starts it
+        // at a place of this stroke's own
+        if fill.is_some() && brush.setting("grain_offset_jitter") >= 0.5 {
+            style.grain_start = grain_start(seed);
+        }
         // input read in whole pixels is evened out over the steps a slow line goes in, which keeps
         // what is laid for good a stretch behind the pen: only for a stroke the canvas shows on to
         // the pen meanwhile (its tip), not for paint laid in place (a smudge, wet paint) or a dual
@@ -3447,4 +3459,19 @@ impl Drop for CanvasSession {
         // the autosave's thread, waiting for a change, ends
         self.shared.nudge.close();
     }
+}
+
+/// A place for a stroke's grain fixed to the canvas to start at, in tiles each way (0 to 1), of the
+/// stroke's `seed`: spread evenly over the tile by the seed's bits.
+pub(crate) fn grain_start(seed: u32) -> [f32; 2] {
+    let mix = |mut x: u32| {
+        x ^= x >> 16;
+        x = x.wrapping_mul(0x7feb_352d);
+        x ^= x >> 15;
+        x = x.wrapping_mul(0x846c_a68b);
+        x ^ (x >> 16)
+    };
+    let a = mix(seed);
+    let b = mix(a ^ 0x9e37_79b9);
+    [(a >> 8) as f32 / (1 << 24) as f32, (b >> 8) as f32 / (1 << 24) as f32]
 }

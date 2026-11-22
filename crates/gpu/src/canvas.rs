@@ -50,7 +50,7 @@ const MULTIPLY_MODE: u32 = 1;
 const STROKE_LUMINANCE: u32 = 0x100;
 
 /// The largest uniform block a shader reads.
-const UNIFORM_SIZE: u64 = 160;
+const UNIFORM_SIZE: u64 = 176;
 const _: () = assert!(
     size_of::<LayerUniform>() as u64 <= UNIFORM_SIZE
         && size_of::<StampUniform>() as u64 <= UNIFORM_SIZE
@@ -273,6 +273,9 @@ pub struct StrokeStyle {
     pub burnt_blend: u32,
     /// The grain turned, radians.
     pub grain_rotation: f32,
+    /// Where a grain fixed to the canvas starts, in tiles each way: a place of the stroke's own,
+    /// for a fill whose brush's grain starts somewhere new each stroke; [0, 0] for any other.
+    pub grain_start: [f32; 2],
     /// No grain filtering: the grain read pixel by pixel, sharp, as from a finer image.
     pub grain_sharp: bool,
     /// A brush file's grain to read in place of the brush images (see
@@ -398,6 +401,7 @@ impl StrokeStyle {
             grain_blend: MULTIPLY_MODE,
             burnt_blend: MULTIPLY_MODE,
             grain_rotation: 0.0,
+            grain_start: [0.0; 2],
             grain_sharp: false,
             full_grain: None,
             grain_side: TEXTURE_SIZE as f32,
@@ -468,6 +472,7 @@ impl StrokeStyle {
             // the editors' turn of the image, the whole grain with it (the rotation control is
             // each stamp's own: `Stamp::grain_turn`)
             grain_rotation: brush.setting("grain_turn").clamp(-1.0, 1.0) * std::f32::consts::PI,
+            grain_start: [0.0; 2],
             grain_sharp: brush.setting("grain_filtering") < 0.5,
             full_grain: None,
             grain_side: TEXTURE_SIZE as f32,
@@ -1192,6 +1197,8 @@ struct LayerUniform {
     /// the stroke takes no paper), how many canvas pixels a pixel of its tile covers, and how deep
     /// it shows in the background (0: a flat colour).
     paper: [f32; 4],
+    /// Where the grain fixed to the canvas starts, in tiles (x, y; the rest unused).
+    grain_start: [f32; 4],
 }
 
 impl Default for LayerUniform {
@@ -1225,6 +1232,7 @@ impl Default for LayerUniform {
             grain_side: TEXTURE_SIZE as f32,
             scaled: [1.0, 0.0, 0.0, 0.0],
             paper: [0.0, 1.0, 0.0, 0.0],
+            grain_start: [0.0; 4],
         }
     }
 }
@@ -1286,7 +1294,11 @@ impl LayerUniform {
             ..self
         };
         match s.canvas_grain() {
-            Some((g, scale, depth)) => LayerUniform { grain: g as i32, grain_scale: scale, grain_depth: depth, ..look },
+            Some((g, scale, depth)) => {
+                let start = s.grain_start.map(|t| if t.is_finite() { t.rem_euclid(1.0) } else { 0.0 });
+                let grain_start = [start[0], start[1], 0.0, 0.0];
+                LayerUniform { grain: g as i32, grain_scale: scale, grain_depth: depth, grain_start, ..look }
+            }
             None => look,
         }
     }
@@ -2358,7 +2370,7 @@ enum Op {
         coverage: Vec<u8>,
         colour: [f32; 3],
     },
-    Commit(ActiveStroke),
+    Commit(Box<ActiveStroke>),
     /// The next stroke committed changed pixels only within these rectangles: its undo step
     /// keeps only them.
     Within(Vec<IRect>),
@@ -4557,7 +4569,7 @@ impl Canvas {
             if !self.measuring {
                 self.strokes_ended += 1;
                 active.number = self.strokes_ended;
-                self.ops.push(Op::Commit(active));
+                self.ops.push(Op::Commit(Box::new(active)));
             }
         }
     }
@@ -4753,7 +4765,7 @@ impl Canvas {
             self.strokes_ended += 1;
             active.number = self.strokes_ended;
             self.ops.push(Op::Within(rects));
-            self.ops.push(Op::Commit(active));
+            self.ops.push(Op::Commit(Box::new(active)));
         }
     }
 
@@ -7026,7 +7038,7 @@ impl Canvas {
                     }
                 }
                 Op::Commit(stroke) => {
-                    self.commit(device, &mut encoder, &mut uniforms, stroke);
+                    self.commit(device, &mut encoder, &mut uniforms, *stroke);
                     history_changed = true;
                 }
                 Op::Cancel if self.smudge.is_some() => {

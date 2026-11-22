@@ -5647,6 +5647,49 @@ fn a_paper_s_tooth_takes_paint_only_above_its_strength_and_none_leaves_it_as_it_
     assert!(laid(Some(&paper(f32::NAN))).0 == soft);
 }
 
+/// A fill's grain fixed to the canvas starts where its style says, a share of a tile each way: a
+/// quarter of a tile across, a grunge grain comes out as from no start moved a quarter of a tile (to
+/// within two levels); a whole tile, as from none.
+#[test]
+fn a_fill_s_grain_starts_where_its_stroke_says() {
+    use procraft_engine::geom::IRect;
+    let Some(gpu) = gpu() else { return };
+    let _check = NoErrors(&gpu);
+    let side = 64u32;
+    let laid = |start: [f32; 2]| {
+        let mut doc = Document::new(side, side);
+        let mut canvas = Canvas::new(&gpu, &doc).unwrap();
+        let style = StrokeStyle {
+            grain: Some(procraft_engine::textures::grain::GRUNGE),
+            grain_mode: procraft_engine::brush::GrainMode::Texturized,
+            grain_scale: 64.0,
+            grain_depth: 1.0,
+            grain_start: start,
+            ..style(StrokeTool::Paint, 1.0)
+        };
+        canvas.begin_stroke(doc.current(), style.as_fill());
+        canvas.fill_stroke(IRect::new(0, 0, side as i32, side as i32), vec![255; (side * side) as usize]);
+        canvas.end_stroke();
+        canvas.render(&gpu, &mut doc, None);
+        canvas.read_layer(&gpu, doc.current()).unwrap()
+    };
+    let alpha = |px: &[u8], x: u32, y: u32| pixel(px, side, x, y)[3];
+    let none = laid([0.0, 0.0]);
+    let (least, most) =
+        (0..side * side).map(|i| alpha(&none, i % side, i / side)).fold((255, 0), |(l, m), a| (l.min(a), m.max(a)));
+    assert!(most - least > 30, "the grain shows: {least} to {most}");
+    // a quarter of a tile, 16 pixels across: each pixel as none's 16 to its right
+    let half = laid([0.25, 0.0]);
+    let off = (0..side)
+        .flat_map(|y| (0..side - 16).map(move |x| (x, y)))
+        .filter(|&(x, y)| alpha(&half, x, y).abs_diff(alpha(&none, x + 16, y)) > 2)
+        .count();
+    assert_eq!(off, 0, "a quarter of a tile across");
+    assert!(half != none);
+    // a whole tile is none
+    assert!(laid([1.0, 0.0]) == none);
+}
+
 #[test]
 fn a_fill_stroke_lays_its_region_in_place_of_its_stamps_as_its_paint_one_step_and_takes_the_paper() {
     use procraft_engine::geom::IRect;

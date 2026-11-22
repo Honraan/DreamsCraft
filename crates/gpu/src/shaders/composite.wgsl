@@ -59,6 +59,8 @@ struct LayerUniform {
     // background (0: a flat colour), and its tooth (0: soft, 1: only what stands above the
     // strength takes paint)
     paper: vec4<f32>,
+    // where the grain fixed to the canvas starts, in tiles (xy): a fill's place of its own
+    grain_start: vec4<f32>,
 }
 
 // in stroke_blend: the stroke mixed in by its coverage in squared colour (nearer to light)
@@ -132,7 +134,7 @@ fn stroke_pixel(p: vec2<i32>) -> StrokePixel {
         let at = (vec2<f32>(p) + 0.5) / lu.scaled.x + lu.scaled.yz;
         let gc = cos(lu.grain_rotation);
         let gs = sin(lu.grain_rotation);
-        let uv = vec2<f32>(at.x * gc - at.y * gs, at.x * gs + at.y * gc) / lu.grain_scale;
+        let uv = vec2<f32>(at.x * gc - at.y * gs, at.x * gs + at.y * gc) / lu.grain_scale + lu.grain_start.xy;
         let sharp = lu.grain_sharp > 0.5;
         // a brush file's own image has the fine detail itself; ours only stands in for it
         let own = lu.grain_side > 256.0;

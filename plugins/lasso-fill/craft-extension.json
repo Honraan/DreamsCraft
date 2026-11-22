@@ -2,11 +2,11 @@
   "schema": 1,
   "id": "io.github.artcraftandroid.lasso-fill",
   "name": "Lasso fill",
-  "version": "1.0.0",
-  "holds": ["hooks"],
+  "version": "1.1.0",
+  "holds": ["hooks", "brushes"],
   "publisher": { "name": "ProCraft" },
-  "description": "Strokes that fill what they go round: every stroke while Lasso fill is on (Actions > Canvas, or Alt+F), or a brush's own, by its Fill row in the brush studio.",
-  "compat": { "procraft": { "interface": 12 } },
+  "description": "Strokes that fill what they go round: the Fills brushes it brings, any brush by its Fill row in the brush studio, or every stroke while Lasso fill is on (Actions > Canvas, or Alt+F).",
+  "compat": { "procraft": { "interface": 14 } },
   "permissions": [],
   "hooks": ["stroke_fill"],
   "controls": [
@@ -15,6 +15,7 @@
     { "key": "eraser", "type": "switch", "label": "Eraser too", "starts": false }
   ],
   "brush_controls": [
-    { "key": "fill", "label": "Fill", "choices": ["Off", "Fill what it encloses"] }
+    { "key": "fill", "label": "Fill", "choices": ["Off", "Fill what it encloses"] },
+    { "key": "shown", "label": "Fill shown", "choices": ["As it's drawn", "As the pen lifts"] }
   ]
 }

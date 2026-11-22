@@ -23,7 +23,7 @@ const MANIFEST: &str = "craft-extension.json";
 /// The manifest format read here: a newer one may mean anything, so it is refused.
 const SCHEMA: u64 = 1;
 /// What a plugin's code is written to, see [`crate::plugin_run`]: a newer one is refused too.
-const INTERFACE: u32 = 13;
+const INTERFACE: u32 = 14;
 /// What ids of our own start with: no file may claim one.
 const OWN_PREFIX: &str = "procraft.";
 /// The file, its entries, one entry, all of them unpacked, and the manifest, in bytes.
@@ -37,6 +37,10 @@ const MOST_SHADER: usize = 64 << 10;
 pub(crate) const FILTER_CODE: &str = "filter.wgsl";
 /// A picker's picture's code in its folder (code on the `picker` hook brings it).
 pub(crate) const PICTURE_CODE: &str = "picture.wgsl";
+/// A plugin's set of brushes in its folder (interface 14): a set file of the app's own, of at most
+/// so many brushes.
+pub(crate) const BRUSH_SET: &str = "brushes.brushset";
+const MOST_SET_BRUSHES: usize = 64;
 /// Where each of the filters a plugin lists keeps its code, as `<key>.wgsl`.
 const FILTERS_FOLDER: &str = "filters";
 /// The most filters a plugin lists, and plugins it takes the place of.
@@ -93,6 +97,7 @@ pub(crate) enum Refusal {
     Clash,
     Replaced,
     NotKept,
+    Brushes,
 }
 
 impl Refusal {
@@ -113,6 +118,7 @@ impl Refusal {
             Refusal::Clash => "Another plugin already holds a setting this one needs.",
             Refusal::Replaced => "A plugin already here takes this one's place.",
             Refusal::NotKept => "This plugin couldn't be saved.",
+            Refusal::Brushes => "This plugin's brushes can't be read.",
         }
     }
 }
@@ -869,7 +875,12 @@ fn read_manifest(text: &[u8]) -> Result<Manifest, Refusal> {
     }
     let filter = fits(FILTER_CODE, MOST_SHADER) == (has(PluginPart::Filter) && !listed).then_some(true);
     let filters = shape.filters.iter().all(|f| fits(&f.code, MOST_SHADER) == Some(true));
-    if !module || !filter || !filters {
+    // a set of brushes (interface 14), in a file of its own
+    if has(PluginPart::Brushes) && compat.interface.is_none_or(|interface| interface < 14) {
+        return Err(Refusal::Described);
+    }
+    let brushes = fits(BRUSH_SET, MOST_ENTRY) == has(PluginPart::Brushes).then_some(true);
+    if !module || !filter || !filters || !brushes {
         return Err(Refusal::Described);
     }
     let mut hooks = Vec::new();
@@ -1156,6 +1167,11 @@ pub(crate) fn value_names(controls: &[PluginControl]) -> Vec<String> {
 /// Why `data`, listed by `manifest` under `path`, can't run, if it is code at all: checked by
 /// reading it, as nothing in it runs until the plugin is on or the filter opened.
 fn code_refused(manifest: &Manifest, path: &str, data: &[u8]) -> Option<Refusal> {
+    // a set of brushes: a set file that reads, of a few brushes
+    if manifest.holds.contains(&PluginPart::Brushes) && path == BRUSH_SET {
+        let count = procraft_engine::brushfile::read_set(data).map_or(0, |(_, brushes)| brushes.len());
+        return (!(1..=MOST_SET_BRUSHES).contains(&count)).then_some(Refusal::Brushes);
+    }
     if manifest.holds.contains(&PluginPart::Filter) && path == FILTER_CODE {
         let text = std::str::from_utf8(data).map_err(|e| e.to_string());
         let read = text.and_then(|text| procraft_gpu::read_filter(text, &value_names(&manifest.controls)));
@@ -1471,6 +1487,15 @@ pub(crate) fn read_folder(folder: &Path, id: &str, version: &str) -> Option<Mani
         }
     }
     Some(manifest)
+}
+
+/// The set of brushes (interface 14) of the plugin `id` at `version` in `dir`, if it holds one and
+/// all of it holds up as it did.
+pub(crate) fn read_brush_set(dir: &Path, id: &str, version: &str) -> Option<Vec<u8>> {
+    let folder = dir.join(id).join(version);
+    let manifest = read_folder(&folder, id, version)?;
+    manifest.holds.contains(&PluginPart::Brushes).then_some(())?;
+    read_capped(&folder.join(BRUSH_SET), MOST_ENTRY)
 }
 
 /// The hooks and the module of the plugin `id` at `version` in `dir`, if all of it holds up as it
@@ -2297,6 +2322,114 @@ pub(crate) mod tests {
         pack(manifest, &[(MODULE, module)])
     }
 
+    /// The Lasso fill plugin's id, whose brushes these are.
+    const LASSO_FILL: &str = "io.github.artcraftandroid.lasso-fill";
+
+    /// The Lasso fill plugin's brushes, the set its `brushes.brushset` holds: the app's round pen
+    /// filling what it goes round (its Fill row on, shown as it's drawn), at one size, unsmoothed,
+    /// plain or with one of the app's own grains fixed to the canvas (a tile so many canvas pixels
+    /// across), some started at a place of their own each stroke, the scratches multiplied.
+    pub(crate) fn fill_brushes() -> Vec<procraft_engine::brush::Brush> {
+        use procraft_engine::brush::{Brush, Grain, GrainMode};
+        use procraft_engine::textures::grain;
+        let fill = |name: &str, grain: Option<(u32, f32)>, jitter: bool, multiply: bool| {
+            let grain = grain.map_or_else(Grain::default, |(image, scale)| Grain {
+                image: Some(image),
+                source: None,
+                mode: GrainMode::Texturized,
+                scale,
+                depth: 1.0,
+            });
+            let mut brush = Brush {
+                name: name.to_owned(),
+                spacing: 0.05,
+                streamline: 0.0,
+                hardness: 1.0,
+                pressure_size: 0.0,
+                grain,
+                ..Brush::round_pen()
+            };
+            brush.set_setting(&format!("plugin:{LASSO_FILL}:fill"), 1.0);
+            if jitter {
+                brush.set_setting("grain_offset_jitter", 1.0);
+            }
+            if multiply {
+                brush.set_setting("blend_mode", procraft_engine::document::BlendMode::Multiply.id() as f32);
+            }
+            brush
+        };
+        vec![
+            fill("Solid Fill", None, false, false),
+            fill("Screentone Fill", Some((grain::HALFTONE, 138.0)), false, false),
+            fill("Debris Fill", Some((grain::SPECKLE, 512.0)), true, false),
+            fill("Grunge Fill", Some((grain::GRUNGE, 512.0)), true, false),
+            fill("Scratch Fill", Some((grain::SCRATCHES, 256.0)), true, true),
+            fill("Checker Fill", Some((grain::CHECKER, 512.0)), false, false),
+        ]
+    }
+
+    /// [`fill_brushes`] as a set file called Fills, as the app writes one to share.
+    pub(crate) fn fill_brushes_file() -> Vec<u8> {
+        let s = crate::CanvasSession::new(100, 100);
+        let brushes = fill_brushes();
+        let count = brushes.len();
+        {
+            let mut st = s.shared.lock();
+            let origins = vec![None; count];
+            let icon = crate::brush_library::IMPORTED_ICON;
+            st.library.insert(0, crate::brush_library::LibrarySet { name: "Fills".to_owned(), brushes, origins, icon });
+        }
+        s.brushes_as_set_file(0, 0..count, "Fills", 1).unwrap()
+    }
+
+    /// Where the Lasso fill plugin keeps its brushes.
+    fn fill_brushes_path() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/lasso-fill").join(BRUSH_SET)
+    }
+
+    /// Writes the Lasso fill plugin's `brushes.brushset` once [`fill_brushes`] changes (then pack the
+    /// plugin again): `cargo test -p procraft-core write_the_fill_brushes -- --ignored`.
+    #[test]
+    #[ignore]
+    fn write_the_fill_brushes() {
+        std::fs::write(fill_brushes_path(), fill_brushes_file()).unwrap();
+    }
+
+    #[test]
+    fn the_lasso_fill_plugin_holds_its_fill_brushes_as_written_now_byte_for_byte() {
+        let made = fill_brushes_file();
+        assert!(made == fill_brushes_file(), "a set file is written the same each time");
+        let kept = std::fs::read(fill_brushes_path()).unwrap();
+        assert!(kept == made, "plugins/lasso-fill/{BRUSH_SET} is old: write_the_fill_brushes, then pack it");
+        let (name, brushes) = procraft_engine::brushfile::read_set(&kept).unwrap();
+        assert_eq!((name.as_str(), brushes.len()), ("Fills", 6));
+    }
+
+    #[test]
+    fn a_plugin_s_brushes_are_a_set_file_that_reads_from_interface_14() {
+        let module = a_module();
+        let set = fill_brushes_file();
+        let holding = |set: &[u8], interface: u32| {
+            let manifest = with(coded("org.example.brushes", &module), "/holds", json!(["hooks", "brushes"]));
+            let manifest = with(manifest, "/compat/procraft/interface", json!(interface));
+            let files = json!([
+                { "path": MODULE, "sha256": sha256(&module), "size": module.len() },
+                { "path": BRUSH_SET, "sha256": sha256(set), "size": set.len() },
+            ]);
+            read_package(&pack(&with(manifest, "/files", files), &[(MODULE, &module), (BRUSH_SET, set)]))
+        };
+        let package = holding(&set, 14).unwrap();
+        assert_eq!(package.manifest.holds, [PluginPart::Hooks, PluginPart::Brushes]);
+        assert_eq!(package.file(BRUSH_SET), Some(set.as_slice()));
+        // written to an interface before 14, or a set file that doesn't read: refused
+        assert_eq!(holding(&set, 13).err(), Some(Refusal::Described));
+        assert_eq!(holding(b"not a set of brushes", 14).err(), Some(Refusal::Brushes));
+        // said to hold brushes, its set file not there: refused
+        let manifest = with(coded("org.example.brushes", &module), "/holds", json!(["hooks", "brushes"]));
+        let manifest = with(manifest, "/compat/procraft/interface", json!(14));
+        assert_eq!(read_package(&a_coded_file(&manifest, &module)).err(), Some(Refusal::Described));
+    }
+
     #[test]
     fn a_good_plugin_is_read() {
         let module = a_module();
@@ -2314,7 +2447,7 @@ pub(crate) mod tests {
         };
         // a hook or an interface this app doesn't have is for a newer one
         assert_eq!(of("/hooks", json!(["position", "layers"])), Refusal::Newer);
-        assert_eq!(of("/compat/procraft/interface", json!(14)), Refusal::Newer);
+        assert_eq!(of("/compat/procraft/interface", json!(15)), Refusal::Newer);
         assert_eq!(of("/hooks", json!([])), Refusal::Described);
         assert_eq!(of("/hooks", json!(["position", "position"])), Refusal::Described);
         assert_eq!(of("/compat/procraft", json!({ "min_app": "0.0.1" })), Refusal::Described);
@@ -2327,7 +2460,7 @@ pub(crate) mod tests {
     #[test]
     fn plugins_written_to_every_interface_so_far_still_load_and_a_new_hook_needs_its_function() {
         let module = a_module();
-        for interface in 1..=13 {
+        for interface in 1..=14 {
             let manifest = with(coded("org.example.plugin", &module), "/compat/procraft/interface", json!(interface));
             assert!(read_package(&a_coded_file(&manifest, &module)).is_ok(), "interface {interface}");
         }

@@ -1143,6 +1143,7 @@ impl CanvasSession {
         // rather than as it is drawn
         let look = hooks.view_look();
         let dim = hooks.view_dim_others();
+        let sets = plugins.brush_sets();
         // the colour round the canvas and the picture there, read again only as it changes
         let surround =
             hooks.interface_colour(SURROUND_ROLE).map(|rgb| [16, 8, 0].map(|s| ((rgb >> s) & 0xFF) as f32 / 255.0));
@@ -1173,6 +1174,7 @@ impl CanvasSession {
         let mut st = self.shared.lock();
         st.paper_picture = paper_picture;
         st.hooks = Some(hooks);
+        st.plugin_sets = sets;
         let mut changed = false;
         if st.plugin_look != look {
             st.plugin_look = look;
@@ -1201,6 +1203,9 @@ impl CanvasSession {
         if changed {
             self.shared.frame(&mut st);
         }
+        drop(st);
+        // the brushes they come with, into the library once it is open
+        self.give_plugin_sets();
     }
 
     /// The picker plugin's picture for `hue` (0..1), `side` pixels square: premultiplied RGBA rows,

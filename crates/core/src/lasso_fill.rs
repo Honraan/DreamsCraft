@@ -406,6 +406,45 @@ mod tests {
         assert_eq!((pixel(&eight, 30, 42), pixel(&eight, 70, 58)), (RED, RED));
     }
 
+    /// The pixels [`picture`] reads.
+    type Picture = Vec<[u8; 4]>;
+
+    /// What two fills of the same square lay, one undone before the other, the brush's grain a
+    /// grunge fixed to the canvas, started somewhere new each stroke (`jitter`) or not.
+    fn two_grained_fills(jitter: bool) -> Option<(Picture, Picture)> {
+        use procraft_engine::brush::{Grain, GrainMode};
+        let s = red()?;
+        filling(&s, "(i32.const 2)");
+        {
+            let mut st = s.shared.lock();
+            let tool = st.tool;
+            let brush = st.brush_mut(tool)?;
+            let grunge = Some(procraft_engine::textures::grain::GRUNGE);
+            brush.grain = Grain { image: grunge, source: None, mode: GrainMode::Texturized, scale: 64.0, depth: 1.0 };
+            brush.set_setting("grain_offset_jitter", if jitter { 1.0 } else { 0.0 });
+        }
+        draw(&s, &square_u());
+        let first = picture(&s);
+        s.undo();
+        draw(&s, &square_u());
+        Some((first, picture(&s)))
+    }
+
+    #[test]
+    fn a_fill_whose_brush_starts_its_grain_somewhere_new_each_stroke_does() {
+        let Some((first, again)) = two_grained_fills(true) else { return };
+        let Some((plain, plain_again)) = two_grained_fills(false) else { return };
+        // with Offset jitter each fill's grain starts somewhere new; without, where the last did
+        assert!(first != again, "the grain moved between fills");
+        assert!(plain == plain_again);
+        assert!(first != plain || again != plain);
+        // the places a stroke's seed gives spread evenly over the tile
+        let starts: Vec<[f32; 2]> = (0..1000u32).map(|i| crate::grain_start(i.wrapping_mul(0x9e37_79b9))).collect();
+        assert!(starts.iter().flatten().all(|t| (0.0..1.0).contains(t)));
+        let mean = |k: usize| starts.iter().map(|s| s[k]).sum::<f32>() / starts.len() as f32;
+        assert!((mean(0) - 0.5).abs() < 0.05 && (mean(1) - 0.5).abs() < 0.05, "{} {}", mean(0), mean(1));
+    }
+
     #[test]
     fn a_fill_is_as_opaque_as_the_brush_and_slider_and_keeps_inside_the_selection() {
         let Some(s) = red() else { return };

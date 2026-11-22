@@ -74,6 +74,8 @@ pub enum PluginPart {
     Hooks,
     /// A filter, under Adjustments while the plugin is on.
     Filter,
+    /// A set of brushes, added to the brush library the first time the plugin is on (interface 14).
+    Brushes,
 }
 
 impl PluginPart {
@@ -82,6 +84,7 @@ impl PluginPart {
         match name {
             "hooks" => Some(PluginPart::Hooks),
             "filter" => Some(PluginPart::Filter),
+            "brushes" => Some(PluginPart::Brushes),
             _ => None,
         }
     }
@@ -611,8 +614,13 @@ fn can_do(manifest: &Manifest) -> String {
     } else {
         "This plugin adds a filter to Adjustments, which changes only the layer you use it on."
     });
+    let brushes = manifest
+        .holds
+        .contains(&PluginPart::Brushes)
+        .then_some("This plugin comes with a set of brushes, added to your brush library when you turn it on.");
     let sentences: Vec<&str> = adds
         .into_iter()
+        .chain(brushes)
         .chain(manifest.hooks.iter().map(|hook| hook.sentence()))
         .chain(manifest.permissions.iter().map(|permission| permission.sentence()))
         .collect();
@@ -1164,6 +1172,21 @@ impl Plugins {
         let values = values.map(|c| format!("{} {}", c.key(), c.kept()));
         let flags = list.files.iter().map(|p| format!("{} {}", p.on_key, p.on));
         values.chain(flags).chain(list.moved.iter().map(|(key, value)| format!("{key} {value}"))).collect()
+    }
+
+    /// The set of brushes each plugin on holds (interface 14), by its id: its set file, as kept.
+    pub(crate) fn brush_sets(&self) -> Vec<(String, std::sync::Arc<[u8]>)> {
+        let Some(store) = &self.store else { return Vec::new() };
+        let holders: Vec<(String, String)> = {
+            let list = self.listed();
+            let holding = list.files.iter().filter(|p| p.on && p.problem.is_none() && p.holds(PluginPart::Brushes));
+            holding.map(|p| (p.id.clone(), p.version.clone())).collect()
+        };
+        let sets = holders.into_iter().map(|(id, version)| {
+            let set = plugin_file::read_brush_set(store, &id, &version);
+            set.map(|set| (id, set.into()))
+        });
+        sets.flatten().collect()
     }
 
     /// Takes `bytes` in, as `install` says.
@@ -4369,17 +4392,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn lasso_fill_s_brushes_join_the_library_once_it_is_open_and_once_only() {
+        let dir = store("bundled-lasso-fill-brushes");
+        let brushes = std::path::Path::new(&dir).join("brushes").to_string_lossy().into_owned();
+        let plugins = app_at(&dir);
+        let fills = |s: &crate::CanvasSession| s.shared.lock().library.iter().filter(|set| set.name == "Fills").count();
+        // the import screen says it comes with brushes
+        let file = crate::bundled::BUNDLED.iter().find(|(name, _)| *name == "lasso-fill").unwrap().1;
+        assert!(plugins.inspect(file.to_vec()).message.contains("comes with a set of brushes"));
+        // as it comes, off: no brushes of its
+        let s = viewed();
+        assert!(!s.open_brushes(brushes.clone()));
+        s.use_plugins(Arc::clone(&plugins));
+        assert_eq!(fills(&s), 0);
+        // on: its Fills at the top of the library, each filling by the plugin's row
+        assert!(plugins.set_on(LASSO_FILL.to_owned(), true));
+        s.use_plugins(Arc::clone(&plugins));
+        let row = card(&plugins, LASSO_FILL).brush_controls[0].key.clone();
+        {
+            let st = s.shared.lock();
+            let set = &st.library[0];
+            let names: Vec<&str> = set.brushes.iter().map(|b| b.name.as_str()).collect();
+            assert_eq!(set.name, "Fills");
+            assert_eq!(
+                names,
+                ["Solid Fill", "Screentone Fill", "Debris Fill", "Grunge Fill", "Scratch Fill", "Checker Fill"]
+            );
+            assert!(set.brushes.iter().all(|b| b.setting(&row) == 1.0), "{row}");
+            // the solid one plain, the rest with a grain
+            let grained = |b: &procraft_engine::brush::Brush| b.grain.image.is_some() || b.grain.source.is_some();
+            assert!(!grained(&set.brushes[0]) && set.brushes[1..].iter().all(grained));
+        }
+        // again, and off and on again: one set
+        s.use_plugins(Arc::clone(&plugins));
+        assert!(plugins.set_on(LASSO_FILL.to_owned(), false));
+        s.use_plugins(Arc::clone(&plugins));
+        assert!(plugins.set_on(LASSO_FILL.to_owned(), true));
+        s.use_plugins(Arc::clone(&plugins));
+        assert_eq!(fills(&s), 1);
+        // kept with the library: the brushes opened again have it, and aren't given it twice (told
+        // the plugins before the brushes open, as Android does)
+        let t = viewed();
+        t.use_plugins(Arc::clone(&plugins));
+        assert_eq!(fills(&t), 0, "not given before the brushes are open");
+        assert!(t.open_brushes(brushes.clone()));
+        assert_eq!(fills(&t), 1);
+        // deleted, it stays deleted
+        let at = t.shared.lock().library.iter().position(|set| set.name == "Fills").unwrap();
+        assert!(t.delete_brush_set(at as u32));
+        assert!(t.keep_brushes(brushes.clone()));
+        let u = viewed();
+        assert!(u.open_brushes(brushes));
+        u.use_plugins(Arc::clone(&plugins));
+        assert_eq!(fills(&u), 0);
+        // brushes of their own elsewhere are given it once they open
+        let elsewhere = std::path::Path::new(&dir).join("elsewhere").to_string_lossy().into_owned();
+        let v = viewed();
+        v.use_plugins(Arc::clone(&plugins));
+        assert!(!v.open_brushes(elsewhere));
+        assert_eq!(fills(&v), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     const LASSO_FILL: &str = "io.github.artcraftandroid.lasso-fill";
 
     #[test]
     fn lasso_fill_fills_every_stroke_while_its_switch_is_on_and_a_brush_s_own_by_its_row() {
-        // the brush in use, every one of its rows at `row` (0 Off, 1 Fill what it encloses)
-        let brush = |row: f32| {
+        // the brush in use, its Fill row at `fill` (0 Off, 1 Fill what it encloses) and its Fill
+        // shown row at `shown` (0 as it's drawn, 1 as the pen lifts)
+        let brush = |fill: f32, shown: f32| {
             move |keys: &[String]| crate::stroke_sound::SoundBrush {
                 name: "Studio pen".to_owned(),
                 set: "Inking".to_owned(),
-                controls: keys.iter().map(|_| row).collect(),
-                key: u64::from(row.to_bits()),
+                controls: keys.iter().map(|k| if k.ends_with(":shown") { shown } else { fill }).collect(),
+                key: u64::from(fill.to_bits()) << 32 | u64::from(shown.to_bits()),
             }
         };
         let dir = store("bundled-lasso-fill");
@@ -4387,36 +4474,37 @@ mod tests {
         let hooks = plugins.hooks();
         // as it comes, off: no stroke fills, whatever the brush says
         assert!(!card(&plugins, LASSO_FILL).on);
-        assert_eq!(hooks.stroke_fill(0, 1, brush(1.0)), 0);
+        assert_eq!(hooks.stroke_fill(0, 1, brush(1.0, 0.0)), 0);
         assert!(!hooks.listens(crate::plugin_run::Hook::StrokeFill));
         assert!(plugins.set_on(LASSO_FILL.to_owned(), true));
         // on, its switch off and the brush's row Off: strokes paint as they did
         let row: Vec<(String, usize)> =
             card(&plugins, LASSO_FILL).brush_controls.iter().map(|c| (c.label.clone(), c.choices.len())).collect();
-        assert_eq!(row, [("Fill".to_owned(), 2)]);
-        assert_eq!(hooks.stroke_fill(0, 1, brush(0.0)), 0);
-        // a brush whose Fill row says: its strokes fill, shown as they grow; the eraser's only with
-        // Eraser too
-        assert_eq!(hooks.stroke_fill(0, 1, brush(1.0)), 1);
-        assert_eq!(hooks.stroke_fill(1, 1, brush(1.0)), 0);
+        assert_eq!(row, [("Fill".to_owned(), 2), ("Fill shown".to_owned(), 2)]);
+        assert_eq!(hooks.stroke_fill(0, 1, brush(0.0, 0.0)), 0);
+        // a brush whose Fill row says: its strokes fill, shown as they grow, or filled as the pen
+        // lifts as its Fill shown row says; the eraser's only with Eraser too
+        assert_eq!(hooks.stroke_fill(0, 1, brush(1.0, 0.0)), 1);
+        assert_eq!(hooks.stroke_fill(0, 1, brush(1.0, 1.0)), 2);
+        assert_eq!(hooks.stroke_fill(1, 1, brush(1.0, 0.0)), 0);
         assert!(plugins.set_switch(format!("{LASSO_FILL}.eraser"), true));
-        assert_eq!(hooks.stroke_fill(1, 2, brush(1.0)), 1);
+        assert_eq!(hooks.stroke_fill(1, 2, brush(1.0, 0.0)), 1);
         // every stroke while Lasso fill is on, a finger's too; with Show the fill while drawing
         // off, shown as a plain stroke and filled as it ends
         assert!(plugins.set_switch(format!("{LASSO_FILL}.every"), true));
         assert!(plugins.set_switch(format!("{LASSO_FILL}.growing"), false));
-        assert_eq!((hooks.stroke_fill(0, 0, brush(0.0)), hooks.stroke_fill(1, 0, brush(0.0))), (2, 2));
+        assert_eq!((hooks.stroke_fill(0, 0, brush(0.0, 0.0)), hooks.stroke_fill(1, 0, brush(0.0, 0.0))), (2, 2));
         // asked once a stroke: quick, even unoptimised
         let t = std::time::Instant::now();
         for i in 0..1000 {
-            std::hint::black_box(hooks.stroke_fill(i % 2, 1, brush((i % 2) as f32)));
+            std::hint::black_box(hooks.stroke_fill(i % 2, 1, brush((i % 2) as f32, 0.0)));
         }
         let each = t.elapsed() / 1000;
         println!("a stroke asked whether it fills in {each:?}");
         assert!(each < std::time::Duration::from_micros(500), "{each:?}");
         // off again: as it came
         assert!(plugins.set_on(LASSO_FILL.to_owned(), false));
-        assert_eq!(hooks.stroke_fill(0, 1, brush(1.0)), 0);
+        assert_eq!(hooks.stroke_fill(0, 1, brush(1.0, 0.0)), 0);
         assert!(!hooks.listens(crate::plugin_run::Hook::StrokeFill));
         let _ = std::fs::remove_dir_all(&dir);
     }
