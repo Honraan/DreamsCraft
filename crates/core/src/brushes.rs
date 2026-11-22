@@ -380,7 +380,7 @@ impl CanvasSession {
         }
         st.note_choice((set, index));
         warm_pictures([st.brush(st.tool)]);
-        st.warm_sharper();
+        st.load_brush_pictures();
         // a brush a plugin's brush engine draws: its look made now, on a thread of its own, for its
         // first stroke
         if let Some(hooks) = st.hooks.clone() {

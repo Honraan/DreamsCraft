@@ -455,6 +455,7 @@ struct LastLibrary {
 pub fn prepare_brushes(dir: String) {
     // the brushes the app comes with first, kept or not
     crate::stock_library::prepare();
+    crate::big_pictures::use_folder(std::path::Path::new(&dir));
     let library = crate::brush_libraries::file_in_use(std::path::Path::new(&dir));
     if holds(&LAST_LIBRARY, &library) || !library.is_file() {
         return;
@@ -1507,8 +1508,12 @@ impl CanvasSession {
             drop(st);
             crate::brush_pictures::forget_unnamed(&dir.join(crate::brush_pictures::FOLDER), &libraries);
         }
-        // the tools' brushes ready by the first stroke
-        self.shared.lock().warm_tools_brushes();
+        // the tools' brushes ready by the first stroke, their big pictures too, and every other
+        // brush's big pictures made ahead
+        let st = self.shared.lock();
+        st.warm_tools_brushes();
+        st.big_pictures_ahead(&dir);
+        drop(st);
         loaded
     }
 }

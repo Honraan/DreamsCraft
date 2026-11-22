@@ -3825,6 +3825,30 @@ impl Canvas {
         }
     }
 
+    /// How many shape and grain images at their own size (brush files' own, and big pictures) it
+    /// holds on the GPU now: the last few used of each, never more.
+    pub fn full_images_held(&self) -> (usize, usize) {
+        (self.full_shapes.held.len(), self.full_grains.held.len())
+    }
+
+    /// [`Canvas::use_full_shape`] for an image given with its smaller levels (see [`grey_levels`]),
+    /// so that only copying them is left to do here.
+    pub fn use_full_shape_levels(&mut self, gpu: &Gpu, style: &mut StrokeStyle, id: u64, side: u32, levels: &[u8]) {
+        if self.full_shapes.hold_levels(gpu, id, side, levels) {
+            style.shape = Some(0);
+            style.full_shape = Some(id);
+        }
+    }
+
+    /// [`Canvas::use_full_grain`] for an image given with its smaller levels (see [`grey_levels`]).
+    pub fn use_full_grain_levels(&mut self, gpu: &Gpu, style: &mut StrokeStyle, id: u64, side: u32, levels: &[u8]) {
+        if self.full_grains.hold_levels(gpu, id, side, levels) {
+            style.grain = Some(0);
+            style.full_grain = Some(id);
+            style.grain_side = side as f32;
+        }
+    }
+
     /// `style` reads its shapes from the set `id` (`tips`, each `side` square, in order) in place of
     /// the brush images, each stamp the one its `tip` says: kept on the GPU while it is among the
     /// last few used. A grey byte a pixel for masks, else four (RGBA, straight; see [`TipKind`]).
@@ -13694,9 +13718,83 @@ impl FullGrains {
         true
     }
 
+    /// Has the grey image `id` ready from `levels` (`side` square and its smaller levels after it,
+    /// as [`grey_levels`] gives them); false if they aren't that.
+    fn hold_levels(&mut self, gpu: &Gpu, id: u64, side: u32, levels: &[u8]) -> bool {
+        self.clock += 1;
+        let clock = self.clock;
+        if let Some(slot) = self.held.iter_mut().find(|slot| slot.0 == id) {
+            slot.2 = clock;
+            return true;
+        }
+        if !side.is_power_of_two() || levels.len() != levels_bytes(side) {
+            return false;
+        }
+        let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("full grain"),
+            size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: gpu.array_layers_least() },
+            mip_level_count: side.ilog2() + 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let (mut at, mut size) = (0, side);
+        for mip in 0..side.ilog2() + 1 {
+            let bytes = (size * size) as usize;
+            let Some(level) = levels.get(at..at + bytes) else { return false };
+            gpu.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: mip,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                level,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size), rows_per_image: Some(size) },
+                wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+            );
+            at += bytes;
+            size = (size / 2).max(1);
+        }
+        if self.held.len() >= FULL_GRAINS_HELD
+            && let Some(oldest) = self.held.iter().enumerate().min_by_key(|(_, slot)| slot.2).map(|(i, _)| i)
+        {
+            self.held.swap_remove(oldest);
+        }
+        self.held.push((id, array_view(&texture), clock));
+        true
+    }
+
     fn view(&self, id: u64) -> Option<&wgpu::TextureView> {
         self.held.iter().find(|slot| slot.0 == id).map(|slot| &slot.1)
     }
+}
+
+/// A grey image `side` (a power of two) square with its smaller levels after it, each the 2×2
+/// average of the one before (as the GPU holds a brush file's image), down to one pixel: a big
+/// brush image made ready off the thread that draws, for [`Canvas::use_full_shape_levels`]. None
+/// if `pixels` aren't that square.
+pub fn grey_levels(pixels: &[u8], side: u32) -> Option<Vec<u8>> {
+    let mut size = side as usize;
+    if !side.is_power_of_two() || pixels.len() != size * size {
+        return None;
+    }
+    let mut all = Vec::with_capacity(levels_bytes(side));
+    all.extend_from_slice(pixels);
+    let mut level = pixels.to_vec();
+    while size > 1 {
+        level = half_size(&level, size);
+        size /= 2;
+        all.extend_from_slice(&level);
+    }
+    Some(all)
+}
+
+/// How many bytes a grey image `side` (a power of two) square takes with its smaller levels.
+fn levels_bytes(side: u32) -> usize {
+    (0..side.ilog2() + 1).map(|mip| ((side >> mip) as usize).pow(2)).sum()
 }
 
 /// The spare layers of a brush image array, after the shipped images: which image of the user's

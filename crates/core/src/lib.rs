@@ -18,6 +18,7 @@ mod adjust_menu;
 mod adjusting;
 mod animation;
 mod app_log;
+mod big_pictures;
 mod blend_wheel;
 mod brush_files;
 mod brush_libraries;
@@ -98,10 +99,10 @@ mod reveal;
 mod scene3d;
 mod selection;
 mod sharp;
-mod sharper;
 mod side_bar;
 mod side_slider;
 mod sound_file;
+mod stand_ins;
 mod stock_brushes;
 mod stock_library;
 mod stroke_sound;
@@ -149,6 +150,7 @@ pub use animation::{
     AnimationPlayback, AnimationSettings, FrameRate, PlayStep, animation_next_step, export_fps_at, export_fps_fraction,
     export_fps_label, frame_rate,
 };
+pub use big_pictures::{big_pictures_left, wait_for_big_pictures};
 pub use blend_wheel::{
     BLEND_TAP_SECONDS, BlendCoast, BlendStep, blend_centred, blend_coast, blend_coast_at, blend_pull_for, blend_pulled,
     blend_stretch, blend_tap, blend_tap_at, blend_unstretch,
@@ -1117,58 +1119,50 @@ impl State {
         }
         self.use_full_grain(&mut style, &brush);
         self.use_full_shape(&mut style, &brush);
-        self.use_sharper(&mut style, &brush, diameter);
+        self.use_big_pictures(&mut style, &brush, diameter);
         (brush, style, diameter)
     }
 
-    /// `style` reads `brush`'s shape and grain, ours, drawn sharper for a stamp `diameter` canvas
-    /// pixels across (its grain's tile from that) where that is bigger than they are, once they
-    /// are drawn (see `sharper.rs`); a brush file's own big images go their own way.
-    fn use_sharper(&mut self, style: &mut StrokeStyle, brush: &Brush, diameter: f32) {
-        // a test draws them at once, so that its strokes draw the same each time
-        let now = cfg!(test);
-        let shape = style.full_shape.is_none().then(|| crate::sharper::shape_wanted(brush, diameter)).flatten();
-        let grain = (style.full_grain.is_none() && style.grain.is_some())
-            .then(|| crate::sharper::grain_wanted(brush, diameter))
+    /// `style` reads `brush`'s shape and grain, ours, from their big pictures for a stamp
+    /// `diameter` canvas pixels across (its grain's tile from that) bigger than brushes hold them,
+    /// if those are made: none is drawn here (see `big_pictures.rs`). A brush file's own big images
+    /// go their own way.
+    fn use_big_pictures(&mut self, style: &mut StrokeStyle, brush: &Brush, diameter: f32) {
+        use crate::big_pictures::{grain_of, grain_tile, past_held, ready, shape_of};
+        if self.canvas.is_none() || self.gpu.is_none() {
+            return;
+        }
+        let shape = (style.full_shape.is_none() && past_held(diameter)).then(|| shape_of(brush)).flatten();
+        let grain = (style.full_grain.is_none() && style.grain.is_some() && past_held(grain_tile(brush, diameter)))
+            .then(|| grain_of(brush))
             .flatten();
+        let shape = shape.and_then(|big| Some((big.id, ready(&big)?)));
+        let grain = grain.and_then(|big| Some((big.id, ready(&big)?)));
         let (Some(canvas), Some(gpu)) = (self.canvas.as_mut(), self.gpu.as_ref()) else { return };
-        if let Some(wanted) = shape
-            && let Some(pixels) = crate::sharper::pixels(&wanted, now)
-        {
-            canvas.use_full_shape(gpu, style, wanted.id, wanted.side, &pixels);
+        if let Some((id, picture)) = shape {
+            canvas.use_full_shape_levels(gpu, style, id, picture.side, &picture.levels);
         }
-        if let Some(wanted) = grain
-            && let Some(pixels) = crate::sharper::pixels(&wanted, now)
-        {
-            canvas.use_full_grain(gpu, style, wanted.id, wanted.side, &pixels);
+        if let Some((id, picture)) = grain {
+            canvas.use_full_grain_levels(gpu, style, id, picture.side, &picture.levels);
         }
     }
 
-    /// The current tool's brush's shape and grain (and its second's) drawn sharper ahead, off this
-    /// thread, for the size its slider is at, so that its first stroke there has them (see
-    /// `sharper.rs`). Not in tests, whose strokes draw them at once.
-    pub(crate) fn warm_sharper(&self) {
-        if !cfg!(test) {
-            self.ask_sharper();
-        }
-    }
-
-    /// [`State::warm_sharper`], in tests too: what it asks for.
-    pub(crate) fn ask_sharper(&self) -> Vec<crate::sharper::Wanted> {
+    /// The current tool's brush chosen: its big pictures (and its second's) that it reaches at its
+    /// most size read in, off this thread (made before any other, if they aren't yet), and a brush
+    /// file's own images at their own size read from their files, so that its first stroke has
+    /// them (see `big_pictures.rs`).
+    pub(crate) fn load_brush_pictures(&mut self) {
         let brush = self.brush(self.tool);
-        let size = self.sliders(self.tool).size;
-        let wanted: Vec<crate::sharper::Wanted> = std::iter::once(brush)
+        crate::big_pictures::load(crate::big_pictures::reached_by(brush));
+        let fulls: Vec<procraft_engine::brush::FullGrain> = std::iter::once(brush)
             .chain(brush.secondary.as_deref())
-            .flat_map(|b| {
-                let diameter = b.diameter(size);
-                [crate::sharper::shape_wanted(b, diameter), crate::sharper::grain_wanted(b, diameter)]
-            })
+            .flat_map(|b| [b.grain_file_now().and_then(|f| f.full.as_ref()), b.shape_file_now().map(|f| &f.full)])
             .flatten()
+            .cloned()
             .collect();
-        for w in &wanted {
-            crate::sharper::pixels(w, false);
+        for full in &fulls {
+            drop(self.grain_store.pixels(full));
         }
-        wanted
     }
 
     /// `style` reads `brush`'s shape from its file's image at its own size, if it has one.
@@ -1243,7 +1237,7 @@ impl State {
         }
         self.use_full_grain(&mut style, &second);
         self.use_full_shape(&mut style, &second);
-        self.use_sharper(&mut style, &second, diameter);
+        self.use_big_pictures(&mut style, &second, diameter);
         let mode = first.setting("dual_blend").round().max(0.0) as u32;
         let classic = first.setting("classic_combine") >= 0.5;
         Some((second, SecondStroke { style, mode, threshold: style.alpha_threshold, classic }, diameter))
@@ -3140,7 +3134,7 @@ impl CanvasSession {
         }
         st.tool = tool;
         crate::brushes::warm_pictures([st.brush(tool)]);
-        st.warm_sharper();
+        st.load_brush_pictures();
     }
 
     /// The paint colour, sRGB 0..1 (red, green, blue).
@@ -3151,9 +3145,7 @@ impl CanvasSession {
     /// The current tool's size slider, 0..1.
     pub fn set_brush_size(&self, slider: f32) {
         if slider.is_finite() {
-            let mut st = self.shared.lock();
-            st.sliders_mut().size = slider.clamp(0.0, 1.0);
-            st.warm_sharper();
+            self.shared.lock().sliders_mut().size = slider.clamp(0.0, 1.0);
         }
     }
 

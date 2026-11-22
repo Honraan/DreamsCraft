@@ -443,7 +443,7 @@ impl CanvasSession {
         if let Some(gpu) = st.gpu.as_ref() {
             gpu.let_go_of_kept_buffers();
         }
-        crate::sharper::let_go();
+        crate::big_pictures::let_go();
     }
 
     /// The visible paint layers with something drawn under window point (`x`, `y`), top first.

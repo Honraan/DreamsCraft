@@ -11,7 +11,7 @@
 //! own lists doubling as they grow), the lift within each brush's [`lift_most`]. (A test of its
 //! own, as it counts every allocation the program makes.)
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use procraft_core::{CanvasSession, PenSample, PointerKind, TouchMove};
 use procraft_engine::profile::Profile;
@@ -58,6 +58,17 @@ fn point(k: usize) -> PenSample {
 /// Bytes the program has allocated in all, so far.
 fn allocated() -> u64 {
     dhat::HeapStats::get().total_bytes
+}
+
+/// Waits for the big pictures a brush just chosen asks for to be made: on a thread of their own, a
+/// first start's work and not its pen's, but counted here with every other allocation the program
+/// makes (a 2048 picture's drawing, 33 MB, in the middle of an event).
+fn settle_big_pictures() {
+    let asked = Instant::now();
+    while procraft_core::big_pictures_left() == 0 && asked.elapsed() < Duration::from_secs(1) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(procraft_core::wait_for_big_pictures(Duration::from_secs(600)), "the big pictures weren't made");
 }
 
 /// The median of `v`.
@@ -123,6 +134,7 @@ fn a_long_pen_stroke_s_last_events_allocate_no_more_than_its_first() {
         assert!(s.select_brush(set, index));
         s.set_brush_size(size);
         s.set_color(0.8, 0.2, 0.1);
+        settle_big_pictures();
         frame(&s);
         let mut each = Vec::with_capacity(EVENTS);
         let before = allocated();
