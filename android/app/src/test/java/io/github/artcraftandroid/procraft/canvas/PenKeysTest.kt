@@ -335,6 +335,32 @@ class PenKeysTest {
         assertEquals(PointerKind.FINGER, pointerKind(5, screen or InputDevice.SOURCE_STYLUS))
     }
 
+    /**
+     * A hand resting on the screen never paints: a contact the screen calls a palm (one that tells
+     * palms apart names them), at any size, and a finger's 25 mm or more across; a fingertip, a
+     * pen's or a mouse's contact never, nor any on a screen that says nothing of a touch's size.
+     */
+    @Test
+    fun a_palm_is_told_by_its_tool_type_or_its_size() {
+        val dpi = 287f // a Galaxy Tab S6's
+        val mm = { size: Float -> size / 25.4f * dpi }
+        // the screen's own word, whatever the size (none, a fingertip's)
+        assertEquals(true, palmContact(TOOL_TYPE_PALM, PointerKind.FINGER, 0f, dpi))
+        assertEquals(true, palmContact(TOOL_TYPE_PALM, PointerKind.FINGER, mm(10f), dpi))
+        // a finger's by its size: a fingertip and a flat thumb not, the side of a hand yes
+        assertEquals(false, palmContact(MotionEvent.TOOL_TYPE_FINGER, PointerKind.FINGER, mm(10f), dpi))
+        assertEquals(false, palmContact(MotionEvent.TOOL_TYPE_FINGER, PointerKind.FINGER, mm(19f), dpi))
+        assertEquals(true, palmContact(MotionEvent.TOOL_TYPE_FINGER, PointerKind.FINGER, mm(25f), dpi))
+        assertEquals(true, palmContact(MotionEvent.TOOL_TYPE_FINGER, PointerKind.FINGER, mm(40f), dpi))
+        // a screen that gives no size, or no dpi: no palm by size
+        assertEquals(false, palmContact(MotionEvent.TOOL_TYPE_FINGER, PointerKind.FINGER, 0f, dpi))
+        assertEquals(false, palmContact(MotionEvent.TOOL_TYPE_FINGER, PointerKind.FINGER, mm(40f), 0f))
+        assertEquals(false, palmContact(MotionEvent.TOOL_TYPE_FINGER, PointerKind.FINGER, Float.NaN, dpi))
+        // a pen's or a mouse's, however big its contact reads
+        assertEquals(false, palmContact(MotionEvent.TOOL_TYPE_STYLUS, PointerKind.STYLUS, mm(40f), dpi))
+        assertEquals(false, palmContact(MotionEvent.TOOL_TYPE_MOUSE, PointerKind.MOUSE, mm(40f), dpi))
+    }
+
     @Test
     fun a_pen_with_no_tool_type_hovers_and_has_its_buttons_heard() {
         val pen = InputDevice.SOURCE_TOUCHSCREEN or InputDevice.SOURCE_STYLUS

@@ -168,18 +168,18 @@ class CanvasSurfaceView(context: Context, private val vm: CanvasViewModel) : Sur
     // every touch is the shared touches' (crates/core touch.rs): painting, picking, the snapped shape,
     // the gestures and every tool's touch, the same in every app
 
-    /** Contacts too big for a fingertip (a palm, on a screen that says how big a touch is): the shared touches never see them, and one that grows that big is taken back. */
+    /**
+     * Palms (as the screen names them, or contacts too big for a fingertip on a screen that says how
+     * big a touch is): the shared touches never see them, and one that becomes one is taken back.
+     */
     private val palms = mutableSetOf<Int>()
 
     /** When the last pointer landed on the canvas (event time, ms). */
     private var landedAt = 0L
 
-    /** Whether pointer [i] of [e] is a finger's contact [PALM_MM] or more across. */
-    private fun palmSized(e: MotionEvent, i: Int): Boolean {
-        if (kindOf(e, i) != PointerKind.FINGER) return false
-        val dpi = resources.displayMetrics.xdpi.takeIf { it > 0f } ?: return false
-        return e.getTouchMajor(i) / dpi * 25.4f >= PALM_MM
-    }
+    /** Whether pointer [i] of [e] is a palm (see [palmContact]). */
+    private fun isPalm(e: MotionEvent, i: Int): Boolean =
+        palmContact(e.getToolType(i), kindOf(e, i), e.getTouchMajor(i), resources.displayMetrics.xdpi)
 
     /** Hands [e] to the shared touches and does what they ask. */
     private fun route(e: MotionEvent, s: CanvasSession) {
@@ -192,7 +192,7 @@ class CanvasSurfaceView(context: Context, private val vm: CanvasViewModel) : Sur
                 }
                 landedAt = e.eventTime
                 tellPointer(e, i, "down")
-                if (palmSized(e, i)) {
+                if (isPalm(e, i)) {
                     palms += e.getPointerId(i)
                     emptyList()
                 } else {
@@ -209,7 +209,7 @@ class CanvasSurfaceView(context: Context, private val vm: CanvasViewModel) : Sur
             }
             MotionEvent.ACTION_MOVE -> {
                 if (penStrokes.summing) e.findPointerIndex(summedPointer).takeIf { it >= 0 }?.let { sumPressures(e, it) }
-                val grown =(0 until e.pointerCount).filter { i -> e.getPointerId(i) !in palms && palmSized(e, i) }
+                val grown =(0 until e.pointerCount).filter { i -> e.getPointerId(i) !in palms && isPalm(e, i) }
                 val back = grown.flatMap { i -> palms += e.getPointerId(i); s.touchCancelOne(e.getPointerId(i).toULong()) }
                 back + s.touchMoves((0 until e.pointerCount).filter { i -> e.getPointerId(i) !in palms }.map { i -> TouchMove(e.getPointerId(i).toULong(), samples(e, i)) })
             }
@@ -637,8 +637,5 @@ class CanvasSurfaceView(context: Context, private val vm: CanvasViewModel) : Sur
 
         /** How long a prediction stands with no input after it, milliseconds: a few input intervals. */
         const val PREDICTION_LASTS_MS = 40L
-
-        /** A finger's contact this far across (mm) or more is a palm: a fingertip is 8 to 15, a flat thumb under 20. */
-        const val PALM_MM = 25f
     }
 }

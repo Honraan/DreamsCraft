@@ -67,6 +67,26 @@ internal fun pointerKind(toolType: Int, source: Int, classification: Int = 0): P
     else -> PointerKind.FINGER
 }
 
+/** A palm's tool type, as a touchscreen that tells a palm from a finger gives it (Android keeps its own name for it hidden). */
+internal const val TOOL_TYPE_PALM = 5
+
+/** A finger's contact this far across (mm) or more is a palm: a fingertip is 8 to 15, a flat thumb under 20. */
+internal const val PALM_MM = 25f
+
+/**
+ * Whether a contact is a hand resting on the screen, never handed to the shared touches (and taken
+ * back from them if it becomes one): one its screen says is a palm ([toolType]), whatever painting
+ * with a finger is set to, or a finger's ([kind]) [touchMajor] pixels across, [PALM_MM] or more on
+ * a screen of [xdpi] pixels an inch (a screen that says nothing of a touch's size, 0, gives none).
+ * A pen's or a mouse's never is.
+ */
+internal fun palmContact(toolType: Int, kind: PointerKind, touchMajor: Float, xdpi: Float): Boolean = when {
+    toolType == TOOL_TYPE_PALM -> true
+    kind != PointerKind.FINGER -> false
+    xdpi <= 0f || !touchMajor.isFinite() -> false
+    else -> touchMajor / xdpi * 25.4f >= PALM_MM
+}
+
 /** What pointer [index] of [e] is to the canvas (see [pointerKind]). */
 internal fun pointerKindOf(e: MotionEvent, index: Int): PointerKind =
     pointerKind(e.getToolType(index), e.source, if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) e.classification else 0)
