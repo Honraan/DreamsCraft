@@ -7186,7 +7186,10 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         refreshPalettes()
     }
 
-    /** A palette of the main colours in the picture at [uri], light to dark, added at the end. */
+    /**
+     * A palette of the colours in the picture at [uri], by hue, added at the end: a picture of few
+     * colours gives exactly its own (the shared core's palette.rs).
+     */
     fun paletteFromImage(uri: android.net.Uri) {
         val resolver = getApplication<Application>().contentResolver
         viewModelScope.launch {
@@ -7194,14 +7197,20 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 runCatching {
                     val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
                     resolver.openInputStream(uri)?.use { android.graphics.BitmapFactory.decodeStream(it, null, bounds) }
-                    // read small: a few hundred pixels across is plenty to find its colours
-                    var sample = 1
-                    while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= 256) sample *= 2
-                    val bitmap = resolver.openInputStream(uri)?.use {
-                        android.graphics.BitmapFactory.decodeStream(it, null, android.graphics.BitmapFactory.Options().apply { inSampleSize = sample })
-                    } ?: return@runCatching false
-                    val pixels = IntArray(bitmap.width * bitmap.height).also { bitmap.getPixels(it, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height) }
-                    paletteStore.addFromPixels(pixels.map { it.toUInt() })
+                    // read whole, its colours as they are (read small, neighbouring colours were
+                    // skipped or, a JPEG, blended), in sRGB
+                    val options = android.graphics.BitmapFactory.Options().apply {
+                        inSampleSize = io.github.artcraftandroid.procraft.gallery.paletteSampleSize(bounds.outWidth, bounds.outHeight)
+                        inPreferredConfig = Bitmap.Config.ARGB_8888
+                        inPreferredColorSpace = android.graphics.ColorSpace.get(android.graphics.ColorSpace.Named.SRGB)
+                    }
+                    val bitmap = resolver.openInputStream(uri)?.use { android.graphics.BitmapFactory.decodeStream(it, null, options) }
+                        ?: return@runCatching false
+                    try {
+                        paletteStore.addFromArgb(io.github.artcraftandroid.procraft.gallery.paletteArgb(bitmap))
+                    } finally {
+                        bitmap.recycle()
+                    }
                 }.getOrNull() == true
             }
             if (!added) {
