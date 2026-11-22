@@ -87,8 +87,9 @@ struct SmudgeStamp {
     dual: u32,
     dual_threshold: f32,
     // 1: the stamp only adds to the paint laid so far (`amount`'s second half), which
-    // cs_synthesize lays over the layer as it was; 2: wet paint, which also keeps what it lays in
-    // `grained`, so that the brush goes on mixing with the stroke as it was laid
+    // cs_synthesize lays over the layer as it was; 2: wet paint, which also keeps the colour it
+    // mixes in `grained` (see `as_laid`), so that the brush goes on mixing with the stroke as it
+    // was laid
     laid_apart: u32,
     // the coarsest mip level the shape is read from
     shape_lod_cap: f32,
@@ -333,7 +334,7 @@ fn pixel(x: i32, y: i32) -> vec4<f32> {
     }
     // the brush picks up the stroke as it is without the grain laid over it, or its second
     if (st.laid_apart == 2u) {
-        return grained_at(c);
+        return as_laid(before_at(c), grained_at(c), shown_at(c));
     }
     return work_at(c);
 }
@@ -691,8 +692,8 @@ fn wet_weight(d: Dab, p: vec2<f32>, t: vec2<f32>) -> f32 {
 }
 
 // What a stamp lays at a canvas pixel: the pixel as it leaves it (dithered, before it is rounded to 8
-// bits), whether that goes where the stroke keeps what it laid (`grained`) rather than into the
-// layer, and how much of the paint the pixel has taken and shows (and whether those changed).
+// bits), whether that goes where the stroke keeps the colour it mixed (`grained`) rather than into
+// the layer, and how much of the paint the pixel has taken and shows (and whether those changed).
 // Nothing laid (outside the stamp, or where it lays nothing): `laid` false.
 struct Deposit {
     laid: bool,
@@ -705,8 +706,9 @@ struct Deposit {
 }
 
 // What a stamp finds at a pixel of the window, and leaves there for the next: the layer as the
-// stroke has left it, the stroke as laid (wet paint laid apart), how much of the paint the pixel
-// has taken and how much of it shows (each of those two read only where the pass keeps it).
+// stroke has left it, the colour the stroke mixed there (wet paint laid apart, see `as_laid`), how
+// much of the paint the pixel has taken and how much of it shows (each of those two read only
+// where the pass keeps it).
 struct Found {
     work: vec4<f32>,
     grained: vec4<f32>,
@@ -767,6 +769,7 @@ fn deposit(d: Dab, p: vec2<i32>, found: Found) -> Deposit {
     if (shape * d.alpha <= 0.0) {
         return dep;
     }
+    // (wet paint laid apart: the colour the stroke mixed there, see `as_laid`)
     let w = select(found.work, found.grained, st.laid_apart == 2u);
     var out = w;
     if (st.mode == 0u) {
@@ -814,18 +817,32 @@ fn deposit(d: Dab, p: vec2<i32>, found: Found) -> Deposit {
             dep.shown_set = true;
         }
         dep.amount = kept_amount(dep.amount);
-        out = from_mix(mix(to_mix(w), to_mix(laid), weight));
+        if (st.laid_apart == 2u) {
+            // the stroke as laid goes `weight` of the way to what the stamp lays (in the mix's
+            // space); the colour it holds at full strength, by that stamp's share of all the paint
+            // shown there now
+            let held = found.shown;
+            let shown = held + weight * (1.0 - held);
+            let share = select(0.0, clamp(weight / shown, 0.0, 1.0), shown > 0.0);
+            out = from_mix(mix(to_mix(w), to_mix(laid), share));
+        } else {
+            out = from_mix(mix(to_mix(w), to_mix(laid), weight));
+        }
     }
-    if (st.preserve_alpha == 1u) {
-        out = out * (w.a / max(out.a, 1e-6));
+    // (the colour wet paint laid apart mixes is kept whole: the stroke's alpha lock and selection
+    // are put to it once, as it is put together)
+    if (!dep.into_grained) {
+        if (st.preserve_alpha == 1u) {
+            out = out * (w.a / max(out.a, 1e-6));
+        }
+        // outside the selection the layer stays as it is
+        out = mix(w, out, selected_at(p));
     }
-    // outside the selection the layer stays as it is
-    out = mix(w, out, selected_at(p));
     // rounded to 8 bits up or down at random, in proportion to the remainder, so that faint stamps
-    // add up as they should instead of rounding away (wet paint laid apart is kept as it was laid;
-    // shown by cs_synthesize). At random by the pixel's place from the stamp's middle pixel, the
-    // same each way round, and by which stamp it is: a symmetry's copies of a stamp, mirrored or
-    // turned by right angles, round each pixel as the stamp does the one it lands on.
+    // add up as they should instead of rounding away (wet paint laid apart is kept as the colour
+    // it mixed; shown by cs_synthesize). At random by the pixel's place from the stamp's middle
+    // pixel, the same each way round, and by which stamp it is: a symmetry's copies of a stamp,
+    // mirrored or turned by right angles, round each pixel as the stamp does the one it lands on.
     let o = abs(p - vec2<i32>(floor(d.center)));
     let h = dither(u32(min(o.x, o.y)), u32(max(o.x, o.y)), d.dither);
     dep.out = clamp(kept_paint(out, w) + (h - 0.5) / 255.0, vec4<f32>(0.0), vec4<f32>(1.0));
@@ -833,50 +850,26 @@ fn deposit(d: Dab, p: vec2<i32>, found: Found) -> Deposit {
     return dep;
 }
 
+// Wet paint laid apart (and dry paint laid in place) keeps, at each pixel, the colour its stamps
+// mixed there at full strength (premultiplied, in the window's `grained`), beside how much of it
+// shows (`shown`): the stroke as laid is the layer as it was taken that far towards that colour,
+// in the space the paint mixes in. Every stamp takes the stroke as laid a share of the way to what
+// it lays, so the colour moves towards that by the stamp's share of all the paint shown there.
+// Kept so, a thin wash keeps its own colour as surely as a thick one: the change a thin wash makes
+// to the layer, kept to 8 bits, would be mostly rounding, which a grain or a second raising it
+// many times over would show as speckle.
+fn as_laid(was: vec4<f32>, colour: vec4<f32>, shown: f32) -> vec4<f32> {
+    return from_mix(mix(to_mix(was), to_mix(colour), shown));
+}
+
 // Paint laid in place with a texturized grain or a second, put together where its stamps or its
 // second's went: the paint over the layer as it was, as far as how much of it was laid combines
-// with the grain by its mode, then the second's coverage (cut at its threshold) by the dual mode. Wet
-// paint keeps what it laid: its change to the layer, scaled from how much was laid to that. Only
-// this far at a pixel: more, and the change's own rounding shows as speckle; past that, what it adds
-// is the paint as laid over the pixels round about (see `laid_paint_near`).
-const LAID_MOST_SCALE: f32 = 4.0;
-
-// How many pixels each way `laid_paint_near` reads.
-const LAID_NEAR: i32 = 2;
-
-// `c` in the space paint laid apart is shown in over the layer (see `over_layer`).
-fn laid_space(c: vec4<f32>) -> vec4<f32> {
-    return select(c, to_mix(c), st.luminance == 2u);
-}
-
-// The paint laid apart around canvas pixel `p` (in `laid_space`): what the stamps mixed and laid
-// there, which each pixel holds as far as it took it over the layer as it was (`grained` = `was` +
-// (paint - `was`) x how much it took), worked out over the pixels near: their paint less what
-// shows of the layer, over how much they took all told. Kept to 8 bits, a thin wash's change at
-// one pixel is mostly rounding, so its own paint, scaled up to what a second makes of it, would
-// speckle; over a few pixels' worth it is the wash's own colour, and dry paint's plain colour.
-// (A second raising the paint shows more of that paint, over whatever layer: never colour that
-// isn't in it, as plain colour over a thin wash would be: its rim stays a thin wash.)
-fn laid_paint_near(p: vec2<i32>) -> vec4<f32> {
-    let lo = max(st.bbox.xy, vec2<i32>(0));
-    let hi = min(st.bbox.zw, vec2<i32>(st.size)) - 1;
-    var paint = vec4<f32>(0.0);
-    var took = 0.0;
-    for (var dy = -LAID_NEAR; dy <= LAID_NEAR; dy++) {
-        for (var dx = -LAID_NEAR; dx <= LAID_NEAR; dx++) {
-            let q = clamp(p + vec2<i32>(dx, dy), lo, hi);
-            let s = shown_at(q);
-            if (s > 0.0) {
-                paint += laid_space(grained_at(q)) - laid_space(before_at(q)) * (1.0 - s);
-                took += s;
-            }
-        }
-    }
-    return paint / max(took, 1e-6);
-}
-
-// The layer at canvas pixel `p` (one of the stamp's bounds, and selected) once paint laid apart is
-// put together there, dithered, before it is rounded to 8 bits.
+// with the grain by its mode, then the second's coverage (cut at its threshold) by the dual mode,
+// a rise past what was laid held back where little was (see `rise_held`). Wet paint shows the
+// colour its stamps mixed (see `as_laid`) that far over the layer as it was: however far a grain or
+// a second raises it, never plain paint. This is the layer at canvas pixel `p` (one of the stamp's
+// bounds, and selected) once paint laid apart is put together there, dithered, before it is
+// rounded to 8 bits.
 fn synthesized(p: vec2<i32>) -> vec4<f32> {
     let laid = shown_at(p);
     let was = before_at(p);
@@ -922,45 +915,46 @@ fn synthesized(p: vec2<i32>) -> vec4<f32> {
         out = vec4<f32>(min(added.rgb, vec3<f32>(added.a)), added.a);
     }
     if (st.laid_apart == 2u && laid > 0.0) {
-        // the paint as laid, scaled to how much of it shows with the second (as far as one pixel can)
-        let scale = min(a / laid, LAID_MOST_SCALE);
-        var kept = over_layer(was, grained_at(p), scale);
-        // (the paint as it was laid, for a Normal second)
-        var first = grained_at(p);
+        // the colour the stamps mixed, at full strength in the space it is shown over the layer
+        // in (with luminance blending only as the paint mixes: the stroke as laid scaled from
+        // what it laid)
+        let colour = grained_at(p);
+        var own = colour;
+        if (st.luminance == 1u) {
+            own = was + (as_laid(was, colour, laid) - was) / laid;
+        }
         if (st.burnt > 0.0) {
             // burnt edges show where the stroke is thin: where its grain or its second took paint
             // away, or without either wherever it is less than full. The paint itself, blended
             // once more with what was under it (nothing shows where the layer was empty)
             let full = select(1.0, built, st.grain_once > 0.5 || st.dual != 0u);
-            let own = clamp(over_layer(was, grained_at(p), 1.0 / laid), vec4<f32>(0.0), vec4<f32>(1.0));
-            let burnt = vec4<f32>(unpremultiply(blend(was, own, st.burnt_blend)) * own.a, own.a);
-            let burning = mix(own, burnt, clamp(st.burnt * abs(full - a), 0.0, 1.0));
-            kept = over_layer(was, burning, laid * scale);
-            first = over_layer(was, burning, laid);
+            let held = clamp(own, vec4<f32>(0.0), vec4<f32>(1.0));
+            let burnt = vec4<f32>(unpremultiply(blend(was, held, st.burnt_blend)) * held.a, held.a);
+            own = mix(held, burnt, clamp(st.burnt * abs(full - a), 0.0, 1.0));
         }
-        out = kept;
-        let rest = max(a - laid * scale, 0.0);
-        if (rest > 0.0) {
-            // what the second adds past that: more of the paint as it was laid round about
-            let past = laid_space(kept) + (laid_paint_near(p) - laid_space(was)) * rest;
-            out = clamp(select(past, from_mix(past), st.luminance == 2u), vec4<f32>(0.0), vec4<f32>(1.0));
-            out = vec4<f32>(min(out.rgb, vec3<f32>(out.a)), out.a);
-        }
+        // shown as far as the stroke's grain and second make it
+        out = over_layer(was, own, a);
         if (toward > 0.0) {
-            // a Normal second: the paint as laid turned toward the stroke's own colour as far as
-            // the second shows where the first laid little, then shown as far as the two together
-            // (where the first laid nothing, the second's colour over the layer)
-            var turned = mix(first, vec4<f32>(st.paint.rgb, 1.0), toward);
-            if ((st.dual & DUAL_CLASSIC) != 0u && turned.a > 0.0) {
+            // a Normal second: the colour turned toward the stroke's own as far as the second
+            // shows where the first laid little, of all that shows of the two together (where the
+            // first laid nothing, the second's colour over the layer)
+            let shown = toward + (1.0 - toward) * laid;
+            out = over_layer(was, mix(own, vec4<f32>(st.paint.rgb, 1.0), toward / shown), a);
+            if ((st.dual & DUAL_CLASSIC) != 0u) {
                 // the classic combine: the colours of the paint as laid, by how much was, and of
                 // the stroke, by the second's share, added up (as far as it shows, the same)
-                let own = first.rgb / max(first.a, 1e-6);
-                let colour = (own * laid + st.paint.rgb * toward) / (laid + toward);
-                turned = vec4<f32>(colour * turned.a, turned.a);
+                let first = over_layer(was, own, laid);
+                var turned = mix(first, vec4<f32>(st.paint.rgb, 1.0), toward);
+                if (turned.a > 0.0) {
+                    let straight = first.rgb / max(first.a, 1e-6);
+                    let mixed = (straight * laid + st.paint.rgb * toward) / (laid + toward);
+                    turned = vec4<f32>(mixed * turned.a, turned.a);
+                }
+                out = over_layer(was, turned, a / shown);
             }
-            let shown = toward + (1.0 - toward) * laid;
-            out = over_layer(was, turned, min(a / max(shown, 1e-6), LAID_MOST_SCALE));
         }
+        out = clamp(out, vec4<f32>(0.0), vec4<f32>(1.0));
+        out = vec4<f32>(min(out.rgb, vec3<f32>(out.a)), out.a);
     }
     if (st.preserve_alpha == 1u) {
         out = out * (was.a / max(out.a, 1e-6));

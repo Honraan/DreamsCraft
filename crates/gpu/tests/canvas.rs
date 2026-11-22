@@ -3486,6 +3486,91 @@ fn a_wet_dual_brush_s_second_shows_more_of_its_wash_never_plain_paint() {
     }
 }
 
+/// A wet dual brush's first, however thin, shows the colour it mixed at full strength as far as its
+/// second raises it, pixel by pixel: a stamp that took a pixel `p` of the way and a second taking
+/// it to `c` show the colour a full stamp lays, `c` of the way over the layer; that rise held to
+/// `p + min(1, 63.75 p) (c - p)`, so none where nothing was laid and all of it from 4/255 up.
+/// Before, past four times what it laid, it showed the wash as laid round about, whose change to
+/// the layer, kept to 8 bits, was mostly rounding: specks a dozen levels off.
+#[test]
+fn a_wet_dual_brush_s_thin_first_raised_by_its_second_shows_its_own_colour_at_full_strength() {
+    let backends: Vec<(&str, Gpu)> = [("compute", Gpu::headless()), ("fragments", Gpu::headless_old())]
+        .into_iter()
+        .filter_map(|(name, gpu)| Some((name, gpu.ok()?)))
+        .collect();
+    if backends.is_empty() {
+        eprintln!("skipped: no GPU");
+        return;
+    }
+    const SIDE: u32 = 64;
+    const RADIUS: f32 = 24.0;
+    let first = StrokeStyle {
+        hardness: 1.0,
+        wet_pull: Some(0.5),
+        dilution: 0.3,
+        ..StrokeStyle::new(StrokeTool::Paint, [0.1, 0.2, 1.0], 1.0)
+    };
+    let middle = Vec2::new(SIDE as f32 / 2.0, SIDE as f32 / 2.0);
+    // the pixels well inside the stamp
+    let inside: Vec<(u32, u32)> = (0..SIDE)
+        .flat_map(|y| (0..SIDE).map(move |x| (x, y)))
+        .filter(|&(x, y)| Vec2::new(x as f32 + 0.5, y as f32 + 0.5).distance(middle) < RADIUS - 3.0)
+        .collect();
+    for (name, gpu) in &backends {
+        let _check = NoErrors(gpu);
+        // over white
+        let white = |canvas: &mut Canvas, doc: &mut Document| {
+            canvas.begin_stroke(doc.current(), StrokeStyle::new(StrokeTool::Paint, [1.0, 1.0, 1.0], 1.0));
+            canvas.add_stamps(&[dot(middle, 80.0)]);
+            canvas.end_stroke();
+            canvas.render(gpu, doc, None);
+        };
+        // the colour a full stamp lays
+        let mut doc = Document::new(SIDE, SIDE);
+        let mut canvas = Canvas::new(gpu, &doc).unwrap();
+        white(&mut canvas, &mut doc);
+        canvas.begin_stroke(doc.current(), first);
+        canvas.add_stamps(&[dot(middle, RADIUS)]);
+        canvas.end_stroke();
+        canvas.render(gpu, &mut doc, None);
+        let full = canvas.read_layer(gpu, doc.current()).unwrap();
+        let colour = pixel(&full, SIDE, SIDE / 2, SIDE / 2);
+        assert!(colour[0] < 230 && colour[2] > 250, "{name}: the full stamp's colour {colour:?}");
+        let mut worst = 0u8;
+        for p in [2.0f32 / 255.0, 3.0 / 255.0, 0.03, 0.2] {
+            // Lighten with a whole second: `c` is 1
+            let rise = p + (63.75 * p).min(1.0) * (1.0 - p);
+            let second = procraft_gpu::SecondStroke {
+                style: StrokeStyle::new(StrokeTool::Paint, [0.0, 0.0, 0.0], 1.0),
+                mode: 6,
+                threshold: -1.0,
+                classic: false,
+            };
+            let mut doc = Document::new(SIDE, SIDE);
+            let mut canvas = Canvas::new(gpu, &doc).unwrap();
+            white(&mut canvas, &mut doc);
+            canvas.begin_dual_stroke(doc.current(), first, second);
+            canvas.add_second_stamps(&[Stamp::round(middle, 60.0, 1.0)]);
+            canvas.add_stamps(&[Stamp::round(middle, RADIUS, p)]);
+            canvas.end_stroke();
+            canvas.render(gpu, &mut doc, None);
+            let raised = canvas.read_layer(gpu, doc.current()).unwrap();
+            let mut off = 0u8;
+            for &(x, y) in &inside {
+                let (got, own) = (pixel(&raised, SIDE, x, y), pixel(&full, SIDE, x, y));
+                for k in 0..3 {
+                    let want = 255.0 + (f32::from(own[k]) - 255.0) * rise;
+                    off = off.max((f32::from(got[k]) - want).abs().round() as u8);
+                }
+            }
+            eprintln!("{name}: laid {p:.4}, raised to {rise:.3}: off by at most {off} levels");
+            assert!(off <= 3, "{name}: laid {p}, raised to {rise}: off by {off} levels");
+            worst = worst.max(off);
+        }
+        eprintln!("{name}: worst {worst} levels over {} pixels", inside.len());
+    }
+}
+
 /// A dry first laid in place, raised by its second well past what it laid at its soft rim, shows its
 /// own plain colour there whatever the layer under it: over stripes of red and blue a column wide
 /// (where an average of what the paint changed, near and far, would bring the stripes in).

@@ -890,9 +890,10 @@ impl Canvas {
         let (work, kept) = pieces.iter().fold((false, false), |(w, k), p| (w || p.work, k || p.kept));
         let count: usize = pieces.iter().map(|p| p.uniforms.len()).sum();
         self.smudge_uniform_room(gpu, params, count);
-        // the layer as it was is read by a glaze and paint put together, else not filled in
+        // the layer as it was is read by a glaze, paint laid apart and paint put together, else
+        // not filled in
         let before = pieces.iter().any(|p| {
-            p.uniforms.iter().any(|u| u.source_before == 1)
+            p.uniforms.iter().any(|u| u.source_before == 1 || u.laid_apart == 2)
                 || p.dispatches.iter().any(|d| matches!(d.0, smudge::Pipe::Synthesize))
         });
         if !self.window_in_fragments(gpu, encoder, (reach, before), &each) {

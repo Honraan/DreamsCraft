@@ -62,9 +62,10 @@ fn part(x0: u32, y0: u32, x1: u32, y1: u32) -> u32 {
     x0.min(255) | (y0.min(255) << 8) | (x1.min(255) << 16) | (y1.min(255) << 24)
 }
 
-/// What a smudge stroke keeps besides the layer as it was: the stroke as laid (wet paint laid
-/// apart), how much each pixel has taken (the modulated mode) and how much of the paint shows
-/// (laid apart, the amount's second half).
+/// What a smudge stroke keeps besides the layer as it was: the colour its stamps mixed (wet paint
+/// laid apart, at full strength: with the layer as it was and how much of the paint shows, the
+/// stroke as laid), how much each pixel has taken (the modulated mode) and how much of the paint
+/// shows (laid apart, the amount's second half).
 #[derive(Clone, Copy)]
 pub(super) struct Keeps {
     pub grained: bool,
@@ -80,7 +81,7 @@ impl Keeps {
 }
 
 /// What a smudge stroke keeps of a tile of its layer once it has written there: the layer as it
-/// was, and (as it keeps them) the stroke as laid, how much each pixel has taken and how much of
+/// was, and (as it keeps them) the colour the stroke mixed, how much each pixel has taken and how much of
 /// the paint shows (these two f32s a pixel, as their bytes); and the textures it changes besides
 /// the one it works in as they were (see [`Canvas::smudge_also`]).
 pub(super) struct Tile {
@@ -95,7 +96,8 @@ pub(super) struct Tile {
 type KeptOf = fn(&Tile) -> Option<&wgpu::Texture>;
 
 /// The buffers a smudge stroke's passes work in (see the module): the layer as the stroke has left
-/// it, the stroke as laid, the amounts (both halves), and the layer as it was.
+/// it, the colour the stroke mixed, the amounts (both halves), and the layer as it was (which wet
+/// paint laid apart reads the stroke as laid from).
 pub(super) struct Window {
     work: wgpu::Buffer,
     grained: Option<wgpu::Buffer>,
@@ -549,9 +551,10 @@ impl Canvas {
         let (work, kept) = pieces.iter().fold((false, false), |(w, k), p| (w || p.work, k || p.kept));
         let count: usize = pieces.iter().map(|p| p.uniforms.len()).sum();
         self.smudge_uniform_room(gpu, params, count);
-        // the layer as it was is read by a glaze and paint put together, else not filled in
+        // the layer as it was is read by a glaze, paint laid apart and paint put together, else
+        // not filled in
         let before = pieces.iter().any(|p| {
-            p.uniforms.iter().any(|u| u.source_before == 1)
+            p.uniforms.iter().any(|u| u.source_before == 1 || u.laid_apart == 2)
                 || p.dispatches.iter().any(|d| matches!(d.0, Pipe::Synthesize))
         });
         if !self.window_in(gpu, encoder, (reach, before), &each) {

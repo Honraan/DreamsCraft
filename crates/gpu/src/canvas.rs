@@ -2119,8 +2119,8 @@ struct Smudge {
     resident: Option<(usize, Kept)>,
     /// It paints wet: what it carries is a pass's plots and the plot carried over between passes.
     wet: bool,
-    /// What it keeps besides the layer as it was: paint laid apart, the stroke as laid (see
-    /// `grain_once`) and how much of the paint shows at each pixel; wet paint that builds up by
+    /// What it keeps besides the layer as it was: paint laid apart, the colour its stamps mixed
+    /// (see `grain_once`) and how much of the paint shows at each pixel; wet paint that builds up by
     /// what is left (the modulated mode), how much each pixel has taken so far, 0..1.
     keeps: smudge::Keeps,
     /// A dual brush's paint laid in place: laid apart (into `amount`'s second half) and put
@@ -7965,8 +7965,8 @@ impl Canvas {
                 .or(alone.then_some((0, -1.0)))
                 .filter(|_| wet_paint)
                 .map(|(mode, threshold)| (*style, mode, threshold));
-            // and keeps the stroke as it was laid, each stamp's colour in it (and wet paint to go on
-            // mixing with), and how much of its paint shows; wet paint in the modulated mode or a
+            // and keeps the colour its stamps mixed (with how much of its paint shows, the stroke as
+            // laid, which wet paint goes on mixing with); wet paint in the modulated mode or a
             // glaze of its own keeps how much each pixel has taken, or how far its glaze shows
             let keeps = smudge::Keeps {
                 grained: apart.is_some(),

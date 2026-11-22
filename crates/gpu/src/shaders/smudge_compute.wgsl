@@ -4,7 +4,7 @@
 
 @group(0) @binding(1) var<storage, read_write> work: array<u32>;
 @group(0) @binding(2) var<storage, read_write> carry: array<vec4<f32>>;
-// wet paint laid apart: the stroke as it was laid, without its grain or its second
+// wet paint laid apart: the colour its stamps mixed at each pixel, at full strength (see `as_laid`)
 @group(0) @binding(3) var<storage, read_write> grained: array<u32>;
 // wet paint in the modulated mode: how much each pixel has taken so far; and (its second half) how
 // much of the paint laid apart shows
