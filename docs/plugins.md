@@ -87,7 +87,8 @@ panels' rows of colours 10, the recent colours and brushes, actions at the pen, 
 brushes and rings, the `interface_colour` hook's surround, the `surround_picture` and `slider_look`
 hooks and `file` controls of pictures 11, the `stroke_fill` hook, the `paper` hook's tooth and
 picture, actions in the Layers panel, `set_control` and the `colour_panel` hook 12, the
-`view_dim_others` hook 13, and a set of brushes 14.
+`view_dim_others` hook 13, a set of brushes 14, and `texture` controls, panels' rows of a control and
+the `paper` hook's grain 15.
 
 ### Brushes it comes with
 
@@ -144,6 +145,23 @@ control). An action, and a filter of several, can come `under` a switch too.
 A `file` control shows Import, or the name of the file picked and Clear. The plugin is told 1 while a
 file is picked, 0 while none is, and is handed the file itself if it takes files (see below); what
 the file is for is up to the plugin.
+
+A `texture` control (interface 15) is a texture someone picks: one of the app's own grains, or a
+picture picked for one of the plugin's `file` controls of pictures that it names in `own` (each once,
+up to eight):
+
+```json
+{ "key": "texture", "type": "texture", "label": "Texture", "own": ["picture", "picture2"], "starts": 0 }
+```
+
+Its card shows the texture chosen; a tap opens the app's Textures: its grains, as the Source Library
+shows them, then the plugin's pictures, then a tile that picks another picture into the first of
+`own` with none (and chooses it). Holding one of the plugin's pictures offers to delete it, which
+clears that file control. The plugin is told a grain by its number in the Source Library (from 1),
+0 for none (the Library's Blank), or a picture as -1 less its place in `own`; one that stops being
+there (a picture cleared) is still told as it was set, for the plugin to see that none is picked
+there. `starts` is a grain's number, 0 by default. It can't be in the Canvas tab, nor keep a
+setting the app used to have.
 
 ### In the Canvas tab, on a key, and with each artwork
 
@@ -562,6 +580,7 @@ procraft_paper(side: i32) -> i32            // where its tile is; 0 for no paper
 procraft_paper_look(what: i32) -> f32       // how it is taken, by what
 procraft_paper_colour() -> i32              // the colour under the art
 procraft_paper_picture() -> i32             // a picture of its controls' as the paper (interface 12)
+procraft_paper_grain() -> i32               // one of the app's grains as the paper (interface 15)
 ```
 
 `procraft_paper` answers where in `memory` a tile `side` × `side` bytes is (the app asks for 256),
@@ -588,6 +607,12 @@ hundredth is a hollow and its lightest a peak (a picture of one tone is flat, al
 again only as the file changes. With no picture picked there, there's no paper; a place below -1 or
 past 255 stops the plugin.
 
+`procraft_paper_grain` (interface 15, which a module may leave out) answers one of the app's grains
+as the paper, by its number in the Source Library (from 1, as a `texture` control has it), or 0 or
+-1 for none. It's asked after `procraft_paper_picture`, and only while that names none; while it
+names a grain, `procraft_paper` isn't asked: the grain is the tile as it is (it repeats already).
+A number past the grains stops the plugin.
+
 Every stroke laid by the app's brush engine from then on takes the paper on top of its brush's own
 grain, the eraser too, whatever the layer; a stroke laid with paint mixed on the layer in place (wet
 mixing, the smudge tool) takes none yet. With strength 0 and depth 0 every pixel is as it would be
@@ -599,8 +624,9 @@ seconds. A strength or depth past 0 to 1, a tile's size past its range, a colour
 tile past `memory` stops the plugin. With several plugins on this hook, the first by id that gives a
 paper is used.
 
-The Paper plugin the app comes with draws five papers of its own, or makes one of a picture someone
-picks for Your own paper, and keeps each artwork's choice, colour (one of its own, or any from its
+The Paper plugin the app comes with draws five papers of its own, makes one of a picture someone
+picks for Your own paper, or takes one from its Textures (its `texture` control: the app's grains,
+or up to four pictures of your own, shown in its panel too), and keeps each artwork's choice, colour (one of its own, or any from its
 Hue, Saturation and Brightness), grain and tooth with the artwork (see
 [`artwork`](#in-the-canvas-tab-on-a-key-and-with-each-artwork)).
 
@@ -1252,6 +1278,10 @@ some words, or a button. The plugin describes the panel as JSON text and hands i
   innermost; it has no title or Done, and a tap off it closes it, as Done does.
 - Labels and the title are at most 40 characters, an option at most 24, and words at most 400.
 - A field the app doesn't know, or a kind of row it doesn't have, makes the panel not hold up.
+- A `control` row (interface 15) shows one of the plugin's own `texture` controls by its key, as its
+  card shows it: `{ "type": "control", "key": "texture" }`. Set there, it's set as on the card (kept,
+  its hooks told), and the panel isn't told. A key that is none of its texture controls shows
+  nothing.
 - A `keys` row shows presses (written as for the [`key_shortcut`](#key_shortcut) hook) the way the
   platform writes them, "Ctrl+Z" or "⌘Z", or "None" for none, and is tapped as a button is:
   `{ "type": "keys", "label": "Undo", "keys": ["command+z"] }`. It has eight presses at most.
@@ -1974,8 +2004,9 @@ the recent colours and brushes (`recent_colour`, `recent_brush`, `current_brush`
 actions at the pen, panels' rows of brushes and rings, the `interface_colour` hook's surround, the
 `surround_picture` and `slider_look` hooks and `file` controls of pictures, interface 12 the `stroke_fill` hook,
 the `paper` hook's tooth and picture, actions in the Layers panel, `set_control` and the
-`colour_panel` hook, interface 13 the `view_dim_others` hook, and interface 14 sets of brushes a
-plugin comes with. What comes under a switch at the top of the list, taking the place of other plugins, a menu of
+`colour_panel` hook, interface 13 the `view_dim_others` hook, interface 14 sets of brushes a
+plugin comes with, and interface 15 `texture` controls, panels' rows of a control and the `paper`
+hook's grain. What comes under a switch at the top of the list, taking the place of other plugins, a menu of
 its own, and controls in the Canvas tab, on a key or kept with each artwork need no newer
 interface: an older app shows every control, leaves the others where they are, shows no menu and
 keeps every control with the plugin. What a

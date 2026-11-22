@@ -926,6 +926,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 is io.github.artcraftandroid.procraft.core.PluginControl.Slider ->
                     if (io.github.artcraftandroid.procraft.core.pluginSliderWhole(c.control)) edit.putInt(c.control.key, c.control.value.roundToInt()) else edit.putFloat(c.control.key, c.control.value)
                 is io.github.artcraftandroid.procraft.core.PluginControl.File -> Unit
+                is io.github.artcraftandroid.procraft.core.PluginControl.Texture -> edit.putInt(c.control.key, c.control.value)
             }
         }
         edit.apply()
@@ -963,6 +964,39 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             }
             if (kept) pluginsChanged() else message = "This picture couldn't be used. Pick a PNG or a JPEG."
         }
+    }
+
+    /** A plugin's texture control [key] set to [value] (a grain's number in the Source Library, 0 for none, below 0 one of the plugin's own pictures); a key no texture has changes nothing. */
+    fun setPluginTexture(key: String, value: Int) {
+        val landed = plugins.setTexture(key, value) ?: return
+        interfacePrefs.edit().putInt(key, landed).apply()
+        pluginsChanged()
+    }
+
+    /** A picture picked at [uri] into a plugin's file control [file], then chosen for its texture control [texture] as [value]; told if it can't be used. */
+    fun pickPluginTexture(texture: String, file: String, value: Int, uri: android.net.Uri) {
+        viewModelScope.launch {
+            val kept = withContext(Dispatchers.IO) {
+                val bytes = runCatching {
+                    getApplication<Application>().contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                }.getOrNull() ?: return@withContext false
+                plugins.setPictureFile(file, fileName(uri) ?: "Picture", bytes)
+            }
+            if (kept) setPluginTexture(texture, value) else message = "This picture couldn't be used. Pick a PNG or a JPEG."
+        }
+    }
+
+    /** The picture picked for a plugin's file control [key], small, for a texture's tile; null while none is. */
+    fun pluginPictureThumbnail(key: String): ImageBitmap? {
+        val p = plugins.pictureThumbnail(key, 256u) ?: return null
+        val (w, h) = p.width.toInt() to p.height.toInt()
+        if (w <= 0 || h <= 0 || p.pixels.size != w * h * 4) return null
+        val argb = IntArray(w * h) { i ->
+            val o = i * 4
+            val c = { k: Int -> p.pixels[o + k].toInt() and 0xFF }
+            (c(3) shl 24) or (c(0) shl 16) or (c(1) shl 8) or c(2)
+        }
+        return Bitmap.createBitmap(argb, w, h, Bitmap.Config.ARGB_8888).asImageBitmap()
     }
 
     /** A plugin's file control [key] lets its file go. */

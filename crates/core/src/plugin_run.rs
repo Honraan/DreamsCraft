@@ -81,7 +81,9 @@
 //!   taken as 0); `procraft_paper_colour() -> i32` the colour under the art, 0xRRGGBB, or -1 for the
 //!   artwork's. Interface 12: a module may export `procraft_paper_picture() -> i32` too, the place
 //!   in its controls of a `file` control of pictures whose picture is the paper (the app makes the
-//!   tile of it, and doesn't ask `procraft_paper`), or -1 for the tile it gives.
+//!   tile of it, and doesn't ask `procraft_paper`), or -1 for the tile it gives. Interface 15:
+//!   `procraft_paper_grain() -> i32` too, one of the app's grains as the paper, by its number in
+//!   the Source Library (from 1), or 0 or -1 for none, asked after the picture.
 //! - `procraft_reference_windows() -> i32`: for the hook `reference_windows` (interface 8), how
 //!   many Reference windows may be open at once, 1 to 8.
 //! - For the hook `pressure` (interface 9): `procraft_pressure(pointer: i32, first: i32, x: f32,
@@ -280,6 +282,7 @@ const PAPER: &str = "procraft_paper";
 const PAPER_LOOK: &str = "procraft_paper_look";
 const PAPER_COLOUR: &str = "procraft_paper_colour";
 const PAPER_PICTURE: &str = "procraft_paper_picture";
+const PAPER_GRAIN: &str = "procraft_paper_grain";
 const REFERENCE_WINDOWS: &str = "procraft_reference_windows";
 /// The most a view look's entry may be, either way.
 const MOST_VIEW_LOOK: f32 = 16.0;
@@ -1029,6 +1032,8 @@ struct PaperCalls {
     colour: TypedFunc<(), i32>,
     /// Which of its controls' pictures is the paper (interface 12), if it says.
     picture: Option<TypedFunc<(), i32>>,
+    /// Which of the app's grains is the paper (interface 15), if it says.
+    grain: Option<TypedFunc<(), i32>>,
 }
 
 /// A paper a plugin gives: its tile, [`PAPER_SIDE`] square, each byte how high the paper stands
@@ -1256,6 +1261,7 @@ impl Running {
                     look: instance.get_typed_func(&store, PAPER_LOOK).ok()?,
                     colour: instance.get_typed_func(&store, PAPER_COLOUR).ok()?,
                     picture: instance.get_typed_func(&store, PAPER_PICTURE).ok(),
+                    grain: instance.get_typed_func(&store, PAPER_GRAIN).ok(),
                 })
             })();
             let reference_windows = instance.get_typed_func(&store, REFERENCE_WINDOWS).ok();
@@ -2421,8 +2427,19 @@ impl Running {
                 },
                 None => None,
             };
-            let mut tile = Vec::new();
-            if picture.is_none() {
+            // else one of the app's grains, as it is (it repeats already)
+            let grain = match (&paper.grain, picture) {
+                (Some(grain), None) => match long_call(store, grain, (), &mut left, until)? {
+                    -1 | 0 => None,
+                    n if (1..=procraft_engine::textures::GRAIN_COUNT as i32).contains(&n) => {
+                        procraft_engine::textures::grain_at(n as u32 - 1, PAPER_SIDE)
+                    }
+                    _ => return Err(Stop::Nonsense),
+                },
+                _ => None,
+            };
+            let mut tile = grain.unwrap_or_default();
+            if picture.is_none() && tile.is_empty() {
                 let side = PAPER_SIDE as i32;
                 let at = long_call(store, &paper.tile, side, &mut left, until)?;
                 if at == 0 {

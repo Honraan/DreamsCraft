@@ -302,6 +302,7 @@ fn plugin_placed_rows(showing: &Showing) -> Vec<Row> {
             Slid::Plugin(0),
         ),
         PluginControl::File { control } => Row::Button(kept_label(&control.label), None, None),
+        PluginControl::Texture { control } => Row::Button(kept_label(&control.label), None, None),
     });
     let actions = showing.plugin_actions.iter().map(|action| Row::Button(kept_label(&action.label), None, None));
     // each by its place, as far as a number counts
@@ -557,6 +558,8 @@ pub struct Actions {
     /// A plugin's choice menu, and the setting it picks for.
     plugin_menu: Menu,
     plugin_choice: Option<PluginChoice>,
+    /// A plugin's texture row clicked: the control's key, for the Textures sheet (interface 15).
+    textures_asked: Option<String>,
     /// Remove tapped on a plugin's card: the question it asks, and the plugin's id.
     removing: Alert,
     remove_what: Option<String>,
@@ -640,7 +643,7 @@ impl Actions {
                 let to = plugin_slider_choice(control.clone(), next);
                 prefs.plugins.set_slider(control.key.clone(), to).is_some()
             }
-            PluginControl::File { .. } => false,
+            PluginControl::File { .. } | PluginControl::Texture { .. } => false,
         };
         changed.then_some(Act::Prefs)
     }
@@ -648,6 +651,11 @@ impl Actions {
     /// The key of the plugin action last tapped, once ([`Act::PluginAction`]).
     pub fn take_plugin_action(&mut self) -> Option<String> {
         self.plugin_action.take()
+    }
+
+    /// The key of the texture control whose row was last clicked, once: its Textures sheet opens.
+    pub fn take_textures_asked(&mut self) -> Option<String> {
+        self.textures_asked.take()
     }
 
     /// Shows the panel hanging from `button`; returns where it is (points) and what a row asked. A setting changed in `prefs` returns
@@ -1176,6 +1184,7 @@ impl Actions {
                                     &mut self.plugin_moved,
                                     &mut self.plugin_action,
                                     &mut self.plugin_choice,
+                                    &mut self.textures_asked,
                                     &mut remove,
                                 )
                             })
@@ -1461,7 +1470,9 @@ fn plugin_height(painter: &Painter, plugin: &PluginInfo, width: f32) -> f32 {
         .iter()
         .filter(|_| controls_show(plugin))
         .map(|c| match c {
-            PluginControl::Switch { .. } | PluginControl::File { .. } => 1.0 + ROW_HEIGHT,
+            PluginControl::Switch { .. } | PluginControl::File { .. } | PluginControl::Texture { .. } => {
+                1.0 + ROW_HEIGHT
+            }
             PluginControl::Slider { control } if !plugin_slider_choices(control.clone()).is_empty() => 1.0 + ROW_HEIGHT,
             PluginControl::Slider { .. } => 1.0 + SLIDE_HEIGHT,
         })
@@ -1486,6 +1497,7 @@ fn plugin_card(
     moved: &mut Option<(String, f32)>,
     action: &mut Option<String>,
     choice: &mut Option<PluginChoice>,
+    textures: &mut Option<String>,
     remove: &mut Option<PluginInfo>,
 ) -> (bool, egui::Response, Rect) {
     let width = ui.available_width();
@@ -1554,6 +1566,19 @@ fn plugin_card(
                     }
                 }
                 y += SLIDE_HEIGHT;
+            }
+            PluginControl::Texture { control } => {
+                // its label, the texture chosen in blue; a click opens the Textures sheet
+                let cell = Rect::from_min_size(pos2(area.left(), y), vec2(width, ROW_HEIGHT));
+                let at = pos2(cell.left() + 16.0, cell.center().y);
+                text(&painter, at, Align2::LEFT_CENTER, &control.label, 17.0, Weight::Regular, argb(ACTIONS_ROW));
+                let right = pos2(cell.right() - 16.0, cell.center().y);
+                let shown = crate::textures::chosen_name(plugins, control);
+                text(&painter, right, Align2::RIGHT_CENTER, &shown, 17.0, Weight::Regular, argb(pc::ACCENT));
+                if ui.interact(cell, ui.scope_id().with(("plugin texture", g, i)), Sense::click()).clicked() {
+                    *textures = Some(control.key.clone());
+                }
+                y += ROW_HEIGHT;
             }
             PluginControl::File { control } => {
                 // its label; the name of what was picked and Clear, or Import; a click picks another
@@ -1628,10 +1653,12 @@ fn plugin_card(
 }
 
 /// What a plugin's panel was asked.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum PanelTouch {
     /// Row `.0` touched with `.1` (a slider's, a switch's 1 or 0, a choice's place, 1 for a button).
     Touch(u32, f32),
+    /// A row of the plugin's texture control kept under `.0` clicked: its Textures sheet opens.
+    Textures(String),
     Close,
 }
 
@@ -1777,9 +1804,11 @@ pub fn plugin_ring(ctx: &egui::Context, panel: &PluginPanel, strokes: &Strokes) 
 /// on a card as the Actions panel's are. A slider moved is told as it lets go (`held` keeps where it
 /// is meanwhile); anything else at once. Returns what was asked. It shows at the size a plugin
 /// gives floating panels, its top right corner where it stays.
+#[allow(clippy::too_many_arguments)]
 pub fn plugin_panel(
     ctx: &egui::Context,
     look: &mut Look,
+    plugins: &Plugins,
     panel: &PluginPanel,
     held: &mut Option<(usize, f32)>,
     backdrops: &mut Vec<f32>,
@@ -1999,6 +2028,40 @@ pub fn plugin_panel(
                                     asked = Some(PanelTouch::Touch(row_at, 1.0));
                                 }
                             }
+                            // one of its texture controls, as its card shows it (others show nothing)
+                            PanelRow::Control { key } => {
+                                let texture =
+                                    plugins.plugins().into_iter().flat_map(|p| p.controls).find_map(|c| match c {
+                                        PluginControl::Texture { control } if control.key == *key => Some(control),
+                                        _ => None,
+                                    });
+                                if let Some(control) = texture {
+                                    let ink = argb(ACTIONS_ROW);
+                                    text(
+                                        &painter,
+                                        label_at,
+                                        Align2::LEFT_CENTER,
+                                        &control.label,
+                                        17.0,
+                                        Weight::Regular,
+                                        ink,
+                                    );
+                                    let right = pos2(cell.right() - 16.0, cell.center().y);
+                                    let shown = crate::textures::chosen_name(plugins, &control);
+                                    text(
+                                        &painter,
+                                        right,
+                                        Align2::RIGHT_CENTER,
+                                        &shown,
+                                        17.0,
+                                        Weight::Regular,
+                                        argb(pc::ACCENT),
+                                    );
+                                    if tapped(ui) {
+                                        asked = Some(PanelTouch::Textures(key.clone()));
+                                    }
+                                }
+                            }
                         }
                         y += h;
                     }
@@ -2009,7 +2072,7 @@ pub fn plugin_panel(
     if !ctx.input(|i| i.pointer.any_down())
         && let Some((row, value)) = held.take()
     {
-        asked = asked.or(Some(PanelTouch::Touch(row as u32, value)));
+        asked = asked.take().or(Some(PanelTouch::Touch(row as u32, value)));
     }
     asked
 }
@@ -2354,8 +2417,15 @@ mod tests {
             };
             let mut output = ctx.clone().run_ui(raw, |ui| {
                 panel::put_part_scales(ui.ctx(), [scale, 1.0, 1.0, 1.0, 1.0]);
-                asked =
-                    asked.or(plugin_panel(ui.ctx(), &mut look, &panel, &mut held, &mut Vec::new(), &Strokes::new()));
+                asked = asked.take().or(plugin_panel(
+                    ui.ctx(),
+                    &mut look,
+                    &Plugins::new(),
+                    &panel,
+                    &mut held,
+                    &mut Vec::new(),
+                    &Strokes::new(),
+                ));
             });
             output.textures_delta.clear();
         }
@@ -2432,8 +2502,15 @@ mod tests {
                 ..RawInput::default()
             };
             let mut output = ctx.clone().run_ui(raw, |ui| {
-                asked =
-                    asked.or(plugin_panel(ui.ctx(), &mut look, &panel, &mut held, &mut Vec::new(), &Strokes::new()));
+                asked = asked.take().or(plugin_panel(
+                    ui.ctx(),
+                    &mut look,
+                    &Plugins::new(),
+                    &panel,
+                    &mut held,
+                    &mut Vec::new(),
+                    &Strokes::new(),
+                ));
             });
             output.textures_delta.clear();
         }
@@ -2479,7 +2556,7 @@ mod tests {
                 ..RawInput::default()
             };
             let mut output = ctx.clone().run_ui(raw, |ui| {
-                asked = asked.or(plugin_ring(ui.ctx(), &panel, &Strokes::new()));
+                asked = asked.take().or(plugin_ring(ui.ctx(), &panel, &Strokes::new()));
             });
             output.textures_delta.clear();
         }
@@ -3178,7 +3255,7 @@ mod tests {
                 ..RawInput::default()
             };
             let mut output = ctx.clone().run_ui(raw, |ui| {
-                assert!(!plugin_card(ui, &stranger, 0, &plugins, moved, &mut None, &mut None, &mut None).0);
+                assert!(!plugin_card(ui, &stranger, 0, &plugins, moved, &mut None, &mut None, &mut None, &mut None).0);
             });
             output.textures_delta.clear();
         };

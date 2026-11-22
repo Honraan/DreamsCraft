@@ -161,6 +161,8 @@ pub struct Interface {
     actions_panel: Actions,
     /// A plugin's panel's slider being moved: its row, and where it is.
     plugin_panel_held: Option<(usize, f32)>,
+    /// A plugin's texture control's Textures sheet, while open (interface 15).
+    textures: Option<crate::textures::Textures>,
     /// A plugin's panel took Space as the key press it asked for: let go, it is no tap.
     space_to_panel: bool,
     layers: Layers,
@@ -295,6 +297,7 @@ impl Interface {
             layer_choice: None,
             actions_panel: Actions::default(),
             plugin_panel_held: None,
+            textures: None,
             space_to_panel: false,
             layers: Layers::default(),
             look: Look::default(),
@@ -943,6 +946,20 @@ impl Interface {
         }
         self.transform.show(&ctx, &mut self.look, session, &mut backdrops);
         self.plugin_panel(&ctx, session, &mut backdrops);
+        // a texture control's sheet, over everything: what it changed kept as the card's would be
+        if let Some(key) = self.actions_panel.take_textures_asked() {
+            self.textures = crate::textures::Textures::open(&ctx, &self.prefs.plugins, &key);
+        }
+        if let Some(sheet) = self.textures.as_mut() {
+            let (closed, changed) = sheet.show(&ctx, &self.prefs.plugins);
+            if closed {
+                self.textures = None;
+            }
+            if changed {
+                self.prefs.apply(session);
+                self.prefs.keep();
+            }
+        }
         crate::model_picture::show(&ctx, &mut self.look, session);
         // the bars and panels that hang from the top bar hang from where it ends as it shows
         let bar_bottom = crate::panel::bar_shown(&ctx);
@@ -2015,7 +2032,16 @@ impl Interface {
         let asked = if panel.ring {
             crate::actions::plugin_ring(ctx, &panel, &strokes)
         } else {
-            crate::actions::plugin_panel(ctx, &mut self.look, &panel, &mut self.plugin_panel_held, backdrops, &strokes)
+            let plugins = Arc::clone(&self.prefs.plugins);
+            crate::actions::plugin_panel(
+                ctx,
+                &mut self.look,
+                &plugins,
+                &panel,
+                &mut self.plugin_panel_held,
+                backdrops,
+                &strokes,
+            )
         };
         match asked {
             Some(crate::actions::PanelTouch::Touch(row, value)) => {
@@ -2024,6 +2050,9 @@ impl Interface {
                     plugins.panel_touched(row, value, session);
                     ctx.request_repaint();
                 });
+            }
+            Some(crate::actions::PanelTouch::Textures(key)) => {
+                self.textures = crate::textures::Textures::open(ctx, &self.prefs.plugins, &key);
             }
             Some(crate::actions::PanelTouch::Close) => self.prefs.plugins.close_panel(),
             None => {}

@@ -431,7 +431,7 @@ mod tests {
         assert_eq!(layer(&s), starts);
         let cut = s.adjustment_shown().plugin.unwrap().controls.into_iter().find_map(|control| match control {
             PluginControl::Slider { control } => Some(control.value),
-            PluginControl::Switch { .. } | PluginControl::File { .. } => None,
+            PluginControl::Switch { .. } | PluginControl::File { .. } | PluginControl::Texture { .. } => None,
         });
         assert_eq!(cut, Some(0.5));
         // Undo the same, and it stays open
@@ -627,7 +627,7 @@ mod tests {
                             s.plugin_filter_switch(control.key, !control.starts);
                             layer(&s);
                         }
-                        PluginControl::File { .. } => {}
+                        PluginControl::File { .. } | PluginControl::Texture { .. } => {}
                     }
                 }
                 assert_eq!(s.adjustment_shown().adjustment, Some(Adjustment::Plugin), "{id} stopped");

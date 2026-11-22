@@ -29,6 +29,10 @@
 //! its action came from (the pen whose button ran it, or the window's middle), its rows of colours
 //! and brushes each a ring about it, the first innermost, with no title or Done: a tap off it closes
 //! it.
+//!
+//! From interface 15 a `control` row shows one of the plugin's own `texture` controls, by its key, as
+//! its card does (`{ "type": "control", "key": "texture" }`): set there, it is set as on the card,
+//! and the panel isn't told.
 
 use serde::Deserialize;
 
@@ -120,6 +124,11 @@ pub enum PanelRow {
         label: String,
         keys: String,
     },
+    /// One of the plugin's own controls, kept under `key`, shown as its card shows it (interface
+    /// 15); set as on the card, not told to the panel.
+    Control {
+        key: String,
+    },
 }
 
 #[derive(Deserialize)]
@@ -179,6 +188,9 @@ enum RawRow {
         #[serde(default)]
         chosen: Option<u32>,
     },
+    Control {
+        key: String,
+    },
 }
 
 /// Words that show as they are: some, not too many, and no control characters.
@@ -190,27 +202,37 @@ fn plain(text: &str, most: usize) -> bool {
 /// and numbers that make sense. A slider's value is put in its range. It shows no brushes.
 #[cfg(test)]
 pub(crate) fn read_panel(json: &str) -> Option<PluginPanel> {
-    read_panel_with(json, &|_| None)
+    read_panel_with(json, &|_| None, &|key| Some(format!("org.example.{key}")))
 }
 
 /// The panel `json` describes, as [`read_panel`] reads it, its brushes found by their keys with
-/// `brush` (none for a key that is no brush: the panel doesn't hold up). A ring has one to three
-/// rows, each of colours or brushes, up to twelve on each.
-pub(crate) fn read_panel_with(json: &str, brush: &dyn Fn(i64) -> Option<PanelBrush>) -> Option<PluginPanel> {
+/// `brush` (none for a key that is no brush: the panel doesn't hold up), and its controls' keys
+/// kept as `control` keeps them (none: it doesn't hold up). A ring has one to three rows, each of
+/// colours or brushes, up to twelve on each.
+pub(crate) fn read_panel_with(
+    json: &str,
+    brush: &dyn Fn(i64) -> Option<PanelBrush>,
+    control: &dyn Fn(&str) -> Option<String>,
+) -> Option<PluginPanel> {
     let raw: RawPanel = serde_json::from_str(json).ok()?;
     let most = if raw.ring { MOST_RINGS } else { MOST_ROWS };
     if !plain(&raw.title, 40) || raw.rows.is_empty() || raw.rows.len() > most {
         return None;
     }
     let ring = raw.ring;
-    let rows = raw.rows.into_iter().map(|row| read_row(row, ring, brush)).collect::<Option<Vec<_>>>()?;
+    let rows = raw.rows.into_iter().map(|row| read_row(row, ring, brush, control)).collect::<Option<Vec<_>>>()?;
     if ring && !rows.iter().all(|r| matches!(r, PanelRow::Colours { .. } | PanelRow::Brushes { .. })) {
         return None;
     }
     Some(PluginPanel { title: raw.title, rows, key_press: raw.key_press, ring, at: None })
 }
 
-fn read_row(raw: RawRow, ring: bool, brush: &dyn Fn(i64) -> Option<PanelBrush>) -> Option<PanelRow> {
+fn read_row(
+    raw: RawRow,
+    ring: bool,
+    brush: &dyn Fn(i64) -> Option<PanelBrush>,
+    control: &dyn Fn(&str) -> Option<String>,
+) -> Option<PanelRow> {
     let most = if ring { MOST_ON_A_RING } else { MOST_OPTIONS };
     Some(match raw {
         RawRow::Text { text } => {
@@ -264,6 +286,7 @@ fn read_row(raw: RawRow, ring: bool, brush: &dyn Fn(i64) -> Option<PanelBrush>) 
             let keys = if written.is_empty() { "None".to_owned() } else { written.join("  ") };
             PanelRow::Keys { label, keys }
         }
+        RawRow::Control { key } => PanelRow::Control { key: control(&key)? },
     })
 }
 
@@ -294,6 +317,8 @@ pub(crate) fn touched(panel: &PluginPanel, row: usize, value: f32) -> Option<f32
             (at >= 0.0 && (at as usize) < brushes.len()).then_some(at)
         }
         PanelRow::Button { .. } | PanelRow::Keys { .. } => Some(1.0),
+        // set as on its card
+        PanelRow::Control { .. } => None,
     }
 }
 
@@ -388,7 +413,7 @@ mod tests {
 
     #[test]
     fn a_row_of_brushes_is_found_by_their_keys_and_a_tap_on_one_is_told_as_its_place() {
-        let one = |row: &str| read_panel_with(&format!(r#"{{ "title": "T", "rows": [{row}] }}"#), &brush);
+        let one = |row: &str| read_panel_with(&format!(r#"{{ "title": "T", "rows": [{row}] }}"#), &brush, &|_| None);
         let panel = one(r#"{ "type": "brushes", "label": "Brushes", "brushes": [3, 1], "chosen": 1 }"#).unwrap();
         let found = vec![
             PanelBrush { set: 0, index: 2, name: "Brush 3".into() },
@@ -413,8 +438,9 @@ mod tests {
 
     #[test]
     fn a_ring_holds_rows_of_colours_and_brushes_alone_up_to_twelve_on_each() {
-        let ring =
-            |rows: &str| read_panel_with(&format!(r#"{{ "title": "T", "ring": true, "rows": [{rows}] }}"#), &brush);
+        let ring = |rows: &str| {
+            read_panel_with(&format!(r#"{{ "title": "T", "ring": true, "rows": [{rows}] }}"#), &brush, &|_| None)
+        };
         let twelve = (1..=12).map(|k| k.to_string()).collect::<Vec<_>>().join(",");
         let colours = format!(r#"{{ "type": "colours", "label": "C", "colours": [{twelve}], "chosen": 11 }}"#);
         let brushes = format!(r#"{{ "type": "brushes", "label": "B", "brushes": [{twelve}] }}"#);
@@ -423,7 +449,7 @@ mod tests {
         assert!(matches!(&panel.rows[0], PanelRow::Colours { colours, chosen: Some(11), .. } if colours.len() == 12));
         assert!(matches!(&panel.rows[1], PanelRow::Brushes { brushes, .. } if brushes.len() == 12));
         // twelve is past a card's eight
-        let card = read_panel_with(&format!(r#"{{ "title": "T", "rows": [{colours}] }}"#), &brush);
+        let card = read_panel_with(&format!(r#"{{ "title": "T", "rows": [{colours}] }}"#), &brush, &|_| None);
         assert!(card.is_none());
         // thirteen, a row of another kind, more than three rows: it doesn't hold up
         assert!(ring(&format!(r#"{{ "type": "colours", "label": "C", "colours": [{twelve},13] }}"#)).is_none());

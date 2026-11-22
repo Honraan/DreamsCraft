@@ -141,6 +141,37 @@ pub struct PluginFile {
     pub chosen: Option<String>,
 }
 
+/// A texture someone picks (interface 15): one of the app's own grains, by its number in the Source
+/// Library (from 1; 0, its Blank, for none), or the picture picked for one of the plugin's `file`
+/// controls of pictures it offers (`own`, their keys in order), as -1 less its place there.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct PluginTexture {
+    pub key: String,
+    pub label: String,
+    pub own: Vec<String>,
+    pub value: i32,
+    /// As it starts.
+    pub starts: i32,
+}
+
+impl PluginTexture {
+    /// `value`, if it names a texture this offers; none (0) if it doesn't.
+    pub(crate) fn within(&self, value: f32) -> i32 {
+        let v = value.round();
+        let least = -(self.own.len() as f32);
+        let most = procraft_engine::textures::GRAIN_COUNT as f32;
+        if v.is_finite() && (least..=most).contains(&v) { v as i32 } else { 0 }
+    }
+}
+
+/// A picture, RGBA rows from the top (not premultiplied), `width` × `height`.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct PluginPicture {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
 /// Something a plugin does when its row is tapped: `key` is `<id>.<key>`. Its card lists it, and
 /// `place` may list it somewhere else too.
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
@@ -202,6 +233,7 @@ pub enum PluginControl {
     Switch { control: PluginSwitch },
     Slider { control: PluginSlider },
     File { control: PluginFile },
+    Texture { control: PluginTexture },
 }
 
 /// One as its page shows it.
@@ -258,6 +290,7 @@ impl PluginControl {
             PluginControl::Switch { control } => &control.key,
             PluginControl::Slider { control } => &control.key,
             PluginControl::File { control } => &control.key,
+            PluginControl::Texture { control } => &control.key,
         }
     }
 
@@ -274,6 +307,11 @@ impl PluginControl {
                     control.value = control.stepped(read);
                 }
             }
+            PluginControl::Texture { control } => {
+                if let Ok(read) = text.parse::<f32>() {
+                    control.value = control.within(read);
+                }
+            }
             // what was picked is kept with the plugin, not with the settings
             PluginControl::File { .. } => {}
         }
@@ -284,6 +322,7 @@ impl PluginControl {
         match self {
             PluginControl::Switch { control } => control.on = control.starts,
             PluginControl::Slider { control } => control.value = control.starts,
+            PluginControl::Texture { control } => control.value = control.starts,
             PluginControl::File { .. } => {}
         }
     }
@@ -293,6 +332,7 @@ impl PluginControl {
         match &mut self {
             PluginControl::Switch { control } => control.starts = control.on,
             PluginControl::Slider { control } => control.starts = control.value,
+            PluginControl::Texture { control } => control.starts = control.value,
             PluginControl::File { .. } => {}
         }
         self
@@ -304,6 +344,7 @@ impl PluginControl {
             PluginControl::Switch { control } => f32::from(u8::from(control.on)),
             PluginControl::Slider { control } => control.value,
             PluginControl::File { control } => f32::from(u8::from(control.chosen.is_some())),
+            PluginControl::Texture { control } => control.value as f32,
         }
     }
 
@@ -313,6 +354,7 @@ impl PluginControl {
             PluginControl::Switch { control } => control.on.to_string(),
             PluginControl::Slider { control } => control.value.to_string(),
             PluginControl::File { control } => control.chosen.is_some().to_string(),
+            PluginControl::Texture { control } => control.value.to_string(),
         }
     }
 
@@ -325,6 +367,9 @@ impl PluginControl {
             }
             (PluginControl::File { control }, PluginControl::File { control: from }) => {
                 control.chosen.clone_from(&from.chosen)
+            }
+            (PluginControl::Texture { control }, PluginControl::Texture { control: from }) => {
+                control.value = control.within(from.value as f32);
             }
             _ => {}
         }
@@ -1148,6 +1193,10 @@ impl Plugins {
                         let to = control.stepped(value.unwrap_or(control.starts));
                         std::mem::replace(&mut control.value, to) != to
                     }
+                    PluginControl::Texture { control } => {
+                        let to = value.map_or(control.starts, |v| control.within(v));
+                        std::mem::replace(&mut control.value, to) != to
+                    }
                     PluginControl::File { .. } => false,
                 };
                 if changed {
@@ -1597,6 +1646,39 @@ impl Plugins {
             }
             _ => None,
         })
+    }
+
+    /// Sets the texture control kept under `key` to `value` (see [`PluginTexture`]); what it
+    /// landed on (none, 0, for a texture it doesn't offer), if there is one.
+    pub fn set_texture(&self, key: String, value: i32) -> Option<i32> {
+        self.change(&key, |control| match control {
+            PluginControl::Texture { control } => {
+                control.value = control.within(value as f32);
+                Some(control.value)
+            }
+            _ => None,
+        })
+    }
+
+    /// The picture picked for the file control of pictures kept under `key`, shrunk to fit `side`
+    /// pixels each way (2 to 1024), for a texture's thumbnail; none while none is picked, or if it
+    /// doesn't read.
+    pub fn picture_thumbnail(&self, key: String, side: u32) -> Option<PluginPicture> {
+        let store = self.store.as_deref()?;
+        let path = {
+            let list = self.listed();
+            let plugin = list.files.iter().find(|p| p.controls.iter().any(|c| c.key() == key))?;
+            let file = plugin.controls.iter().find_map(|c| match c {
+                PluginControl::File { control } if control.key == key => Some(control),
+                _ => None,
+            })?;
+            (file.accepts == PluginFileKind::Picture && file.chosen.is_some())
+                .then(|| plugin_file::chosen_paths(store, &plugin.id, &file.key).0)?
+        };
+        let bytes = std::fs::read(path).ok()?;
+        let (width, height, rgba) = crate::plugin_commands::decoded_image(&bytes)?;
+        let (width, height, pixels) = crate::surround::within(width, height, rgba, side.clamp(2, 1024))?;
+        Some(PluginPicture { width, height, pixels })
     }
 
     /// The file control kept under `key` takes the sound `wav` (a WAV file's bytes) picked by `name`:
@@ -2109,6 +2191,7 @@ impl Plugins {
             match control {
                 PluginControl::Switch { control } => control.on = value != 0.0,
                 PluginControl::Slider { control } => control.value = control.stepped(value),
+                PluginControl::Texture { control } => control.value = control.within(value),
                 PluginControl::File { .. } => continue,
             }
             self.hooks.control(&plugin.id, at, control.number());
@@ -3226,6 +3309,7 @@ mod tests {
                 PluginControl::Switch { control } => control.label.clone(),
                 PluginControl::Slider { control } => control.label.clone(),
                 PluginControl::File { control } => control.label.clone(),
+                PluginControl::Texture { control } => control.label.clone(),
             });
             controls.chain(card.actions.iter().map(|a| a.label.clone())).collect::<Vec<_>>()
         };
@@ -3853,6 +3937,48 @@ mod tests {
         opened.use_plugins(Arc::clone(&plugins));
         assert_eq!(paper_of(&opened), None);
         let _ = std::fs::remove_dir_all(&saved);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn paper_from_the_textures_is_the_apps_grain_or_a_picture_of_your_own_and_its_panel_shows_it() {
+        const PAPER: &str = "io.github.artcraftandroid.paper";
+        let dir = store("bundled-paper-textures");
+        let plugins = app_at(&dir);
+        let s = crate::CanvasSession::new(64, 48);
+        assert!(plugins.set_on(PAPER.to_owned(), true));
+        // the artwork's settings taken up first, as an artwork opening does
+        s.use_plugins(Arc::clone(&plugins));
+        let paper_of = |s: &crate::CanvasSession| s.shared.lock().plugin_paper.clone();
+        let texture = format!("{PAPER}.texture");
+        // Textures, none picked: no paper
+        assert!(plugins.set_slider(format!("{PAPER}.paper"), 7.0).is_some());
+        s.use_plugins(Arc::clone(&plugins));
+        assert_eq!(paper_of(&s), None);
+        // the app's grain 19 of the Source Library: its tile, as it is
+        assert_eq!(plugins.set_texture(texture.clone(), 19), Some(19));
+        s.use_plugins(Arc::clone(&plugins));
+        let n = procraft_engine::textures::TEXTURE_SIZE;
+        assert_eq!(paper_of(&s).unwrap().tile, procraft_engine::textures::grain_at(18, n).unwrap());
+        // a picture of your own picked into its second place, and picked from the textures: the
+        // tile made of it (dark on its left half, light on its right)
+        let side = 40_usize;
+        let rgba: Vec<u8> =
+            (0..side * side).flat_map(|i| if i % side < side / 2 { [60, 60, 60, 255] } else { [220; 4] }).collect();
+        let png = crate::project::png_of(side as u32, side as u32, &rgba).unwrap();
+        assert!(plugins.set_picture_file(format!("{PAPER}.picture2"), "weave.png".to_owned(), png));
+        assert_eq!(plugins.set_texture(texture.clone(), -2), Some(-2));
+        s.use_plugins(Arc::clone(&plugins));
+        let given = paper_of(&s).unwrap();
+        assert_eq!((given.tile[100 * n + 60], given.tile[100 * n + 200]), (0, 255));
+        // its row in the Layers panel shows the texture's row under the Paper's
+        assert!(plugins.run_action(format!("{PAPER}.settings"), Arc::clone(&s)));
+        let rows = plugins.panel().unwrap().rows;
+        assert_eq!(rows.get(1), Some(&crate::PanelRow::Control { key: texture.clone() }));
+        // none picked again: no paper
+        assert_eq!(plugins.set_texture(texture, 0), Some(0));
+        s.use_plugins(Arc::clone(&plugins));
+        assert_eq!(paper_of(&s), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

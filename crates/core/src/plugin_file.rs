@@ -16,6 +16,7 @@ use serde_json::Value;
 use crate::plugin_run::{self, Hook, MODULE, MOST_MODULE};
 use crate::plugins::{
     self, PluginBrushControl, PluginControl, PluginFile, PluginFileKind, PluginPart, PluginSlider, PluginSwitch,
+    PluginTexture,
 };
 
 /// The manifest's name in a plugin file, and in its folder.
@@ -23,7 +24,7 @@ const MANIFEST: &str = "craft-extension.json";
 /// The manifest format read here: a newer one may mean anything, so it is refused.
 const SCHEMA: u64 = 1;
 /// What a plugin's code is written to, see [`crate::plugin_run`]: a newer one is refused too.
-const INTERFACE: u32 = 14;
+const INTERFACE: u32 = 15;
 /// What ids of our own start with: no file may claim one.
 const OWN_PREFIX: &str = "procraft.";
 /// The file, its entries, one entry, all of them unpacked, and the manifest, in bytes.
@@ -616,6 +617,9 @@ struct RawControl {
     /// Kept with each artwork rather than with the plugin.
     #[serde(default)]
     artwork: Option<bool>,
+    /// The keys of the file controls of pictures a texture offers too.
+    #[serde(default)]
+    own: Option<Vec<String>>,
 }
 
 /// Whether `text`, at most `most` characters, is fit to show: nothing that hides, reorders or
@@ -661,7 +665,7 @@ fn valid_id(id: &str) -> bool {
 }
 
 /// A control's key: it goes in a settings line, after the plugin's id, so it is one plain word.
-fn valid_key(key: &str) -> bool {
+pub(crate) fn valid_key(key: &str) -> bool {
     let mut bytes = key.bytes();
     key.len() <= 32
         && key != "on"
@@ -705,6 +709,27 @@ fn sha_digits(sha: &str) -> bool {
     sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// Whether the texture controls among `controls` hold up: written to interface 15 or later, each
+/// offering pictures of file controls of pictures among them, each once.
+fn textures_hold_up(controls: &[PluginControl], interface: Option<u32>) -> bool {
+    let picture = |key: &str| {
+        controls.iter().any(
+            |c| matches!(c, PluginControl::File { control } if control.key == key && control.accepts == PluginFileKind::Picture),
+        )
+    };
+    let mut any = false;
+    for c in controls {
+        if let PluginControl::Texture { control } = c {
+            any = true;
+            let distinct: HashSet<&String> = control.own.iter().collect();
+            if distinct.len() != control.own.len() || !control.own.iter().all(|k| picture(k)) {
+                return false;
+            }
+        }
+    }
+    !any || interface.is_some_and(|interface| interface >= 15)
+}
+
 /// `control` as the list has it, its key under the plugin's id.
 fn checked_control(id: &str, raw: RawControl) -> Result<PluginControl, Refusal> {
     if !valid_key(&raw.key) || raw.label.trim().is_empty() || !shows_plainly(&raw.label, 40) {
@@ -725,6 +750,24 @@ fn checked_control(id: &str, raw: RawControl) -> Result<PluginControl, Refusal> 
             };
             let control = PluginSwitch { key, label: raw.label, on: starts, starts };
             Ok(PluginControl::Switch { control })
+        }
+        // a texture someone picks, of the app's grains or the plugin's own pictures (interface 15)
+        "texture" => {
+            let starts = match raw.starts {
+                _ if raw.keeps.is_some() => return Err(Refusal::Described),
+                None => 0,
+                Some(Value::Number(n)) => match n.as_i64() {
+                    Some(n) if (0..=i64::from(procraft_engine::textures::GRAIN_COUNT)).contains(&n) => n as i32,
+                    _ => return Err(Refusal::Described),
+                },
+                Some(_) => return Err(Refusal::Described),
+            };
+            let own = raw.own.unwrap_or_default();
+            if own.len() > MOST_FILES || !own.iter().all(|k| valid_key(k)) {
+                return Err(Refusal::Described);
+            }
+            let own = own.iter().map(|k| format!("{id}.{k}")).collect();
+            Ok(PluginControl::Texture { control: PluginTexture { key, label: raw.label, own, value: starts, starts } })
         }
         // a file someone picks, kept with the plugin; it takes no setting the app used to have
         "file" => {
@@ -862,6 +905,9 @@ fn read_manifest(text: &[u8]) -> Result<Manifest, Refusal> {
     }
     let distinct: HashSet<_> = holds.iter().collect();
     if holds.is_empty() || distinct.len() != holds.len() || compat.interface.is_none() {
+        return Err(Refusal::Described);
+    }
+    if !textures_hold_up(&controls, compat.interface) {
         return Err(Refusal::Described);
     }
     // what it says it holds and what it lists agree, so what the import screen tells is all of it
@@ -1085,7 +1131,7 @@ fn shape_of(
             Some(name) => plugins::PluginPlace::named(name).ok_or(Refusal::Newer)?,
         };
         let fits = matches!(place, plugins::PluginPlace::Card | plugins::PluginPlace::Canvas);
-        if !fits || (place != plugins::PluginPlace::Card && c.kind == "file") {
+        if !fits || (place != plugins::PluginPlace::Card && (c.kind == "file" || c.kind == "texture")) {
             return Err(Refusal::Described);
         }
         places.push(place);
@@ -2431,6 +2477,47 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_texture_control_offers_its_plugins_pictures_from_interface_15() {
+        let module = crate::plugin_run::tests::position_module(
+            r#"(func (export "procraft_control") (param i32 f32))"#,
+            "(i64.const 0)",
+        );
+        let pictures = |own: Value, interface: u32, starts: Value, place: Value| {
+            let mut manifest = coded("org.example.paper", &module);
+            manifest["compat"]["procraft"]["interface"] = json!(interface);
+            manifest["controls"] = json!([
+                { "key": "texture", "type": "texture", "label": "Texture", "own": own, "starts": starts, "place": place },
+                { "key": "first", "type": "file", "label": "A picture", "accepts": "picture" },
+                { "key": "second", "type": "file", "label": "Another", "accepts": "picture" },
+                { "key": "sound", "type": "file", "label": "A sound", "accepts": "sound" },
+            ]);
+            read_package(&pack(&manifest, &[(MODULE, module.as_slice())]))
+        };
+        let card = json!("card");
+        let package = pictures(json!(["first", "second"]), 15, json!(3), card.clone()).unwrap();
+        let PluginControl::Texture { control } = &package.manifest.controls[0] else { panic!() };
+        assert_eq!(control.own, ["org.example.paper.first", "org.example.paper.second"]);
+        assert_eq!((control.value, control.starts), (3, 3));
+        assert!(pictures(json!([]), 15, json!(0), card.clone()).is_ok(), "the app's grains alone");
+        // before interface 15; offering a sound, a picture not there or one twice; starting past the
+        // grains or below none; or shown in the Canvas tab: refused
+        let most = procraft_engine::textures::GRAIN_COUNT;
+        for (own, interface, starts, place) in [
+            (json!(["first"]), 14, json!(0), card.clone()),
+            (json!(["sound"]), 15, json!(0), card.clone()),
+            (json!(["third"]), 15, json!(0), card.clone()),
+            (json!(["first", "first"]), 15, json!(0), card.clone()),
+            (json!(["first"]), 15, json!(most + 1), card.clone()),
+            (json!(["first"]), 15, json!(-1), card.clone()),
+            (json!(["first"]), 15, json!("grunge"), card.clone()),
+            (json!(["first"]), 15, json!(0), json!("canvas")),
+        ] {
+            let read = pictures(own.clone(), interface, starts.clone(), place.clone());
+            assert_eq!(read.err(), Some(Refusal::Described), "{own} {interface} {starts} {place}");
+        }
+    }
+
+    #[test]
     fn a_good_plugin_is_read() {
         let module = a_module();
         let manifest = coded("org.example.plugin", &module);
@@ -2447,7 +2534,7 @@ pub(crate) mod tests {
         };
         // a hook or an interface this app doesn't have is for a newer one
         assert_eq!(of("/hooks", json!(["position", "layers"])), Refusal::Newer);
-        assert_eq!(of("/compat/procraft/interface", json!(15)), Refusal::Newer);
+        assert_eq!(of("/compat/procraft/interface", json!(16)), Refusal::Newer);
         assert_eq!(of("/hooks", json!([])), Refusal::Described);
         assert_eq!(of("/hooks", json!(["position", "position"])), Refusal::Described);
         assert_eq!(of("/compat/procraft", json!({ "min_app": "0.0.1" })), Refusal::Described);
@@ -2460,7 +2547,7 @@ pub(crate) mod tests {
     #[test]
     fn plugins_written_to_every_interface_so_far_still_load_and_a_new_hook_needs_its_function() {
         let module = a_module();
-        for interface in 1..=14 {
+        for interface in 1..=15 {
             let manifest = with(coded("org.example.plugin", &module), "/compat/procraft/interface", json!(interface));
             assert!(read_package(&a_coded_file(&manifest, &module)).is_ok(), "interface {interface}");
         }

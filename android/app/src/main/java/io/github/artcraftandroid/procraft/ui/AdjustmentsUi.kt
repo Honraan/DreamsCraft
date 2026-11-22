@@ -1393,7 +1393,7 @@ fun PluginFilterPanel(vm: CanvasViewModel, modifier: Modifier = Modifier) {
                         Box(Modifier.tap { vm.setPluginFilterSwitch(control.control.key, !control.control.on) }) { Switch(control.control.on, enabled = true) }
                     }
                     // (a filter has none)
-                    is PluginControl.File -> {}
+                    is PluginControl.File, is PluginControl.Texture -> {}
                 }
             }
         }

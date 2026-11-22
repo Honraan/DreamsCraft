@@ -16,7 +16,8 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 /// The controls by their place, as the manifest starts them.
-static CONTROLS: kit::Controls<11> = kit::Controls::new([0.0, 0.0, 0.6, 1.0, 0.3, 0.0, 0.0, 40.0, 0.1, 0.96, 0.0]);
+static CONTROLS: kit::Controls<15> =
+    kit::Controls::new([0.0, 0.0, 0.6, 1.0, 0.3, 0.0, 0.0, 40.0, 0.1, 0.96, 0.0, 0.0, 0.0, 0.0, 0.0]);
 kit::controls!(CONTROLS);
 const PAPER: usize = 0;
 const COLOUR: usize = 1;
@@ -29,12 +30,23 @@ const HUE: usize = 7;
 const SATURATION: usize = 8;
 const BRIGHTNESS: usize = 9;
 const PICTURE: usize = 10;
+/// The texture picked from the app's textures (its grains, by their number in its Source Library)
+/// or the pictures of your own (below 0, -1 less their place in [`OWN`]), and those pictures' other
+/// file controls.
+const TEXTURE: usize = 11;
+const PICTURE2: usize = 12;
+const PICTURE3: usize = 13;
+const PICTURE4: usize = 14;
+/// The file controls the texture offers, in its order.
+const OWN: [usize; 4] = [PICTURE, PICTURE2, PICTURE3, PICTURE4];
 
 /// The tile's side: what the app asks for.
 const SIDE: usize = 256;
 
-/// The Paper control's step that is the picture picked for Your own paper.
+/// The Paper control's step that is the picture picked for Your own paper, and the one that is the
+/// texture picked.
 const OWN_STEP: u32 = 6;
+const TEXTURES_STEP: u32 = 7;
 
 /// The papers drawn here, by the Paper control's steps (0 is none).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -198,16 +210,39 @@ fn heights(kind: Kind, out: &mut [f32; SIDE * SIDE]) {
 
 /// The papers by the Paper control's steps, and the colours by the Paper colour control's, as the
 /// panel names them.
-const PAPERS: [&str; 7] = ["None", "Cold press", "Hot press", "Rough", "Canvas", "Laid", "Your own"];
+const PAPERS: [&str; 8] =
+    ["None", "Cold press", "Hot press", "Rough", "Canvas", "Laid", "Your own", "Textures"];
 const COLOUR_NAMES: [&str; 7] = ["Background", "White", "Cream", "Ivory", "Grey", "Kraft", "Black"];
 
-/// The app's function that sets one of the plugin's own controls (interface 12).
+/// The app's functions that set one of the plugin's own controls (interface 12) and show its panel.
 #[cfg(target_arch = "wasm32")]
 mod app {
     #[link(wasm_import_module = "procraft")]
     unsafe extern "C" {
         pub fn set_control(at: i32, value: f32) -> i32;
+        pub fn show_panel(at: i32, len: i32) -> i32;
     }
+}
+
+/// What stands in the panel's rows for the row of the texture control, until it is shown: the kit
+/// writes no such row (interface 15), so it goes in in its place.
+const TEXTURE_ROW: &str = "@texture@";
+
+/// `panel`'s text, the texture control's row where it stands in.
+fn panel_text(panel: &kit::app::Panel) -> String {
+    let stand_in = format!(r#"{{"type":"text","text":"{TEXTURE_ROW}"}}"#);
+    panel.json().replace(&stand_in, r#"{"type":"control","key":"texture"}"#)
+}
+
+/// Shows `panel` (or shows it again, changed), the texture control's row where it stands in.
+fn show(panel: &kit::app::Panel) {
+    let text = panel_text(panel);
+    // SAFETY: its own memory, read by the app as it is
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        app::show_panel(text.as_ptr() as i32, text.len() as i32);
+    }
+    let _ = text;
 }
 
 /// Control `at` set to `value`, as on the card (the app keeps it, with the artwork open if it's
@@ -227,8 +262,13 @@ fn panel() -> (kit::app::Panel, Vec<Option<(usize, f32)>>) {
     let step = |at: usize| (CONTROLS.get(at) + 0.5) as usize;
     let shown = |at: usize| (CONTROLS.get(at) * 100.0).round();
     let mut sets = vec![Some((PAPER, 1.0)), Some((COLOUR, 1.0)), Some((OWN_COLOUR, 1.0))];
-    let mut panel = kit::app::Panel::new("Paper")
-        .choice("Paper", &PAPERS, step(PAPER).min(PAPERS.len() - 1))
+    let mut panel = kit::app::Panel::new("Paper").choice("Paper", &PAPERS, step(PAPER).min(PAPERS.len() - 1));
+    // the texture picked, under the Paper while it is Textures
+    if step(PAPER) as u32 == TEXTURES_STEP {
+        panel = panel.text(TEXTURE_ROW);
+        sets.insert(1, None);
+    }
+    panel = panel
         .choice("Colour", &COLOUR_NAMES, step(COLOUR).min(COLOUR_NAMES.len() - 1))
         .switch("A colour of your own", CONTROLS.on(OWN_COLOUR));
     if CONTROLS.on(OWN_COLOUR) {
@@ -252,15 +292,16 @@ fn panel() -> (kit::app::Panel, Vec<Option<(usize, f32)>>) {
 }
 
 kit::actions!(|_| {
-    panel().0.show();
+    show(&panel().0);
 });
 
 kit::panel!(|row, value| {
     if let Some(Some((at, times))) = panel().1.get(row) {
         set(*at, value * times);
     }
-    // shown again as it is now: a colour of your own's sliders come and go with its switch
-    panel().0.show();
+    // shown again as it is now: a colour of your own's sliders come and go with its switch, the
+    // texture with its step
+    show(&panel().0);
 });
 
 /// Memory of the module's own, written by one call at a time (a plugin's module runs on one thread).
@@ -302,7 +343,23 @@ pub extern "C" fn procraft_paper(side: i32) -> i32 {
 /// paper's while the Paper control is on its step; else none (-1), the tile drawn here.
 #[unsafe(no_mangle)]
 pub extern "C" fn procraft_paper_picture() -> i32 {
-    if (CONTROLS.get(PAPER) + 0.5) as u32 == OWN_STEP { PICTURE as i32 } else { -1 }
+    match (CONTROLS.get(PAPER) + 0.5) as u32 {
+        OWN_STEP => PICTURE as i32,
+        // a picture of your own picked from the textures
+        TEXTURES_STEP => {
+            let k = -1 - CONTROLS.get(TEXTURE).round() as i32;
+            usize::try_from(k).ok().and_then(|k| OWN.get(k)).map_or(-1, |&at| at as i32)
+        }
+        _ => -1,
+    }
+}
+
+/// The app's grain that is the paper, by its number in the Source Library, while the Paper control
+/// is Textures and the texture picked is one; else none (0).
+#[unsafe(no_mangle)]
+pub extern "C" fn procraft_paper_grain() -> i32 {
+    let texture = CONTROLS.get(TEXTURE).round() as i32;
+    if (CONTROLS.get(PAPER) + 0.5) as u32 == TEXTURES_STEP && texture > 0 { texture } else { 0 }
 }
 
 /// How the paper is taken: how strongly its hollows take paint away (0), how many canvas pixels a
@@ -341,6 +398,37 @@ mod tests {
 
     fn alone() -> std::sync::MutexGuard<'static, ()> {
         SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn on_textures_the_paper_is_the_grain_or_picture_its_texture_names_and_its_panel_shows_it() {
+        let _alone = alone();
+        procraft_control(PAPER as i32, TEXTURES_STEP as f32);
+        // none picked: no paper
+        procraft_control(TEXTURE as i32, 0.0);
+        assert_eq!((procraft_paper_grain(), procraft_paper_picture(), procraft_paper(SIDE as i32)), (0, -1, 0));
+        // one of the app's grains, by its number in the Source Library
+        procraft_control(TEXTURE as i32, 19.0);
+        assert_eq!((procraft_paper_grain(), procraft_paper_picture()), (19, -1));
+        // the third picture of your own; past the four, none
+        procraft_control(TEXTURE as i32, -3.0);
+        assert_eq!((procraft_paper_grain(), procraft_paper_picture()), (0, PICTURE3 as i32));
+        procraft_control(TEXTURE as i32, -5.0);
+        assert_eq!((procraft_paper_grain(), procraft_paper_picture()), (0, -1));
+        // its panel: the texture's row under the Paper's, set as the card sets it (no row of the
+        // panel's own)
+        let (shown, sets) = panel();
+        let text = panel_text(&shown);
+        assert!(text.contains(r#"{"type":"control","key":"texture"}"#) && !text.contains(TEXTURE_ROW), "{text}");
+        assert_eq!((sets[0], sets[1]), (Some((PAPER, 1.0)), None));
+        // another paper: neither, and no texture row
+        procraft_control(PAPER as i32, 1.0);
+        procraft_control(TEXTURE as i32, 19.0);
+        assert_eq!((procraft_paper_grain(), procraft_paper_picture()), (0, -1));
+        assert!(!panel_text(&panel().0).contains("control"));
+        // as it starts again
+        procraft_control(PAPER as i32, 0.0);
+        procraft_control(TEXTURE as i32, 0.0);
     }
 
     /// Paper `kind`'s heights, worked out as its tile is.

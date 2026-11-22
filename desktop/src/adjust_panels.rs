@@ -767,7 +767,8 @@ fn plugin_filter(ctx: &egui::Context, session: &CanvasSession, shown: &AdjustSho
                     }
                 }
                 // (a filter has none)
-                PluginControl::File { .. } => {}
+                // a filter has neither
+                PluginControl::File { .. } | PluginControl::Texture { .. } => {}
             }
         }
     });

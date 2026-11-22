@@ -1711,6 +1711,84 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A paper plugin with a texture control (interface 15) whose value is the app's grain it gives
+    /// as its paper, and an action showing a panel of that control.
+    const TEXTURED: &str = r#"(module
+        (import "procraft" "show_panel" (func $show (param i32 i32) (result i32)))
+        (memory (export "memory") 1)
+        (global $texture (mut f32) (f32.const 0))
+        (data (i32.const 16) "{\"title\":\"P\",\"rows\":[{\"type\":\"control\",\"key\":\"texture\"}]}")
+        (func (export "procraft_control") (param i32 f32)
+            (if (i32.eqz (local.get 0)) (then (global.set $texture (local.get 1)))))
+        (func (export "procraft_action") (param i32) (result i32)
+            (drop (call $show (i32.const 16) (i32.const 57)))
+            (i32.const 0))
+        (func (export "procraft_panel_event") (param i32 f32) (result i32) (i32.const 0))
+        (func (export "procraft_paper") (param i32) (result i32) (i32.const 0))
+        (func (export "procraft_paper_look") (param i32) (result f32)
+            (select (f32.const 1) (f32.const 0.5) (i32.eq (local.get 0) (i32.const 1))))
+        (func (export "procraft_paper_colour") (result i32) (i32.const -1))
+        (func (export "procraft_paper_grain") (result i32) (i32.trunc_f32_s (global.get $texture))))"#;
+
+    #[test]
+    fn a_texture_control_names_the_papers_grain_and_shows_in_its_panel_as_on_its_card() {
+        use crate::plugins::PluginControl;
+        let s = CanvasSession::new(64, 64);
+        let dir = store("textures");
+        let module = wat::parse_str(TEXTURED).unwrap();
+        let plugins = Plugins::with_store(dir.clone());
+        let mut manifest = coded(ID, &module);
+        manifest["compat"]["procraft"]["interface"] = json!(15);
+        manifest["hooks"] = json!(["paper"]);
+        manifest["permissions"] = json!(["panel"]);
+        manifest["controls"] = json!([
+            { "key": "texture", "type": "texture", "label": "Texture", "own": ["first", "second"] },
+            { "key": "first", "type": "file", "label": "A picture", "accepts": "picture" },
+            { "key": "second", "type": "file", "label": "Another", "accepts": "picture" }
+        ]);
+        manifest["actions"] = json!([{ "key": "open", "label": "Paper", "place": "layers" }]);
+        assert_eq!(plugins.install(file(&manifest, &module)), None);
+        assert!(plugins.set_on(ID.to_owned(), true));
+        let key = format!("{ID}.texture");
+        let texture = || match card(&plugins).controls.first() {
+            Some(PluginControl::Texture { control }) => control.value,
+            other => panic!("{other:?}"),
+        };
+        // as it starts, none: no paper
+        assert_eq!(texture(), 0);
+        assert!(plugins.hooks().paper().is_none());
+        // the app's grains by their number in the Source Library, the plugin's pictures below 0;
+        // past either end, none
+        let most = procraft_engine::textures::GRAIN_COUNT as i32;
+        assert_eq!(plugins.set_texture(key.clone(), most), Some(most));
+        assert_eq!(plugins.set_texture(key.clone(), -2), Some(-2));
+        assert_eq!(plugins.set_texture(key.clone(), -3), Some(0));
+        assert_eq!(plugins.set_texture(key.clone(), most + 1), Some(0));
+        assert_eq!(plugins.set_texture(format!("{ID}.first"), 1), None, "a file control is no texture");
+        // grain 19 of the Source Library (the app's grain 18): the paper's tile, as it is
+        assert_eq!(plugins.set_texture(key.clone(), 19), Some(19));
+        assert_eq!(texture(), 19);
+        let (_, paper) = plugins.hooks().paper().unwrap();
+        assert_eq!(paper.tile, procraft_engine::textures::grain_at(18, crate::plugin_run::PAPER_SIDE).unwrap());
+        // its panel shows the control by its key, as its card does; a touch there is the card's
+        s.use_plugins(Arc::clone(&plugins));
+        assert!(plugins.run_action(format!("{ID}.open"), Arc::clone(&s)));
+        assert_eq!(plugins.panel().unwrap().rows, [crate::PanelRow::Control { key: key.clone() }]);
+        assert!(plugins.panel_touched(0, 3.0, Arc::clone(&s)));
+        assert_eq!(texture(), 19);
+        // a picture picked for one it offers, shrunk to a thumbnail; none picked, none
+        let first = format!("{ID}.first");
+        assert_eq!(plugins.picture_thumbnail(first.clone(), 64), None);
+        let picture: Vec<u8> = (0..300 * 200).flat_map(|i| [(i % 300) as u8, 90, 160, 255]).collect();
+        let png = crate::project::png_of(300, 200, &picture).unwrap();
+        assert!(plugins.set_picture_file(first.clone(), "weave.png".to_owned(), png));
+        let thumbnail = plugins.picture_thumbnail(first, 64).unwrap();
+        assert!(thumbnail.width == 64 && (42..=43).contains(&thumbnail.height), "{thumbnail:?}");
+        assert_eq!(thumbnail.pixels.len(), (thumbnail.width * thumbnail.height * 4) as usize);
+        assert_eq!(plugins.picture_thumbnail(format!("{ID}.second"), 64), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_plugin_reads_the_recent_colours_and_brushes_and_its_ring_opens_where_the_pen_is() {
         let s = CanvasSession::new(64, 64);

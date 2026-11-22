@@ -830,6 +830,7 @@ private fun PluginControlRow(control: PluginControl, vm: CanvasViewModel) {
             else PluginChoiceRow(control.control, choices, vm::setPluginSlider)
         }
         is PluginControl.File -> PluginFileRow(control.control, vm)
+        is PluginControl.Texture -> PluginTextureRow(control.control, vm)
     }
 }
 
@@ -882,6 +883,9 @@ fun PluginPanelView(vm: CanvasViewModel, modifier: Modifier = Modifier) {
                         is PanelRow.Colours -> PanelColoursRow(row) { vm.touchPluginPanel(i, it.toFloat()) }
                         is PanelRow.Keys -> PanelKeysRow(row) { vm.touchPluginPanel(i, 1f) }
                         is PanelRow.Brushes -> PanelBrushesRow(vm, row) { vm.touchPluginPanel(i, it.toFloat()) }
+                        // one of its texture controls, as its card shows it (others show nothing)
+                        is PanelRow.Control -> vm.pluginList.flatMap { it.controls }.filterIsInstance<PluginControl.Texture>()
+                            .firstOrNull { it.control.key == row.key }?.let { PluginTextureRow(it.control, vm) }
                     }
                 }
             }

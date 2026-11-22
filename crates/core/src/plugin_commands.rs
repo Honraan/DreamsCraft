@@ -502,7 +502,12 @@ pub(crate) fn link(linker: &mut Linker<Host>, granted: &[PluginPermission]) -> R
             // its brushes found by their keys, as the library is now
             let s = session(&caller);
             let brush = |key: i64| s.as_ref().and_then(|s| s.plugin_brush(key));
-            let Some(panel) = read.as_deref().and_then(|json| read_panel_with(json, &brush)) else { return 0 };
+            // its own controls by their keys, under its id (interface 15)
+            let owner = caller.data().owner.clone();
+            let control = |key: &str| crate::plugin_file::valid_key(key).then(|| format!("{owner}.{key}"));
+            let Some(panel) = read.as_deref().and_then(|json| read_panel_with(json, &brush, &control)) else {
+                return 0;
+            };
             // one that asks for a key press has somewhere for it to go
             let takes = |name: &str| caller.get_export(name).and_then(Extern::into_func).is_some();
             if panel.key_press && !(takes(crate::plugin_run::PANEL_KEY) && takes(crate::plugin_run::KEY_BUFFER)) {
