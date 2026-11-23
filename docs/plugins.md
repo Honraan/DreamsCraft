@@ -22,13 +22,14 @@ A plugin holds one or both of these:
   a function the GPU runs over a layer.
 
 The samples are in [`plugins/`](../plugins). `radial-segments` is the smallest with code and
-`vector-layers` the largest. Five are made of [features](#features), each what a plugin of its own
-once was: `colour-tools`, `interface-look`, `view-tools`, `brush-extras` and `layer-toolbox`.
+`vector-layers` the largest. Six are made of [features](#features), each what a plugin of its own
+once was: `colour-tools`, `interface-look`, `view-tools`, `brush-extras`, `layer-toolbox` and
+`infinite-plugins`.
 
 - `colour-tools`: its Colour triangle is a picker whose picture draws its hue ring as its switch says
   and whose [menu](#a-menu-of-its-own) switches its shape; Colour labels keeps a mark with each layer
   from an action in its options, shows it with the `layer_label` hook and asks for it with a row of
-  colours; Colour extras answers the `colour_panel` hook, and ColorDrop tools the fill hooks.
+  colours; and ColorDrop tools answers the fill hooks.
 - `interface-look`: Interface answers several hooks, one for each of its switches, a switch under a
   switch among them; Slider look makes the side bar's sliders see-through frosted glass on the
   `slider_look` hook; Canvas surround colours the area round the canvas on the `interface_colour`
@@ -36,18 +37,24 @@ once was: `colour-tools`, `interface-look`, `view-tools`, `brush-extras` and `la
   hook; Floating panels lets panels float in windows of their own; and Coloured brush previews tints
   the brush library's strokes on the `brush_preview_colour` hook.
 - `view-tools`: Rotation reset has an action and two switches in the Canvas tab, Value check a switch
-  there with a key of its own, Trace view a choice there, a row in the Layers panel and keys for its
-  actions, and Reference windows a single slider.
+  there with a key of its own, and Reference windows a single slider.
 - `brush-extras`: Finger pressure gives a finger a pressure on the `pressure` hook, Touch position
   offset moves samples on the `position` hook, Brush sounds plays sounds with files picked for it and
   a row in the brush studio, and Randomise and QuickShape curves answer a hook each.
 - `layer-toolbox`: Layer tools answers three hooks, one for each of its switches; Layer fills has an
-  action beside a filter; Effects lists three filters, each under a switch of its own; and Filter
-  layers offers 38 filter layers, eleven of colour and the rest filters (interfaces 17 and 18).
+  action beside a filter; and Effects lists three filters, each under a switch of its own.
+- `infinite-plugins`: Lasso fill answers the `stroke_fill` hook with two rows in the brush studio and
+  comes with brushes under its switch; Paper answers the `paper` hook with controls kept with each
+  artwork, pictures picked for it and a panel from its row in the Layers panel; Trace view has a
+  choice in the Canvas tab, a row in the Layers panel and keys for its actions; Filter layers offers
+  38 filter layers, eleven of colour and the rest filters (interfaces 17 and 18); and Colour extras
+  answers the `colour_panel` hook. It took Lasso fill and Paper's places, and the features it took
+  from View tools, Layer tools and Colour tools (see [Taking a feature from a plugin that
+  stays](#taking-a-feature-from-a-plugin-that-stays)).
 
-`keyboard-shortcuts` rebinds keys from a panel of its own and keeps what it binds, `paper` has
-controls kept with each artwork, `pop-up-palette` has an action a pen's button runs, which shows a ring
-of the recent colours and brushes where the pen is, and `lasso-fill` comes with brushes.
+`keyboard-shortcuts` rebinds keys from a panel of its own and keeps what it binds, and
+`pop-up-palette` has an action a pen's button runs, which shows a ring of the recent colours and
+brushes where the pen is.
 
 ## What you write
 
@@ -98,8 +105,9 @@ brushes and rings, the `interface_colour` hook's surround, the `surround_picture
 hooks and `file` controls of pictures 11, the `stroke_fill` hook, the `paper` hook's tooth and
 picture, actions in the Layers panel, `set_control` and the `colour_panel` hook 12, the
 `view_dim_others` hook 13, a set of brushes 14, `texture` controls, panels' rows of a control and
-the `paper` hook's grain 15, and [features](#features), a row in the brush studio kept as a plugin it
-takes the place of kept it, and the marks of one it takes the place of 16.
+the `paper` hook's grain 15, [features](#features), a row in the brush studio kept as a plugin it
+takes the place of kept it, and the marks of one it takes the place of 16, and a feature taken from a
+plugin that stays and a set of brushes under a switch 19.
 
 ### Brushes it comes with
 
@@ -115,8 +123,22 @@ they are with the plugin off or removed, and a row of the plugin's in the brush 
 keeps (see [Rows in the brush studio](#rows-in-the-brush-studio)) does what the plugin says only
 while it's on.
 
-The Lasso fill plugin the app comes with brings Fills: the round pen filling what it goes round, plain
-and with the app's own halftone, speckle, grunge, scratch and checker grains. Its set file is written
+A plugin of features can have its set come with one of them (interface 19), and be the set of a
+plugin it takes the place of:
+
+```json
+"brushes": { "under": "lasso_fill", "from": "org.example.lasso-fill" }
+```
+
+- `under` is the key of the switch it comes under: the set is added once that is on too (and the
+  plugin), and not while it's off.
+- `from` is the id of a plugin it takes the place of (see [Taking the place of other
+  plugins](#taking-the-place-of-other-plugins)) whose set this is: it's written down as given by that
+  id, so a library that plugin gave it to isn't given it again, nor one that deleted it.
+
+Infinite Plugins' Lasso fill, which the app comes with, brings Fills: the round pen filling what it
+goes round, plain and with the app's own halftone, speckle, grunge, scratch and checker grains, as
+the Lasso fill plugin did before. Its set file is written
 by the core's `write_the_fill_brushes` test (`cargo test -p procraft-core write_the_fill_brushes --
 --ignored`), and a test checks the one kept is the same, byte for byte.
 
@@ -635,7 +657,7 @@ plugins' layers aren't drawn sharp meanwhile. An answer that isn't a number, or 
 stops the plugin. The app asks as the plugins change, not as it draws. With several plugins on this
 hook, the most any says.
 
-View tools' Trace view, which the app comes with, has a Layer view of Normal (none dimmed), Solo (all the way)
+Infinite Plugins' Trace view, which the app comes with, has a Layer view of Normal (none dimmed), Solo (all the way)
 and Trace (as far as its slider says, 70% as it starts), chosen in the Canvas tab or from its row in
 the Layers panel, whose panel holds both; Alt+S and Alt+T toggle Solo and Trace.
 
@@ -694,7 +716,7 @@ seconds. A strength or depth past 0 to 1, a tile's size past its range, a colour
 tile past `memory` stops the plugin. With several plugins on this hook, the first by id that gives a
 paper is used.
 
-The Paper plugin the app comes with draws five papers of its own, makes one of a picture someone
+Infinite Plugins' Paper, which the app comes with, draws five papers of its own, makes one of a picture someone
 picks for Your own paper, or takes one from its Textures (its `texture` control: the app's grains,
 or up to four pictures of your own, shown in its panel too), and keeps each artwork's choice, colour (one of its own, or any from its
 Hue, Saturation and Brightness), grain and tooth with the artwork (see
@@ -830,7 +852,7 @@ asks:
 An answer past 0 to 2 stops the plugin. With several plugins on this hook, the first by id that says
 a stroke fills says how it shows.
 
-The Lasso fill plugin the app comes with fills every stroke while its switch is on (shown as its
+Infinite Plugins' Lasso fill, which the app comes with, fills every stroke while its switch is on (shown as its
 other switch says), and a brush's strokes whose Fill row says so (shown as its Fill shown row says),
 and brings a set of such brushes (see [Brushes it comes with](#brushes-it-comes-with)).
 
@@ -923,7 +945,7 @@ procraft_colour_panel(part: i32) -> i32
 Answer 0 for a part you don't know: more may come. It's asked as the plugins change. With several
 plugins on this hook, a part is done if any says so.
 
-Colour tools' Colour extras, which the app comes with, does each by a switch of its own.
+Infinite Plugins' Colour extras, which the app comes with, does each by a switch of its own.
 
 ### `pin_panels`
 
@@ -1369,8 +1391,8 @@ some words, or a button. The plugin describes the panel as JSON text and hands i
   touch ends: kept as the card keeps it (one kept with each artwork, for the artwork open), its hooks
   told, and the copy of the code that set it told too, as it was set. It answers 1, or 0 for a place
   past 63 or a value that isn't a number; a place that is no switch or slider of its is left alone. So
-  a panel can hold the plugin's settings, as the Paper plugin's does, from its row in the Layers
-  panel.
+  a panel can hold the plugin's settings, as Infinite Plugins' Paper does, from its row in the
+  Layers panel.
 - Done closes the panel. So does another action, or the plugin being turned off.
 - A panel with `"key_press": true` asks for the next key press: while it shows, that press goes to the
   plugin rather than to the canvas, Escape too, as
@@ -2050,7 +2072,9 @@ below); then it is taken as far as the layer's opacity says. Clipped to a layer,
 much as that layer does. Hidden, it does nothing.
 
 - It saves, undoes, duplicates, groups, masks and clips as any layer. The artwork keeps its filter
-  as `<plugin id>.<key>` and its values by their keys. With its plugin off or gone, it shows nothing,
+  as `<plugin id>.<key>` and its values by their keys. A layer kept by an id a plugin's filter had
+  before is that filter's, if the plugin took it with its feature (see [Taking a feature from a
+  plugin that stays](#taking-a-feature-from-a-plugin-that-stays)). With its plugin off or gone, it shows nothing,
   its values kept as they are, until the plugin is on again.
 - It takes no paint, and nothing that changes a layer's pixels (a fill, Clear, an adjustment, a
   transform). Nothing merges into it. Merged down, its filter is run over the layer below alone and
@@ -2131,6 +2155,38 @@ A plugin can take the place of others, such as several small ones made into one,
 - With `"marks": true` (interface 16, one of them at most), the marks the old one kept with layers
   are its own: it reads and keeps them by that one's id, so every artwork's labels still show.
 - An old one can't be imported while it is here.
+- What an artwork kept for an old one's controls kept with each artwork (see
+  [`artwork`](#in-the-canvas-tab-on-a-key-and-with-each-artwork)) is taken by those that took their
+  values, in every artwork opened, until they have values of their own there (interface 19).
+
+### Taking a feature from a plugin that stays
+
+A plugin of features can take a feature from another plugin that stays (interface 19), such as one
+moved from one plugin to another:
+
+```json
+"takes": [
+  { "id": "org.example.view-tools", "feature": "trace_view", "switch": "trace_view",
+    "controls": { "view": "view", "dim": "dim" } },
+  { "id": "org.example.layer-toolbox", "feature": "filter_layers", "switch": "filter_layers",
+    "filters": true }
+]
+```
+
+- Each id is beside the plugin's own, and not one it takes the place of. `feature` is the key the
+  feature's switch had there, and `switch` the key of the feature here that takes it. `controls` maps
+  the keys of the feature's controls there to the keys of the controls here that take their values.
+  Up to eight, each feature once.
+- The other plugin stays as it is; a later version of it, without the feature, is a plugin like any
+  other. What was kept for the feature, on a start, comes here instead: its switch to `switch`, and
+  its controls' values to those that took them, until those have values of their own, which then say
+  instead. This one is turned on if both that plugin and the feature were on, unless its own on or
+  off is read back, before or after.
+- What an artwork kept for those controls (kept with each artwork) comes here too, as for a plugin
+  it takes the place of.
+- With `"filters": true`, the filter layers under `switch` answer to the ids they had there as well
+  (`<id>.<key>`), so the layers an artwork kept of them go on showing, with their values, as these.
+  A new one is added by its id here.
 
 The packed files are committed, so building the app needs no WebAssembly target. Whenever anything
 under `plugins/` changes, pack them again and commit what changed:
@@ -2168,8 +2224,10 @@ the `paper` hook's tooth and picture, actions in the Layers panel, `set_control`
 plugin comes with, interface 15 `texture` controls, panels' rows of a control and the `paper`
 hook's grain, interface 16 features (each running in a copy of the code of its own), a row in
 the brush studio kept as a plugin it takes the place of kept it (`from`), and the marks and picked
-files of a plugin it takes the place of, interface 17 filter layers, and interface 18 filter
-layers' editors. What comes under a switch at the top of the list (a menu and
+files of a plugin it takes the place of, interface 17 filter layers, interface 18 filter
+layers' editors, and interface 19 a feature taken from a plugin that stays (`takes`), a set of
+brushes under a switch and given as a plugin's it takes the place of (`brushes`), and an artwork's
+values kept for one it takes the place of. What comes under a switch at the top of the list (a menu and
 a row in the brush studio too), taking the place of other plugins, a menu of its own, and controls in
 the Canvas tab, on a key or kept with each artwork need no newer interface: an older app shows every
 control, leaves the others where they are, shows no menu and keeps every control with the plugin. What a

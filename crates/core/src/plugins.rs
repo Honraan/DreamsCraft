@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::KeyCombo;
 use crate::hooks::Hooks;
-use crate::plugin_file::{self, Added, Manifest, Refusal, Replaced, Shape};
+use crate::plugin_file::{self, Added, Manifest, Refusal, Replaced, Shape, Taken};
 use crate::plugin_run::{Hook, Running, Stop};
 
 /// A setting the app used to have and a plugin now brings: what it was kept under, as it started
@@ -694,6 +694,40 @@ fn replacing<'a>(
     })
 }
 
+/// The plugin of `files` taking a feature from one that stays as `find` says, and how, by their
+/// `shapes` (interface 19).
+fn taking<'a>(
+    files: &'a mut [PluginInfo],
+    shapes: &HashMap<String, Shape>,
+    find: impl Fn(&Taken) -> bool,
+) -> Option<(&'a mut PluginInfo, Taken)> {
+    files.iter_mut().find_map(|plugin| {
+        let taken = shapes.get(&plugin.id)?.takes.iter().find(|t| find(t))?.clone();
+        Some((plugin, taken))
+    })
+}
+
+/// Each plugin of `files` that took a feature from a plugin that stays, both of which were read
+/// back on (`taken_on`), on (interface 19), with the switch above that which took it: unless its
+/// own on or off was read back (`flagged`). Each turned on is written down as `carried`, as one
+/// taking another's place is.
+fn take_on(
+    files: &mut [PluginInfo],
+    shapes: &HashMap<String, Shape>,
+    taken_on: &HashSet<String>,
+    flagged: &HashSet<String>,
+    carried: &mut HashSet<String>,
+) {
+    for plugin in files.iter_mut() {
+        let Some(shape) = shapes.get(&plugin.id) else { continue };
+        let both = |t: &Taken| taken_on.contains(&format!("{}.on", t.id)) && taken_on.contains(&t.feature);
+        if shape.takes.iter().any(both) && !flagged.contains(&plugin.id) && plugin.problem.is_none() {
+            plugin.on = true;
+            carried.insert(plugin.id.clone());
+        }
+    }
+}
+
 /// What `from` had set, taken over by `to`, which takes its place as `replaced` says: on if it was,
 /// the switch that stands for it with it, and the values of its controls.
 fn carry(to: &mut PluginInfo, replaced: &Replaced, from: &PluginInfo, shape: Option<&Shape>) {
@@ -838,6 +872,9 @@ struct Listed {
     read: HashSet<String>,
     /// The switches set as the on or off of a plugin they stand for was read back.
     flag_switched: HashSet<String>,
+    /// Of the plugins features were taken from and those features' switches (interface 19), the
+    /// keys read back on: `<id>.on` and `<id>.<feature>`.
+    taken_on: HashSet<String>,
     /// The order someone put the plugins in on the Plugins page, by id, as written down in the
     /// store; those not in it come after, as they are listed.
     order: Vec<String>,
@@ -1005,6 +1042,7 @@ impl Plugins {
             carried: HashSet::new(),
             read: HashSet::new(),
             flag_switched: HashSet::new(),
+            taken_on: HashSet::new(),
             order,
             order_unkept_said: false,
         };
@@ -1423,7 +1461,9 @@ impl Plugins {
                 if shape.artwork.get(at) != Some(&true) {
                     continue;
                 }
-                let value = kept.get(control.key()).copied();
+                // (or under the key it was kept by before it was this one's, interface 19)
+                let before = || shape.kept_before(at).find_map(|key| kept.get(key).copied());
+                let value = kept.get(control.key()).copied().or_else(before);
                 let changed = match control {
                     PluginControl::Switch { control } => {
                         let on = value.map_or(control.starts, |v| v >= 0.5);
@@ -1463,17 +1503,26 @@ impl Plugins {
         values.chain(flags).chain(list.moved.iter().map(|(key, value)| format!("{key} {value}"))).collect()
     }
 
-    /// The set of brushes each plugin on holds (interface 14), by its id: its set file, as kept.
+    /// The set of brushes each plugin on holds (interface 14), while the switch it comes under is
+    /// on (interface 19), by the id it is given by: its own, or that of the plugin it takes the
+    /// place of whose set it is. Its set file, as kept.
     pub(crate) fn brush_sets(&self) -> Vec<(String, std::sync::Arc<[u8]>)> {
         let Some(store) = &self.store else { return Vec::new() };
-        let holders: Vec<(String, String)> = {
+        let holders: Vec<(String, String, String)> = {
             let list = self.listed();
             let holding = list.files.iter().filter(|p| p.on && p.problem.is_none() && p.holds(PluginPart::Brushes));
-            holding.map(|p| (p.id.clone(), p.version.clone())).collect()
+            let shown = |p: &PluginInfo| {
+                let shape = list.shapes.get(&p.id);
+                shape.is_none_or(|shape| shape.shows(shape.brushes_under, &p.controls))
+            };
+            let given_as = |p: &PluginInfo| -> String {
+                list.shapes.get(&p.id).map_or_else(|| p.id.clone(), |s| s.brushes_id(&p.id).to_owned())
+            };
+            holding.filter(|p| shown(p)).map(|p| (p.id.clone(), p.version.clone(), given_as(p))).collect()
         };
-        let sets = holders.into_iter().map(|(id, version)| {
+        let sets = holders.into_iter().map(|(id, version, given_as)| {
             let set = plugin_file::read_brush_set(store, &id, &version);
-            set.map(|set| (id, set.into()))
+            set.map(|set| (given_as, set.into()))
         });
         sets.flatten().collect()
     }
@@ -1582,19 +1631,21 @@ impl Plugins {
                 let (Some(layer), Some((_, text))) = (&f.layer, codes.iter().find(|(path, _)| *path == f.code)) else {
                     continue;
                 };
-                out.insert(
-                    f.id.clone(),
-                    crate::filter_layers::LayerFilterDef {
-                        plugin: plugin.id.clone(),
-                        label: f.label.clone(),
-                        values: layer.values.clone(),
-                        reach: layer.reach,
-                        touch: layer.touch,
-                        editor: layer.editor,
-                        text: Arc::from(text.as_str()),
-                        store: Some(store.to_path_buf()),
-                    },
-                );
+                let def = crate::filter_layers::LayerFilterDef {
+                    plugin: plugin.id.clone(),
+                    label: f.label.clone(),
+                    values: layer.values.clone(),
+                    reach: layer.reach,
+                    touch: layer.touch,
+                    editor: layer.editor,
+                    text: Arc::from(text.as_str()),
+                    store: Some(store.to_path_buf()),
+                };
+                // the layers an artwork kept of it by an id it had before go on showing (interface 19)
+                for was in shape.filter_was(f, &plugin.id) {
+                    out.entry(was).or_insert_with(|| def.clone());
+                }
+                out.insert(f.id.clone(), def);
             }
         }
         out
@@ -1797,9 +1848,48 @@ impl Plugins {
     /// those was, with the switch standing for each, and their values to the controls that took
     /// them; unless its own on or off, or those controls' own values, are read back, in whatever
     /// order, which say instead.
+    ///
+    /// What was kept for a feature another took from a plugin that stays goes to that one too
+    /// (interface 19): the feature's switch to the switch that took it and its values to the
+    /// controls that took them, and that one on while the plugin and the feature both were; unless
+    /// its own are read back, in whatever order.
     pub fn read_kept(&self, key: String, value: String) {
         let mut list = self.listed();
-        let Listed { files, moved: unheld, flagged, added, shapes, carried, read, flag_switched, .. } = &mut *list;
+        let Listed { files, moved: unheld, flagged, added, shapes, carried, read, flag_switched, taken_on, .. } =
+            &mut *list;
+        // a plugin a feature was taken from, or that feature's switch: on, it may turn on the one
+        // that took it
+        let takers = || shapes.values().flat_map(|shape| &shape.takes);
+        if takers().any(|t| key == format!("{}.on", t.id) || key == t.feature) {
+            if value.parse::<bool>() == Ok(true) {
+                taken_on.insert(key.clone());
+            } else {
+                taken_on.remove(&key);
+            }
+            take_on(files, shapes, taken_on, flagged, carried);
+        }
+        // (a key a plugin here holds is its own)
+        let held = files.iter().any(|p| p.controls.iter().any(|c| c.key() == key));
+        if !held && let Some((plugin, taken)) = taking(files, shapes, |t| t.feature == key) {
+            if let (Ok(on), Some(PluginControl::Switch { control })) =
+                (value.parse::<bool>(), plugin.controls.get_mut(taken.switch))
+                && !read.contains(&control.key)
+            {
+                control.on = on;
+                flag_switched.insert(control.key.clone());
+            }
+            return;
+        }
+        if !held && let Some((plugin, taken)) = taking(files, shapes, |t| t.controls.iter().any(|(old, _)| *old == key))
+        {
+            let at = taken.controls.iter().find(|(old, _)| *old == key).map(|(_, at)| *at);
+            if let Some(control) = at.and_then(|at| plugin.controls.get_mut(at))
+                && !read.contains(control.key())
+            {
+                control.read(&value);
+            }
+            return;
+        }
         if let Some(plugin) = files.iter_mut().find(|p| p.on_key == key) {
             if let Ok(on) = value.parse::<bool>() {
                 plugin.on = on && plugin.problem.is_none();
@@ -3365,6 +3455,7 @@ mod tests {
     const VIEW_TOOLS: &str = "io.github.artcraftandroid.view-tools";
     const BRUSH_EXTRAS: &str = "io.github.artcraftandroid.brush-extras";
     const LAYER_TOOLBOX: &str = "io.github.artcraftandroid.layer-toolbox";
+    const INFINITE: &str = "io.github.artcraftandroid.infinite-plugins";
     /// The features the plugins these named once are now, by the plugin holding them.
     const EFFECTS: &str = LAYER_TOOLBOX;
     const COLORDROP: &str = COLOUR_TOOLS;
@@ -3670,25 +3761,20 @@ mod tests {
             controls.chain(card.actions.iter().map(|a| a.label.clone())).collect::<Vec<_>>()
         };
         // a feature for each of the plugins it was made of, named as they were
-        let features = ["Colour triangle", "Colour labels", "Colour extras", "ColorDrop tools"];
+        let features = ["Colour triangle", "Colour labels", "ColorDrop tools"];
         assert_eq!(labels(&plugins, COLOUR_TOOLS), features);
         assert!(plugins.set_switch(format!("{COLOUR_TOOLS}.colordrop"), true));
         let colordrop = ["ColorDrop tools", "ColorDrop fills by all layers", "ColorDrop gap closing"];
-        assert_eq!(labels(&plugins, COLOUR_TOOLS)[3..], colordrop);
+        assert_eq!(labels(&plugins, COLOUR_TOOLS)[2..], colordrop);
         assert!(plugins.set_switch(format!("{COLOUR_TOOLS}.gap_closing"), true));
-        assert_eq!(labels(&plugins, COLOUR_TOOLS)[3..], [&colordrop[..], &["Gap"]].concat());
+        assert_eq!(labels(&plugins, COLOUR_TOOLS)[2..], [&colordrop[..], &["Gap"]].concat());
         // each a heading on the card, its words under it, what comes under it while it is on
         let colour = card(&plugins, COLOUR_TOOLS);
         let headings: Vec<(&str, bool, usize)> =
             colour.features.iter().map(|f| (f.control.label.as_str(), f.control.on, f.controls.len())).collect();
         assert_eq!(
             headings,
-            [
-                ("Colour triangle", false, 0),
-                ("Colour labels", false, 0),
-                ("Colour extras", false, 0),
-                ("ColorDrop tools", true, 3)
-            ]
+            [("Colour triangle", false, 0), ("Colour labels", false, 0), ("ColorDrop tools", true, 3)]
         );
         assert!(colour.features.iter().all(|f| !f.description.is_empty()));
         let looks = ["Interface", "Slider look", "Canvas surround", "Floating panels", "Coloured brush previews"];
@@ -3730,7 +3816,14 @@ mod tests {
         assert!(plugins.set_switch(format!("{EFFECTS}.extract_lines"), true));
         let lines = ["Effects", "Extract lines", "Paper", "Softness", "Keep the colour", "Outline", "Posterise"];
         assert_eq!(labels(&plugins, LAYER_TOOLBOX)[5..12], lines);
-        assert_eq!(labels(&plugins, LAYER_TOOLBOX)[12], "Filter layers");
+        assert_eq!(labels(&plugins, LAYER_TOOLBOX).len(), 12, "Filter layers are Infinite Plugins' now");
+        // Infinite Plugins: a feature for each of what painters asked for
+        let infinite = ["Lasso fill", "Paper", "Trace view", "Filter layers", "Colour extras"];
+        assert_eq!(labels(&plugins, INFINITE), infinite);
+        assert!(card(&plugins, INFINITE).features.iter().all(|f| !f.description.is_empty()));
+        assert!(plugins.set_switch(format!("{INFINITE}.trace_view"), true));
+        assert_eq!(labels(&plugins, INFINITE)[2..5], ["Trace view", "Layer view", "Trace dims the others"]);
+        assert!(plugins.set_switch(format!("{INFINITE}.trace_view"), false));
         // an action too, and it doesn't run with its switch off
         assert!(plugins.set_switch(format!("{LAYER_TOOLBOX}.layer_fills"), true));
         assert_eq!(labels(&plugins, LAYER_TOOLBOX)[4..7], ["Layer fills", "Grid layer", "Paper texture"]);
@@ -3759,14 +3852,14 @@ mod tests {
 
     #[test]
     fn bundled_filter_layers_show_what_is_below_changed_and_keep_their_values_with_the_layer() {
-        const INVERT: &str = "io.github.artcraftandroid.layer-toolbox.invert";
+        const INVERT: &str = "io.github.artcraftandroid.infinite-plugins.invert";
         let dir = store("bundled-filter-layers");
         let plugins = app_at(&dir);
         // off as it comes, and with its feature off: none offered
         assert!(plugins.layer_filters().is_empty());
-        assert!(plugins.set_on(LAYER_TOOLBOX.to_owned(), true));
+        assert!(plugins.set_on(INFINITE.to_owned(), true));
         assert!(plugins.layer_filters().is_empty());
-        assert!(plugins.set_switch(format!("{LAYER_TOOLBOX}.filter_layers"), true));
+        assert!(plugins.set_switch(format!("{INFINITE}.filter_layers"), true));
         let offered = plugins.layer_filters();
         assert_eq!(offered.len(), 38);
         assert_eq!(offered.iter().filter(|f| f.group == "Colour").count(), 11);
@@ -3811,11 +3904,11 @@ mod tests {
         // merged down, its filter goes into the layer below
         assert!(row.can_merge);
         // with the feature off, the layer shows nothing, its value kept
-        assert!(plugins.set_switch(format!("{LAYER_TOOLBOX}.filter_layers"), false));
+        assert!(plugins.set_switch(format!("{INFINITE}.filter_layers"), false));
         s.use_plugins(Arc::clone(&plugins));
         assert_eq!(shown(&s), [255, 0, 0, 255]);
         assert!(!s.filter_layer_settings());
-        assert!(plugins.set_switch(format!("{LAYER_TOOLBOX}.filter_layers"), true));
+        assert!(plugins.set_switch(format!("{INFINITE}.filter_layers"), true));
         s.use_plugins(Arc::clone(&plugins));
         assert_eq!(shown(&s), [0, 255, 255, 255]);
         // merged down: the layer below inverted, the filter layer gone, all as shown before
@@ -3835,7 +3928,7 @@ mod tests {
         // Curves: the app's Curves panel on the layer, with alpha; red turned over shows black
         s.delete_layer(layer);
         assert_eq!(shown(&s), [255, 0, 0, 255]);
-        let curves = s.add_filter_layer("io.github.artcraftandroid.layer-toolbox.curves".to_owned());
+        let curves = s.add_filter_layer(format!("{INFINITE}.curves"));
         assert_ne!(curves, 0);
         assert_eq!(shown(&s), [255, 0, 0, 255], "straight curves change nothing");
         assert!(s.filter_layer_settings());
@@ -3850,7 +3943,7 @@ mod tests {
         assert_eq!(shown(&s), [255, 0, 0, 255]);
         // Gradient Map: red's lightness (0.30) through black, grey and white
         s.delete_layer(curves);
-        let mapped = s.add_filter_layer("io.github.artcraftandroid.layer-toolbox.gradient_map".to_owned());
+        let mapped = s.add_filter_layer(format!("{INFINITE}.gradient_map"));
         assert_ne!(mapped, 0);
         let grey = shown(&s);
         assert!(grey[..3].iter().all(|c| c.abs_diff(77) <= 2), "{grey:?}");
@@ -3861,10 +3954,17 @@ mod tests {
     fn each_bundled_filter_layer_s_code_holds_up_and_reads_within_its_reach() {
         let dir = store("bundled-filter-layer-codes");
         let plugins = app_at(&dir);
-        assert!(plugins.set_on(LAYER_TOOLBOX.to_owned(), true));
-        assert!(plugins.set_switch(format!("{LAYER_TOOLBOX}.filter_layers"), true));
+        assert!(plugins.set_on(INFINITE.to_owned(), true));
+        assert!(plugins.set_switch(format!("{INFINITE}.filter_layers"), true));
         let defs = plugins.layer_filter_defs();
-        assert_eq!(defs.len(), 38);
+        // each by its id, and by the id it had in Layer tools, which artworks kept its layers by
+        assert_eq!(defs.len(), 2 * 38);
+        for (name, def) in &defs {
+            let key = name.rsplit('.').next().unwrap();
+            let now = &defs[&format!("{INFINITE}.{key}")];
+            assert_eq!((def.label.as_str(), &def.text, def.plugin.as_str()), (now.label.as_str(), &now.text, INFINITE));
+            assert!(name.starts_with(&format!("{INFINITE}.")) || name.starts_with(&format!("{LAYER_TOOLBOX}.")));
+        }
         for (name, def) in &defs {
             let keys = crate::plugin_file::value_names(&def.values);
             let mut keys = keys;
@@ -4288,17 +4388,17 @@ mod tests {
         use crate::KeyShortcut::{Erase, Selection, Undo};
         // Trace view's Solo is on Alt+S, which the app's S (selection) took as S
         let dir = store("bundled-alt-s");
-        let plugins = featured_app(&dir, VIEW_TOOLS, "trace_view");
+        let plugins = featured_app(&dir, INFINITE, "trace_view");
         let shortcut = |key: &str, alt: bool| plugins.key_shortcut(key.to_owned(), false, false, alt, false);
         let first = |text: &str| plugins.plugin_press_first(KeyCombo::read(text).unwrap());
         // off, Alt+S is the app's selection, as S is
         assert_eq!(shortcut("s", true), Some(Selection));
         assert!(!first("alt+s"));
-        assert!(plugins.set_on(VIEW_TOOLS.to_owned(), true));
+        assert!(plugins.set_on(INFINITE.to_owned(), true));
         // on, Alt+S and Alt+T are Solo's and Trace's; S alone is still the app's
         for (text, action) in [("alt+s", "solo"), ("alt+t", "trace")] {
             assert!(first(text), "{text}");
-            assert_eq!(press(&plugins, text), Some(PluginPressed::Action { key: format!("{VIEW_TOOLS}.{action}") }));
+            assert_eq!(press(&plugins, text), Some(PluginPressed::Action { key: format!("{INFINITE}.{action}") }));
         }
         assert_eq!(shortcut("s", true), None);
         assert_eq!(shortcut("s", false), Some(Selection));
@@ -4307,7 +4407,7 @@ mod tests {
         assert!(!first("command+alt+s"));
         assert_eq!(shortcut("e", true), Some(Erase));
         // the feature off, Alt+S is the app's again
-        assert!(plugins.set_switch(format!("{VIEW_TOOLS}.trace_view"), false));
+        assert!(plugins.set_switch(format!("{INFINITE}.trace_view"), false));
         assert!(!first("alt+s"));
         assert_eq!(shortcut("s", true), Some(Selection));
         let _ = std::fs::remove_dir_all(&dir);
@@ -4435,9 +4535,9 @@ mod tests {
 
     #[test]
     fn a_paper_is_kept_with_each_artwork_and_given_to_its_canvas() {
-        const PAPER: &str = "io.github.artcraftandroid.paper";
+        const PAPER: &str = INFINITE;
         let dir = store("bundled-paper");
-        let plugins = app_at(&dir);
+        let plugins = featured_app(&dir, PAPER, "paper");
         assert!(plugins.set_on(PAPER.to_owned(), true));
         let paper_of = |s: &crate::CanvasSession| s.shared.lock().plugin_paper.clone();
         // an artwork starts with none
@@ -4446,7 +4546,7 @@ mod tests {
         assert_eq!(paper_of(&one), None);
         // chosen for it: given to its canvas, and kept with it
         let edits = one.edits();
-        assert!(plugins.set_slider(format!("{PAPER}.paper"), 3.0).is_some());
+        assert!(plugins.set_slider(format!("{PAPER}.kind"), 3.0).is_some());
         assert!(plugins.set_slider(format!("{PAPER}.colour"), 2.0).is_some());
         assert_ne!(one.edits(), edits);
         // its tile drawn once a change, and given as drawn after: what the app asks each time the
@@ -4483,14 +4583,14 @@ mod tests {
         two.use_plugins(Arc::clone(&plugins));
         assert_eq!(paper_of(&two), None);
         assert!(
-            matches!(plugins.control(&format!("{PAPER}.paper")), Some(PluginControl::Slider { control }) if control.value == 0.0)
+            matches!(plugins.control(&format!("{PAPER}.kind")), Some(PluginControl::Slider { control }) if control.value == 0.0)
         );
         // the first opened again has its paper back
         let opened = crate::CanvasSession::open(saved.to_string_lossy().into_owned()).unwrap();
         opened.use_plugins(Arc::clone(&plugins));
         assert_eq!(paper_of(&opened), Some(given));
         // None takes it away
-        assert!(plugins.set_slider(format!("{PAPER}.paper"), 0.0).is_some());
+        assert!(plugins.set_slider(format!("{PAPER}.kind"), 0.0).is_some());
         opened.use_plugins(Arc::clone(&plugins));
         assert_eq!(paper_of(&opened), None);
         let _ = std::fs::remove_dir_all(&saved);
@@ -4499,9 +4599,9 @@ mod tests {
 
     #[test]
     fn paper_from_the_textures_is_the_apps_grain_or_a_picture_of_your_own_and_its_panel_shows_it() {
-        const PAPER: &str = "io.github.artcraftandroid.paper";
+        const PAPER: &str = INFINITE;
         let dir = store("bundled-paper-textures");
-        let plugins = app_at(&dir);
+        let plugins = featured_app(&dir, PAPER, "paper");
         let s = crate::CanvasSession::new(64, 48);
         assert!(plugins.set_on(PAPER.to_owned(), true));
         // the artwork's settings taken up first, as an artwork opening does
@@ -4509,7 +4609,7 @@ mod tests {
         let paper_of = |s: &crate::CanvasSession| s.shared.lock().plugin_paper.clone();
         let texture = format!("{PAPER}.texture");
         // Textures, none picked: no paper
-        assert!(plugins.set_slider(format!("{PAPER}.paper"), 7.0).is_some());
+        assert!(plugins.set_slider(format!("{PAPER}.kind"), 7.0).is_some());
         s.use_plugins(Arc::clone(&plugins));
         assert_eq!(paper_of(&s), None);
         // the app's grain 19 of the Source Library: its tile, as it is
@@ -4541,14 +4641,14 @@ mod tests {
 
     #[test]
     fn paper_of_your_own_picture_any_colour_and_a_tooth_reach_the_canvas_and_off_leave_it_as_it_was() {
-        const PAPER: &str = "io.github.artcraftandroid.paper";
+        const PAPER: &str = INFINITE;
         let dir = store("bundled-paper-own");
-        let plugins = app_at(&dir);
+        let plugins = featured_app(&dir, PAPER, "paper");
         let s = crate::CanvasSession::new(64, 48);
         s.use_plugins(Arc::clone(&plugins));
         let paper_of = |s: &crate::CanvasSession| s.shared.lock().plugin_paper.clone();
         // as it comes, off: no paper, whatever it is set to
-        assert!(plugins.set_slider(format!("{PAPER}.paper"), 6.0).is_some());
+        assert!(plugins.set_slider(format!("{PAPER}.kind"), 6.0).is_some());
         s.use_plugins(Arc::clone(&plugins));
         assert_eq!(paper_of(&s), None);
         assert!(plugins.set_on(PAPER.to_owned(), true));
@@ -4586,10 +4686,17 @@ mod tests {
         let colour = given.colour.unwrap();
         assert!(colour.iter().all(|c| (0.43..0.51).contains(c)) && colour[0] > colour[2], "{colour:?}");
         // a paper drawn here again: its own tile, no picture kept
-        assert!(plugins.set_slider(format!("{PAPER}.paper"), 1.0).is_some());
+        assert!(plugins.set_slider(format!("{PAPER}.kind"), 1.0).is_some());
         s.use_plugins(Arc::clone(&plugins));
         assert_ne!(paper_of(&s).unwrap().tile, given.tile);
         assert!(s.shared.lock().paper_picture.is_none());
+        // its feature off, the plugin on: none
+        assert!(plugins.set_switch(format!("{PAPER}.paper"), false));
+        s.use_plugins(Arc::clone(&plugins));
+        assert_eq!(paper_of(&s), None);
+        assert!(plugins.set_switch(format!("{PAPER}.paper"), true));
+        s.use_plugins(Arc::clone(&plugins));
+        assert!(paper_of(&s).is_some());
         // off: as it was
         assert!(plugins.set_on(PAPER.to_owned(), false));
         s.use_plugins(Arc::clone(&plugins));
@@ -4604,15 +4711,15 @@ mod tests {
     #[test]
     #[ignore]
     fn paper_tile_cost() {
-        const PAPER: &str = "io.github.artcraftandroid.paper";
+        const PAPER: &str = INFINITE;
         let dir = store("bundled-paper-cost");
-        let plugins = app_at(&dir);
+        let plugins = featured_app(&dir, PAPER, "paper");
         assert!(plugins.set_on(PAPER.to_owned(), true));
         let mut times = Vec::new();
         for _ in 0..5 {
             // another paper drawn between, so each time this one is drawn again
             for (paper, timed) in [(1.0, false), (3.0, true)] {
-                assert!(plugins.set_slider(format!("{PAPER}.paper"), paper).is_some());
+                assert!(plugins.set_slider(format!("{PAPER}.kind"), paper).is_some());
                 let hooks = plugins.hooks();
                 let t = std::time::Instant::now();
                 assert!(hooks.paper().is_some());
@@ -5004,7 +5111,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    const COLOUR_EXTRAS: &str = COLOUR_TOOLS;
+    const COLOUR_EXTRAS: &str = INFINITE;
 
     #[test]
     fn colour_extras_steps_the_sliders_and_shows_the_colour_before_each_by_its_switch() {
@@ -5028,7 +5135,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    const TRACE_VIEW: &str = VIEW_TOOLS;
+    const TRACE_VIEW: &str = INFINITE;
 
     #[test]
     fn trace_view_shows_the_layer_alone_or_the_others_dimmed_from_its_keys_its_choice_or_its_row() {
@@ -5091,10 +5198,10 @@ mod tests {
     fn lasso_fill_s_brushes_join_the_library_once_it_is_open_and_once_only() {
         let dir = store("bundled-lasso-fill-brushes");
         let brushes = std::path::Path::new(&dir).join("brushes").to_string_lossy().into_owned();
-        let plugins = app_at(&dir);
+        let plugins = featured_app(&dir, LASSO_FILL, "lasso_fill");
         let fills = |s: &crate::CanvasSession| s.shared.lock().library.iter().filter(|set| set.name == "Fills").count();
         // the import screen says it comes with brushes
-        let file = crate::bundled::BUNDLED.iter().find(|(name, _)| *name == "lasso-fill").unwrap().1;
+        let file = crate::bundled::BUNDLED.iter().find(|(name, _)| *name == "infinite-plugins").unwrap().1;
         assert!(plugins.inspect(file.to_vec()).message.contains("comes with a set of brushes"));
         // as it comes, off: no brushes of its
         let s = viewed();
@@ -5103,9 +5210,15 @@ mod tests {
         assert_eq!(fills(&s), 0);
         assert!(!s.take_brushes_changed());
         let sets = s.shared.lock().library.len();
-        // on: its Fills at the top of the library, each filling by the plugin's row; the app told
-        // the library changed, every set a place on, to read it again
+        // on, Lasso fill's switch off: none either
+        assert!(plugins.set_switch(format!("{LASSO_FILL}.lasso_fill"), false));
         assert!(plugins.set_on(LASSO_FILL.to_owned(), true));
+        s.use_plugins(Arc::clone(&plugins));
+        assert_eq!(fills(&s), 0);
+        assert!(!s.take_brushes_changed());
+        // its switch on: its Fills at the top of the library, each filling by the plugin's row; the
+        // app told the library changed, every set a place on, to read it again
+        assert!(plugins.set_switch(format!("{LASSO_FILL}.lasso_fill"), true));
         s.use_plugins(Arc::clone(&plugins));
         assert_eq!(s.shared.lock().library.len(), sets + 1);
         assert!(s.take_brushes_changed());
@@ -5155,10 +5268,19 @@ mod tests {
         v.use_plugins(Arc::clone(&plugins));
         assert!(!v.open_brushes(elsewhere));
         assert_eq!(fills(&v), 1);
+        // brushes given the set by the Lasso fill plugin before Infinite Plugins took its place
+        // aren't given it again: it is the same set
+        let before = std::path::Path::new(&dir).join("before");
+        std::fs::create_dir_all(&before).unwrap();
+        std::fs::write(before.join("plugin-sets.txt"), "io.github.artcraftandroid.lasso-fill\n").unwrap();
+        let w = viewed();
+        w.use_plugins(Arc::clone(&plugins));
+        assert!(!w.open_brushes(before.to_string_lossy().into_owned()));
+        assert_eq!(fills(&w), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    const LASSO_FILL: &str = "io.github.artcraftandroid.lasso-fill";
+    const LASSO_FILL: &str = INFINITE;
 
     #[test]
     fn lasso_fill_fills_every_stroke_while_its_switch_is_on_and_a_brush_s_own_by_its_row() {
@@ -5173,7 +5295,7 @@ mod tests {
             }
         };
         let dir = store("bundled-lasso-fill");
-        let plugins = app_at(&dir);
+        let plugins = featured_app(&dir, LASSO_FILL, "lasso_fill");
         let hooks = plugins.hooks();
         // as it comes, off: no stroke fills, whatever the brush says
         assert!(!card(&plugins, LASSO_FILL).on);
@@ -5357,7 +5479,7 @@ mod tests {
         Old { name: "colour-labels", now: COLOUR_TOOLS, switches: &["colour_labels"], values: &[] },
         Old {
             name: "colour-extras",
-            now: COLOUR_TOOLS,
+            now: INFINITE,
             switches: &["colour_extras"],
             values: &[("steps", "true", "steps"), ("compare", "true", "compare")],
         },
@@ -5452,7 +5574,7 @@ mod tests {
         },
         Old {
             name: "trace-view",
-            now: VIEW_TOOLS,
+            now: INFINITE,
             switches: &["trace_view"],
             values: &[("view", "2", "view"), ("dim", "0.5", "dim")],
         },
@@ -5551,6 +5673,30 @@ mod tests {
         Old { name: "extract-lines", now: LAYER_TOOLBOX, switches: &["effects", "extract_lines"], values: &[] },
         Old { name: "outline", now: LAYER_TOOLBOX, switches: &["effects", "outline"], values: &[] },
         Old { name: "posterise", now: LAYER_TOOLBOX, switches: &["effects", "posterise"], values: &[] },
+        Old {
+            name: "lasso-fill",
+            now: INFINITE,
+            switches: &["lasso_fill"],
+            values: &[("every", "true", "every"), ("growing", "false", "growing"), ("eraser", "true", "eraser")],
+        },
+        Old {
+            name: "paper",
+            now: INFINITE,
+            switches: &["paper"],
+            values: &[
+                ("paper", "3", "kind"),
+                ("colour", "2", "colour"),
+                ("grain", "0.4", "grain"),
+                ("size", "2", "size"),
+                ("shown", "0.5", "shown"),
+                ("tooth", "0.25", "tooth"),
+                ("own_colour", "true", "own_colour"),
+                ("hue", "200", "hue"),
+                ("saturation", "0.3", "saturation"),
+                ("brightness", "0.8", "brightness"),
+                ("texture", "19", "texture"),
+            ],
+        },
     ];
 
     /// The key a value kept as `key` (its last part, or a setting the app used to have) of plugin
@@ -5619,9 +5765,9 @@ mod tests {
                 assert!(same_value(&got, value), "{id} off: {now}: {got}, not {value}");
             }
         }
-        // thirteen in all, each off as the app comes
+        // twelve in all, each off as the app comes
         let plugins = app_at(&dir);
-        assert_eq!(plugins.plugins().len(), 13);
+        assert_eq!(plugins.plugins().len(), 12);
         assert!(plugins.plugins().iter().all(|p| !p.on));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5732,6 +5878,242 @@ mod tests {
         let rows = card(&plugins, BRUSH_EXTRAS).brush_controls;
         let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
         assert_eq!(keys, ["plugin:io.github.artcraftandroid.brush-sounds:sound"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- what moved into Infinite Plugins (interface 19)
+
+    /// A feature taken into Infinite Plugins from a plugin that stays: that plugin, the feature's
+    /// key there, and its values someone changed as kept there (its key's last part), each with the
+    /// key's last part it is kept under now.
+    /// A value someone changed: its key's last part there, as kept, and its key's last part now.
+    type TakenValue = (&'static str, &'static str, &'static str);
+
+    const TAKEN: &[(&str, &str, &[TakenValue])] = &[
+        (VIEW_TOOLS, "trace_view", &[("view", "2", "view"), ("dim", "0.4", "dim")]),
+        (LAYER_TOOLBOX, "filter_layers", &[]),
+        (COLOUR_TOOLS, "colour_extras", &[("steps", "true", "steps"), ("compare", "true", "compare")]),
+    ];
+
+    #[test]
+    fn what_a_feature_taken_from_a_plugin_that_stays_kept_comes_back_under_infinite_plugins() {
+        let dir = store("infinite-taken");
+        for (from, feature, values) in TAKEN {
+            // as an earlier app kept it: the plugin's on or off, the feature's switch, its values
+            let lines_of = |on: bool, feature_on: bool| {
+                let mut lines = vec![format!("{from}.on {on}"), format!("{from}.{feature} {feature_on}")];
+                lines.extend(values.iter().map(|(key, value, _)| format!("{from}.{key} {value}")));
+                lines
+            };
+            let taken = |plugins: &Plugins, what: &str| {
+                for (key, value, now) in *values {
+                    let got = kept_value(plugins, &format!("{INFINITE}.{now}"));
+                    assert!(same_value(&got, value), "{what}: {key} as {now}: {got}, not {value}");
+                }
+            };
+            // the plugin and the feature on, in either order: Infinite Plugins on with the feature,
+            // its values taken; the plugin it came from on as it was
+            for reversed in [false, true] {
+                let plugins = app_at(&dir);
+                let mut lines = lines_of(true, true);
+                if reversed {
+                    lines.reverse();
+                }
+                read_lines(&plugins, &lines);
+                assert!(card(&plugins, INFINITE).on, "{from}.{feature}");
+                assert!(switch_of(&plugins, &format!("{INFINITE}.{feature}")), "{feature}");
+                assert!(card(&plugins, from).on, "{from}");
+                taken(&plugins, feature);
+                // and from then on kept as its own, its old keys no more
+                let kept = plugins.kept_lines();
+                assert!(kept.contains(&format!("{INFINITE}.on true")), "{kept:?}");
+                assert!(kept.contains(&format!("{INFINITE}.{feature} true")), "{kept:?}");
+                let old = |line: &String| {
+                    line.starts_with(&format!("{from}.{feature} "))
+                        || values.iter().any(|(key, ..)| line.starts_with(&format!("{from}.{key} ")))
+                };
+                assert!(!kept.iter().any(old), "{kept:?}");
+                // through the next start, as kept now
+                let next = app_at(&dir);
+                read_lines(&next, &kept);
+                assert_eq!(next.plugins(), plugins.plugins(), "{feature}");
+            }
+            // the plugin off, or the feature: Infinite Plugins stays off, the feature's switch as
+            // it was, its values taken all the same
+            for (on, feature_on) in [(false, true), (true, false), (false, false)] {
+                let plugins = app_at(&dir);
+                read_lines(&plugins, &lines_of(on, feature_on));
+                assert!(!card(&plugins, INFINITE).on, "{feature}: {on} {feature_on}");
+                assert_eq!(switch_of(&plugins, &format!("{INFINITE}.{feature}")), feature_on, "{feature}");
+                taken(&plugins, feature);
+            }
+            // its own on or off read back too, before or after, says instead
+            for first in [false, true] {
+                let plugins = app_at(&dir);
+                let mut lines = lines_of(true, true);
+                lines.insert(if first { 0 } else { lines.len() }, format!("{INFINITE}.on false"));
+                read_lines(&plugins, &lines);
+                assert!(!card(&plugins, INFINITE).on, "{feature}: its own first {first}");
+                assert!(switch_of(&plugins, &format!("{INFINITE}.{feature}")));
+            }
+        }
+        // all three at once, with Lasso fill's plugin off: one Infinite Plugins, those three on
+        let plugins = app_at(&dir);
+        let mut lines = vec!["io.github.artcraftandroid.lasso-fill.on false".to_owned()];
+        for (from, feature, _) in TAKEN {
+            lines.extend([format!("{from}.on true"), format!("{from}.{feature} true")]);
+        }
+        read_lines(&plugins, &lines);
+        assert!(card(&plugins, INFINITE).on);
+        let on: Vec<String> = card(&plugins, INFINITE)
+            .features
+            .iter()
+            .filter(|f| f.control.on)
+            .map(|f| f.control.label.clone())
+            .collect();
+        assert_eq!(on, ["Trace view", "Filter layers", "Colour extras"]);
+        // and each does what it did: Trace dims, the colour panel steps, filter layers are offered
+        assert!(plugins.set_slider(format!("{INFINITE}.view"), 2.0).is_some());
+        assert!((plugins.hooks().view_dim_others() - 0.7).abs() < 1e-6);
+        assert!(plugins.set_switch(format!("{INFINITE}.steps"), true));
+        assert!(plugins.colour_steps() && !plugins.colour_before());
+        assert_eq!(plugins.layer_filters().len(), 38);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_artwork_s_filter_layer_kept_by_its_layer_tools_id_shows_as_it_did() {
+        const OLD_INVERT: &str = "io.github.artcraftandroid.layer-toolbox.invert";
+        let dir = store("infinite-old-filter-layer");
+        let plugins = featured_app(&dir, INFINITE, "filter_layers");
+        let Some(s) = crate::tests::session(32, 32) else { return };
+        s.set_color(1.0, 0.0, 0.0);
+        let base = s.layers().last().unwrap().id;
+        assert!(s.fill_layer(base));
+        let shown = |s: &crate::CanvasSession| crate::tests::pixel(s, 16, 16);
+        // off: no filter offered by its old id either
+        s.use_plugins(Arc::clone(&plugins));
+        assert_eq!(s.add_filter_layer(OLD_INVERT.to_owned()), 0);
+        // on: a layer as an earlier app kept it, by Layer tools' id, shows inverted
+        assert!(plugins.set_on(INFINITE.to_owned(), true));
+        s.use_plugins(Arc::clone(&plugins));
+        let layer = s.add_filter_layer(OLD_INVERT.to_owned());
+        assert_ne!(layer, 0);
+        assert_eq!(shown(&s), [0, 255, 255, 255]);
+        let row = s.layers().into_iter().find(|l| l.id == layer).unwrap();
+        assert_eq!(row.filter.as_deref(), Some("Invert"));
+        // its settings (Infinite Plugins' own) open and set it as ever, the layer keeping its id
+        assert!(s.filter_layer_settings());
+        let landed = s.plugin_filter_slider(format!("{INFINITE}.invert.value"), 0.0, false).unwrap();
+        assert!(landed.abs() < 1e-5, "{landed}");
+        assert!(s.adjustment_end(true));
+        let grey = shown(&s);
+        assert!(grey[..3].iter().all(|c| c.abs_diff(128) <= 1), "half inverted: {grey:?}");
+        let kept = s.shared.lock().doc.layer(procraft_engine::document::LayerId(layer)).unwrap().filter.clone();
+        assert_eq!(kept.map(|f| f.filter).as_deref(), Some(OLD_INVERT));
+        // the feature off: it shows nothing, as any filter layer whose filter is off
+        assert!(plugins.set_switch(format!("{INFINITE}.filter_layers"), false));
+        s.use_plugins(Arc::clone(&plugins));
+        assert_eq!(shown(&s), [255, 0, 0, 255]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_artwork_s_paper_kept_by_the_paper_plugin_s_keys_comes_back_and_its_own_say_instead() {
+        const OLD: &str = "io.github.artcraftandroid.paper";
+        let dir = store("infinite-old-paper-artwork");
+        let plugins = featured_app(&dir, INFINITE, "paper");
+        assert!(plugins.set_on(INFINITE.to_owned(), true));
+        let kind = |plugins: &Plugins| slider_value(plugins, &format!("{INFINITE}.kind"));
+        // an artwork the Paper plugin kept Rough on, in Cream, its grain at 40%
+        let one = crate::CanvasSession::new(64, 48);
+        for (key, value) in [("paper", 3.0), ("colour", 2.0), ("grain", 0.4)] {
+            one.keep_plugin_value(format!("{OLD}.{key}"), value);
+        }
+        one.use_plugins(Arc::clone(&plugins));
+        assert_eq!(kind(&plugins), 3.0);
+        assert_eq!(slider_value(&plugins, &format!("{INFINITE}.colour")), 2.0);
+        assert!((slider_value(&plugins, &format!("{INFINITE}.grain")) - 0.4).abs() < 1e-6);
+        let given = one.shared.lock().plugin_paper.clone().unwrap();
+        assert!((given.strength - 0.4).abs() < 1e-6, "{}", given.strength);
+        let cream = [0xF4, 0xEC, 0xD8].map(|c| c as f32 / 255.0);
+        assert_eq!(given.colour, Some(cream));
+        // what isn't kept starts as it starts
+        assert_eq!(slider_value(&plugins, &format!("{INFINITE}.size")), 1.0);
+        // set again now, kept under its own key, which says instead from then on
+        assert!(plugins.set_slider(format!("{INFINITE}.kind"), 1.0).is_some());
+        let values = one.plugin_values();
+        assert_eq!((values[&format!("{INFINITE}.kind")], values[&format!("{OLD}.paper")]), (1.0, 3.0));
+        let two = crate::CanvasSession::new(64, 48);
+        for (key, value) in values {
+            two.keep_plugin_value(key, value);
+        }
+        two.use_plugins(Arc::clone(&plugins));
+        assert_eq!(kind(&plugins), 1.0);
+        // an artwork with none kept: none
+        let three = crate::CanvasSession::new(64, 48);
+        three.use_plugins(Arc::clone(&plugins));
+        assert_eq!((kind(&plugins), three.shared.lock().plugin_paper.clone()), (0.0, None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_old_paper_kept_on_the_disk_goes_whole_its_pictures_with_infinite_plugins() {
+        const OLD: &str = "io.github.artcraftandroid.paper";
+        let dir = store("infinite-old-paper-disk");
+        let store_path = std::path::Path::new(&dir);
+        // as an earlier app left it: Paper on, Your own paper chosen, a picture picked for its third
+        let earlier = at(&dir);
+        let old = old_file(
+            "paper",
+            json!([
+                { "key": "paper", "type": "slider", "label": "Paper", "least": 0, "most": 7, "step": 1, "starts": 0 },
+                { "key": "picture", "type": "file", "label": "Your own paper", "accepts": "picture" },
+                { "key": "picture3", "type": "file", "label": "Your own paper 3", "accepts": "picture" },
+            ]),
+        );
+        assert_eq!(earlier.install(old), None);
+        assert!(earlier.set_on(OLD.to_owned(), true));
+        assert_eq!(earlier.set_slider(format!("{OLD}.paper"), 6.0), Some(6.0));
+        let png = crate::project::png_of(4, 4, &[200; 64]).unwrap();
+        assert!(earlier.set_picture_file(format!("{OLD}.picture3"), "weave.png".to_owned(), png.clone()));
+        let lines = earlier.kept_lines();
+        // the app comes with Infinite Plugins now: the old one goes from the disk, its picture first
+        let now = app_with(&dir, &all_bundled());
+        read_lines(&now, &lines);
+        assert!(!has(&now, OLD) && !dir_holds(&dir, OLD));
+        assert!(card(&now, INFINITE).on && switch_of(&now, &format!("{INFINITE}.paper")));
+        assert_eq!(slider_value(&now, &format!("{INFINITE}.kind")), 6.0);
+        let key = format!("{INFINITE}.picture3");
+        let (file, name) = plugin_file::chosen_paths(store_path, INFINITE, &key);
+        assert_eq!(std::fs::read(&file).ok(), Some(png));
+        assert_eq!(std::fs::read_to_string(&name).ok().as_deref(), Some("weave.png"));
+        let chosen = |plugins: &Plugins, key: &str| match plugins.control(key) {
+            Some(PluginControl::File { control }) => control.chosen,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(chosen(&now, &key).as_deref(), Some("weave.png"));
+        assert_eq!(chosen(&now, &format!("{INFINITE}.picture")), None);
+        // and so on the next start
+        let next = app_at(&dir);
+        read_lines(&next, &now.kept_lines());
+        assert_eq!(chosen(&next, &key).as_deref(), Some("weave.png"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lasso_fill_s_brush_rows_are_kept_under_the_key_its_brushes_kept_them_by() {
+        let dir = store("infinite-rows");
+        let plugins = featured_app(&dir, INFINITE, "lasso_fill");
+        assert!(plugins.set_on(INFINITE.to_owned(), true));
+        let keys: Vec<String> = card(&plugins, INFINITE).brush_controls.into_iter().map(|r| r.key).collect();
+        assert_eq!(
+            keys,
+            ["plugin:io.github.artcraftandroid.lasso-fill:fill", "plugin:io.github.artcraftandroid.lasso-fill:shown"]
+        );
+        // with its feature off, none
+        assert!(plugins.set_switch(format!("{INFINITE}.lasso_fill"), false));
+        assert!(card(&plugins, INFINITE).brush_controls.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

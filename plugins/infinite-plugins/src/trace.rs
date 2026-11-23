@@ -106,7 +106,7 @@ pub fn touched(row: usize, value: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LAYER_VIEW, procraft_action, procraft_control, procraft_panel_event};
+    use crate::{LAYER_VIEW, procraft_action, procraft_control};
 
     #[test]
     fn normal_dims_none_solo_all_the_way_and_trace_as_its_slider_says() {
@@ -144,8 +144,8 @@ mod tests {
         procraft_action(SOLO_KEY as i32);
         assert_eq!((CONTROLS.get(VIEW), procraft_view_dim_others()), (NORMAL, 0.0));
         // the panel: Trace chosen, then its dim at 40%
-        procraft_panel_event(0, TRACE);
-        procraft_panel_event(1, 40.0);
+        touched(0, TRACE);
+        touched(1, 40.0);
         assert!((procraft_view_dim_others() - 0.4).abs() < 1e-6);
         // and as it reads the controls back
         assert!(panel().json().contains(r#""chosen":2"#) && panel().json().contains(r#""value":40"#));
@@ -162,8 +162,8 @@ mod tests {
         procraft_action(TRACE_KEY as i32);
         procraft_action(SOLO_KEY as i32);
         procraft_action(LAYER_VIEW as i32);
-        procraft_panel_event(0, TRACE);
-        procraft_panel_event(1, 40.0);
+        touched(0, TRACE);
+        touched(1, 40.0);
         assert_eq!((CONTROLS.get(VIEW), CONTROLS.get(DIM)), (SOLO, 0.7));
         procraft_control(FEATURE as i32, 1.0);
         assert_eq!(procraft_view_dim_others(), 1.0);

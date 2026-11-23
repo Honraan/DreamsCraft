@@ -1,10 +1,10 @@
 [package]
-name = "paper"
-version = "1.2.0"
+name = "infinite-plugins"
+version = "1.0.0"
 edition = "2024"
 publish = false
 license = "MIT OR Apache-2.0"
-description = "A plugin for ProCraft: papers of its own every stroke takes as a grain fixed to the canvas, shown under the art in a colour of its own"
+description = "A plugin for ProCraft: lasso fill, paper, Trace view, filter layers and colour extras, each with a switch of its own"
 
 [lib]
 crate-type = ["cdylib"]

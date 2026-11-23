@@ -5,24 +5,15 @@
 //! textured with the app's own grains (`brushes.brushset`, written by the core's
 //! `write_the_fill_brushes` test). The fill shows as it grows, or as a plain stroke filled as the
 //! pen lifts: for every stroke as its switch says, for a brush's own as its Fill shown row says. The
-//! eraser takes away what it goes round only while Eraser too is on. It's a plugin, not part of the
-//! app: `tools/pack_plugin.py` makes a `.procraft-plugin` file of it.
+//! eraser takes away what it goes round only while Eraser too is on. Off, every stroke paints as
+//! usual, whatever its brush's rows say, and its brushes come no more (those given stay).
 //!
 //! The app asks the stroke-fill hook as each stroke begins, after telling the brush's rows; how a
-//! region is filled (the winding rule, the colour, the paper, the selection) is the app's. The
-//! interface is written down at the top of `crates/core/src/plugin_run.rs`.
-
-#![cfg_attr(not(test), no_std)]
+//! region is filled (the winding rule, the colour, the paper, the selection) is the app's.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-/// The controls by their place, as the manifest starts them: every stroke fills, the fill shows
-/// as it grows, and the eraser fills too.
-static CONTROLS: kit::Controls<3> = kit::Controls::new([0.0, 1.0, 0.0]);
-kit::controls!(CONTROLS);
-const EVERY: usize = 0;
-const GROWING: usize = 1;
-const ERASER: usize = 2;
+use crate::{CONTROLS, ERASER, EVERY, GROWING, LASSO_FILL as FEATURE};
 
 /// How the app numbers the tools it asks about.
 const PAINT: i32 = 0;
@@ -48,6 +39,9 @@ pub extern "C" fn procraft_brush_control(index: i32, value: f32) {
 /// brush's Fill shown row says, else as the switch for every stroke says.
 #[unsafe(no_mangle)]
 pub extern "C" fn procraft_stroke_fill(tool: i32, _pointer: i32) -> i32 {
+    if !CONTROLS.on(FEATURE) {
+        return 0;
+    }
     let brush = f32::from_bits(ROW.load(Ordering::Relaxed)) >= 0.5;
     let fills = match tool {
         PAINT => CONTROLS.on(EVERY) || brush,
@@ -62,19 +56,16 @@ pub extern "C" fn procraft_stroke_fill(tool: i32, _pointer: i32) -> i32 {
     }
 }
 
-#[cfg(not(test))]
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    core::arch::wasm32::unreachable()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procraft_control;
 
+    /// Every stroke, growing and the eraser set as `controls` says, the brush's Fill row `row` and
+    /// its Fill shown as it's drawn.
     fn set(controls: [f32; 3], row: f32) {
-        for (i, v) in controls.into_iter().enumerate() {
-            procraft_control(i as i32, v);
+        for (at, v) in [EVERY, GROWING, ERASER].into_iter().zip(controls) {
+            procraft_control(at as i32, v);
         }
         procraft_brush_control(0, row);
         procraft_brush_control(1, 0.0);
@@ -82,6 +73,7 @@ mod tests {
 
     #[test]
     fn strokes_fill_while_the_switch_or_the_brush_says_and_show_as_its_switch_says() {
+        let _turn = crate::fresh(FEATURE);
         // as it starts: nothing fills
         set([0.0, 1.0, 0.0], 0.0);
         assert_eq!((procraft_stroke_fill(PAINT, 1), procraft_stroke_fill(ERASE, 1)), (0, 0));
@@ -104,5 +96,17 @@ mod tests {
         // a smudge, or a tool it doesn't know, never
         set([1.0, 1.0, 1.0], 1.0);
         assert_eq!((procraft_stroke_fill(2, 1), procraft_stroke_fill(7, 1)), (0, 0));
+    }
+
+    #[test]
+    fn with_its_switch_off_every_stroke_paints_whatever_the_brush_says() {
+        let _turn = crate::fresh(FEATURE);
+        set([1.0, 1.0, 1.0], 1.0);
+        assert_eq!((procraft_stroke_fill(PAINT, 1), procraft_stroke_fill(ERASE, 1)), (1, 1));
+        procraft_control(FEATURE as i32, 0.0);
+        assert_eq!((procraft_stroke_fill(PAINT, 1), procraft_stroke_fill(ERASE, 1)), (0, 0));
+        procraft_control(FEATURE as i32, 1.0);
+        assert_eq!(procraft_stroke_fill(PAINT, 1), 1);
+        set([0.0, 1.0, 0.0], 0.0);
     }
 }

@@ -24,13 +24,15 @@ const MANIFEST: &str = "craft-extension.json";
 /// The manifest format read here: a newer one may mean anything, so it is refused.
 const SCHEMA: u64 = 1;
 /// What a plugin's code is written to, see [`crate::plugin_run`]: a newer one is refused too.
-const INTERFACE: u32 = 18;
+const INTERFACE: u32 = 19;
 /// The first interface with features (several plugins' worth in one, each a switch of its own).
 const FEATURES_FROM: u32 = 16;
 /// The interface filter layers came in.
 const FILTER_LAYERS_FROM: u32 = 17;
 /// The interface filter layers' editors (curves, a gradient) came in.
 const FILTER_EDITORS_FROM: u32 = 18;
+/// The interface features taken from a plugin that stays, and brushes under a switch, came in.
+const TAKES_FROM: u32 = 19;
 /// A plugin of features: so many features, controls under each (besides its own switch) and
 /// actions under each; and in all so many controls (files among them), hooks and actions.
 const MOST_FEATURES: usize = 16;
@@ -67,6 +69,8 @@ const MOST_LAYER_FILTERS: usize = 64;
 const MOST_LAYER_FILTER_VALUES: usize = procraft_gpu::MOST_LAYER_FILTER_VALUES;
 const MOST_GROUP: usize = 24;
 const MOST_REPLACES: usize = 16;
+/// The most features a plugin takes from others that stay.
+const MOST_TAKES: usize = 8;
 /// How far an entry may shrink in the archive, from this size on: text never gets near it.
 const MOST_RATIO: usize = 100;
 const RATIO_FROM: usize = 64 << 10;
@@ -201,11 +205,19 @@ pub(crate) struct Shape {
     /// None for a plugin with one filter, in `filter.wgsl`.
     pub filters: Vec<ListedFilter>,
     pub replaces: Vec<Replaced>,
+    /// The features it takes from plugins that stay (interface 19).
+    pub takes: Vec<Taken>,
     pub menu: Option<Menu>,
     /// The switch each of its rows in the brush studio comes under: shown only while it is on.
     pub brush_under: Vec<Option<usize>>,
     /// Its features (interface 16), in their order: none for a plugin written without.
     pub features: Vec<Feature>,
+    /// The switch its set of brushes comes under (interface 19): given to the library only while
+    /// that is on.
+    pub brushes_under: Option<usize>,
+    /// The plugin it takes the place of whose set of brushes its own is (interface 19): one given
+    /// before as that one's isn't given again.
+    pub brushes_from: Option<String>,
 }
 
 /// One of the features of a plugin made of several (interface 16): a switch at the top of its list,
@@ -289,6 +301,20 @@ pub(crate) struct Replaced {
     pub marks: bool,
 }
 
+/// A feature it takes from a plugin that stays (interface 19), by that plugin's id: the key that
+/// feature's switch was kept under (`<id>.<feature>`), the switch here that takes it (a feature),
+/// each of its controls by the key its value was kept under with the place of the control taking
+/// it, and whether its filter layers (those under that switch here) answer to the ids they had
+/// there (`<id>.<key>`), so the layers an artwork kept of them go on showing.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Taken {
+    pub id: String,
+    pub feature: String,
+    pub switch: usize,
+    pub controls: Vec<(String, usize)>,
+    pub filters: bool,
+}
+
 /// How many switches may stand above a control: a switch at the top, one under it and one under
 /// that, the top a feature (interface 16); without features, one fewer.
 const MOST_ABOVE: usize = 3;
@@ -346,6 +372,32 @@ impl Shape {
     /// marks it keeps, or `id`, its own.
     pub(crate) fn marks_id<'a>(&'a self, id: &'a str) -> &'a str {
         self.replaces.iter().find(|r| r.marks).map_or(id, |r| r.id.as_str())
+    }
+
+    /// The id its set of brushes is given by: that of the plugin it takes the place of whose set it
+    /// is, or `id`, its own.
+    pub(crate) fn brushes_id<'a>(&'a self, id: &'a str) -> &'a str {
+        self.brushes_from.as_deref().unwrap_or(id)
+    }
+
+    /// The keys the value of control `at` was kept under before it was this one's: by a plugin it
+    /// takes the place of, or one it takes a feature from (interface 19).
+    pub(crate) fn kept_before(&self, at: usize) -> impl Iterator<Item = &str> {
+        let replaced = self.replaces.iter().flat_map(|r| &r.controls);
+        let taken = self.takes.iter().flat_map(|t| &t.controls);
+        replaced.chain(taken).filter(move |(_, to)| *to == at).map(|(key, _)| key.as_str())
+    }
+
+    /// The ids filter layer `filter` (its id here) had before it was this one's: under a feature
+    /// taken whose filter layers answer to their ids there (interface 19).
+    pub(crate) fn filter_was(&self, filter: &ListedFilter, plugin: &str) -> Vec<String> {
+        let Some(key) = filter.id.strip_prefix(plugin).and_then(|rest| rest.strip_prefix('.')) else {
+            return Vec::new();
+        };
+        let feature = self.feature_under(filter.under);
+        let theirs =
+            self.takes.iter().filter(|t| t.filters && feature.is_some() && self.feature_of(t.switch) == feature);
+        theirs.map(|t| format!("{}.{key}", t.id)).collect()
     }
 }
 
@@ -418,6 +470,10 @@ struct RawManifest {
     filters: Vec<RawFilter>,
     #[serde(default)]
     replaces: Vec<RawReplaced>,
+    #[serde(default)]
+    takes: Vec<RawTaken>,
+    #[serde(default)]
+    brushes: Option<RawBrushes>,
     #[serde(default)]
     menu: Option<RawMenu>,
 }
@@ -618,6 +674,31 @@ struct RawReplaced {
     controls: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     marks: bool,
+}
+
+/// A feature this one takes from a plugin that stays (interface 19): that plugin's id, the key of
+/// the feature's switch there, the key of the feature here that takes it, the feature's controls'
+/// keys there, each with the key of the control here that takes its value, and whether its filter
+/// layers answer to the ids they had there.
+#[derive(Deserialize)]
+struct RawTaken {
+    id: String,
+    feature: String,
+    switch: String,
+    #[serde(default)]
+    controls: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    filters: bool,
+}
+
+/// What a plugin's set of brushes comes under (interface 19): the key of the switch it is given
+/// while on, and the id of the plugin it takes the place of whose set it is.
+#[derive(Deserialize)]
+struct RawBrushes {
+    #[serde(default)]
+    under: Option<String>,
+    #[serde(default)]
+    from: Option<String>,
 }
 
 /// A brush engine a plugin has: its key, what it is called, and the endings of the names of the
@@ -1127,6 +1208,7 @@ fn read_manifest(text: &[u8]) -> Result<Manifest, Refusal> {
         &raw.actions,
         &raw.filters,
         &raw.replaces,
+        (&raw.takes, raw.brushes.as_ref()),
         &raw.brush_controls,
         menu_under,
         compat.interface,
@@ -1190,6 +1272,10 @@ fn read_manifest(text: &[u8]) -> Result<Manifest, Refusal> {
         return Err(Refusal::Described);
     }
     let brushes = fits(BRUSH_SET, MOST_ENTRY) == has(PluginPart::Brushes).then_some(true);
+    let set_said = shape.brushes_under.is_some() || shape.brushes_from.is_some();
+    if set_said && !has(PluginPart::Brushes) {
+        return Err(Refusal::Described);
+    }
     if !module || !filter || !filters || !brushes {
         return Err(Refusal::Described);
     }
@@ -1405,6 +1491,7 @@ fn shape_of(
     actions: &[RawAction],
     listed: &[RawFilter],
     replacing: &[RawReplaced],
+    (taking, brushes): (&[RawTaken], Option<&RawBrushes>),
     brush_rows: &[RawBrushControl],
     menu_under: Option<&str>,
     interface: Option<u32>,
@@ -1560,6 +1647,48 @@ fn shape_of(
     if marking > 1 || (marking == 1 && interface.is_none_or(|i| i < FEATURES_FROM)) {
         return Err(Refusal::Described);
     }
+    // features taken from plugins that stay (interface 19), by a plugin of features: each from a
+    // plugin beside it that it doesn't take the place of, once, taken by a feature here, its
+    // controls' values by controls here
+    let takes_fit = taking.is_empty() || (featured && interface.is_some_and(|i| i >= TAKES_FROM));
+    if !takes_fit || taking.len() > MOST_TAKES {
+        return Err(Refusal::Described);
+    }
+    let mut features_taken = HashSet::new();
+    let mut takes = Vec::new();
+    for t in taking {
+        let beside = space(&t.id).is_some() && space(&t.id) == space(id);
+        let replaced = replaces.iter().any(|r| r.id == t.id);
+        let once = features_taken.insert((t.id.as_str(), t.feature.as_str()));
+        if !valid_id(&t.id) || t.id == id || !beside || replaced || !valid_key(&t.feature) || !once {
+            return Err(Refusal::Described);
+        }
+        let switch = position(&t.switch).filter(|&at| controls.get(at).is_some_and(|c| c.kind == "feature"));
+        let switch = switch.ok_or(Refusal::Described)?;
+        let mut taken = Vec::new();
+        for (old, new) in &t.controls {
+            if !valid_key(old) {
+                return Err(Refusal::Described);
+            }
+            taken.push((format!("{}.{old}", t.id), any_at(new)?));
+        }
+        let feature = format!("{}.{}", t.id, t.feature);
+        takes.push(Taken { id: t.id.clone(), feature, switch, controls: taken, filters: t.filters });
+    }
+    // what its brushes come under, and whose set they are (interface 19): one it takes the place of
+    let (brushes_under, brushes_from) = match brushes {
+        None => (None, None),
+        Some(_) if interface.is_none_or(|i| i < TAKES_FROM) => return Err(Refusal::Described),
+        Some(b) => {
+            let under = b.under.as_deref().map(switch_at).transpose()?;
+            let from = match &b.from {
+                None => None,
+                Some(from) if replaces.iter().any(|r| r.id == *from) => Some(from.clone()),
+                Some(_) => return Err(Refusal::Described),
+            };
+            (under, from)
+        }
+    };
     let mut shape = Shape {
         under,
         action_under,
@@ -1569,9 +1698,12 @@ fn shape_of(
         artwork,
         filters,
         replaces,
+        takes,
         menu: None,
         brush_under,
         features: Vec::new(),
+        brushes_under,
+        brushes_from,
     };
     shape.features = features_of(controls, &shape, actions.len())?;
     Ok((shape, menu_under))
@@ -2799,10 +2931,11 @@ pub(crate) mod tests {
         pack(manifest, &[(MODULE, module)])
     }
 
-    /// The Lasso fill plugin's id, whose brushes these are.
+    /// The id Lasso fill's brush rows are kept by: the plugin it was, before Infinite Plugins took
+    /// its place.
     const LASSO_FILL: &str = "io.github.artcraftandroid.lasso-fill";
 
-    /// The Lasso fill plugin's brushes, the set its `brushes.brushset` holds: the app's round pen
+    /// Lasso fill's brushes, the set Infinite Plugins' `brushes.brushset` holds: the app's round pen
     /// filling what it goes round (its Fill row on, shown as it's drawn), at one size, unsmoothed,
     /// plain or with one of the app's own grains fixed to the canvas (a tile so many canvas pixels
     /// across), some started at a place of their own each stroke, the scratches multiplied.
@@ -2859,12 +2992,12 @@ pub(crate) mod tests {
         s.brushes_as_set_file(0, 0..count, "Fills", 1).unwrap()
     }
 
-    /// Where the Lasso fill plugin keeps its brushes.
+    /// Where Infinite Plugins keeps Lasso fill's brushes.
     fn fill_brushes_path() -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/lasso-fill").join(BRUSH_SET)
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/infinite-plugins").join(BRUSH_SET)
     }
 
-    /// Writes the Lasso fill plugin's `brushes.brushset` once [`fill_brushes`] changes (then pack the
+    /// Writes Infinite Plugins' `brushes.brushset` once [`fill_brushes`] changes (then pack the
     /// plugin again): `cargo test -p procraft-core write_the_fill_brushes -- --ignored`.
     #[test]
     #[ignore]
@@ -2877,7 +3010,7 @@ pub(crate) mod tests {
         let made = fill_brushes_file();
         assert!(made == fill_brushes_file(), "a set file is written the same each time");
         let kept = std::fs::read(fill_brushes_path()).unwrap();
-        assert!(kept == made, "plugins/lasso-fill/{BRUSH_SET} is old: write_the_fill_brushes, then pack it");
+        assert!(kept == made, "plugins/infinite-plugins/{BRUSH_SET} is old: write_the_fill_brushes, then pack it");
         let (name, brushes) = procraft_engine::brushfile::read_set(&kept).unwrap();
         assert_eq!((name.as_str(), brushes.len()), ("Fills", 6));
     }
@@ -2965,7 +3098,7 @@ pub(crate) mod tests {
         };
         // a hook or an interface this app doesn't have is for a newer one
         assert_eq!(of("/hooks", json!(["position", "layers"])), Refusal::Newer);
-        assert_eq!(of("/compat/procraft/interface", json!(19)), Refusal::Newer);
+        assert_eq!(of("/compat/procraft/interface", json!(20)), Refusal::Newer);
         assert_eq!(of("/hooks", json!([])), Refusal::Described);
         assert_eq!(of("/hooks", json!(["position", "position"])), Refusal::Described);
         assert_eq!(of("/compat/procraft", json!({ "min_app": "0.0.1" })), Refusal::Described);
@@ -3561,7 +3694,7 @@ pub(crate) mod tests {
         };
         // they came with interface 17; an older app says it needs a newer one
         assert_eq!(of("/compat/procraft/interface", json!(16)), Refusal::Described);
-        assert_eq!(of("/compat/procraft/interface", json!(19)), Refusal::Newer);
+        assert_eq!(of("/compat/procraft/interface", json!(20)), Refusal::Newer);
         // a heading, a value or few, of their own; none of the plugin's controls
         assert_eq!(of("/filters/0/group", json!(" ")), Refusal::Described);
         assert_eq!(of("/filters/0/group", json!("A heading much longer than it can be")), Refusal::Described);
@@ -4030,6 +4163,111 @@ pub(crate) mod tests {
         assert_eq!(of(older.clone()).err(), Some(Refusal::Described));
         older["brush_controls"][0].as_object_mut().unwrap().remove("from");
         assert_eq!(of(older).unwrap().manifest.brush_controls[0].key, "plugin:org.example.older:kind");
+    }
+
+    #[test]
+    fn what_a_plugin_of_features_takes_from_plugins_that_stay_holds_up_from_interface_19() {
+        let module = two_hook_module();
+        let of = |manifest: Value| read_package(&a_coded_file(&manifest, &module));
+        let mut manifest = with(featured(), "/compat/procraft/interface", json!(19));
+        manifest["replaces"] = json!([{ "id": "org.example.old", "switch": "offset", "controls": { "spacing": "x" } }]);
+        manifest["takes"] = json!([
+            { "id": "org.example.stays", "feature": "pressing", "switch": "press", "controls": { "how": "level", "flag": "lighter" } },
+            { "id": "org.example.also", "feature": "moving", "switch": "offset", "filters": true },
+        ]);
+        let package = of(manifest.clone()).unwrap();
+        let shape = &package.manifest.shape;
+        let taken: Vec<(&str, &str, usize, bool)> =
+            shape.takes.iter().map(|t| (t.id.as_str(), t.feature.as_str(), t.switch, t.filters)).collect();
+        assert_eq!(
+            taken,
+            [
+                ("org.example.stays", "org.example.stays.pressing", 2, false),
+                ("org.example.also", "org.example.also.moving", 0, true)
+            ]
+        );
+        let controls = [("org.example.stays.flag".to_owned(), 3), ("org.example.stays.how".to_owned(), 5)];
+        assert_eq!(shape.takes[0].controls, controls);
+        // the keys each control's value was kept under before: by one it replaces, or a feature taken
+        assert_eq!(shape.kept_before(5).collect::<Vec<_>>(), ["org.example.stays.how"]);
+        assert_eq!(shape.kept_before(1).collect::<Vec<_>>(), ["org.example.old.spacing"]);
+        assert_eq!(shape.kept_before(4).count(), 0);
+        // refused: before interface 19; its own id, one not beside it, one it replaces, or a
+        // feature twice; by a switch that isn't a feature, or a control it hasn't; a key not plain
+        assert_eq!(of(with(manifest.clone(), "/compat/procraft/interface", json!(18))).err(), Some(Refusal::Described));
+        for (path, value) in [
+            ("/takes/0/id", json!("org.example.both")),
+            ("/takes/0/id", json!("com.other.stays")),
+            ("/takes/0/id", json!("org.example.old")),
+            ("/takes/1", json!({ "id": "org.example.stays", "feature": "pressing", "switch": "offset" })),
+            ("/takes/0/switch", json!("lighter")),
+            ("/takes/0/switch", json!("gone")),
+            ("/takes/0/controls", json!({ "how": "gone" })),
+            ("/takes/0/controls", json!({ "Not a key": "level" })),
+            ("/takes/0/feature", json!("Not a key")),
+        ] {
+            assert_eq!(
+                of(with(manifest.clone(), path, value.clone())).err(),
+                Some(Refusal::Described),
+                "{path} {value}"
+            );
+        }
+        let another = json!({ "id": "org.example.stays", "feature": "moving", "switch": "offset" });
+        assert!(of(with(manifest.clone(), "/takes/1", another)).is_ok(), "another of its features");
+        // eight at most
+        let eight: Vec<Value> =
+            (0..8).map(|i| json!({ "id": format!("org.example.p{i}"), "feature": "f", "switch": "press" })).collect();
+        assert!(of(with(manifest.clone(), "/takes", json!(eight.clone()))).is_ok());
+        let mut nine = eight;
+        nine.push(json!({ "id": "org.example.p8", "feature": "f", "switch": "press" }));
+        assert_eq!(of(with(manifest.clone(), "/takes", json!(nine))).err(), Some(Refusal::Described));
+        // a plugin without features takes none
+        let mut plain = coded("org.example.plain", &module);
+        plain["compat"]["procraft"]["interface"] = json!(19);
+        plain["controls"] = json!([{ "key": "on_too", "type": "switch", "label": "On" }]);
+        assert!(of(plain.clone()).is_ok());
+        plain["takes"] = json!([{ "id": "org.example.stays", "feature": "f", "switch": "on_too" }]);
+        assert_eq!(of(plain).err(), Some(Refusal::Described));
+    }
+
+    #[test]
+    fn a_plugin_s_brushes_come_under_a_switch_given_as_one_it_replaces_from_interface_19() {
+        let module = two_hook_module();
+        let set = fill_brushes_file();
+        let holding = |brushes: Value, interface: u32| {
+            let mut manifest = with(featured(), "/compat/procraft/interface", json!(interface));
+            manifest["holds"] = json!(["hooks", "brushes"]);
+            manifest["replaces"] = json!([{ "id": "org.example.old", "switch": "offset" }]);
+            manifest["brushes"] = brushes;
+            let files = json!([
+                { "path": MODULE, "sha256": sha256(&module), "size": module.len() },
+                { "path": BRUSH_SET, "sha256": sha256(&set), "size": set.len() },
+            ]);
+            read_package(&pack(&with(manifest, "/files", files), &[(MODULE, &module), (BRUSH_SET, &set)]))
+        };
+        let given = |package: Package| {
+            let shape = package.manifest.shape;
+            (shape.brushes_under, shape.brushes_id("org.example.both").to_owned())
+        };
+        assert_eq!(
+            given(holding(json!({ "under": "lighter", "from": "org.example.old" }), 19).unwrap()),
+            (Some(3), "org.example.old".to_owned())
+        );
+        assert_eq!(given(holding(json!({ "under": "press" }), 19).unwrap()), (Some(2), "org.example.both".to_owned()));
+        assert_eq!(given(holding(Value::Null, 19).unwrap()), (None, "org.example.both".to_owned()), "as before 19");
+        // under no switch, from one it doesn't replace, or before 19: refused
+        for (brushes, interface) in [
+            (json!({ "under": "x" }), 19),
+            (json!({ "under": "gone" }), 19),
+            (json!({ "from": "org.example.stranger" }), 19),
+            (json!({ "under": "press" }), 18),
+        ] {
+            assert_eq!(holding(brushes.clone(), interface).err(), Some(Refusal::Described), "{brushes} {interface}");
+        }
+        // said of a plugin with no set
+        let mut no_set = with(featured(), "/compat/procraft/interface", json!(19));
+        no_set["brushes"] = json!({ "under": "press" });
+        assert_eq!(read_package(&a_coded_file(&no_set, &module)).err(), Some(Refusal::Described));
     }
 
     #[test]

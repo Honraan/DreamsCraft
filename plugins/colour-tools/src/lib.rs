@@ -1,10 +1,8 @@
-//! Colour tools: four ways round colour, each a feature with a switch of its own and its controls
+//! Colour tools: three ways round colour, each a feature with a switch of its own and its controls
 //! under it. Colour triangle: the colour panel's Classic tab picks saturation and brightness in a
 //! triangle, with the hue on a ring round it if you like ([`triangle`]). Colour labels: a layer's
-//! colour label, from its options, shown on its row in the Layers panel ([`labels`]). Colour extras:
-//! the colour panel's sliders step at their ends, and its swatch shows the colour before
-//! ([`extras`]). ColorDrop tools: a fill by every layer seen, kept out of gaps in the lines
-//! ([`colordrop`]). It's a plugin made of those features, not part of the app:
+//! colour label, from its options, shown on its row in the Layers panel ([`labels`]). ColorDrop
+//! tools: a fill by every layer seen, kept out of gaps in the lines ([`colordrop`]). It's a plugin made of those features, not part of the app:
 //! `tools/pack_plugin.py` makes a `.procraft-plugin` file of it.
 //!
 //! The app runs each feature that is on in a copy of this code of its own, and tells that copy the
@@ -13,13 +11,12 @@
 //! `crates/core/src/plugin_run.rs`.
 
 mod colordrop;
-mod extras;
 mod labels;
 mod triangle;
 
 /// The controls by their place in the manifest, as they start: each feature's switch off.
-const STARTS: [f32; 12] = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-static CONTROLS: kit::Controls<12> = kit::Controls::new(STARTS);
+const STARTS: [f32; 9] = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+static CONTROLS: kit::Controls<9> = kit::Controls::new(STARTS);
 kit::controls!(CONTROLS);
 
 /// Colour triangle's switch, then its own: the triangle in Classic, the hue ring round it, and the
@@ -30,16 +27,12 @@ pub const RING: usize = 2;
 pub const PICKER_ONLY: usize = 3;
 /// Colour labels' switch: it has no controls of its own, only its action.
 pub const COLOUR_LABELS: usize = 4;
-/// Colour extras' switch, then its own: the sliders' steps, and the colour before beside now.
-pub const COLOUR_EXTRAS: usize = 5;
-pub const STEPS: usize = 6;
-pub const COMPARE: usize = 7;
 /// ColorDrop tools' switch, then its own: a fill by all layers, gap closing and its gap (whole
 /// pixels, from Off).
-pub const COLORDROP: usize = 8;
-pub const ALL_LAYERS: usize = 9;
-pub const GAP_CLOSING: usize = 10;
-pub const GAP: usize = 11;
+pub const COLORDROP: usize = 5;
+pub const ALL_LAYERS: usize = 6;
+pub const GAP_CLOSING: usize = 7;
+pub const GAP: usize = 8;
 
 /// The actions by their place in the manifest: Colour label, in a layer's options.
 const LABEL: usize = 0;
@@ -55,7 +48,7 @@ kit::panel!(labels::touched);
 
 /// Each feature's switch, in order: what comes after one, up to the next, is its own.
 #[cfg(test)]
-const FEATURES: [usize; 4] = [COLOUR_TRIANGLE, COLOUR_LABELS, COLOUR_EXTRAS, COLORDROP];
+const FEATURES: [usize; 3] = [COLOUR_TRIANGLE, COLOUR_LABELS, COLORDROP];
 
 /// The tests one at a time, as they share the controls.
 #[cfg(test)]
