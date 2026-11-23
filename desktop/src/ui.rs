@@ -2581,6 +2581,9 @@ impl Interface {
             self.open = None;
         }
         self.open = if self.open == Some(popover) { None } else { Some(popover) };
+        if self.open == Some(Popover::Brushes) {
+            self.library.opens();
+        }
     }
 
     /// The modes open now, as the core's [`mode_switch`] takes them.

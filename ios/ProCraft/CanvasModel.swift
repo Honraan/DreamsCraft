@@ -409,9 +409,6 @@ final class CanvasModel {
             return
         }
         if tool == pressed {
-            if let current = currentBrush {
-                shownSet = Int(current.set)
-            }
             toggle(.brushes)
         } else {
             select(pressed)
@@ -472,7 +469,7 @@ final class CanvasModel {
     }
 
     /// Shows set `index`; its last chosen brush becomes the current one, as choosing it again
-    /// would.
+    /// would (as the core keeps it: chosen here or anywhere else, a tool's brush held to it too).
     func showSet(_ index: Int) {
         shownSet = index
         pickedBrushes = []
@@ -480,11 +477,8 @@ final class CanvasModel {
             recentBrushes = session.recentBrushes()
             return
         }
-        guard let choice = setChoice[index], brushSets.indices.contains(index) else { return }
-        let brushes = brushSets[index].brushes
-        if brushes.indices.contains(choice) {
-            chooseBrush(brushes[choice])
-        }
+        guard index >= 0, let choice = session.brushSetChoice(set: UInt32(index)) else { return }
+        chooseBrush(choice)
     }
 
     func chooseBrush(_ b: BrushInfo) {
@@ -1069,6 +1063,19 @@ final class CanvasModel {
         if panel == .layers {
             refreshThumbnails()
         }
+        if p == .brushes, panel == .brushes {
+            libraryOpens()
+        }
+    }
+
+    /// The brush library opens, from its tool's button, a gesture or the QuickMenu alike: on the
+    /// current brush's set, or on the Recent set if it was shown (read again), not on a set tapped
+    /// last time that the brush didn't come from.
+    private func libraryOpens() {
+        if shownSet != Self.recentSet, let current = currentBrush {
+            shownSet = Int(current.set)
+        }
+        recentBrushes = session.recentBrushes()
     }
 
     func closePanels() {

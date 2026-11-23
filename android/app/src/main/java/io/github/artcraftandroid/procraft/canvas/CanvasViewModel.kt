@@ -4496,9 +4496,6 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         if (this.tool == tool) {
-            // the library opens on the current brush's set, or on the Recent set if it was shown
-            if (shownSet != RECENT_SET) currentBrush?.let { shownSet = it.set.toInt() }
-            readRecentBrushes()
             toggle(Panel.BRUSHES)
         } else {
             select(tool)
@@ -7417,6 +7414,16 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         }
         panel = if (panel == p) Panel.NONE else p
         if (layersShown) refreshThumbnails()
+        if (p == Panel.BRUSHES && panel == Panel.BRUSHES) libraryOpens()
+    }
+
+    /**
+     * The brush library opens, from its tool's button, a gesture or the QuickMenu alike: on the current brush's set,
+     * or on the Recent set if it was shown (read again), not on a set tapped last time that the brush didn't come from.
+     */
+    private fun libraryOpens() {
+        if (shownSet != RECENT_SET) currentBrush?.let { shownSet = it.set.toInt() }
+        readRecentBrushes()
     }
 
     /** The modes open now, as the core's [modeSwitch] takes them. */

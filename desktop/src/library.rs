@@ -389,6 +389,14 @@ impl Library {
         self.shown_set = None;
     }
 
+    /// The library opens: on the current brush's set (or the Recent set, if that was shown), not
+    /// on one tapped last time that the brush didn't come from.
+    pub fn opens(&mut self) {
+        if !self.recent {
+            self.shown_set = None;
+        }
+    }
+
     /// A menu or question of the library's is up: a press elsewhere only closes it.
     pub fn modal(&self) -> bool {
         self.plus_menu.is_open()
@@ -2758,6 +2766,31 @@ mod tests {
         f.frame(Vec::new());
         assert_eq!((f.session.current_brush().set, f.session.current_brush().index), (set as u32, 1));
         assert!(f.library.studio.is_none());
+    }
+
+    /// The library opens on the current brush's set: a set never chosen in, looked at last time
+    /// (the brush staying in another), isn't the one it opens on again.
+    #[test]
+    fn the_library_opens_on_the_current_brush_s_set() {
+        let mut f = Finger::new();
+        let start = f.session.current_brush();
+        let set = f
+            .library
+            .set_rects
+            .iter()
+            .map(|(s, _)| *s)
+            .find(|&s| s as u32 != start.set && f.session.brush_set_choice(s as u32).is_none())
+            .expect("a set never chosen in");
+        let row = f.library.set_rects.iter().find(|(s, _)| *s == set).map(|(_, r)| r.center()).unwrap();
+        f.down(row);
+        f.up(row);
+        f.frame(Vec::new());
+        assert!(f.library.brush_rects.iter().all(|(k, _)| k.0 == set as u32));
+        // shut, and opened again
+        f.library.opens();
+        f.frame(Vec::new());
+        assert!(f.library.brush_rects.iter().all(|(k, _)| k.0 == start.set));
+        assert_eq!(f.library.highlighted, Some((start.set, start.index)));
     }
 
     #[test]
