@@ -252,12 +252,39 @@ class TimeLapse(artwork: File) {
      * false. False if there are none or the encoder fails.
      */
     fun export(out: File, seconds: Int?, going: (Float) -> Boolean = { true }): Boolean {
-        val picks = timeLapsePicks(count.toUInt(), seconds?.toUInt()).map { it.toInt() }
+        val started = android.os.SystemClock.elapsedRealtime()
+        val total = count
+        val picks = timeLapsePicks(total.toUInt(), seconds?.toUInt()).map { it.toInt() }
+        val video = settings
+        // what it was asked, and how it ended, in the log: a failure with the step it got to
+        AppLog.i(
+            "ProCraft",
+            "exporting the time-lapse: ${picks.size} of $total frames${seconds?.let { " ($it s)" }.orEmpty()}, " +
+                "${video.side} at most, ${video.bitsPerPixel} bits a pixel, ${if (video.hevc) "HEVC" else "H.264"}",
+        )
+        failure = null
+        var stopped = false
+        val made = export(out, picks, total) { done -> going(done).also { if (!it) stopped = true } }
+        val ms = android.os.SystemClock.elapsedRealtime() - started
+        when {
+            stopped -> AppLog.i("ProCraft", "the time-lapse export stopped after $ms ms")
+            made -> AppLog.i("ProCraft", "the time-lapse exported in $ms ms: ${out.length()} bytes${unread.takeIf { it > 0 }?.let { ", $it frames unread" }.orEmpty()}")
+            else -> AppLog.w("ProCraft", "the time-lapse couldn't be exported (after $ms ms): ${failure ?: "the video wasn't made"}")
+        }
+        return made
+    }
+
+    private fun export(out: File, picks: List<Int>, total: Int, going: (Float) -> Boolean): Boolean {
         // all of it, as asked or too short to cut: the videos kept for packages, made where they
         // don't reach yet, put end to end, nothing read back from them
-        if (picks.size == count) joined(out, going)?.let { return it }
-        return encode(out, picks, null, going = going) != null
+        if (picks.size == total) joined(out, going)?.let { return it }
+        // (a device with no HEVC encoder makes it H.264, rather than nothing)
+        return encode(out, picks, null, going = going, orH264 = true) != null
     }
+
+    /** Why the last video wasn't made, for the log: the step it got to, the codec and size. */
+    @Volatile
+    private var failure: String? = null
 
     /**
      * Every frame at [out] as the package's videos joined: the frames in none yet made into one
@@ -282,17 +309,20 @@ class TimeLapse(artwork: File) {
                 File(plan.path).delete()
                 return false
             }
+            if (made == null) AppLog.w("ProCraft", "the time-lapse's video of frames ${plan.frames.firstOrNull()} to ${plan.frames.lastOrNull()} wasn't made (${failure ?: "?"}): planned again")
             plan = core.segmentMade(plan, (made?.first ?: 0).toUInt(), (made?.second ?: 0).toUInt(), made != null)
             if (made == null && plan == null) return null
         }
         // a video that couldn't be noted (or one gone): the frames out of them are made afresh
-        if (!core.allInVideos()) return null
+        if (!core.allInVideos()) return null.also { AppLog.i("ProCraft", "the time-lapse's frames aren't all in its videos: made afresh") }
         dropClipFrames()
         // a video a frame of which read back unfilled here (made before videos were read back as
         // they are made) isn't copied as it is: made afresh, with the frame before in its place
-        if (synchronized(clipLock) { broken.isNotEmpty() }) return null
+        if (synchronized(clipLock) { broken.isNotEmpty() }) return null.also { AppLog.i("ProCraft", "a time-lapse video reads back unfilled here: made afresh") }
         val parts = core.forPackage().segments.map(::File)
-        return if (parts.isNotEmpty() && VideoWriter.join(parts, out, FPS.toFloat())) true else null
+        if (parts.isNotEmpty() && VideoWriter.join(parts, out, FPS.toFloat())) return true
+        AppLog.w("ProCraft", "the time-lapse's ${parts.size} videos (${parts.sumOf { it.length() }} bytes) couldn't be put end to end: made afresh")
+        return null
     }
 
     /**
@@ -309,15 +339,28 @@ class TimeLapse(artwork: File) {
         picks: List<Int>,
         size: Pair<Int, Int>?,
         hevc: Boolean = settings.hevc,
+        orH264: Boolean = false,
         going: (Float) -> Boolean = { true },
     ): Pair<Int, Int>? {
         unread = 0
-        if (picks.isEmpty()) return null
+        if (picks.isEmpty()) return null.also { failure = "no frames to make it of" }
         val video = settings
-        val mime = if (hevc) android.media.MediaFormat.MIMETYPE_VIDEO_HEVC else android.media.MediaFormat.MIMETYPE_VIDEO_AVC
+        var mime = if (hevc) android.media.MediaFormat.MIMETYPE_VIDEO_HEVC else android.media.MediaFormat.MIMETYPE_VIDEO_AVC
         val (w, h) = size ?: run {
-            val first = picks.asSequence().take(FIRST_TRIES).firstNotNullOfOrNull { frame(it) } ?: return null
-            VideoWriter.fit(first.width, first.height, video.side, mime, ALIGN).also { first.recycle() }
+            val first = picks.asSequence().take(FIRST_TRIES).firstNotNullOfOrNull { frame(it) }
+                ?: return null.also { failure = "none of its first ${minOf(FIRST_TRIES, picks.size)} frames could be read (frame ${picks.first()}: ${core.frameFile(picks.first().toUInt()) != null} a picture, ${kept(picks.first())} kept)" }
+            val fitted = VideoWriter.fit(first.width, first.height, video.side, mime, ALIGN)
+                ?: if (hevc && orH264) {
+                    AppLog.w("ProCraft", "no HEVC encoder here takes the time-lapse's ${first.width}x${first.height} frames: H.264 instead")
+                    mime = android.media.MediaFormat.MIMETYPE_VIDEO_AVC
+                    VideoWriter.fit(first.width, first.height, video.side, mime, ALIGN)
+                } else {
+                    null
+                }
+            fitted.also {
+                if (it == null) failure = "no $mime encoder here takes its ${first.width}x${first.height} frames, ${video.side} at most"
+                first.recycle()
+            }
         } ?: return null
         val frameBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.WHITE) }
         val paint = Paint(Paint.FILTER_BITMAP_FLAG)
@@ -339,6 +382,7 @@ class TimeLapse(artwork: File) {
             unread = missed
             val inRow = picks.last() - picks.first() == picks.size - 1
             if (made == VideoWriter.Made.CHECKED && missed == 0 && inRow) synchronized(clipLock) { checked += picks.first() to picks.size }
+            if (made == VideoWriter.Made.NONE) failure = "the ${w}x$h $mime video of ${picks.size} frames wasn't made (the encoders' lines above say why)"
             return if (made != VideoWriter.Made.NONE) w to h else null
         } finally {
             frameBitmap.recycle()

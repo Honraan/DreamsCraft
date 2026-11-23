@@ -26,15 +26,25 @@ object VideoWriter {
         val caps = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
             .filter { it.isEncoder && it.supportedTypes.any { t -> t.equals(mime, ignoreCase = true) } }
             .mapNotNull { runCatching { it.getCapabilitiesForType(mime).videoCapabilities }.getOrNull() }
-        if (caps.isEmpty()) return null
+        if (caps.isEmpty()) return null.also { AppLog.w("ProCraft", "this device has no $mime encoder") }
         var scale = minOf(1f, maxSide / maxOf(width, height).toFloat())
         repeat(40) {
             val (w, h) = aligned(width * scale, height * scale, align)
             if (caps.any { it.isSizeSupported(w, h) }) return w to h
             scale *= 0.9f
         }
-        return null
+        return null.also { AppLog.w("ProCraft", "no $mime encoder here takes a ${width}x$height video made smaller (${sizesTaken(mime)})") }
     }
+
+    /** The sizes each encoder for [mime] takes, for the log: "name: widths x heights". */
+    private fun sizesTaken(mime: String): String =
+        MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
+            .filter { it.isEncoder && it.supportedTypes.any { t -> t.equals(mime, ignoreCase = true) } }
+            .joinToString("; ") { info ->
+                val caps = runCatching { info.getCapabilitiesForType(mime).videoCapabilities }.getOrNull()
+                "${info.name}: ${caps?.supportedWidths ?: "?"} x ${caps?.supportedHeights ?: "?"}"
+            }
+            .ifEmpty { "none" }
 
     /** [width] × [height] rounded down to multiples of [align] (2 at least), never below one [align]. */
     fun aligned(width: Float, height: Float, align: Int): Pair<Int, Int> {
@@ -68,7 +78,9 @@ object VideoWriter {
         bitsPerPixel: Int = BITS_PER_PIXEL, check: Boolean, only: String? = null, frame: (Int, IntArray) -> Boolean,
     ): Made {
         var first: File? = null
-        for (info in encoders(mime, width, height).filter { only == null || it.name == only }) {
+        val takers = encoders(mime, width, height).filter { only == null || it.name == only }
+        if (takers.isEmpty()) AppLog.w("ProCraft", "no $mime encoder here takes a ${width}x$height video (${sizesTaken(mime)})")
+        for (info in takers) {
             val looks = if (check) ArrayList<ByteArray>(count) else null
             if (!writeWith(info, out, width, height, fps, count, mime, bitsPerPixel, frame, looks)) {
                 out.delete()
@@ -85,8 +97,13 @@ object VideoWriter {
                 }
             }
         }
-        val kept = first ?: return Made.NONE
-        return if (kept.renameTo(out)) Made.UNCHECKED else Made.NONE.also { kept.delete() }
+        val kept = first ?: return Made.NONE.also {
+            if (takers.isNotEmpty()) AppLog.w("ProCraft", "no encoder made the ${width}x$height $mime video (${takers.joinToString { it.name }} tried)")
+        }
+        return if (kept.renameTo(out)) Made.UNCHECKED else Made.NONE.also {
+            AppLog.w("ProCraft", "the ${width}x$height video made couldn't be put in place at ${out.name}")
+            kept.delete()
+        }
     }
 
     /** The names of the encoders for [mime] that take [width] × [height], in the system's order. */
@@ -124,24 +141,46 @@ object VideoWriter {
             setInteger(MediaFormat.KEY_FRAME_RATE, fps.roundToInt().coerceAtLeast(1))
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
         }
-        val codec = runCatching { MediaCodec.createByCodecName(info.name) }.getOrNull() ?: return false
-        val muxer = MediaMuxer(out.path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        // each way it can fail said in the log, with the encoder, the size and the step it got to
+        val what = "${info.name}'s ${width}x$height $mime video"
+        val codec = try {
+            MediaCodec.createByCodecName(info.name)
+        } catch (e: Exception) {
+            AppLog.w("ProCraft", "$what: the encoder couldn't be made", e)
+            return false
+        }
+        val muxer = try {
+            MediaMuxer(out.path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        } catch (e: Exception) {
+            AppLog.w("ProCraft", "$what: its file ${out.name} couldn't be begun", e)
+            codec.release()
+            return false
+        }
         var track = -1
         val done = MediaCodec.BufferInfo()
         val pixels = IntArray(width * height)
+        var step = "configured"
+        // an encoder that stops taking frames or giving them back is given up on, not waited for
+        // for ever (the export's card up all the while)
+        val patience = Patience()
         try {
             codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            step = "started"
             codec.start()
             fun drain(end: Boolean) {
                 while (true) {
                     val index = codec.dequeueOutputBuffer(done, if (end) TIMEOUT_US else 0)
                     when {
-                        index == MediaCodec.INFO_TRY_AGAIN_LATER -> if (!end) return
+                        index == MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                            if (!end) return
+                            if (patience.spent()) throw IllegalStateException("no end of its stream for ${Patience.MOST_MS} ms")
+                        }
                         index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                             track = muxer.addTrack(codec.outputFormat)
                             muxer.start()
                         }
                         index >= 0 -> {
+                            patience.progressed()
                             val buffer = codec.getOutputBuffer(index)
                             if (buffer != null && done.size > 0 && track >= 0 && done.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
                                 muxer.writeSampleData(track, buffer, done)
@@ -153,44 +192,55 @@ object VideoWriter {
                 }
             }
             fun nextInput(): Int {
+                // (the wait for it counted, not the frame's making before)
+                patience.progressed()
                 var input: Int
                 do {
                     input = codec.dequeueInputBuffer(TIMEOUT_US)
-                    if (input < 0) drain(false)
+                    if (input < 0) {
+                        drain(false)
+                        if (patience.spent()) throw IllegalStateException("no input buffer for ${Patience.MOST_MS} ms")
+                    }
                 } while (input < 0)
+                patience.progressed()
                 return input
             }
             var n = 0
             for (i in 0 until count) {
+                step = "frame $i of $count"
                 if (!frame(i, pixels)) continue
                 looks?.add(Yuv.cells(pixels, width, height))
                 val index = nextInput()
                 // the whole buffer is given back: a codec padding its rows or planes reads all of
                 // it, and one given less may leave the rest of the frame unfilled (green)
-                val size = codec.getInputBuffer(index)?.capacity() ?: return false
+                val size = codec.getInputBuffer(index)?.capacity()
+                    ?: return false.also { AppLog.w("ProCraft", "$what: no input buffer to write $step into") }
                 // without a picture to fill, the buffer could never be given back
                 val picture = codec.getInputImage(index)?.let { image ->
                     val planes = image.planes
-                    if (planes.size < 3) return false
+                    if (planes.size < 3) return false.also { AppLog.w("ProCraft", "$what: its input picture has ${planes.size} planes ($step)") }
                     val plane = { k: Int -> YuvPlane(planes[k].buffer, planes[k].rowStride, planes[k].pixelStride) }
                     YuvPicture(plane(0), plane(1), plane(2), 0, 0, width, height)
                 } ?: run {
                     val f = codec.inputFormat
                     val int = { key: String -> if (f.containsKey(key)) f.getInteger(key) else 0 }
-                    val buffer = codec.getInputBuffer(index) ?: return false
+                    val buffer = codec.getInputBuffer(index) ?: return false.also { AppLog.w("ProCraft", "$what: no input buffer to write $step into") }
                     val laid = if (f.containsKey(MediaFormat.KEY_COLOR_FORMAT)) f.getInteger(MediaFormat.KEY_COLOR_FORMAT) else input
                     Yuv.planesIn(buffer, laid, width, height, int(MediaFormat.KEY_STRIDE), int(MediaFormat.KEY_SLICE_HEIGHT))
-                } ?: return false.also { AppLog.w("ProCraft", "${info.name} lays its input out as this can't write ($input)") }
+                } ?: return false.also { AppLog.w("ProCraft", "$what: it lays its input out as this can't write ($input)") }
                 Yuv.write(pixels, width, height, picture)
                 codec.queueInputBuffer(index, 0, size, frameTime(n, fps), 0)
                 n++
                 drain(false)
             }
+            step = "ended after $n frames"
             codec.queueInputBuffer(nextInput(), 0, 0, frameTime(n, fps), MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+            patience.progressed()
             drain(true)
+            if (track < 0) AppLog.w("ProCraft", "$what: the encoder gave nothing back ($step)")
             return track >= 0
         } catch (e: Exception) {
-            AppLog.e("ProCraft", "video", e)
+            AppLog.w("ProCraft", "$what failed, $step", e)
             return false
         } finally {
             runCatching { codec.stop() }
@@ -270,6 +320,26 @@ object VideoWriter {
             a.getInteger(MediaFormat.KEY_WIDTH) == b.getInteger(MediaFormat.KEY_WIDTH) &&
             a.getInteger(MediaFormat.KEY_HEIGHT) == b.getInteger(MediaFormat.KEY_HEIGHT) &&
             listOf("csd-0", "csd-1", "csd-2").all { key -> same(key) && (!a.containsKey(key) || a.getByteBuffer(key) == b.getByteBuffer(key)) }
+    }
+
+    /**
+     * How long an encoder may go without taking a frame or giving one back before it is given up on:
+     * [mostMs] since it last did, on the clock [now] (milliseconds).
+     */
+    internal class Patience(private val mostMs: Long = MOST_MS, private val now: () -> Long = { System.nanoTime() / 1_000_000 }) {
+        private var since = now()
+
+        /** It took a frame or gave one back: the wait starts again. */
+        fun progressed() {
+            since = now()
+        }
+
+        /** It has been waited for longer than the most since it last did. */
+        fun spent(): Boolean = now() - since > mostMs
+
+        companion object {
+            const val MOST_MS = 10_000L
+        }
     }
 
     /** The bit rate a [width] × [height] video is encoded at, bits a second. */

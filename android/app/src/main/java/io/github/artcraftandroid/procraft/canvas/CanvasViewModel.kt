@@ -4642,9 +4642,13 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
      * made (a notice says so).
      */
     suspend fun exportTimeLapse(seconds: Int?): File? {
-        val t = timeLapse ?: return null
-        val s = session ?: return null
-        if (timeLapseExporting || exportShown != null) return null
+        // (none of these goes by unsaid in the log)
+        val t = timeLapse ?: return null.also { AppLog.w(TAG, "a time-lapse export asked with no time-lapse open") }
+        val s = session ?: return null.also { AppLog.w(TAG, "a time-lapse export asked with no artwork open") }
+        if (timeLapseExporting || exportShown != null) {
+            AppLog.i(TAG, "a time-lapse export asked while another export runs: not begun")
+            return null
+        }
         timeLapseExporting = true
         exportCancelled = false
         exportShown = ExportShown(0f)
@@ -4668,7 +4672,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 }.onFailure { AppLog.e(TAG, "exporting the time-lapse", it) }.getOrDefault(false)
                 out.takeIf { ok }
             }
-            if (exportCancelled) return null
+            if (exportCancelled) return null.also { AppLog.i(TAG, "the time-lapse export was cancelled") }
             if (made == null) {
                 // which of the three: they are different faults, in a report too
                 val why = withContext(Dispatchers.IO) {
@@ -4678,6 +4682,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                         else -> TIME_LAPSE_MISSING
                     }
                 }
+                AppLog.w(TAG, "the time-lapse export told: $why")
                 showNotice(why, warning = true)
                 return null
             }

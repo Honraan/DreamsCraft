@@ -154,7 +154,10 @@ fun ActionsPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier)
         // made outside the panel, which may be closed meanwhile: the share comes all the same
         // (cancelled or failed, there is nothing to share; a failure is told)
         vm.viewModelScope.launch {
-            vm.exportTimeLapse(seconds)?.let { runCatching { shareFile(context, it, "video/mp4") } }
+            vm.exportTimeLapse(seconds)?.let { video ->
+                runCatching { shareFile(context, video, "video/mp4") }
+                    .onFailure { io.github.artcraftandroid.procraft.AppLog.e("ProCraft", "sharing the time-lapse video (${video.length()} bytes)", it) }
+            }
         }
     }
     var page by remember { mutableStateOf(ActionsPage.TABS) }
