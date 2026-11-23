@@ -60,6 +60,17 @@ class BrushHoldTest {
     }
 
     @Test
+    fun brushesHeldOverAnotherSetUntilItOpensGoAmongItsBrushes() {
+        // set 2 opened under brushes of set 1: let go over one of its brushes, they go to its place
+        // (the core copies them there, a different set from theirs)
+        val opened = (0 until 3).map { (2 to it) to Rect(220f, it * 100f, 620f, it * 100f + 90f) }
+        assertEquals(2 to 1, brushesDropPlace(listOf(1 to 0, 1 to 3), Offset(400f, 145f), sets, opened))
+        assertEquals(2 to 1, brushDropPlace(1 to 0, Offset(400f, 145f), sets, opened))
+        // it opens only after a hold as long as the original's (1.76 s measured)
+        assertTrue(SPRING_LOAD_MS in 1600L..2000L)
+    }
+
+    @Test
     fun aPickedBrushHeldTakesThePickedOnesWithItInTheirOrder() {
         val set = (0 until 6).map { BrushInfo(1u, it.toUInt(), "Brush $it") }
         // not picked: it alone; picked, or the current brush while others are: all of them in order

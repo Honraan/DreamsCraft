@@ -134,18 +134,31 @@ private final class LibraryUi {
         dragged != nil || draggedSet != nil
     }
 
-    /// A brush let go of: onto a set, to its top; onto a brush of the shown set, to its place.
+    /// Whether the dragged brush would be copied where the finger is now (onto another set, or a
+    /// brush of another set), as the green plus on it says.
+    var dropCopies: Bool {
+        guard let b = dragged else { return false }
+        // over a set's row, or a brush of a set (its key "set-index")
+        let underBrush = brushFrames.first { $0.value.contains(dragAt) }
+            .flatMap { Int($0.key.split(separator: "-").first ?? "") }
+        let underSet = setFrames.first { $0.value.contains(dragAt) }?.key
+        guard let set = underSet ?? underBrush, set >= 0 else { return false }
+        return brushDropCopies(from: b.set, to: UInt32(set))
+    }
+
+    /// A brush let go of: onto another set, copied to its top; onto a brush of the shown set, to its
+    /// place (copied there from another set, moved along its own).
     func dropBrush(_ model: CanvasModel, shown: [BrushInfo]) {
         guard let b = dragged else { return }
         dragged = nil
         if let set = setFrames.first(where: { $0.value.contains(dragAt) })?.key {
             if set != Int(b.set) {
-                model.moveBrush(b, set: set, index: 0)
+                model.dropBrush(b, set: set, index: 0)
             }
             return
         }
         if let target = shown.first(where: { brushFrames[CanvasModel.brushKey($0)]?.contains(dragAt) == true }) {
-            model.moveBrush(b, set: Int(target.set), index: Int(target.index))
+            model.dropBrush(b, set: Int(target.set), index: Int(target.index))
         }
     }
 
@@ -1055,6 +1068,17 @@ private struct DragGhost: View {
             }
             .frame(width: ui.brushFrames[key]?.width ?? 0, height: brushHeight)
             .clipShape(shape)
+            // over another set it would be copied into: a green plus on its corner
+            .overlay(alignment: .topTrailing) {
+                if ui.dropCopies {
+                    Text(verbatim: "+")
+                        .font(.system(size: 15))
+                        .foregroundStyle(Color.white)
+                        .frame(width: 24, height: 24)
+                        .background(Circle().fill(Color(argb: 0xFF30_D158)))
+                        .offset(x: 12, y: -12)
+                }
+            }
             .offset(x: at.x, y: at.y)
             .allowsHitTesting(false)
         } else if let i = ui.draggedSet, model.brushSets.indices.contains(i) {

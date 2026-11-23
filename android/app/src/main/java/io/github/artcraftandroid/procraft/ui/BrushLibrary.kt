@@ -326,16 +326,25 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
     var listBounds by remember { mutableStateOf(Rect.Zero) }
     // the set the dragged brush or set is over, if any
     val overSet = if (dragged == null && draggedSet == null) null else setBounds.entries.firstOrNull { it.value.contains(dragAt) }?.key?.takeIf { it != draggedSet }
+    // where the dragged brushes would go let go now: onto a set, to its top; onto a brush of the set
+    // shown, to its place
+    fun dropPlace(): Pair<Int, Int>? {
+        val b = dragged ?: return null
+        val moving = draggedWith.ifEmpty { listOf(b) }
+        val brushes = shown?.brushes.orEmpty().mapNotNull { t -> brushBounds["${t.set}-${t.index}"]?.let { (t.set.toInt() to t.index.toInt()) to it } }
+        return brushesDropPlace(moving.map { it.set.toInt() to it.index.toInt() }, dragAt, setBounds, brushes)
+    }
+    // into another set they go as copies, as a green plus on them says while they would
+    val dropCopies = dragged?.let { b -> dropPlace()?.let { io.github.artcraftandroid.procraft.core.brushDropCopies(b.set, it.first.toUInt()) } } == true
     fun drop() {
         val b = dragged ?: return
         val moving = draggedWith.ifEmpty { listOf(b) }
+        val place = dropPlace()
         dragged = null
         draggedWith = emptyList()
         dragPointer = null
-        // onto a set: to its top; onto a brush of the set shown: to its place
-        val brushes = shown?.brushes.orEmpty().mapNotNull { t -> brushBounds["${t.set}-${t.index}"]?.let { (t.set.toInt() to t.index.toInt()) to it } }
-        val (set, index) = brushesDropPlace(moving.map { it.set.toInt() to it.index.toInt() }, dragAt, setBounds, brushes) ?: return
-        vm.moveBrushes(moving, set, index)
+        val (set, index) = place ?: return
+        vm.dropBrushes(moving, set, index)
     }
     // held over another set a moment, the dragged brush opens it, to be let go among its brushes
     LaunchedEffect(overSet, dragged != null) {
@@ -841,22 +850,25 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
                 val at = dragAt - grab - listBounds.topLeft
                 Box(
                     Modifier.offset { IntOffset(at.x.roundToInt(), at.y.roundToInt()) }
-                        .size(with(density) { dragSize.width.toDp() }, BrushHeight)
-                        .clip(RoundedCornerShape(12.dp)).background(Pc.RowSelected.copy(alpha = 0.9f)),
+                        .size(with(density) { dragSize.width.toDp() }, BrushHeight),
                 ) {
-                    vm.previews["${d.set}-${d.index}"]?.let {
-                        Image(it, contentDescription = null, contentScale = ContentScale.Crop, colorFilter = pluginFilter(tints.second), modifier = Modifier.fillMaxSize())
-                    }
-                    Text(d.name, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, modifier = Modifier.padding(start = 18.dp, top = 11.dp))
-                    // several going together: how many
-                    if (draggedWith.size > 1) {
-                        Box(
-                            Modifier.align(Alignment.TopEnd).padding(top = 8.dp, end = 8.dp).size(24.dp).clip(CircleShape).background(Color.White),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Text("${draggedWith.size}", color = Pc.RowSelected, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                    Box(Modifier.matchParentSize().clip(RoundedCornerShape(12.dp)).background(Pc.RowSelected.copy(alpha = 0.9f))) {
+                        vm.previews["${d.set}-${d.index}"]?.let {
+                            Image(it, contentDescription = null, contentScale = ContentScale.Crop, colorFilter = pluginFilter(tints.second), modifier = Modifier.fillMaxSize())
+                        }
+                        Text(d.name, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, modifier = Modifier.padding(start = 18.dp, top = 11.dp))
+                        // several going together: how many
+                        if (draggedWith.size > 1) {
+                            Box(
+                                Modifier.align(Alignment.TopEnd).padding(top = 8.dp, end = 8.dp).size(24.dp).clip(CircleShape).background(Color.White),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Text("${draggedWith.size}", color = Pc.RowSelected, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                            }
                         }
                     }
+                    // over another set they would be copied into: a green plus on its corner
+                    if (dropCopies) DragBadge(LandsBadge, "+", Modifier.align(Alignment.TopEnd).offset(12.dp, (-12).dp))
                 }
             }
             // and the dragged set
@@ -1361,8 +1373,11 @@ internal fun draggedTogether(held: BrushInfo, picked: List<String>, selected: Bo
     return going.ifEmpty { listOf(held) }
 }
 
-/** How long a dragged brush is held over a set before it opens (as the system's own drags do). */
-private const val SPRING_LOAD_MS = 500L
+/**
+ * How long a dragged brush is held over another set before it opens, to be let go among its
+ * brushes (measured on the original: 1.76 s, from frames 0.1 s apart).
+ */
+internal const val SPRING_LOAD_MS = 1800L
 
 /** Hanging from its button, the library's grabber tears it off into a window of its own, while a plugin lets it ([floating]: it floats). */
 @Composable

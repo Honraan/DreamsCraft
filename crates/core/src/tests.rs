@@ -9901,6 +9901,61 @@ fn brushes_dragged_together_move_into_a_set_in_their_order() {
     assert_eq!(s.brush_library(), kept);
 }
 
+/// Brushes let go on another set are copied there (to its top, from a set's row), keeping their
+/// names and what they started as, those dragged staying where they were, as the original's
+/// library does; along their own set they still move. The tools, the Recent set and each set's
+/// choice stay on their brushes, the places after the copies moving down past them.
+#[test]
+fn brushes_dropped_on_another_set_are_copied_there_and_along_their_own_moved() {
+    let s = CanvasSession::new(64, 64);
+    let names = |set: usize| s.brush_library()[set].brushes.iter().map(|b| b.name.clone()).collect::<Vec<_>>();
+    assert_eq!(s.new_brush_set(), 0);
+    let library = s.brush_library();
+    let own = library.iter().position(|set| set.name == "Untitled Set").unwrap() as u32;
+    let stock = library.iter().position(|set| set.name != "Untitled Set").unwrap() as u32;
+    let from = names(stock as usize);
+    assert!(from.len() >= 5);
+    // the current brush among them, and one pinned in the Recent set
+    assert!(s.select_brush(stock, 3));
+    assert!(s.pin_recent_brush(stock, 3, true));
+    let origins = |set: u32| s.shared.lock().library[set as usize].origins.clone();
+    let stock_origins = origins(stock);
+    // onto the set's row: to its top, in their order; theirs untouched
+    assert!(crate::brush_drop_copies(stock, own) && !crate::brush_drop_copies(stock, stock));
+    assert!(s.drop_brushes(stock, vec![3, 1], own, 0));
+    assert_eq!(names(stock as usize), from);
+    assert_eq!(names(own as usize), [from[1].clone(), from[3].clone()]);
+    let origin = |i: usize| stock_origins.get(i).copied().flatten();
+    assert_eq!(origins(own), [origin(1), origin(3)]);
+    assert_eq!(origins(stock), stock_origins);
+    let c = s.current_brush();
+    assert_eq!((c.set, c.index), (stock, 3));
+    assert!(s.recent_brushes().iter().any(|r| (r.set, r.index, r.pinned) == (stock, 3, true)));
+    // each copy is a brush of its own: renamed, the one it came from keeps its name
+    assert!(s.rename_brush(own, 0, "Copied".into()));
+    assert_eq!(names(stock as usize)[1], from[1]);
+    // a brush in use after the place they go to moves down past them
+    assert!(s.select_brush(own, 1));
+    assert!(s.drop_brushes(stock, vec![0], own, 1));
+    assert_eq!(names(own as usize), ["Copied".to_owned(), from[0].clone(), from[3].clone()]);
+    let c = s.current_brush();
+    assert_eq!((c.set, c.index), (own, 2));
+    // along their own set they move (counted without them there), and the tool follows its brush
+    assert!(s.select_brush(stock, 0));
+    assert!(s.drop_brushes(stock, vec![0], stock, 2));
+    assert_eq!(names(stock as usize)[..3], [from[1].clone(), from[2].clone(), from[0].clone()]);
+    assert_eq!(names(stock as usize).len(), from.len());
+    let c = s.current_brush();
+    assert_eq!((c.set, c.index), (stock, 2));
+    // nothing there, or nowhere to go: refused, nothing copied
+    let kept = s.brush_library();
+    assert!(!s.drop_brushes(own, vec![0, 99], stock, 0));
+    assert!(!s.drop_brushes(own, vec![0], 99, 0));
+    assert!(!s.drop_brushes(own, vec![], stock, 0));
+    assert!(!s.copy_brushes(99, vec![0], own, 0));
+    assert_eq!(s.brush_library(), kept);
+}
+
 /// Brush `index` of `set` as a brush file, as Share makes it.
 fn brushfile_of(s: &CanvasSession, set: u32, index: u32) -> Vec<u8> {
     s.brush_as_file(set, index).expect("a brush file")

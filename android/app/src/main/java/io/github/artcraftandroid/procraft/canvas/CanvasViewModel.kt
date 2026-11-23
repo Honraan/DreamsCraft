@@ -5630,21 +5630,16 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         if (places.count { (set, index) -> s.deleteBrush(set, index) } > 0) libraryChanged()
     }
 
-    /** Moves [b] to place [index] of set [set] (a brush dragged onto a set, or along its own). */
-    fun moveBrush(b: BrushInfo, set: Int, index: Int) {
-        if (set == b.set.toInt() && index == b.index.toInt()) return
-        if (session?.moveBrush(b.set, b.index, set.toUInt(), index.toUInt()) == true) libraryChanged()
-    }
-
     /**
-     * Moves [brushes] (of one set) together, in their order, to place [index] of set [set]
-     * (counted without them there): brushes picked and dragged onto a set, or along their own.
+     * [brushes] (of one set, dragged together, in their order) let go at place [index] of set [set]
+     * (counted without them there): along their own set they move there; onto another set they are
+     * copied there, those dragged staying where they were (see the core's `brushDropCopies`).
      */
-    fun moveBrushes(brushes: List<BrushInfo>, set: Int, index: Int) {
+    fun dropBrushes(brushes: List<BrushInfo>, set: Int, index: Int) {
         val first = brushes.firstOrNull() ?: return
-        if (brushes.size == 1) return moveBrush(first, set, index)
+        if (brushes.size == 1 && set == first.set.toInt() && index == first.index.toInt()) return
         val indices = brushes.filter { it.set == first.set }.map { it.index }
-        if (session?.moveBrushes(first.set, indices, set.toUInt(), index.toUInt()) == true) libraryChanged()
+        if (session?.dropBrushes(first.set, indices, set.toUInt(), index.toUInt()) == true) libraryChanged()
     }
 
     /** A new brush at the top of the shown set, opened in the studio. */

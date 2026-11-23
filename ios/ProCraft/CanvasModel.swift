@@ -613,12 +613,13 @@ final class CanvasModel {
         }
     }
 
-    /// Moves `b` to place `index` of set `set` (a brush dragged onto a set, or along its own).
-    func moveBrush(_ b: BrushInfo, set: Int, index: Int) {
+    /// `b` dragged and let go at place `index` of set `set`: along its own set it moves there; onto
+    /// another set it is copied there, the one dragged staying where it was (the core's rule).
+    func dropBrush(_ b: BrushInfo, set: Int, index: Int) {
         if set == Int(b.set), index == Int(b.index) {
             return
         }
-        if session.moveBrush(set: b.set, index: b.index, toSet: UInt32(set), toIndex: UInt32(index)) {
+        if session.dropBrushes(set: b.set, indices: [b.index], toSet: UInt32(set), toIndex: UInt32(index)) {
             libraryChanged()
         }
     }

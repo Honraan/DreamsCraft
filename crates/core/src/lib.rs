@@ -163,7 +163,7 @@ pub use brush_files::{
     ReadBrushes, is_brush_zip, read_any_brushes, read_brushes, read_brushes_file, read_brushes_from,
 };
 pub use brush_libraries::BrushLibraryInfo;
-pub use brush_library::prepare_brushes;
+pub use brush_library::{brush_drop_copies, prepare_brushes};
 pub use brushes::{BrushInfo, BrushSetInfo, HoverFill, RecentBrush};
 pub use clipboard::{COPY_PIXELS_A_METRE, copy_straight, picture_png, write_copy_png};
 pub use colour::{

@@ -91,9 +91,9 @@ const PICKER_GLASS: menu::Glass = menu::Glass {
 /// menu (and moved on from there, drags the brush).
 pub(crate) const SLOP: f32 = 8.0;
 pub(crate) const HOLD: Duration = Duration::from_millis(400);
-/// A dragged brush held this long over a set opens it, to be let go among its brushes (as the
-/// system's own drags do).
-const SPRING_LOAD: Duration = Duration::from_millis(500);
+/// A dragged brush held this long over another set opens it, to be let go among its brushes
+/// (measured on the original: 1.76 s).
+const SPRING_LOAD: Duration = Duration::from_millis(1800);
 /// A press slides its brush once this far sideways (points), going this many times further
 /// sideways than up or down: a hand scrolling swings in an arc, and a slide opens onto Delete, so
 /// anything less plainly sideways is left to the list.
@@ -546,6 +546,14 @@ impl Library {
         }
     }
 
+    /// Whether the brushes dragged by `p` would be copied where the pointer is now (onto another
+    /// set, or among the brushes of another set it opened), as the green plus on them says.
+    fn drop_copies(&self, p: Press) -> bool {
+        let moving = if self.dragged_with.is_empty() { vec![p.key] } else { self.dragged_with.clone() };
+        drop_place(&moving, p.last, &self.set_rects, &self.brush_rects)
+            .is_some_and(|(to, _)| procraft_core::brush_drop_copies(p.key.0, to))
+    }
+
     /// The library changed: its sample strokes are drawn again (they go by place), and it is kept.
     pub fn library_changed(&mut self) {
         self.stale = true;
@@ -876,6 +884,12 @@ impl Library {
                     painter.circle_filled(badge, 12.0, Color32::WHITE);
                     let count = self.dragged_with.len().to_string();
                     text(&painter, badge, Align2::CENTER_CENTER, &count, 13.0, Weight::SemiBold, argb(pc::ACCENT));
+                }
+                // over another set they would be copied into: a green plus on its corner
+                if self.drop_copies(p) {
+                    let lands = ui.painter_at(lists.expand(12.0));
+                    lands.circle_filled(at.right_top(), 12.0, argb(crate::held_layers::LANDS));
+                    text(&lands, at.right_top(), Align2::CENTER_CENTER, "+", 15.0, Weight::Medium, Color32::WHITE);
                 }
                 ctx.request_repaint();
             }
@@ -1409,19 +1423,14 @@ impl Library {
                 }
             }
             Way::Drag => {
-                // onto another set: to its top; onto a brush of the set shown not among them: to
-                // its place (the first of them taking it, the rest after it)
+                // onto another set: copied to its top; onto a brush of the set shown not among
+                // them: to its place (the first of them taking it, the rest after it), copied
+                // there from another set, moved along their own
                 let moving = std::mem::take(&mut self.dragged_with);
                 let moving = if moving.is_empty() { vec![p.key] } else { moving };
                 let place = drop_place(&moving, at, &self.set_rects, &self.brush_rects);
-                let moved = place.is_some_and(|(to, index)| match moving.as_slice() {
-                    [(set, from)] => session.move_brush(*set, *from, to, index),
-                    _ => {
-                        let indices = moving.iter().map(|&(_, i)| i).collect();
-                        session.move_brushes(p.key.0, indices, to, index)
-                    }
-                });
-                if moved {
+                let indices = moving.iter().map(|&(_, i)| i).collect();
+                if place.is_some_and(|(to, index)| session.drop_brushes(p.key.0, indices, to, index)) {
                     self.library_changed();
                 }
             }
@@ -2556,6 +2565,9 @@ mod tests {
             f.to(from + (over - from) * (i as f32 / 6.0));
         }
         assert_eq!(f.library.dragged_with, vec![key, other]);
+        // over another set they would be copied there, as the green plus on them says
+        let press = f.library.press.unwrap();
+        assert!(f.library.drop_copies(press));
         // held there a moment: it opens, its brushes shown
         std::thread::sleep(SPRING_LOAD + Duration::from_millis(50));
         f.frame(Vec::new());
@@ -2572,7 +2584,8 @@ mod tests {
         let now = names(&f, to);
         assert_eq!(now.len(), theirs.len() + 2);
         assert_eq!(now[1..3], [before[key.1 as usize].clone(), before[other.1 as usize].clone()]);
-        assert_eq!(names(&f, key.0 as usize).len(), before.len() - 2);
+        // copied there: their own set keeps them
+        assert_eq!(names(&f, key.0 as usize), before);
     }
 
     #[test]

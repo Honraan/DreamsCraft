@@ -472,6 +472,14 @@ struct LastLibrary {
     library: Vec<LibrarySet>,
 }
 
+/// Whether brushes dragged from set `from` and let go on set `to` are copied there, those dragged
+/// staying where they were (a green plus on them says so while they are dragged over it): onto
+/// another set they are; along their own set they move.
+#[uniffi::export]
+pub fn brush_drop_copies(from: u32, to: u32) -> bool {
+    from != to
+}
+
 /// Reads the library in use kept in folder `dir` ahead of the first artwork (while the gallery
 /// shows), so that it opens without reading it (see [`CanvasSession::open_brushes`]); nothing if it
 /// is held already or there is none. Slow with many brushes brought in: call it off the main thread.
@@ -1268,6 +1276,52 @@ impl CanvasSession {
             Some((rs, if rs == ts && ri >= ti { ri + count } else { ri }))
         });
         true
+    }
+
+    /// Copies brushes `indices` of `set` together, in their order, to place `to_index` of set
+    /// `to_set` (its top at 0), each with its own name and what it started as; the brushes copied
+    /// stay where they were, and a tool keeps the brush it had. False, copying none, if any isn't a
+    /// brush there or there is no such set.
+    pub fn copy_brushes(&self, set: u32, indices: Vec<u32>, to_set: u32, to_index: u32) -> bool {
+        let mut st = self.shared.lock();
+        let (s, ts) = (set as usize, to_set as usize);
+        let mut copying: Vec<usize> = indices.iter().map(|&i| i as usize).collect();
+        copying.sort_unstable();
+        copying.dedup();
+        let Some(entry) = st.library.get(s) else { return false };
+        if copying.is_empty() || ts >= st.library.len() || copying.iter().any(|&i| i >= entry.brushes.len()) {
+            return false;
+        }
+        let copies: Vec<(Brush, Option<(usize, usize)>)> = copying
+            .iter()
+            .filter_map(|&i| Some((entry.brushes.get(i)?.clone(), entry.origins.get(i).copied().flatten())))
+            .collect();
+        let count = copies.len();
+        let Some(target) = st.library.get_mut(ts) else { return false };
+        let ti = (to_index as usize).min(target.brushes.len());
+        for (k, (brush, origin)) in copies.into_iter().enumerate() {
+            target.brushes.insert(ti + k, brush);
+            if ti + k <= target.origins.len() {
+                target.origins.insert(ti + k, origin);
+            } else {
+                target.origins.push(origin);
+            }
+        }
+        // the brushes after them in their new set move down past them
+        st.move_brush_refs(|(rs, ri)| Some((rs, if rs == ts && ri >= ti { ri + count } else { ri })));
+        true
+    }
+
+    /// Brushes `indices` of `set` dragged and let go at place `to_index` of set `to_set` (counted
+    /// without them there): along their own set they move there; onto another set they are copied
+    /// there, those dragged staying where they were (see [`brush_drop_copies`]). Whether any moved
+    /// or were copied.
+    pub fn drop_brushes(&self, set: u32, indices: Vec<u32>, to_set: u32, to_index: u32) -> bool {
+        if brush_drop_copies(set, to_set) {
+            self.copy_brushes(set, indices, to_set, to_index)
+        } else {
+            self.move_brushes(set, indices, to_set, to_index)
+        }
     }
 
     /// Names brush `index` of `set` (from its menu in the library), as a set is named: trimmed, at
