@@ -12651,6 +12651,12 @@ pub fn textures_bytes(textures: &[wgpu::Texture]) -> u64 {
 }
 
 impl Pipelines {
+    /// Whether the compute passes were made (see [`Gpu::computes`]): not where one failed.
+    #[cfg(test)]
+    pub(crate) fn computes(&self) -> bool {
+        self.compute.is_some()
+    }
+
     pub(crate) fn new(device: &wgpu::Device, abilities: Abilities, cache: Option<wgpu::PipelineCache>) -> Pipelines {
         let kept = cache.as_ref();
         let tex_entry = |binding| wgpu::BindGroupLayoutEntry {
@@ -12949,7 +12955,10 @@ impl Pipelines {
             LiquifyPipelines { stamp, step, format, layout: liquify_layout }
         });
         let surround_pipeline_layout = layout("surround", &[Some(&uniform_layout)]);
-        // the compute passes, where the GPU runs them (none where it has no storage buffers)
+        // the compute passes, where the GPU runs them (none where it has no storage buffers, or
+        // where one of them can't be made: an OpenGL ES's shading language lacking what it needs,
+        // a driver failing to compile it; the fragment passes stand in, as where there are none)
+        let compute_failed = abilities.computes.then(|| device.push_error_scope(wgpu::ErrorFilter::Validation));
         let compute = abilities.computes.then(|| {
             let storage = |binding| wgpu::BindGroupLayoutEntry {
                 binding,
@@ -13134,6 +13143,16 @@ impl Pipelines {
                 smudge_wet_plots,
             }
         });
+        let compute = match compute_failed.and_then(|scope| pollster::block_on(scope.pop())) {
+            Some(e) => {
+                log::warn!(
+                    "the compute passes couldn't be made on this GPU ({e}): strokes, smudges and wet paint are laid \
+                     in fragment passes instead"
+                );
+                None
+            }
+            None => compute,
+        };
 
         // in place of the compute passes or half floats where the GPU lacks either
         let fragments = (compute.is_none() || liquify.is_none()).then(|| {

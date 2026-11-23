@@ -115,12 +115,39 @@ pub fn log_line(level: LogLevel, tag: String, message: String) {
 #[uniffi::export]
 pub fn trace_text(trace: Vec<u8>) -> String {
     let text = match std::str::from_utf8(&trace) {
-        Ok(text) if text.chars().all(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t')) => text.to_owned(),
+        Ok(text) if is_text(text) => text.to_owned(),
         _ => {
             tombstone::read(&trace).unwrap_or_else(|| format!("(a trace of {} bytes the app can't read)", trace.len()))
         }
     };
     trimmed(&text, TRACE_MOST)
+}
+
+/// Whether a trace is text (a frozen app's, an older system's crash), not a record in binary form.
+fn is_text(text: &str) -> bool {
+    text.chars().all(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
+}
+
+/// The files the frames of the thread that crashed were in, innermost first, from the system's
+/// trace of a crash in native code (its record in binary form, or as text: the first backtrace's),
+/// as much of it as was read; none if it names none.
+pub(crate) fn crashed_frame_files(trace: &[u8]) -> Vec<String> {
+    let text = match std::str::from_utf8(trace) {
+        Ok(text) => Some(text),
+        // cut short inside a character
+        Err(e) if e.error_len().is_none() => trace.get(..e.valid_up_to()).and_then(|t| std::str::from_utf8(t).ok()),
+        Err(_) => None,
+    };
+    match text {
+        Some(text) if is_text(text) => text
+            .lines()
+            .map(str::trim_start)
+            .skip_while(|line| !line.starts_with("#00 pc "))
+            .take_while(|line| line.starts_with('#') && line.split_whitespace().nth(1) == Some("pc"))
+            .filter_map(|line| line.split_whitespace().nth(3).map(str::to_owned))
+            .collect(),
+        _ => tombstone::crashed_files(trace),
+    }
 }
 
 /// Writes the log to share into the file `to`: what the GPU start record says and the GPU each run
@@ -187,18 +214,24 @@ fn shared_log(dir: &Path) -> String {
     let crashed = read(CRASHED_LOG).filter(|c| process_of(c.as_bytes()) != run_before);
     let record = read(crate::device::RECORD).map(|r| r.trim().to_owned()).filter(|r| !r.is_empty());
     let mut out = String::from("ProCraft's log\n\n");
-    // "<backend> trying|made|drew", and on a second line the build it was kept for
+    // "<backend> trying|made|drew", on a second line the build it was kept for, and on a third
+    // what the GPU's drivers' crashes came to
     let record = match record {
         Some(r) => {
             let mut lines = r.lines();
             let first = lines.next().unwrap_or_default().trim().to_owned();
             let build = lines.next().map(str::trim).filter(|b| !b.is_empty());
+            let crashes = lines.next().map(str::trim).filter(|c| !c.is_empty());
             let shown = match first.split_whitespace().next().and_then(|b| b.parse::<usize>().ok()) {
                 Some(backend) => format!("{first} (backend {backend} is {})", procraft_gpu::Gpu::backend_name(backend)),
                 None => first,
             };
-            match build {
+            let shown = match build {
                 Some(build) => format!("{shown}, kept for the build {build}"),
+                None => shown,
+            };
+            match crashes {
+                Some(crashes) => format!("{shown}; {crashes}"),
                 None => shown,
             }
         }
@@ -696,6 +729,30 @@ mod tombstone {
         lines
     }
 
+    /// A thread from the record's map of them: each under its number, as a pair of fields.
+    fn thread_entry(bytes: &[u8]) -> Option<Thread> {
+        Fields(bytes).find_map(|(n, v)| match (n, v) {
+            (2, Value::Bytes(b)) => Some(thread(b)),
+            _ => None,
+        })
+    }
+
+    /// The files the crashed thread's frames were in, innermost first (see
+    /// [`super::crashed_frame_files`]).
+    pub(super) fn crashed_files(bytes: &[u8]) -> Vec<String> {
+        let mut crashed = None;
+        let mut threads = Vec::new();
+        for (n, value) in Fields(bytes) {
+            match (n, value) {
+                (6, Value::Number(v)) => crashed = Some(v),
+                (16, Value::Bytes(b)) => threads.extend(thread_entry(b)),
+                _ => {}
+            }
+        }
+        let thread = threads.into_iter().find(|t| Some(t.id) == crashed);
+        thread.map(|t| t.frames.into_iter().map(|f| f.file).collect()).unwrap_or_default()
+    }
+
     /// The record `bytes` as text: none if it isn't one (no signal and no threads in it).
     pub(super) fn read(bytes: &[u8]) -> Option<String> {
         let (mut crashed, mut uptime, mut said) = (None, None, None);
@@ -710,11 +767,7 @@ mod tombstone {
                     (1, Value::Bytes(b)) => Some(text(b)),
                     _ => None,
                 })),
-                // each thread under its number, as a pair of fields
-                (16, Value::Bytes(b)) => threads.extend(Fields(b).find_map(|(n, v)| match (n, v) {
-                    (2, Value::Bytes(b)) => Some(thread(b)),
-                    _ => None,
-                })),
+                (16, Value::Bytes(b)) => threads.extend(thread_entry(b)),
                 (18, Value::Bytes(b)) => logs.extend(log_lines(b)),
                 (20, Value::Number(v)) => uptime = Some(v),
                 _ => {}
@@ -1115,6 +1168,51 @@ mod tests {
         }
         assert!(!text.contains("memory map"), "{text}");
         assert!(!text.contains("#04"), "{text}");
+    }
+
+    /// The files the crashed thread's frames were in, innermost first, from the record in binary
+    /// form (the crashed thread's, wherever it is among the others), from one cut short after its
+    /// threads, and from text (the first backtrace's, as the log tells it).
+    #[test]
+    fn a_native_crash_s_frames_are_told_by_the_files_they_were_in() {
+        let files = [
+            "/vendor/lib64/hw/vulkan.mt6761.so",
+            "/system/lib64/libvulkan.so",
+            "/data/app/~~a==/io.github.artcraftandroid.procraft-b==/base.apk",
+        ];
+        let mut t = number(1, 31694);
+        t.extend(bytes(2, b"procraft-render"));
+        for (i, file) in files.iter().enumerate() {
+            let mut f = number(1, 0x6d2f8 + i as u64);
+            f.extend(bytes(6, file.as_bytes()));
+            t.extend(bytes(4, &f));
+        }
+        let mut entry = number(1, 31694);
+        entry.extend(bytes(2, &t));
+        let mut record = number(6, 31694);
+        record.extend(thread(31304, "ndroid.procraft", 4));
+        record.extend(bytes(16, &entry));
+        record.extend(thread(31305, "Signal Catcher", 2));
+        record.extend(bytes(17, &[0x7f; 64]));
+        assert_eq!(crashed_frame_files(&record), files);
+        assert_eq!(crashed_frame_files(&record[..record.len() - 20]), files);
+        let text = trace_text(record);
+        assert_eq!(crashed_frame_files(text.as_bytes()), files);
+        // text cut short inside a character
+        let mut cut = format!("{text}\u{e9}").into_bytes();
+        cut.pop();
+        assert_eq!(crashed_frame_files(&cut), files);
+        // a system's own text tombstone: its backtrace
+        let tombstone = "pid: 1, tid: 2, name: procraft-render  >>> io.github.artcraftandroid.procraft <<<\n\
+                         backtrace:\n      #00 pc 0000000000001234  /vendor/lib64/egl/libGLESv2_mtk.so (BuildId: 0a)\n      \
+                         #01 pc 0000000000005678  /system/lib64/libGLESv2.so (glDrawArrays+28)\n\nmemory near x0:\n";
+        assert_eq!(
+            crashed_frame_files(tombstone.as_bytes()),
+            ["/vendor/lib64/egl/libGLESv2_mtk.so", "/system/lib64/libGLESv2.so"]
+        );
+        // no thread that crashed, or neither form
+        assert!(crashed_frame_files(&thread(4000, "main", 3)).is_empty());
+        assert!(crashed_frame_files(&[8, 1, 0xff]).is_empty());
     }
 
     #[test]

@@ -163,6 +163,12 @@ impl FilterCode {
     pub(super) fn into_module(self) -> Module {
         self.module
     }
+
+    /// The module as read, for a test to translate.
+    #[cfg(test)]
+    pub(crate) fn module(&self) -> &Module {
+        &self.module
+    }
 }
 
 /// `work` on a stack that parsing or compiling what a file holds can't run out of: a stack

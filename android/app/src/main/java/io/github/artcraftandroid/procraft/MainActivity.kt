@@ -67,6 +67,13 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         // the log's file first, so that what follows is in it
         AppLog.start(this)
+        // which graphics backend the app is trying, kept before the model (made at its first use
+        // below) makes the GPU device: a driver that crashes the app then sends the next start to
+        // the next backend (one that drew is trusted until the app or the system is updated); and
+        // how the last runs ended, so that a driver that crashed them while drawing sends this one
+        // to the other backend
+        io.github.artcraftandroid.procraft.core.setGpuRecordFolder(filesDir.path, installedBuild())
+        AppLog.toGpuStart(this)
         // text's fonts given to the core, off the main thread
         io.github.artcraftandroid.procraft.canvas.TextRenderer.prepare(assets, java.io.File(filesDir, "fonts"))
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) window.isNavigationBarContrastEnforced = false
@@ -74,10 +81,6 @@ class MainActivity : ComponentActivity() {
         // a colour dragged down from the top bar puts back the bars the drag showed
         vm.hideSystemBars = barsHider
         vm.pickBrushFile = brushPickerOpener
-        // which graphics backend the app is trying, kept before the model makes the GPU device: a
-        // driver that crashes the app then sends the next start to the next backend (one that drew
-        // is trusted until the app or the system is updated)
-        io.github.artcraftandroid.procraft.core.setGpuRecordFolder(filesDir.path, installedBuild())
         // made here, not inside the flow's read-only snapshot, where its setup can't write state
         val model = vm
         // laid out left to right in every language, as the original is: a right-to-left one

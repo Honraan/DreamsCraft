@@ -7,6 +7,9 @@
 mod canvas;
 #[cfg(windows)]
 mod compiler;
+// (naga's GLSL writer comes with the OpenGL backend, which Apple's systems go without)
+#[cfg(all(test, not(target_vendor = "apple")))]
+mod gles_shaders;
 mod kept;
 mod lighting;
 mod placed;
@@ -195,6 +198,75 @@ fn keeps_textures_uncompressed(name: &str, backend: wgpu::Backend) -> bool {
     backend == wgpu::Backend::Vulkan && name.to_ascii_lowercase().contains("mali")
 }
 
+/// Whether a GPU named `name` starts on OpenGL ES on Android: an old PowerVR Rogue (GE8100,
+/// GE8300, GE8320 and the like, in budget MediaTek and Unisoc phones and tablets), whose Vulkan
+/// driver crashed the app in the queue's submit some seconds after a canvas opened.
+fn crashes_on_vulkan(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("powervr rogue")
+}
+
+/// The backends on Android, best first, for the GPUs Vulkan sees (`vulkan_gpus`): Vulkan, then
+/// OpenGL ES (for a device whose Vulkan is missing or fails); the other way round for a GPU whose
+/// Vulkan driver is known to crash (see [`crashes_on_vulkan`]).
+fn android_backends(vulkan_gpus: &[String]) -> Vec<wgpu::Backends> {
+    if vulkan_gpus.iter().any(|name| crashes_on_vulkan(name)) {
+        vec![wgpu::Backends::GL, wgpu::Backends::VULKAN]
+    } else {
+        vec![wgpu::Backends::VULKAN, wgpu::Backends::GL]
+    }
+}
+
+/// Whether a device on `backend` whose canvases' pipelines failed in part is kept, not given up
+/// for the next backend: OpenGL ES, not lost, where it is kept whatever fails (`kept`, see
+/// [`opengl_kept`]). What needs the pipelines that failed doesn't draw; the rest does.
+fn takes_opengl_with_errors(backend: wgpu::Backend, lost: bool, kept: bool) -> bool {
+    let taken = backend == wgpu::Backend::Gl && !lost && kept;
+    if taken {
+        log::warn!(
+            "OpenGL ES kept all the same, as Vulkan's driver crashes on this GPU: only what needs the pipelines \
+             that failed (above) won't draw"
+        );
+    }
+    taken
+}
+
+/// Whether the app's record says Vulkan's driver crashed the app on this device and system (see
+/// [`vulkan_crashed`]).
+static VULKAN_CRASHED: AtomicBool = AtomicBool::new(false);
+
+/// Tells the GPU whether Vulkan's driver crashed the app on this device and system, as the app's
+/// record of its starts says: OpenGL ES is then kept even where some of the canvases' pipelines
+/// fail on it (see [`Gpu::for_canvases`]).
+pub fn vulkan_crashed(crashed: bool) {
+    VULKAN_CRASHED.store(crashed, Ordering::Relaxed);
+}
+
+/// Whether OpenGL ES is kept whatever pipelines fail on it, never giving way to Vulkan: Vulkan's
+/// driver crashed the app here (see [`vulkan_crashed`]), or is known to crash on this GPU (see
+/// [`crashes_on_vulkan`]). A crash takes the app down where a pipeline that fails costs only what
+/// needs it.
+fn opengl_kept() -> bool {
+    VULKAN_CRASHED.load(Ordering::Relaxed)
+        || (cfg!(target_os = "android") && vulkan_gpus().iter().any(|name| crashes_on_vulkan(name)))
+}
+
+/// The GPUs Vulkan sees, by name, asked once (it lists them, making no device); none where it
+/// can't.
+fn vulkan_gpus() -> &'static [String] {
+    static SEEN: OnceLock<Vec<String>> = OnceLock::new();
+    SEEN.get_or_init(|| {
+        let seen: Vec<String> = std::panic::catch_unwind(|| Gpu::adapters(wgpu::Backends::VULKAN))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
+        if let Some(name) = seen.iter().find(|name| crashes_on_vulkan(name)) {
+            log::info!("{name}: its Vulkan driver is known to crash, so OpenGL ES first");
+        }
+        seen
+    })
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum GpuError {
     #[error("no suitable GPU: {0}")]
@@ -256,7 +328,8 @@ impl Gpu {
 
     /// The backends a device is made from, best first: those `WGPU_BACKEND` names if it is set
     /// (to try another when a driver fails); on Android Vulkan, then OpenGL ES (for a device
-    /// whose Vulkan is missing or fails); on Windows Vulkan and Direct3D 12, Direct3D 12 first on
+    /// whose Vulkan is missing or fails), the other way round for a GPU whose Vulkan driver is
+    /// known to crash (see [`android_backends`]); on Windows Vulkan and Direct3D 12, Direct3D 12 first on
     /// ARM (the Snapdragon X's Vulkan driver fails as a canvas opens), then OpenGL (a GPU or
     /// driver too old for either); on Linux Vulkan, then OpenGL (the same); elsewhere the native
     /// API. A backend's index here is the one the other calls take.
@@ -265,7 +338,7 @@ impl Gpu {
             return vec![chosen];
         }
         if cfg!(target_os = "android") {
-            vec![wgpu::Backends::VULKAN, wgpu::Backends::GL]
+            android_backends(vulkan_gpus())
         } else if cfg!(all(windows, target_arch = "aarch64")) {
             vec![wgpu::Backends::DX12, wgpu::Backends::VULKAN, wgpu::Backends::GL]
         } else if cfg!(windows) {
@@ -382,7 +455,8 @@ impl Gpu {
 
     /// The app's device, the canvases' pipelines made: from the first instance that makes one
     /// and builds them without an error or losing it (a driver that fails on them gives way to
-    /// the next backend; the last is kept as it is).
+    /// the next backend; the last is kept as it is). OpenGL ES with pipelines failing on it is
+    /// kept all the same where Vulkan's driver crashes (see [`opengl_kept`]).
     pub fn for_canvases() -> Result<Gpu, GpuError> {
         Gpu::for_canvases_from(0, |_| {}).map(|(gpu, _)| gpu)
     }
@@ -397,7 +471,7 @@ impl Gpu {
             if !fine {
                 log::warn!("the canvases' pipelines: {} GPU errors, lost {}", gpu.errors(), gpu.is_lost());
             }
-            fine
+            fine || takes_opengl_with_errors(gpu.adapter.get_info().backend, gpu.is_lost(), opengl_kept())
         })
     }
 
@@ -780,13 +854,69 @@ impl Gpu {
 #[cfg(test)]
 mod tests {
     /// A GPU or driver too old for the rest still draws: without OpenGL behind them the app can't
-    /// open at all.
+    /// open at all. (First, on Android, for a GPU whose Vulkan driver is known to crash.)
     #[test]
     #[cfg(any(target_os = "linux", windows, target_os = "android"))]
     fn opengl_is_the_last_backend_tried() {
         if std::env::var_os("WGPU_BACKEND").is_none() {
-            assert_eq!(super::Gpu::backends().last(), Some(&wgpu::Backends::GL));
+            let backends = super::Gpu::backends();
+            let first = cfg!(target_os = "android") && super::vulkan_gpus().iter().any(|n| super::crashes_on_vulkan(n));
+            assert_eq!(if first { backends.first() } else { backends.last() }, Some(&wgpu::Backends::GL));
         }
+    }
+
+    /// Old PowerVR Rogue GPUs start on OpenGL ES: their Vulkan driver crashed the app in the
+    /// queue's submit ("PowerVR Rogue GE8300", Vulkan driver 1.15, five starts in a row). Others,
+    /// newer PowerVRs among them, start on Vulkan.
+    #[test]
+    fn old_powervr_rogue_gpus_start_on_opengl_es() {
+        use super::android_backends;
+        use wgpu::Backends;
+        let names = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        for rogue in [
+            "PowerVR Rogue GE8300",
+            "PowerVR Rogue GE8320",
+            "PowerVR Rogue GE8322",
+            "PowerVR Rogue GE8100",
+            "PowerVR Rogue GM9446",
+            "PowerVR Rogue G6200",
+        ] {
+            assert_eq!(android_backends(&names(&[rogue])), [Backends::GL, Backends::VULKAN], "{rogue}");
+        }
+        for other in [
+            "PowerVR B-Series BXM-8-256",
+            "Adreno (TM) 750",
+            "Adreno (TM) 610",
+            "Mali-G57 MC2",
+            "Mali-G52 MC2",
+            "Samsung Xclipse 940",
+        ] {
+            assert_eq!(android_backends(&names(&[other])), [Backends::VULKAN, Backends::GL], "{other}");
+        }
+        // Vulkan seeing no GPU at all: Vulkan first still (it fails soft, and OpenGL ES follows)
+        assert_eq!(android_backends(&[]), [Backends::VULKAN, Backends::GL]);
+    }
+
+    /// Where Vulkan's driver crashes, OpenGL ES with some of the canvases' pipelines failing is
+    /// kept, never given up for Vulkan (the tester's GE8300 went back to Vulkan over three smudge
+    /// pipelines and crashed); anywhere else, or lost, or on another backend, it gives way.
+    #[test]
+    fn opengl_es_with_failing_pipelines_is_kept_where_vulkan_crashes() {
+        use super::takes_opengl_with_errors;
+        use wgpu::Backend::{Dx12, Gl, Vulkan};
+        assert!(takes_opengl_with_errors(Gl, false, true));
+        assert!(!takes_opengl_with_errors(Gl, false, false));
+        assert!(!takes_opengl_with_errors(Gl, true, true));
+        assert!(!takes_opengl_with_errors(Vulkan, false, true));
+        assert!(!takes_opengl_with_errors(Dx12, false, true));
+        // the app's record saying so is enough (no GPU on the known list on the PC)
+        super::vulkan_crashed(true);
+        assert!(super::opengl_kept());
+        super::vulkan_crashed(false);
+        assert_eq!(
+            super::opengl_kept(),
+            cfg!(target_os = "android") && super::vulkan_gpus().iter().any(|n| super::crashes_on_vulkan(n))
+        );
     }
 
     /// Every wait on the GPU outside the tests goes through [`super::poll`], which fails soft where

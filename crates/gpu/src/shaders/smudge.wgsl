@@ -674,7 +674,9 @@ fn grain_plain(d: Dab, p: vec2<f32>) -> f32 {
             // unfiltered: the texel under it at its level
             let l = i32(round(level));
             g = 0.0;
-            if (l < i32(textureNumLevels(grains))) {
+            // its levels by its side: every grain image is square with all its levels (OpenGL ES
+            // can't ask a texture how many it has)
+            if (l < i32(firstLeadingBit(textureDimensions(grains).x)) + 1) {
                 g = textureLoad(grains, vec2<i32>(fract(uv) * vec2<f32>(textureDimensions(grains, l))), st.grain, l).r;
             }
         } else {
