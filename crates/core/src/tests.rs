@@ -3674,6 +3674,103 @@ fn a_dual_brushs_stroke_ends_laying_only_the_rest_as_laid_whole() {
     }
 }
 
+/// A dual brush whose stroke builds up by its rule in the stroke's textures (a dry Heavy Glaze,
+/// Uniform Blending or Uniform Glaze first, or second: the charcoals of an imported dry media set
+/// among them) ends a long stroke laying only what follows what it laid, and comes out bit for bit
+/// as the whole stroke laid again: laid whole again, its end went on for half a second to nearly
+/// two on a tablet after the lift. Its parts are carried from lot to lot in full floats: laid frame
+/// by frame and then only the rest, each lot's sums rounded to half floats apart, they came out a
+/// level apart here and there, and where its dual mode cuts at a threshold (Ironwood, Beluga,
+/// Quagga, Toscana, Grayling, Grampian) a pixel landed on the threshold's other side by 205 to 230
+/// levels; Frost Birch came out with a dark red speck. Again with lots cut small, so that the
+/// whole stroke's lots end inside a frame's stamps and between them.
+#[test]
+fn a_dual_brush_built_up_by_its_rule_ends_a_long_stroke_laying_only_the_rest_as_laid_whole() {
+    use std::time::{Duration, Instant};
+    let side = 512;
+    let point = |k: usize| PenSample {
+        pressure: 0.4 + 0.5 * (k as f32 * 0.05).sin().abs(),
+        ..sample(
+            24.0 + (k % 300) as f32 * 1.55,
+            60.0 + (k / 300) as f32 * 130.0 + (k as f32 * 0.04).sin() * 50.0,
+            k as f64 * 4.17,
+        )
+    };
+    let samples = 900;
+    let names = ["Ironwood", "Beluga", "Frost Birch"];
+    for (name, lot) in names.iter().flat_map(|n| [(*n, None), (*n, Some(60_000))]) {
+        let ended = |whole: bool| -> Option<(Vec<u8>, u64, Duration, Duration, bool)> {
+            let s = session(side, side)?;
+            let (set, index) = library_brush(&s, |b| b.name == name)?;
+            let carried = {
+                use procraft_engine::brush::{Brush, Rendering};
+                let by_rule = |b: &Brush| matches!(b.rendering, Rendering::Gradual | Rendering::Capped);
+                let mut st = s.shared.lock();
+                let brush = &mut st.library[set as usize].brushes[index as usize];
+                // (an end taper reaching back over what was laid lays the stroke again whole)
+                brush.pen_taper.end = 0.0;
+                if let Some(second) = brush.secondary.as_deref_mut() {
+                    second.pen_taper.end = 0.0;
+                }
+                !brush.mixes_wet()
+                    && !brush.laid_in_place()
+                    && (by_rule(brush) || brush.secondary.as_deref().is_some_and(by_rule))
+            };
+            assert!(s.select_brush(set, index));
+            s.set_brush_size(0.4);
+            s.set_color(0.2, 0.2, 0.25);
+            {
+                let mut st = s.shared.lock();
+                let canvas = st.canvas.as_mut()?;
+                canvas.lay_ends_whole(whole);
+                if let Some(work) = lot {
+                    canvas.set_work_at_once(work);
+                }
+            }
+            s.stroke_begin(PointerKind::Stylus, vec![point(0)]);
+            for e in 1..samples / 2 {
+                s.stroke_add(vec![point(2 * e - 1), point(2 * e)]);
+                if e % 2 == 0 {
+                    picture(&s);
+                }
+            }
+            picture(&s);
+            assert!(s.shared.lock().second.is_some(), "{name} is a dual brush");
+            let before = s.shared.lock().canvas.as_ref()?.stamps_queued();
+            let lifted = Instant::now();
+            s.stroke_end(vec![point(samples - 1)]);
+            let lift = lifted.elapsed();
+            picture(&s);
+            let laid = lifted.elapsed();
+            let sent = s.shared.lock().canvas.as_ref()?.stamps_queued() - before;
+            let current = s.layers().iter().find(|l| l.current).map_or(0, |l| l.id);
+            Some((layer_rgba(&s, current), sent, lift, laid, carried))
+        };
+        let (
+            Some((whole, sent_whole, lift_whole, laid_whole, carried)),
+            Some((rest, sent_rest, lift_rest, laid_rest, _)),
+        ) = (ended(true), ended(false))
+        else {
+            continue;
+        };
+        assert!(carried, "{name} builds up by its rule");
+        let (most, count) = differ(&whole, &rest);
+        println!(
+            "{name} (lots of {lot:?}): {count} of {} channels differ, by {most} at most; at its end {sent_rest} stamps \
+             laid against {sent_whole}; the lift {:.1} ms against {:.1}, laid by {:.1} ms against {:.1}",
+            whole.len(),
+            lift_rest.as_secs_f64() * 1e3,
+            lift_whole.as_secs_f64() * 1e3,
+            laid_rest.as_secs_f64() * 1e3,
+            laid_whole.as_secs_f64() * 1e3,
+        );
+        assert!(whole.iter().skip(3).step_by(4).any(|&a| a > 0), "{name} drew nothing");
+        assert_eq!((most, count), (0, 0), "{name} (lots of {lot:?}): ended unlike laid whole");
+        // the end lays a few stamps, not the stroke again
+        assert!(sent_rest * 10 < sent_whole, "{name}: {sent_rest} stamps laid at its end, against {sent_whole} whole");
+    }
+}
+
 /// A stroke shown with a tip whose start taper is a classic one (its first stamps eased over the
 /// points around them, so they change as the next points come) holds those back until they no
 /// longer change, showing them in its tip meanwhile: the stroke shows as far as the pen has come,

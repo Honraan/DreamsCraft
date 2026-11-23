@@ -938,6 +938,16 @@ impl RuleLists {
         self.kept.truncate(RULE_LISTS_KEPT);
         self.next = 0;
     }
+
+    /// The bind groups binding a carried part's full floats are let go (with what they bind: see
+    /// [`Carried`]).
+    fn unbind_carried(&mut self) {
+        for list in &mut self.kept {
+            if list.bind.as_ref().is_some_and(|(binds, _)| binds.carried.is_some()) {
+                list.bind = None;
+            }
+        }
+    }
 }
 
 /// A list of the rule's tiles kept (see [`RuleLists`]), and its bind group with what it binds.
@@ -954,6 +964,8 @@ struct RuleBinds {
     stamps: wgpu::Buffer,
     target: wgpu::TextureView,
     out: wgpu::Buffer,
+    /// A carried part's full floats (see [`Carried`]).
+    carried: Option<wgpu::TextureView>,
 }
 
 /// The most lists of the rule's tiles kept between renders (see [`RuleLists`]).
@@ -1071,6 +1083,120 @@ fn rule_tiles(instances: &[StampInstance], first: u32, part: IRect, rule: u32) -
         }
     }
     Some(out)
+}
+
+/// A dual brush's part laid by its rule in the stroke's textures (its stroke, or its second),
+/// carried from lot to lot in full floats beside its half floats (see [`Canvas::lay_by_rule`]).
+/// The rule adds a lot's stamps up in full floats and keeps the sums in half floats, so lots cut
+/// otherwise round otherwise: laid frame by frame and then only the rest at its end, a part came
+/// out a level apart here and there from the whole stroke laid again in its own lots, and where a
+/// dual mode cuts at a threshold that level put pixels on its other side. Carried, the stamps go on
+/// from the sums the last left, and from those kept in half floats only where a lot of the whole
+/// stroke laid again would begin (stamps of [`WORK_AT_ONCE`]'s work, as [`in_pieces`] cuts them),
+/// so a stroke's end lays only the rest and comes out bit for bit as laid whole.
+#[derive(Default)]
+struct Carried {
+    /// The full floats, four words a pixel, the canvas's size: made when first wanted in a stroke,
+    /// let go as it ends.
+    texture: Option<(wgpu::Texture, wgpu::TextureView)>,
+    /// For each of the canvas's [`RULE_TILE`] tiles (`across` a row), the lot its full floats were
+    /// last written in: those of an earlier lot (or none since the part was cleared) are left for
+    /// its half floats, as the whole stroke laid again rounds a lot's sums as it ends.
+    written: Vec<u32>,
+    across: u32,
+    /// The lot laid now (counted on, never back, so that a lot before it is any other).
+    lot: u32,
+    /// The work and stamps laid since the last lot of the part laid whole would have begun.
+    work: u64,
+    count: u64,
+}
+
+impl Carried {
+    /// The part is cleared (or laid some other way): no full floats are its own, and its lots
+    /// begin again.
+    fn forget(&mut self) {
+        self.begin_lot();
+        self.work = 0;
+        self.count = 0;
+    }
+
+    /// A lot begins: the full floats written before it are the part's no more.
+    fn begin_lot(&mut self) {
+        self.lot = self.lot.wrapping_add(1);
+        if self.lot == 0 {
+            // (counted round: none is written in a lot from now on)
+            self.written.fill(0);
+            self.lot = 1;
+        }
+    }
+
+    /// The runs of `instances` (the next stamps laid on the part) between the ends of the lots the
+    /// part laid whole would be cut into (see [`in_pieces`]), each with whether a lot begins with
+    /// it.
+    fn lots(
+        &mut self,
+        instances: &[StampInstance],
+        full: IRect,
+        most: u64,
+        most_stamps: u64,
+    ) -> Vec<(std::ops::Range<usize>, bool)> {
+        let mut runs = Vec::new();
+        let (mut from, mut begins) = (0, false);
+        for (k, s) in instances.iter().enumerate() {
+            let more = stamp_work(s, full, false);
+            if self.count > 0 && (self.work.saturating_add(more) > most || self.count >= most_stamps) {
+                if k > from {
+                    runs.push((from..k, begins));
+                    from = k;
+                }
+                begins = true;
+                (self.work, self.count) = (0, 0);
+            }
+            self.count += 1;
+            self.work = self.work.saturating_add(more);
+        }
+        if from < instances.len() {
+            runs.push((from..instances.len(), begins));
+        }
+        runs
+    }
+
+    /// The bits of the tiles of `rect` (on the tiles' grid of a canvas `width` × `height`) whose
+    /// full floats aren't the part's in this lot, 32 a word in the order the rule shader takes the
+    /// tiles.
+    fn fresh(&mut self, rect: IRect, width: u32, height: u32) -> Vec<u32> {
+        let across = width.div_ceil(RULE_TILE);
+        let tiles = across as usize * height.div_ceil(RULE_TILE) as usize;
+        if self.across != across || self.written.len() != tiles {
+            (self.across, self.written) = (across, vec![0; tiles]);
+            self.lot = self.lot.max(1);
+        }
+        let wide = rect.width().div_ceil(RULE_TILE);
+        let mut fresh = vec![0u32; (wide * rect.height().div_ceil(RULE_TILE)).div_ceil(32) as usize];
+        for (t, at) in self.tiles(rect).enumerate() {
+            let own = self.written.get(at).is_some_and(|&lot| lot == self.lot);
+            if let (false, Some(f)) = (own, fresh.get_mut(t / 32)) {
+                *f |= 1 << (t % 32);
+            }
+        }
+        fresh
+    }
+
+    /// The full floats of the tiles of `rect` are written in this lot.
+    fn hold(&mut self, rect: IRect) {
+        for at in self.tiles(rect) {
+            if let Some(lot) = self.written.get_mut(at) {
+                *lot = self.lot;
+            }
+        }
+    }
+
+    /// The places of `rect`'s tiles among the canvas's, a row of them after another.
+    fn tiles(&self, rect: IRect) -> impl Iterator<Item = usize> + use<> {
+        let (x0, y0) = (rect.x0.max(0) as u32 / RULE_TILE, rect.y0.max(0) as u32 / RULE_TILE);
+        let (wide, tall, across) = (rect.width().div_ceil(RULE_TILE), rect.height().div_ceil(RULE_TILE), self.across);
+        (0..tall).flat_map(move |ty| (0..wide).map(move |tx| ((y0 + ty) * across + x0 + tx) as usize))
+    }
 }
 
 /// How far past its size a round tip of radius `r` reaches, by its hardness: (scale, growth) for
@@ -2363,6 +2489,8 @@ enum Op {
         layer: LayerId,
         /// Into the adjustment's mask instead of the stroke.
         pencil: bool,
+        /// Laid on a part carried from lot to lot (see [`Carried`]).
+        carry: bool,
     },
     /// The open stroke's paint is cleared and becomes its colour over `coverage` (a byte a pixel,
     /// `rect`'s rows, 255 all of it): a fill stroke's region (see [`Canvas::fill_stroke`]).
@@ -2974,6 +3102,10 @@ impl Abilities {
 pub(crate) struct ComputePipelines {
     stamp_rule: wgpu::ComputePipeline,
     rule_layout: wgpu::BindGroupLayout,
+    /// A dual brush's part carried from lot to lot (see [`Carried`]), and what it is given: the
+    /// rule's and the part's full floats.
+    stamp_rule_carried: wgpu::ComputePipeline,
+    rule_carry_layout: wgpu::BindGroupLayout,
     smudge_layout: wgpu::BindGroupLayout,
     smudge_carry: wgpu::ComputePipeline,
     smudge_dull: wgpu::ComputePipeline,
@@ -3107,6 +3239,15 @@ pub struct Canvas {
     /// Where stamps laid by their stroke's rule go before their part of the stroke takes them
     /// (see [`Canvas::lay_by_rule`]), made when first wanted.
     rule_out: Option<wgpu::Buffer>,
+    /// A dual brush's parts laid by their rule, carried from lot to lot (see [`Carried`]): its
+    /// stroke's and its second's.
+    carried: [Carried; 2],
+    /// Where a carried part's rule passes write, its half floats and then its full floats (see
+    /// `stamp_rule_compute.wgsl`), made when first wanted.
+    carry_out: Option<wgpu::Buffer>,
+    /// What a part is carried with couldn't be made here: a dual brush's stroke laid by its rule
+    /// is laid whole again as it ends, as it was before.
+    carry_refused: bool,
     /// The lists of tiles the rule's passes read (see [`RuleLists`]), and the most words one may
     /// hold (see [`RULE_LIST_MOST`]).
     rule_lists: RuleLists,
@@ -3641,6 +3782,9 @@ impl Canvas {
             tip: None,
             tip_backup: None,
             rule_out: None,
+            carried: Default::default(),
+            carry_out: None,
+            carry_refused: false,
             rule_lists: RuleLists::default(),
             rule_list_most: RULE_LIST_MOST,
             work_left_out: false,
@@ -3857,6 +4001,13 @@ impl Canvas {
             });
         if !dual {
             self.second_stroke.let_go();
+            // and its parts' full floats (see `Carried`)
+            self.carry_out = None;
+            for carried in &mut self.carried {
+                carried.forget();
+                carried.texture = None;
+            }
+            self.rule_lists.unbind_carried();
         }
         self.uploads.kept.lock().unwrap_or_else(PoisonError::into_inner).clear();
         // made again when a group composites on its own, or a clipping group
@@ -4243,19 +4394,42 @@ impl Canvas {
 
     /// Whether the open stroke (`second`: its second) can end laying only what follows the stamps
     /// it has laid and come out as laid whole. Not a dual brush's part laid in the stroke's
-    /// textures by a rule that builds up gradually or towards its transfer: that rounds its sums
-    /// to half floats once a lot (see `stamp_rule.wgsl`), so lots cut otherwise come out a little
-    /// otherwise, and a dual brush's stroke has always been laid whole again at its end. But the
-    /// second of paint laid in place does: laid whole again, it is put together with that paint
-    /// over the whole stroke, which on a slow GPU held the next stroke for a second or more after a
-    /// big brush's lift; what its lots' rounding changes is within a level here and there (see the
-    /// tests). Nor when laying whole is asked for (see [`Canvas::lay_ends_whole`]).
+    /// textures by a rule that builds up gradually or towards its transfer, unless it is carried
+    /// from lot to lot (see [`Carried`]): that rounds its sums to half floats once a lot (see
+    /// `stamp_rule.wgsl`), so lots cut otherwise come out a little otherwise, and a dual brush's
+    /// stroke is laid whole again at its end, as the stroke shows its second's threshold. Carried,
+    /// it ends with the rest: laid whole again, a long stroke's end took a tablet half a second to
+    /// nearly two after the lift. The second of paint laid in place ends so too: laid whole again,
+    /// it is put together with that paint over the whole stroke, which on a slow GPU held the next
+    /// stroke for a second or more after a big brush's lift; what its lots' rounding changes is
+    /// within a level here and there (see the tests). Nor when laying whole is asked for (see
+    /// [`Canvas::lay_ends_whole`]).
     fn ends_with_rest(&self, second: bool) -> bool {
         let Some(active) = self.active.filter(|_| !self.ends_whole) else { return false };
         let Some(dual) = active.second else { return !second };
         let style = if second { dual.style } else { active.style };
         let by_rule_here = self.pipelines.compute.is_some() || self.pipelines.fragments.is_some();
-        style.in_place() || (second && active.style.in_place()) || by_rule(style.rendering).is_none() || !by_rule_here
+        style.in_place()
+            || (second && active.style.in_place())
+            || by_rule(style.rendering).is_none()
+            || !by_rule_here
+            || self.carries(second)
+    }
+
+    /// Whether the open stroke's part (`second`: its second) is carried from lot to lot (see
+    /// [`Carried`]): a dual brush's laid by its rule in the stroke's textures (neither part laid in
+    /// place, nor its stroke onto an adjustment's mask), where the GPU's compute passes lay it.
+    fn carries(&self, second: bool) -> bool {
+        let Some(active) = self.active else { return false };
+        let Some(dual) = active.second else { return false };
+        let style = if second { dual.style } else { active.style };
+        by_rule(style.rendering).is_some()
+            && !style.in_place()
+            && !active.style.in_place()
+            && (second || !active.pencil)
+            && self.pipelines.compute.is_some()
+            && self.pipelines.fragments.is_none()
+            && !self.carry_refused
     }
 
     /// The open stroke goes on without its second (it was made into a shape).
@@ -4418,6 +4592,7 @@ impl Canvas {
         // where the GPU runs the rule's pass (see `Canvas::lay_by_rule`), or lays every stroke by
         // its rule in fragment passes
         let by_rule_here = self.pipelines.compute.is_some() || self.pipelines.fragments.is_some();
+        let carry = self.carries(second);
         let Some(active) = self.active.as_mut() else { return IRect::EMPTY };
         let style = match (second, active.second) {
             (false, _) => active.style,
@@ -4530,6 +4705,7 @@ impl Canvas {
                 layer: active.layer,
                 pencil,
                 second,
+                carry,
             });
         }
         bounds
@@ -6851,6 +7027,15 @@ impl Canvas {
             if matches!(op, Op::Commit(_) | Op::Cancel) {
                 self.queued_second = None;
                 self.smudge_refused = false;
+                // (its stroke cleared as it goes into its layer, its second as the next begins): what
+                // a dual brush's parts were carried in goes, as big as two layers each (kept, it held
+                // a canvas's GPU past half its budget), made again for the next dual brush's stroke
+                for carried in &mut self.carried {
+                    carried.forget();
+                    carried.texture = None;
+                }
+                self.carry_out = None;
+                self.rule_lists.unbind_carried();
             }
             match op {
                 Op::Stamps { instances, wet, picks, times, style, layer, clear, second: false, .. }
@@ -6868,6 +7053,7 @@ impl Canvas {
                 },
                 Op::DropSecond => {
                     self.queued_second = None;
+                    self.carried[1].forget();
                     // paint laid apart is laid alone from here (and put together so all over again)
                     if let Some(smudge) = self.smudge.as_mut()
                         && let Some(apart) = smudge.apart.as_mut()
@@ -6878,6 +7064,7 @@ impl Canvas {
                 }
                 Op::ClearSecond(second) => {
                     self.queued_second = Some(second);
+                    self.carried[1].forget();
                     self.second_unsynthesized = IRect::EMPTY;
                     let (texture, view) = self.second_stroke.get(device);
                     drop(render_pass(
@@ -6888,7 +7075,7 @@ impl Canvas {
                     ));
                     self.clear_built_up(&mut encoder, texture);
                 }
-                Op::Stamps { instances, style, clear, pencil, second, .. } => {
+                Op::Stamps { instances, style, clear, pencil, second, carry, .. } => {
                     let count = u32::try_from(instances.len()).unwrap_or(u32::MAX);
                     let first = next_instance;
                     next_instance = next_instance.saturating_add(count);
@@ -6936,6 +7123,14 @@ impl Canvas {
                         _ => (&self.stroke, &self.stroke_view),
                     };
                     let (texture, target) = (texture.clone(), target.clone());
+                    // a part carried from lot to lot (see `Carried`) goes on from its full floats
+                    // where they are held; laid otherwise (or cleared), they are held nowhere
+                    let part = usize::from(second);
+                    let onto_part = second || !(pencil && self.pencil.is_some());
+                    let carry = carry && onto_part && rule.is_some() && !in_fragments;
+                    if let Some(carried) = self.carried.get_mut(part).filter(|_| onto_part && (clear || !carry)) {
+                        carried.forget();
+                    }
                     if in_fragments {
                         if clear {
                             drop(render_pass(&mut encoder, "stamps clear", &target, load));
@@ -6958,15 +7153,23 @@ impl Canvas {
                             drop(render_pass(&mut encoder, "stamps clear", &target, load));
                         }
                         let brush = own_grain.clone().unwrap_or_else(|| self.brush_bind.clone());
-                        self.lay_by_rule(
-                            gpu,
-                            &mut encoder,
-                            (offset, &brush),
-                            &instances,
-                            first,
-                            (&texture, &target),
-                            rule,
-                        );
+                        let (most, all) = (self.work_at_once, vec![(0..instances.len(), false)]);
+                        let lots = match self.carried.get_mut(part).filter(|_| carry) {
+                            Some(carried) => carried.lots(&instances, full, most, most_stamps),
+                            None => all,
+                        };
+                        for (run, begins) in lots {
+                            let from = first.saturating_add(u32::try_from(run.start).unwrap_or(u32::MAX));
+                            self.lay_by_rule(
+                                gpu,
+                                &mut encoder,
+                                (offset, &brush),
+                                instances.get(run).unwrap_or_default(),
+                                from,
+                                (&texture, &target),
+                                (rule, carry.then_some((part, begins))),
+                            );
+                        }
                     } else {
                         let mut pass = render_pass(&mut encoder, "stamps", &target, load);
                         if count > 0 {
@@ -7000,6 +7203,7 @@ impl Canvas {
                     }
                 }
                 Op::Region { rect, coverage, colour } => {
+                    self.carried[0].forget();
                     drop(render_pass(
                         &mut encoder,
                         "region clear",
@@ -10094,7 +10298,10 @@ impl Canvas {
     /// [`RULE_PART`] pixels a side at a time (smaller where its list of tiles would hold more than
     /// a list may: see [`rule_lists`]), each pixel going through the stamps over its tile in order
     /// as its own paint stands after each, then the part copied into the stroke. A part whose list
-    /// couldn't be made (past the GPU's memory) is left out, and that said once.
+    /// couldn't be made (past the GPU's memory) is left out, and that said once. With `carry`, a
+    /// dual brush's part (0 its stroke, 1 its second) goes on from its full floats, beginning a lot
+    /// or not (see [`Carried`]); where those couldn't be made, it is laid as any other, and dual
+    /// brushes' strokes laid by their rule are laid whole again as they end from then on.
     fn lay_by_rule(
         &mut self,
         gpu: &Gpu,
@@ -10103,21 +10310,56 @@ impl Canvas {
         instances: &[StampInstance],
         first: u32,
         (texture, target): (&wgpu::Texture, &wgpu::TextureView),
-        rule: u32,
+        (rule, carry): (u32, Option<(usize, bool)>),
     ) {
-        let Some(out) = self.rule_out.clone() else { return };
         let pipelines = Arc::clone(&self.pipelines);
         let Some(compute) = pipelines.compute.as_ref() else { return };
+        let carry = carry.and_then(|(part, begins)| {
+            let made = self.carried_made(gpu, part);
+            let carried = self.carried.get_mut(part)?;
+            if !made {
+                self.carry_refused = true;
+                carried.forget();
+            } else if begins {
+                carried.begin_lot();
+            }
+            made.then_some(part)
+        });
+        let out = match carry {
+            Some(_) => self.carry_out.clone(),
+            None => self.rule_out.clone(),
+        };
+        let Some(out) = out else { return };
+        let carried = carry.and_then(|part| self.carried.get(part)).and_then(|c| c.texture.clone());
         let limits = gpu.device.limits();
         let room = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) / 4;
-        let most = self.rule_list_most.min(usize::try_from(room).unwrap_or(usize::MAX));
+        // (a carried part's list ends with its tiles' bits)
+        let trailer = if carry.is_some() { (RULE_PART / RULE_TILE).pow(2).div_ceil(32) as usize } else { 0 };
+        let most = self.rule_list_most.min(usize::try_from(room).unwrap_or(usize::MAX)).saturating_sub(trailer);
         let binds = RuleBinds {
             uniforms: self.uniform_buffer.clone(),
             stamps: self.stamp_buffer.clone(),
             target: target.clone(),
             out: out.clone(),
+            carried: carried.as_ref().map(|(_, view)| view.clone()),
         };
-        let bounds = instances.iter().fold(IRect::EMPTY, |b, s| b.union(quad_reach(s))).intersect(self.full());
+        let (layout, pipeline) = match carry {
+            Some(_) => (&compute.rule_carry_layout, &compute.stamp_rule_carried),
+            None => (&compute.rule_layout, &compute.stamp_rule),
+        };
+        let full = self.full();
+        let mut bounds = instances.iter().fold(IRect::EMPTY, |b, s| b.union(quad_reach(s))).intersect(full);
+        if carry.is_some() && !bounds.is_empty() {
+            // on the canvas's tiles, so that each tile's full floats are written whole or not at all
+            let tile = RULE_TILE as i32;
+            let snapped = IRect {
+                x0: bounds.x0.div_euclid(tile) * tile,
+                y0: bounds.y0.div_euclid(tile) * tile,
+                x1: (bounds.x1 + tile - 1).div_euclid(tile) * tile,
+                y1: (bounds.y1 + tile - 1).div_euclid(tile) * tile,
+            };
+            bounds = snapped.intersect(full);
+        }
         let part = RULE_PART as i32;
         let mut y0 = bounds.y0;
         while y0 < bounds.y1 {
@@ -10125,13 +10367,20 @@ impl Canvas {
             while x0 < bounds.x1 {
                 let whole = IRect { x0, y0, x1: (x0 + part).min(bounds.x1), y1: (y0 + part).min(bounds.y1) };
                 x0 += part;
-                for (rect, words) in rule_lists(instances, first, whole, rule, most) {
-                    let Some(bind) = self.rule_list(gpu, &words, &binds, &compute.rule_layout) else { continue };
+                for (rect, mut words) in rule_lists(instances, first, whole, rule, most) {
+                    let (width, height) = (self.width, self.height);
+                    if let Some(carried) = carry.and_then(|at| self.carried.get_mut(at)) {
+                        words.extend(carried.fresh(rect, width, height));
+                    }
+                    let Some(bind) = self.rule_list(gpu, &words, &binds, layout) else { continue };
+                    if let Some(carried) = carry.and_then(|at| self.carried.get_mut(at)) {
+                        carried.hold(rect);
+                    }
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some("stamp rule"),
                         timestamp_writes: None,
                     });
-                    pass.set_pipeline(&compute.stamp_rule);
+                    pass.set_pipeline(pipeline);
                     pass.set_bind_group(0, &bind, &[uniform]);
                     pass.set_bind_group(1, brush, &[]);
                     pass.dispatch_workgroups(rect.width().div_ceil(RULE_TILE), rect.height().div_ceil(RULE_TILE), 1);
@@ -10150,10 +10399,70 @@ impl Canvas {
                         copy_at(texture, rect.x0, rect.y0),
                         extent(rect.width(), rect.height()),
                     );
+                    if let Some((carried, _)) = &carried {
+                        gpu.copy_buffer_to_texture(
+                            encoder,
+                            wgpu::TexelCopyBufferInfo {
+                                buffer: &out,
+                                layout: wgpu::TexelCopyBufferLayout {
+                                    offset: u64::from(RULE_PART * RULE_PART) * 8,
+                                    bytes_per_row: Some(RULE_PART * 16),
+                                    rows_per_image: Some(rect.height()),
+                                },
+                            },
+                            copy_at(carried, rect.x0, rect.y0),
+                            extent(rect.width(), rect.height()),
+                        );
+                    }
                 }
             }
             y0 += part;
         }
+    }
+
+    /// Whether a carried part's full floats (`part`: 0 the stroke's, 1 its second's) and where its
+    /// rule passes write are made, making them if not (see [`Carried`]); what couldn't be made is
+    /// said once.
+    fn carried_made(&mut self, gpu: &Gpu, part: usize) -> bool {
+        let device = &gpu.device;
+        // its half floats and then its full floats, a part of the canvas at a time
+        let size = u64::from(RULE_PART * RULE_PART) * 24;
+        if device.limits().max_storage_buffer_binding_size < size {
+            return false;
+        }
+        if self.carry_out.is_none() {
+            self.carry_out = self.made_or_told(device, |device| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("stamp rule carried"),
+                    size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                })
+            });
+        }
+        if self.carried.get(part).is_some_and(|c| c.texture.is_none()) {
+            let (width, height) = (self.width, self.height);
+            let made = self.made_or_told(device, |device| {
+                let texture = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("stroke carried"),
+                    size: extent(width, height),
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba32Uint,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                (texture, view)
+            });
+            if let Some(carried) = self.carried.get_mut(part) {
+                // (none of it written yet; the part's lots go on as they were counted)
+                carried.texture = made;
+                carried.begin_lot();
+            }
+        }
+        self.carry_out.is_some() && self.carried.get(part).is_some_and(|c| c.texture.is_some())
     }
 
     /// The bind group for the next part of this render's rule passes (see [`RuleLists`]), its list
@@ -10193,30 +10502,35 @@ impl Canvas {
         }
         let room = device.limits().max_storage_buffer_binding_size;
         let stamps = NonZeroU64::new(binds.stamps.size().min(room) / 4 * 4);
+        let mut entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &binds.uniforms,
+                    offset: 0,
+                    size: NonZeroU64::new(UNIFORM_SIZE),
+                }),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &binds.stamps,
+                    offset: 0,
+                    size: stamps,
+                }),
+            },
+            wgpu::BindGroupEntry { binding: 2, resource: list.buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&binds.target) },
+            wgpu::BindGroupEntry { binding: 4, resource: binds.out.as_entire_binding() },
+        ];
+        // (a part carried: its full floats)
+        if let Some(view) = &binds.carried {
+            entries.push(wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(view) });
+        }
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("stamp rule"),
             layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &binds.uniforms,
-                        offset: 0,
-                        size: NonZeroU64::new(UNIFORM_SIZE),
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &binds.stamps,
-                        offset: 0,
-                        size: stamps,
-                    }),
-                },
-                wgpu::BindGroupEntry { binding: 2, resource: list.buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&binds.target) },
-                wgpu::BindGroupEntry { binding: 4, resource: binds.out.as_entire_binding() },
-            ],
+            entries: &entries,
         });
         list.bind = Some((binds.clone(), bind.clone()));
         Some(bind)
@@ -12279,6 +12593,7 @@ impl Canvas {
         all.extend(self.trace.as_ref().map(|t| &t.texture));
         all.extend(self.scratch.made());
         all.extend(self.second_stroke.made());
+        all.extend(self.carried.iter().filter_map(|c| c.texture.as_ref().map(|(t, _)| t)));
         all.extend(self.groups.iter().flat_map(|(pair, _)| pair));
         all.extend(self.clip_group.made().into_iter().chain(self.clip_group_second.made()));
         all.extend(self.filter_out.made().into_iter().chain(self.filter_keep.made()));
@@ -12726,24 +13041,40 @@ impl Pipelines {
                 },
                 count: None,
             };
+            let rule_entries = [
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: NonZeroU64::new(UNIFORM_SIZE),
+                    },
+                    count: None,
+                },
+                read_storage(1),
+                read_storage(2),
+                compute_texture(3),
+                storage(4),
+            ];
             let rule_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("stamp rule"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: true,
-                            min_binding_size: NonZeroU64::new(UNIFORM_SIZE),
-                        },
-                        count: None,
-                    },
-                    read_storage(1),
-                    read_storage(2),
-                    compute_texture(3),
-                    storage(4),
-                ],
+                entries: &rule_entries,
+            });
+            // (a part carried: its full floats besides)
+            let carried = wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Uint,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            };
+            let rule_carry_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("stamp rule carried"),
+                entries: &[rule_entries.as_slice(), &[carried]].concat(),
             });
             let rule_module = module(
                 "stamp rule",
@@ -12762,9 +13093,19 @@ impl Pipelines {
                 compilation_options: Default::default(),
                 cache: kept,
             });
+            let stamp_rule_carried = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("stamp rule carried"),
+                layout: Some(&layout("stamp rule carried", &[Some(&rule_carry_layout), Some(&brush_layout)])),
+                module: &rule_module,
+                entry_point: Some("cs_stamp_rule_carried"),
+                compilation_options: Default::default(),
+                cache: kept,
+            });
             ComputePipelines {
                 stamp_rule,
                 rule_layout,
+                stamp_rule_carried,
+                rule_carry_layout,
                 smudge_layout,
                 smudge_carry,
                 smudge_dull,
@@ -13199,7 +13540,7 @@ fn stamps_work(stamps: &[StampInstance], full: IRect, in_place: bool) -> u64 {
 fn in_pieces(ops: Vec<Op>, full: IRect, (in_place_most, most): (u64, u64), most_stamps: u64) -> Vec<Op> {
     let mut pieces = Vec::with_capacity(ops.len());
     for op in ops {
-        let Op::Stamps { second, instances, wet, picks, times, style, clear, layer, pencil } = op else {
+        let Op::Stamps { second, instances, wet, picks, times, style, clear, layer, pencil, carry } = op else {
             pieces.push(op);
             continue;
         };
@@ -13218,7 +13559,7 @@ fn in_pieces(ops: Vec<Op>, full: IRect, (in_place_most, most): (u64, u64), most_
             work = work.saturating_add(more);
         }
         if counts.is_empty() {
-            pieces.push(Op::Stamps { second, instances, wet, picks, times, style, clear, layer, pencil });
+            pieces.push(Op::Stamps { second, instances, wet, picks, times, style, clear, layer, pencil, carry });
             continue;
         }
         counts.push(count);
@@ -13236,6 +13577,7 @@ fn in_pieces(ops: Vec<Op>, full: IRect, (in_place_most, most): (u64, u64), most_
                 clear: clear && i == 0,
                 layer,
                 pencil,
+                carry,
             });
         }
     }
@@ -16022,6 +16364,77 @@ mod tests {
         assert_eq!(by_rule(Rendering::Capped), Some(2));
         assert_eq!(by_rule(Rendering::BuildUp), None);
         assert_eq!(by_rule(Rendering::Strongest), None);
+    }
+
+    #[test]
+    fn a_carried_part_begins_its_lots_where_the_whole_stroke_laid_again_cuts_it() {
+        let full = IRect { x0: 0, y0: 0, x1: 512, y1: 512 };
+        let stamps: Vec<StampInstance> = (0..400)
+            .map(|k| StampInstance {
+                center: [(k % 50) as f32 * 9.0, (k / 50) as f32 * 60.0],
+                radius: 3.0 + (k % 13) as f32 * 2.5,
+                roundness: 1.0,
+                ..bytemuck::Zeroable::zeroed()
+            })
+            .collect();
+        let style = StrokeStyle::new(StrokeTool::Paint, [0.0; 3], 1.0);
+        // laid again whole as one op, of work and stamps cut so or not at all
+        for (most, most_stamps) in [(6_000, u64::MAX), (40_000, 30), (u64::MAX, u64::MAX), (1, u64::MAX)] {
+            let whole = Op::Stamps {
+                second: true,
+                instances: stamps.clone(),
+                wet: Vec::new(),
+                picks: Vec::new(),
+                times: Vec::new(),
+                style,
+                clear: true,
+                layer: LayerId(1),
+                pencil: false,
+                carry: true,
+            };
+            let mut cuts = Vec::new();
+            let mut at = 0;
+            for op in in_pieces(vec![whole], full, (most, most), most_stamps) {
+                let Op::Stamps { instances, .. } = op else { continue };
+                cuts.push(at);
+                at += instances.len();
+            }
+            assert_eq!(at, stamps.len());
+            // given a frame at a time, of sizes that put the lots' ends inside a frame's stamps
+            // and between frames
+            let mut carried = Carried::default();
+            let mut begun = Vec::new();
+            let mut from = 0;
+            for frame in [1, 7, 3, 20, 1, 1, 50, 2, 9].iter().cycle() {
+                if from == stamps.len() {
+                    break;
+                }
+                let to = (from + frame).min(stamps.len());
+                let runs = carried.lots(&stamps[from..to], full, most, most_stamps);
+                // the frame's stamps, all of them in order
+                assert_eq!(runs.first().map(|r| r.0.start), Some(0));
+                assert_eq!(runs.last().map(|r| r.0.end), Some(to - from));
+                assert!(runs.windows(2).all(|w| w[0].0.end == w[1].0.start && w[1].1));
+                begun.extend(runs.iter().filter(|r| r.1).map(|r| from + r.0.start));
+                from = to;
+            }
+            // each lot begins where one of the whole stroke's does (but the first, from scratch)
+            assert_eq!(begun, cuts[1..], "lots of {most} work, {most_stamps} stamps");
+            assert!(most == u64::MAX || cuts.len() > 10, "{} lots", cuts.len());
+        }
+        // a tile's full floats are the part's only in the lot they were written in (the rest of a
+        // lot ended is taken from the half floats, as the whole stroke laid again rounds it)
+        let mut carried = Carried::default();
+        let three = IRect { x0: 16, y0: 32, x1: 64, y1: 48 };
+        assert_eq!(carried.fresh(three, 100, 100), [0b111]);
+        carried.hold(three);
+        assert_eq!(carried.fresh(three, 100, 100), [0]);
+        assert_eq!(carried.fresh(IRect { x0: 0, y0: 32, x1: 32, y1: 48 }, 100, 100), [0b01]);
+        carried.begin_lot();
+        assert_eq!(carried.fresh(three, 100, 100), [0b111]);
+        carried.hold(three);
+        carried.forget();
+        assert_eq!(carried.fresh(three, 100, 100), [0b111]);
     }
 
     #[test]
