@@ -520,6 +520,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             cursorAt = null
             return
         }
+        // where a stroke's sample there lands, as a plugin may move it: the cursor stands where the stroke goes
+        val at = session?.cursorPoint(p.x, p.y)?.takeIf { it.size == 2 }?.let { Offset(it[0], it[1]) } ?: p
         // sized as it shows, and while hovering again now and then: the size may have changed
         // meanwhile (painting, it takes its newest stamp's below)
         val now = android.os.SystemClock.uptimeMillis()
@@ -537,11 +539,11 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         // turned as its stamps are: the newest one painting, one laid where it hovers else; and
         // painting, as big as the newest stamp is laid (read without waiting on the canvas)
         session?.let { s ->
-            cursorTurn = if (hovering) s.cursorHovers(p.x, p.y, pen) else s.cursorTurn()
+            cursorTurn = if (hovering) s.cursorHovers(at.x, at.y, pen) else s.cursorTurn()
             if (!hovering) s.cursorRadius()?.let { cursorRadius = it }
         }
         cursorHovering = hovering
-        cursorAt = p
+        cursorAt = at
     }
 
     /**

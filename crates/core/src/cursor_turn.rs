@@ -83,6 +83,9 @@ pub(crate) struct CursorTurns {
     heading: parking_lot::Mutex<Heading>,
     /// Window pixels a point, as last seen.
     points: AtomicU32,
+    /// The plugins strokes go through, for where the cursor shows (see
+    /// [`CanvasSession::cursor_point`]): kept beside the canvas's lock, so it never waits on it.
+    pub(crate) hooks: parking_lot::Mutex<Option<std::sync::Arc<crate::hooks::Hooks>>>,
 }
 
 impl Default for CursorTurns {
@@ -93,6 +96,7 @@ impl Default for CursorTurns {
             hovered: AtomicU32::new(0f32.to_bits()),
             heading: parking_lot::Mutex::new(Heading::default()),
             points: AtomicU32::new(1f32.to_bits()),
+            hooks: parking_lot::Mutex::new(None),
         }
     }
 }
@@ -191,6 +195,16 @@ impl CanvasSession {
     pub fn cursor_turn(&self) -> f32 {
         let painted = load(&self.shared.cursor.painted);
         if painted.is_finite() { painted } else { load(&self.shared.cursor.hovered) }
+    }
+
+    /// Where the brush cursor shows for a pointer at (`x`, `y`), window pixels: where a stroke's
+    /// sample there lands, as the plugins on the `position` hook move it (there, with none on), so
+    /// the cursor stands where the stroke goes, hovering and painting alike. Read without waiting on
+    /// the canvas.
+    pub fn cursor_point(&self, x: f32, y: f32) -> Vec<f32> {
+        let hooks = self.shared.cursor.hooks.lock().clone();
+        let (x, y) = hooks.map_or((x, y), |hooks| hooks.position(x, y));
+        vec![x, y]
     }
 
     /// How big the brush cursor's outline is while a stroke is painted: its newest stamp's radius

@@ -334,7 +334,7 @@ final class CanvasView: UIView {
     func showCursor(at point: CGPoint?, hovering: Bool, alpha: CGFloat = 1, turn: CGFloat = 0) {
         let settings = AppSettings.shared
         let wanted = hovering ? settings.cursorShows != .painting : settings.cursorShows != .hovering
-        guard let point, settings.brushCursorOn, wanted else {
+        guard let asked = point, settings.brushCursorOn, wanted else {
             // (hovering again, it goes on from where it comes back)
             if point == nil {
                 session.cursorHoverGone()
@@ -342,6 +342,9 @@ final class CanvasView: UIView {
             cursor.hide()
             return
         }
+        // where a stroke's sample there lands, as a plugin may move it: the cursor stands where the stroke goes
+        let landed = session.cursorPoint(x: Float(asked.x * scale), y: Float(asked.y * scale))
+        let point = landed.count == 2 ? CGPoint(x: CGFloat(landed[0]) / scale, y: CGFloat(landed[1]) / scale) : asked
         if hovering {
             cursor.show(at: point, alpha: alpha, session: session, pixels: scale, drawn: settings.cursorStyle, turn: turn)
         } else {

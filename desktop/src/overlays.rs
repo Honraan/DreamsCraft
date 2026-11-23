@@ -147,6 +147,11 @@ impl Overlays {
         self.cursor_turn = session.cursor_turn();
         // filled only while it hovers
         self.cursor_fill = None;
+        // where a stroke's sample there lands, as a plugin may move it: the cursor stands where the stroke goes
+        let at = at.map(|(x, y)| match session.cursor_point(x, y)[..] {
+            [to_x, to_y] => (to_x, to_y),
+            _ => (x, y),
+        });
         self.cursor = at.map(|(x, y)| {
             let (r, outline) = self.cursor.map(|(_, r, o)| (r, o)).unwrap_or_else(|| {
                 let info = session.info();
@@ -164,6 +169,11 @@ impl Overlays {
     /// The brush's outline goes to `at` (points), where the pointer hovers, sized for the brush
     /// as it is now (`info`); or away.
     pub fn hover(&mut self, session: &CanvasSession, info: &procraft_core::CanvasInfo, ppp: f32, at: Option<Pos2>) {
+        // where a stroke's sample there lands, as a plugin may move it: the cursor stands where the stroke goes
+        let at = at.map(|at| match session.cursor_point(at.x * ppp, at.y * ppp)[..] {
+            [x, y] => pos2(x / ppp, y / ppp),
+            _ => at,
+        });
         match at {
             Some(at) => {
                 // the core keeps the brush's outline: asked again, it is handed back as it was

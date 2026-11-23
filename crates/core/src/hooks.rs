@@ -1208,6 +1208,8 @@ impl CanvasSession {
             plugins.take_up_artwork(&me);
         }
         let hooks = plugins.hooks();
+        // where the brush cursor shows goes through them too, as a stroke's samples do
+        *self.shared.cursor.hooks.lock() = Some(Arc::clone(&hooks));
         // how the plugins have the window show the canvas, and the paper they give, asked now
         // rather than as it is drawn
         let look = hooks.view_look();
@@ -4906,6 +4908,41 @@ pub(crate) mod tests {
         );
         assert!(merged <= parts * 1.1 + 1.0, "{merged} against {parts}");
         assert!(merged_sounding <= parts_sounding * 1.1 + 1.0, "{merged_sounding} against {parts_sounding}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_brush_cursor_stands_where_a_stroke_s_first_stamp_lands_as_a_plugin_moves_it() {
+        let dir = store("cursor-lands");
+        let plugins = with_offset(&dir);
+        assert!(plugins.set_on(ID.to_owned(), true));
+        assert_eq!(plugins.set_slider(format!("{ID}.x"), 12.0), Some(12.0));
+        assert_eq!(plugins.set_slider(format!("{ID}.y"), -7.0), Some(-7.0));
+        let Some(s) = session() else { return };
+        // with no plugins on the session, where the pointer is
+        assert_eq!(s.cursor_point(80.0, 90.0), [80.0, 90.0]);
+        s.use_plugins(Arc::clone(&plugins));
+        let cursor = s.cursor_point(80.0, 90.0);
+        assert_eq!(cursor, [92.0, 83.0]);
+        // a tap there lays one stamp: its middle, by its pixels, is where the cursor stands
+        s.stroke_begin(PointerKind::Stylus, vec![sample(80.0, 90.0, 0.0)]);
+        s.stroke_end(vec![]);
+        let rgba = picture(&s);
+        let (mut weight, mut across, mut down) = (0.0, 0.0, 0.0);
+        for (i, pixel) in rgba.chunks(4).enumerate() {
+            let a = pixel.get(3).copied().map_or(0.0, f64::from);
+            weight += a;
+            across += a * ((i % 200) as f64 + 0.5);
+            down += a * ((i / 200) as f64 + 0.5);
+        }
+        assert!(weight > 0.0, "the tap painted");
+        let middle = (across / weight, down / weight);
+        let off = ((middle.0 - f64::from(cursor[0])).abs(), (middle.1 - f64::from(cursor[1])).abs());
+        println!("the cursor at {cursor:?}, the stamp's middle at {middle:?}: {off:?} apart");
+        assert!(off.0 < 0.5 && off.1 < 0.5, "{off:?}");
+        // off, where the pointer is again
+        assert!(plugins.set_on(ID.to_owned(), false));
+        assert_eq!(s.cursor_point(80.0, 90.0), [80.0, 90.0]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
