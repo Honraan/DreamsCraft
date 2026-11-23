@@ -3168,6 +3168,10 @@ impl Interface {
         info: &CanvasInfo,
         press: &KeyCombo,
     ) -> bool {
+        // a plugin's press with Alt before the app's shortcut taking the key alone
+        if self.prefs.plugins.plugin_press_first(press.clone()) {
+            return self.plugin_press(ctx, session, press);
+        }
         let shortcut = procraft_core::key_shortcut(
             press.key.clone(),
             press.command,

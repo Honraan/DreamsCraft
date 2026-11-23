@@ -484,6 +484,25 @@ impl Plugins {
             _ => None,
         }
     }
+
+    /// What a plugin that is on gives `press` to now, by its manifest: the key of one of its
+    /// switches (`Err`) or actions (`Ok`), each while its card shows it. None: no plugin's.
+    fn pressed(&self, press: &KeyCombo) -> Option<Result<String, String>> {
+        let press = KeyCombo::of(&press.key, press.command, press.shift, press.alt);
+        let list = self.listed();
+        list.files.iter().filter(|p| p.on && p.problem.is_none()).find_map(|plugin| {
+            let shape = list.shapes.get(&plugin.id)?;
+            let shows =
+                |under: &[Option<usize>], at: usize| shape.shows(under.get(at).copied().flatten(), &plugin.controls);
+            let control = shape.presses.iter().position(|p| p.as_ref() == Some(&press));
+            if let Some(at) = control.filter(|&at| shows(&shape.under, at)) {
+                return Some(Err(plugin.controls.get(at)?.key().to_owned()));
+            }
+            let action = shape.action_presses.iter().position(|p| p.as_ref() == Some(&press));
+            let at = action.filter(|&at| shows(&shape.action_under, at))?;
+            Some(Ok(plugin.actions.get(at)?.key.clone()))
+        })
+    }
 }
 
 /// How the side bar's slider tracks look as the plugins say (interface 11): each part none where
@@ -1661,24 +1680,7 @@ impl Plugins {
     /// the app to keep as one set on its card), or the action for the app to run. None: no
     /// plugin's.
     pub fn plugin_press(&self, press: KeyCombo) -> Option<PluginPressed> {
-        let press = KeyCombo::of(&press.key, press.command, press.shift, press.alt);
-        let found = {
-            let list = self.listed();
-            list.files.iter().filter(|p| p.on && p.problem.is_none()).find_map(|plugin| {
-                let shape = list.shapes.get(&plugin.id)?;
-                let shows = |under: &[Option<usize>], at: usize| {
-                    shape.shows(under.get(at).copied().flatten(), &plugin.controls)
-                };
-                let control = shape.presses.iter().position(|p| p.as_ref() == Some(&press));
-                if let Some(at) = control.filter(|&at| shows(&shape.under, at)) {
-                    return Some(Err(plugin.controls.get(at)?.key().to_owned()));
-                }
-                let action = shape.action_presses.iter().position(|p| p.as_ref() == Some(&press));
-                let at = action.filter(|&at| shows(&shape.action_under, at))?;
-                Some(Ok(plugin.actions.get(at)?.key.clone()))
-            })
-        };
-        match found? {
+        match self.pressed(&press)? {
             Ok(key) => Some(PluginPressed::Action { key }),
             Err(key) => {
                 let on = matches!(self.control(&key), Some(PluginControl::Switch { control }) if control.on);
@@ -1686,6 +1688,15 @@ impl Plugins {
                 Some(PluginPressed::Switched { control: self.control(&key)? })
             }
         }
+    }
+
+    /// Whether `press` (as a plugin rebinding keys took it) goes to a plugin before the app's own
+    /// shortcuts: a press with Alt and without the command key that a plugin that is on gives one
+    /// of its switches or actions now ([`Plugins::plugin_press`]). The app's own shortcuts name no
+    /// such press; they take Alt and a key as the key alone (S, selection, for Alt+S) only for want
+    /// of a plugin's.
+    pub fn plugin_press_first(&self, press: KeyCombo) -> bool {
+        press.alt && !press.command && self.pressed(&press).is_some()
     }
 
     /// The filters that can be opened now: the Adjustments menu's, which has none to show with none
@@ -2480,7 +2491,8 @@ impl Plugins {
     }
 
     /// The shortcut on a press: what [`crate::key_shortcut`] says of the press a plugin rebinding
-    /// keys takes it as ([`Plugins::key_press`]).
+    /// keys takes it as ([`Plugins::key_press`]), unless a plugin's switch or action takes it first
+    /// ([`Plugins::plugin_press_first`]).
     pub fn key_shortcut(
         &self,
         key: String,
@@ -2490,6 +2502,9 @@ impl Plugins {
         transforming: bool,
     ) -> Option<crate::KeyShortcut> {
         let press = self.key_press(KeyCombo { key, command, shift, alt })?;
+        if self.plugin_press_first(press.clone()) {
+            return None;
+        }
         crate::key_shortcut(press.key, press.command, press.shift, press.alt, transforming)
     }
 
@@ -4047,6 +4062,36 @@ mod tests {
 
     fn press(plugins: &Plugins, text: &str) -> Option<PluginPressed> {
         plugins.plugin_press(KeyCombo::read(text).unwrap())
+    }
+
+    #[test]
+    fn a_plugin_s_press_with_alt_comes_before_the_app_s_key_taken_alone() {
+        use crate::KeyShortcut::{Erase, Selection, Undo};
+        // Trace view's Solo is on Alt+S, which the app's S (selection) took as S
+        let dir = store("bundled-alt-s");
+        let plugins = featured_app(&dir, VIEW_TOOLS, "trace_view");
+        let shortcut = |key: &str, alt: bool| plugins.key_shortcut(key.to_owned(), false, false, alt, false);
+        let first = |text: &str| plugins.plugin_press_first(KeyCombo::read(text).unwrap());
+        // off, Alt+S is the app's selection, as S is
+        assert_eq!(shortcut("s", true), Some(Selection));
+        assert!(!first("alt+s"));
+        assert!(plugins.set_on(VIEW_TOOLS.to_owned(), true));
+        // on, Alt+S and Alt+T are Solo's and Trace's; S alone is still the app's
+        for (text, action) in [("alt+s", "solo"), ("alt+t", "trace")] {
+            assert!(first(text), "{text}");
+            assert_eq!(press(&plugins, text), Some(PluginPressed::Action { key: format!("{VIEW_TOOLS}.{action}") }));
+        }
+        assert_eq!(shortcut("s", true), None);
+        assert_eq!(shortcut("s", false), Some(Selection));
+        // the command key's presses, and Alt with a key no plugin names, are the app's as before
+        assert_eq!(plugins.key_shortcut("z".to_owned(), true, false, false, false), Some(Undo));
+        assert!(!first("command+alt+s"));
+        assert_eq!(shortcut("e", true), Some(Erase));
+        // the feature off, Alt+S is the app's again
+        assert!(plugins.set_switch(format!("{VIEW_TOOLS}.trace_view"), false));
+        assert!(!first("alt+s"));
+        assert_eq!(shortcut("s", true), Some(Selection));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

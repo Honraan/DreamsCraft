@@ -235,7 +235,9 @@ leaves them out, the control on the card alone, so they need no newer interface.
 - `"press": "alt+g"` gives a switch a hardware keyboard's press on the canvas, written as for the
   [`key_shortcut`](#key_shortcut) hook: while the plugin is on and the switch shows, the press flips
   it. The app's own shortcuts come first, so a press one of them has does what it does; a plugin
-  rebinding keys takes presses as others before either. Each press is used once in a file, and is
+  rebinding keys takes presses as others before either. The app has none with Alt (without the
+  command key), so Alt and a key is the plugin's, even where the app takes the key alone (Alt+S, not
+  S's selection). Each press is used once in a file, and is
   listed among the keyboard's shortcuts under Plugins, by the switch's label. An action can have one
   too (see [Actions](#actions)).
 - `"artwork": true` keeps a switch's or a slider's value with each artwork: while an artwork is
