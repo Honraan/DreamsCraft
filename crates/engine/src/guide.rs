@@ -4,7 +4,7 @@
 
 use std::f32::consts::{FRAC_PI_6, PI, TAU};
 
-use crate::geom::Vec2;
+use crate::geom::{Affine, Vec2};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GuideKind {
@@ -264,6 +264,39 @@ impl Guide {
         let turned = if horizontal { -self.angle } else { PI - self.angle };
         // within a turn either way of upright, as an archive's guide is read
         self.angle = (turned + PI).rem_euclid(TAU) - PI;
+    }
+
+    /// The guide as it goes with the canvas cropped or resized, `to_new` taking the old canvas's
+    /// pixels to the new one's: its centre and vanishing points moved with the picture, its turn
+    /// turned with it (the handle straight up from the centre, taken across), and each grid's size
+    /// scaled as the picture is, so it stays where it was on the picture. A map that isn't finite
+    /// leaves it as it is.
+    pub fn follow(&mut self, to_new: Affine) {
+        if !to_new.is_finite() {
+            return;
+        }
+        let take = |[x, y]: [f32; 2]| {
+            let p = to_new.apply(Vec2::new(x, y));
+            [p.x, p.y]
+        };
+        self.centre = take(self.centre);
+        for v in &mut self.vanishing {
+            *v = take(*v);
+        }
+        // the handle's way out, (sin a, -cos a), as the map takes it
+        let (sin, cos) = self.angle.sin_cos();
+        let way = Vec2::new(to_new.a * sin - to_new.c * cos, to_new.b * sin - to_new.d * cos);
+        if way.length() > 1e-9 {
+            // within a turn either way of upright, as an archive's guide is read
+            self.angle = (way.x.atan2(-way.y) + PI).rem_euclid(TAU) - PI;
+        }
+        let scale = to_new.scale_factor();
+        for look in &mut self.looks {
+            let size = look.size * scale;
+            if size.is_finite() && size > 0.0 {
+                look.size = size;
+            }
+        }
     }
 
     fn centre(&self) -> Vec2 {
@@ -538,6 +571,64 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A crop takes the guide with the picture, as it takes the layers: its centre and vanishing
+    /// points to where the same picture pixels are on the new canvas (within a thousandth of a
+    /// pixel), its turn turned as the crop turns the picture, its grids scaled as it scales them;
+    /// it was put back in the middle with no vanishing points, so perspective drew nothing.
+    #[test]
+    fn a_cropped_canvas_s_guide_stays_where_it_was_on_the_picture() {
+        use crate::crop::crop;
+        use crate::document::Document;
+        let g = Guide {
+            centre: [210.0, 140.0],
+            angle: 0.4,
+            vanishing: vec![[-150.0, 120.0], [520.0, 110.0], [260.0, 900.0]],
+            ..on(GuideKind::Perspective)
+        };
+        let far = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).hypot(a[1] - b[1]);
+        // turned and resampled to half its size; cut by whole pixels; resized up three times
+        let crops = [
+            ([100.0, 50.0, 400.0, 300.0], 0.3, Some((200, 150)), 0.5),
+            ([30.0, 20.0, 100.0, 80.0], 0.0, None, 1.0),
+            ([0.0, 0.0, 200.0, 100.0], 0.0, Some((600, 300)), 3.0),
+        ];
+        for (rect, turn, size, scale) in crops {
+            let c = crop(rect, turn, size);
+            let mut doc = Document::new(400, 300);
+            doc.guide = g.clone();
+            let m = doc.cropped(&c).guide;
+            let back = |[x, y]: [f32; 2]| {
+                let p = c.to_old.apply(Vec2::new(x, y));
+                [p.x, p.y]
+            };
+            let worst = m
+                .vanishing
+                .iter()
+                .zip(&g.vanishing)
+                .map(|(new, old)| far(back(*new), *old))
+                .fold(far(back(m.centre), g.centre), f32::max);
+            assert_eq!(m.vanishing.len(), 3);
+            assert!(worst < 1e-3, "{rect:?}: {worst} px off");
+            assert!((m.angle - (g.angle - turn)).abs() < 1e-5, "{rect:?}: turned {}", m.angle);
+            for (new, old) in m.looks.iter().zip(&g.looks) {
+                assert!((new.size / old.size - scale).abs() < 1e-5, "{rect:?}: {} from {}", new.size, old.size);
+            }
+            // the rest as it was, and perspective still drawn over the new canvas
+            assert_eq!((m.on, m.kind, m.symmetry, m.assisted), (g.on, g.kind, g.symmetry, g.assisted));
+            assert!(m.lines(c.width, c.height).len() > 24, "{rect:?}");
+        }
+        // cut by whole pixels, the points only move by the cut's corner
+        let c = crop([30.0, 20.0, 100.0, 80.0], 0.0, None);
+        let mut m = g.clone();
+        m.follow(c.to_old.inverse().unwrap());
+        assert_eq!(m.vanishing, vec![[-180.0, 100.0], [490.0, 90.0], [230.0, 880.0]]);
+        assert_eq!(m.centre, [180.0, 120.0]);
+        // a map that is no number leaves it be
+        let mut same = g.clone();
+        same.follow(Affine { a: f32::NAN, ..Affine::IDENTITY });
+        assert_eq!(same, g);
     }
 
     #[test]

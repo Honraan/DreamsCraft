@@ -798,6 +798,18 @@ impl Document {
         d
     }
 
+    /// The same document on the canvas `crop` makes: its size, the drawing guide (every kind's
+    /// centre, turn, grid size and vanishing points) moved with the picture as the layers are, so
+    /// it stays where it was on the picture.
+    pub fn cropped(&self, crop: &crate::crop::Crop) -> Document {
+        let mut d = self.resized(crop.width, crop.height);
+        if let Some(to_new) = crop.to_old.inverse() {
+            d.guide = self.guide.clone();
+            d.guide.follow(to_new);
+        }
+        d
+    }
+
     pub fn height(&self) -> u32 {
         self.height
     }

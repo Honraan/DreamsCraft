@@ -118,7 +118,7 @@ impl CanvasSession {
         }
         let (sw, sh) = (st.doc.width(), st.doc.height());
         let c = crop([x, y, width, height], angle, resample_to.then_some((new_width, new_height)));
-        let mut doc = st.doc.resized(c.width, c.height);
+        let mut doc = st.doc.cropped(&c);
         // plugins' layers' items moved with their pixels (those whose plugin can't move them become
         // ordinary layers); undoing the crop brings back the document as it was
         if let Some(to_new) = c.to_old.inverse() {
@@ -633,6 +633,61 @@ mod tests {
 
     /// A fault drawing the canvas as it is (one a weak GPU makes, and the app lives with) doesn't
     /// stop a crop: only the crop's own work is checked.
+    /// Crop & Resize takes the drawing guide with the picture: the perspective guide's vanishing
+    /// points go where their picture pixels went (within a thousandth of a pixel; they were
+    /// dropped, so the guide drew nothing), and the grids' and symmetry's centre, turn and size
+    /// with them. Undone, the guide is as it was; redone, moved again.
+    #[test]
+    fn a_crop_takes_the_drawing_guide_with_the_picture() {
+        use procraft_engine::geom::Vec2;
+        use procraft_engine::guide::GuideKind;
+        let Some(s) = painted(120) else { return };
+        {
+            let mut st = s.shared.lock();
+            let g = &mut st.doc.guide;
+            g.on = true;
+            g.kind = GuideKind::Perspective;
+            g.centre = [60.0, 50.0];
+            g.angle = 0.2;
+            g.vanishing = vec![[-40.0, 30.0], [150.0, 25.0], [70.0, 300.0]];
+        }
+        let before = s.shared.lock().doc.guide.clone();
+        // the middle 80 x 60, turned 0.25 and resampled to twice its size
+        let (rect, turn, size) = ([20.0, 30.0, 80.0, 60.0], 0.25, (160, 120));
+        assert!(s.crop_canvas(rect[0], rect[1], rect[2], rect[3], turn, true, size.0, size.1));
+        assert_eq!(contents(&s).1, size);
+        let c = procraft_engine::crop::crop(rect, turn, Some(size));
+        let after = s.shared.lock().doc.guide.clone();
+        let back = |[x, y]: [f32; 2]| {
+            let p = c.to_old.apply(Vec2::new(x, y));
+            [p.x, p.y]
+        };
+        let far = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).hypot(a[1] - b[1]);
+        assert_eq!(after.vanishing.len(), 3, "the vanishing points kept");
+        let worst = after
+            .vanishing
+            .iter()
+            .zip(&before.vanishing)
+            .map(|(new, old)| far(back(*new), *old))
+            .fold(far(back(after.centre), before.centre), f32::max);
+        assert!(worst < 1e-3, "{worst} px off");
+        assert!((after.angle - (before.angle - turn)).abs() < 1e-5, "turned {}", after.angle);
+        for (new, old) in after.looks.iter().zip(&before.looks) {
+            assert!((new.size - old.size * 2.0).abs() < 1e-3, "grid {} from {}", new.size, old.size);
+        }
+        // shown: three points and their rays over the new canvas
+        let shown = s.guide();
+        assert!(shown.on);
+        assert_eq!(shown.vanishing.len(), 6);
+        assert!(shown.lines.len() / 4 > 24, "{} lines", shown.lines.len() / 4);
+        // undone, as it was; redone, moved again
+        s.undo();
+        assert_eq!(contents(&s).1, (120, 120));
+        assert_eq!(s.shared.lock().doc.guide, before);
+        s.redo();
+        assert_eq!(s.shared.lock().doc.guide, after);
+    }
+
     #[test]
     fn a_fault_drawing_the_canvas_doesnt_stop_a_crop() {
         let Some(s) = painted(120) else { return };
