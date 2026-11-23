@@ -666,8 +666,9 @@ background colour. Where the artwork's background is hidden, no paper shows.
 `procraft_paper_picture` (interface 12, which a module may leave out) answers the place in
 `controls` of one of its `file` controls of pictures, whose picture is the paper, or -1 for the tile
 `procraft_paper` gives. While it names one, `procraft_paper` isn't asked: the app makes the tile of
-the picture picked, the same for every plugin. It takes the picture's middle square, grey by how
-bright it is (see-through as over white), scales it to the tile, cross-fades its edges into each
+the picture picked, the same for every plugin. It takes all of the picture stretched to a square (a
+picture that isn't one squeezed along its longer side), grey by how bright it is (see-through as over
+white), scales it to the tile, cross-fades its edges into each
 other over 16 pixels so that it repeats without a seam, and stretches its tones so that its darkest
 hundredth is a hollow and its lightest a peak (a picture of one tone is flat, all peak). It is made
 again only as the file changes. With no picture picked there, there's no paper; a place below -1 or

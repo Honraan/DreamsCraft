@@ -1,8 +1,9 @@
 //! A paper made of a picture someone picked (interface 12): a plugin on the `paper` hook names one of
 //! its `file` controls of pictures (`procraft_paper_picture`), and the paper's tile is made here of
-//! the picture picked for it, the same whichever plugin asks: its middle square, grey by how bright
-//! it is, scaled to the tile and cross-faded into itself at its edges so that it repeats without a
-//! seam, its tones stretched from a hollow to a peak.
+//! the picture picked for it, the same whichever plugin asks: all of it stretched to a square (a
+//! picture that isn't one squeezed along its longer side), grey by how bright it is, scaled to the
+//! tile and cross-faded into itself at its edges so that it repeats without a seam, its tones
+//! stretched from a hollow to a peak.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -112,30 +113,28 @@ fn fold(line: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-/// The tile made of a picture `width` × `height` (RGBA8 rows from the top, not premultiplied): its
-/// middle square, grey by how bright it is, scaled to the tile and cross-faded into itself at its
+/// The tile made of a picture `width` × `height` (RGBA8 rows from the top, not premultiplied): all of
+/// it stretched to a square, grey by how bright it is, scaled to the tile and cross-faded into itself at its
 /// edges so that it repeats without a seam, its tones stretched so that its darkest hundredth is a
 /// hollow (0) and its lightest a peak (255). A picture of one tone is flat, all peak. None for no
 /// picture.
 pub(crate) fn picture_tile(width: usize, height: usize, rgba: &[u8]) -> Option<Vec<u8>> {
-    let side = width.min(height);
-    if side == 0 || rgba.len() < width.checked_mul(height)?.checked_mul(4)? {
+    if width == 0 || height == 0 || rgba.len() < width.checked_mul(height)?.checked_mul(4)? {
         return None;
     }
-    let (left, top) = ((width - side) / 2, (height - side) / 2);
     let long = SIDE + FADE;
-    // across each row of the square, then down each column
-    let mut rows = Vec::with_capacity(side * SIDE);
-    let mut line = vec![0.0; side];
-    for y in top..top + side {
+    // across each whole row, then down each whole column: stretched to the square each way
+    let mut rows = Vec::with_capacity(height * SIDE);
+    let mut line = vec![0.0; width];
+    for y in 0..height {
         for (x, v) in line.iter_mut().enumerate() {
-            let at = (y * width + left + x) * 4;
+            let at = (y * width + x) * 4;
             *v = brightness(rgba.get(at..at + 4).unwrap_or_default());
         }
         rows.extend(fold(&resample(&line, long)));
     }
     let mut grey = vec![0.0_f32; SIDE * SIDE];
-    let mut column = vec![0.0; side];
+    let mut column = vec![0.0; height];
     for x in 0..SIDE {
         for (y, v) in column.iter_mut().enumerate() {
             *v = rows.get(y * SIDE + x).copied().unwrap_or(0.0);
@@ -186,9 +185,13 @@ mod tests {
     }
 
     #[test]
-    fn a_picture_makes_a_tile_of_its_middle_square_its_tones_stretched_from_hollow_to_peak() {
-        // 300 × 200, dark on the left half, light on the right: its middle square is x 50 to 250,
-        // the edge at 150, the tile's middle
+    fn a_picture_makes_a_tile_of_all_of_it_stretched_to_a_square_its_tones_from_hollow_to_peak() {
+        // 400 × 100, dark on its first quarter alone: stretched, the tile's first quarter is dark
+        // (a middle square, x 150 to 250, would have been all light)
+        let wide = picture_tile(400, 100, &picture(400, 100, |x, _| if x < 100 { 90 } else { 200 })).unwrap();
+        let at = |x: usize, y: usize| wide[y * SIDE + x];
+        assert_eq!((at(SIDE / 8, SIDE / 2), at(SIDE * 5 / 8, SIDE / 2)), (0, 255));
+        // 300 × 200, dark on the left half, light on the right: the edge at the tile's middle
         let pixels = picture(300, 200, |x, _| if x < 150 { 90 } else { 200 });
         let tile = picture_tile(300, 200, &pixels).unwrap();
         assert_eq!(tile.len(), SIDE * SIDE);
