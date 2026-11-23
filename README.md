@@ -28,7 +28,7 @@
 </p>
 
 <p align="center">
-  <sub>From <a href="https://github.com/artcraft-android/procraft/releases">Releases</a>: Android tablets take the <code>arm64.apk</code> (the <code>legacy-armeabi-v7a.apk</code> is only for older 32-bit tablets), or Obtainium, for updates; Windows the <code>.msi</code> installer or the portable <code>.zip</code>; Linux the <code>.AppImage</code>, the <code>.deb</code> or the <code>.tar.gz</code> (videos and PDFs there use the system's <code>ffmpeg</code> and <code>poppler-utils</code>); iPads the <code>ipados-unsigned.ipa</code>, with a sideloading tool (<a href="#installing-on-an-ipad">how</a>).</sub>
+  <sub>From <a href="https://github.com/artcraft-android/procraft/releases">Releases</a>: Android tablets take the <code>arm64.apk</code> (the <code>legacy-armeabi-v7a.apk</code> is only for older 32-bit tablets), or Obtainium, for updates; Windows the <code>windows-x64</code> <code>.msi</code> installer or portable <code>.zip</code> (the <code>windows-arm64</code> ones are only for ARM laptops, such as Snapdragon ones: any other PC says "This app can't run on your PC"); Linux the <code>.AppImage</code>, the <code>.deb</code> or the <code>.tar.gz</code> (videos and PDFs there use the system's <code>ffmpeg</code> and <code>poppler-utils</code>); iPads the <code>ipados-unsigned.ipa</code>, with a sideloading tool (<a href="#installing-on-an-ipad">how</a>).</sub>
 </p>
 
 <p align="center">
