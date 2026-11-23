@@ -999,14 +999,33 @@ private fun PanelBrushesRow(vm: CanvasViewModel, row: PanelRow.Brushes, onPick: 
 /** A row of keys on a plugin's panel: its label, the keys at its end as a file control's name is; tapped as a button is. */
 @Composable
 private fun PanelKeysRow(row: PanelRow.Keys, onClick: () -> Unit) {
-    Row(
-        Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClick).padding(horizontal = 16.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(row.label, color = Pc.ActionsRow, fontSize = 17.sp, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
-        Box(Modifier.weight(1f))
-        Text(row.keys, color = Pc.SlideValue, fontSize = 15.sp, maxLines = 1, modifier = Modifier.padding(start = 12.dp))
+    androidx.compose.ui.layout.Layout(
+        content = {
+            Text(row.label, color = Pc.ActionsRow, fontSize = 17.sp, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+            Text(row.keys, color = Pc.SlideValue, fontSize = 15.sp, maxLines = 1)
+        },
+        modifier = Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClick).padding(horizontal = 16.dp),
+    ) { measurables, constraints ->
+        val loose = constraints.copy(minWidth = 0, minHeight = 0)
+        val keys = measurables[1].measure(loose)
+        val (labelMost, keysAt) = keysRowPlaces(constraints.maxWidth, keys.width, 12.dp.roundToPx())
+        val label = measurables[0].measure(loose.copy(maxWidth = labelMost))
+        val height = constraints.maxHeight
+        layout(constraints.maxWidth, height) {
+            label.placeRelative(0, (height - label.height) / 2)
+            keys.placeRelative(keysAt, (height - keys.height) / 2)
+        }
     }
+}
+
+/**
+ * Where a row of keys [width] px wide puts its parts: the keys ([keys] px) end where it ends, and
+ * its label has all the room before them but [gap] (none if the keys take it all), cut short only
+ * past that. The label's most width, and where the keys begin.
+ */
+internal fun keysRowPlaces(width: Int, keys: Int, gap: Int): Pair<Int, Int> {
+    val keysAt = (width - keys).coerceAtLeast(0)
+    return (keysAt - gap).coerceAtLeast(0) to keysAt
 }
 
 /** One of a plugin's actions on its card: its words in blue, run when tapped. */
