@@ -1082,6 +1082,9 @@ pub struct StrokeBuilder {
     /// The stamps laid as the stroke is drawn stay as they are when it ends (see
     /// [`StrokeBuilder::hold_laid`]).
     laid_held: bool,
+    /// Laid for good as it comes with no tip to show its end (see
+    /// [`StrokeBuilder::add_short_of_end`]): its first `kept` stamps are laid, the rest wait.
+    end_held: bool,
     /// The stamps placed before the path had a direction turned with it after they were handed
     /// out (see [`StrokeBuilder::take_turned`]).
     turned: bool,
@@ -1505,6 +1508,7 @@ impl StrokeBuilder {
             dab_turn: 0.0,
             spacing_end: None,
             laid_held: false,
+            end_held: false,
             turned: false,
             quiet: false,
             tipped: false,
@@ -1757,6 +1761,44 @@ impl StrokeBuilder {
     pub fn add_tipped(&mut self, samples: &[Sample]) -> (Vec<Stamp>, Vec<Stamp>) {
         let kept = self.add_kept(samples);
         (kept, self.tip_now())
+    }
+
+    /// Whether its end taper (or the pressure's fall) reaches back over what it drew as it went:
+    /// a taper by time, whose end comes before the pen lifts (a classic one tapers only where it
+    /// runs on past the lift).
+    pub fn end_reaches_back(&self) -> bool {
+        !self.is_outside() && !self.classic() && (self.taper().end > 0.0 || self.pressure_taper(1) > 0.0)
+    }
+
+    /// Adds samples to a stroke laid for good as it comes that shows no tip (a smudge, which
+    /// moves the paint under it as it goes): returns the stamps to lay now, those its end taper
+    /// (and the pressure's fall) would no longer reach were it to end here. Those after wait until
+    /// it doesn't, or until the stroke ends and lays them tapered as its end then is
+    /// ([`StrokeBuilder::finish_from`] from [`StrokeBuilder::laid_short_of_end`]). Nothing is laid
+    /// while the start taper's reach still moves.
+    pub fn add_short_of_end(&mut self, samples: &[Sample]) -> Vec<Stamp> {
+        self.end_held = true;
+        let quiet = std::mem::replace(&mut self.quiet, true);
+        self.add(samples);
+        self.quiet = quiet;
+        let start = self.start_span();
+        let reach = match self.start_settled {
+            None if self.taper().start > 0.0 && !self.classic() => f32::NEG_INFINITY,
+            _ => self.eased_before(self.length - self.end_reach(0.0)),
+        };
+        // the stamps lie in order along the path: the first the taper reaches is after those laid
+        let open = self.placed.get(self.kept..).unwrap_or_default();
+        let to = open.iter().position(|p| p.distance >= reach).map_or(self.placed.len(), |i| self.kept + i);
+        let laid = self.placed.get(self.kept..to).unwrap_or_default();
+        let laid = laid.iter().map(|p| self.finish_stamp(p, start, None)).collect();
+        self.kept = to;
+        laid
+    }
+
+    /// How many stamps a stroke laying its end short of where its taper reaches has laid (see
+    /// [`StrokeBuilder::add_short_of_end`]); none for any other.
+    pub fn laid_short_of_end(&self) -> Option<usize> {
+        self.end_held.then_some(self.kept)
     }
 
     /// The first half of [`StrokeBuilder::add_tipped`]: the stamps to draw for good now, the tip
@@ -3063,7 +3105,7 @@ impl StrokeBuilder {
     /// those drawn for good where the end taper shows as the stroke is drawn (where it doesn't,
     /// it thins them once known).
     fn laid_for_good(&self) -> usize {
-        self.left_out + if self.end_shows() { self.kept } else { 0 }
+        self.left_out + if self.end_shows() || self.end_held { self.kept } else { 0 }
     }
 
     /// Lets go of the pieces of path walked that can't be walked again: those before the stamps

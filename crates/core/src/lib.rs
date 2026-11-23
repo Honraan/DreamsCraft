@@ -1450,6 +1450,14 @@ fn draw_samples(
             canvas.add_second_stamps(&guide::mirrored(guide, &added));
         }
     }
+    // a smudge shows no tip, and lays its stamps for good as they come, the paint under them
+    // moved: those its end taper may still reach wait until it no longer does, laid tapered if
+    // the stroke ends first
+    if smudge_holds_end(canvas, builder) {
+        let laid = builder.add_short_of_end(samples);
+        canvas.add_stamps(&guide::mirrored(guide, &laid));
+        return !laid.is_empty();
+    }
     if canvas.shows_tip() && builder.shows_tip() {
         let kept = builder.add_kept(samples);
         canvas.add_stamps(&guide::mirrored(guide, &kept));
@@ -1478,6 +1486,12 @@ fn draw_samples(
     !stamps.is_empty() || builder.holds_start()
 }
 
+/// Whether the open stroke is a smudge whose end taper reaches back over what it lays as it goes
+/// (see [`StrokeBuilder::add_short_of_end`]).
+fn smudge_holds_end(canvas: &Canvas, builder: &StrokeBuilder) -> bool {
+    canvas.stroke_tool() == Some(StrokeTool::Smudge) && !canvas.is_pencil() && builder.end_reaches_back()
+}
+
 /// Draws `samples`, the last of the open stroke's, as the pen lifts: their stamps, unless the stroke
 /// shows its tip (it lays them with the rest of it as it ends); and a dual brush's second takes them.
 fn lift_samples(
@@ -1490,7 +1504,7 @@ fn lift_samples(
     let stamps = builder.add(samples);
     if builder.holds_start() && builder.take_turned() {
         canvas.replace_stamps(&guide::mirrored(guide, &builder.placed_stamps()));
-    } else if !(canvas.shows_tip() && builder.shows_tip()) {
+    } else if !(canvas.shows_tip() && builder.shows_tip()) && builder.laid_short_of_end().is_none() {
         canvas.add_stamps(&guide::mirrored(guide, &stamps));
     }
     if let Some(second) = second {
@@ -1579,10 +1593,17 @@ fn lay_stroke(
             _ => canvas.replace_second_stamps(&guide::mirrored(guide, &second.finish())),
         }
     }
-    // a smudge, or an adjustment painted on, has laid its stamps for good as they came
+    // a smudge, or an adjustment painted on, has laid its stamps for good as they came (a smudge
+    // whose end taper reaches back, those it no longer reaches: the rest are laid now, tapered,
+    // their spacing walked again as the taper thins them)
     if canvas.stroke_tool() == Some(StrokeTool::Smudge) || canvas.is_pencil() {
-        let drawn = builder.stamp_count();
-        builder.hold_laid();
+        let drawn = match builder.laid_short_of_end() {
+            Some(laid) => laid,
+            None => {
+                builder.hold_laid();
+                builder.stamp_count()
+            }
+        };
         canvas.add_stamps(&guide::mirrored(guide, &builder.finish_from(drawn)));
     } else {
         // (a stroke shown with its tip keeps what it drew for good, as it stood before it ended,

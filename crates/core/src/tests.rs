@@ -3261,6 +3261,95 @@ fn a_pen_s_smudge_drags_as_its_pressure_says_whatever_its_tilt_or_rate() {
     assert!(flat >= 15.0 && flat >= 8.0 * at_half.max(1.0) && flat < mouse, "{flat} {at_half} {mouse}");
 }
 
+/// A stroke along y = 160 from x = 60 to 260 in 0.6 s, a render each display frame: with `tool`
+/// Smudge, by the smudge brush (Smudge Pull at most, so it never lets go) out of a black band
+/// across its edge on white; with Paint, black on white. Column by column from x = 200 to 280
+/// every 2 pixels, how many rows are under half white and the darkest. Drawn by `kind`, its tapers
+/// as `taper` says (start, end, size and opacity, and whether classic), or as the brush has them.
+fn smudge_end(kind: PointerKind, taper: Option<([f32; 4], bool)>, tool: ToolKind) -> Option<Vec<(usize, u8)>> {
+    let s = session(320, 320)?;
+    s.set_color(0.0, 0.0, 0.0);
+    s.set_brush_size(0.3);
+    if tool == ToolKind::Smudge {
+        for x in (0..=100).step_by(3) {
+            let x = x as f32;
+            s.stroke_begin(PointerKind::Finger, vec![sample(x, -20.0, 0.0)]);
+            s.stroke_add((1..36).map(|i| sample(x, -20.0 + i as f32 * 10.0, i as f64 * 8.0)).collect());
+            s.stroke_end(vec![sample(x, 340.0, 300.0)]);
+        }
+    }
+    s.set_tool(tool);
+    s.set_brush_size(0.3);
+    s.studio_begin();
+    // (it never lets go of what it carries, so the trail runs on to the stroke's end)
+    s.set_studio_setting("smudge_pull".to_owned(), 1.0);
+    if let Some(([start, end, size, opacity], classic)) = taper {
+        let pen = if kind == PointerKind::Finger { "touch" } else { "pen" };
+        for (k, v) in [("start", start), ("end", end), ("size", size), ("opacity", opacity)] {
+            s.set_studio_setting(format!("{pen}_taper_{k}"), v);
+        }
+        s.set_studio_setting("classic_taper".to_owned(), if classic { 1.0 } else { 0.0 });
+    }
+    s.studio_end(true);
+    let (from, to, ms) = (60.0f32, 260.0f32, 600.0);
+    let count = 120;
+    let at = |i: usize| {
+        let t = i as f64 / count as f64;
+        sample(from + (to - from) * t as f32, 160.0, t * ms)
+    };
+    s.stroke_begin(kind, vec![at(0)]);
+    let (mut i, mut frame) = (1, 1.0);
+    while i < count {
+        let mut batch = Vec::new();
+        while i < count && at(i).time_ms < frame * 1000.0 / 60.0 {
+            batch.push(at(i));
+            i += 1;
+        }
+        if !batch.is_empty() {
+            s.stroke_add(batch);
+        }
+        picture(&s);
+        frame += 1.0;
+    }
+    s.stroke_end(vec![at(count)]);
+    let px = picture(&s);
+    let column = |x: usize| {
+        let reds = (0..320).map(|y| px[(y * 320 + x) * 4]);
+        (reds.clone().filter(|&r| r < 128).count(), reds.min().unwrap_or(255))
+    };
+    Some((200..280).step_by(2).map(column).collect())
+}
+
+/// A smudge's tapers are its brush's, as paint's are: with the finger's newer end taper long (0.5,
+/// thinning by 0.6 and fading by 0.5) what it drags out thins and fades over its last 16 pixels as
+/// a paint stroke's end does there (within 2 pixels across at each column), where with none it
+/// stays whole (12 across) up to its round end. Before, a smudge laid its stamps for good as they
+/// came, so its end taper reached only what came after the last input (none of it here) and the
+/// two ended alike.
+#[test]
+fn a_smudge_s_end_tapers_as_a_paint_stroke_s_does() {
+    let newer = |end: f32| Some(([0.1, end, 0.6, 0.5], false));
+    let Some(long) = smudge_end(PointerKind::Finger, newer(0.5), ToolKind::Smudge) else { return };
+    let none = smudge_end(PointerKind::Finger, newer(0.0), ToolKind::Smudge).unwrap_or_default();
+    let paint = smudge_end(PointerKind::Finger, newer(0.5), ToolKind::Paint).unwrap_or_default();
+    // (columns from x = 200, every 2 pixels: 24 is x = 248, 31 is x = 262)
+    let at = |p: &[(usize, u8)], x: usize| p.get((x - 200) / 2).copied().unwrap_or_default();
+    eprintln!("long {:?}", &long[20..34]);
+    eprintln!("none {:?}", &none[20..34]);
+    eprintln!("paint {:?}", &paint[20..34]);
+    // whole before its end either way
+    assert!(at(&long, 240).0 == 12 && at(&none, 240).0 == 12, "{long:?} {none:?}");
+    // without an end taper, whole until its round end
+    assert!(at(&none, 252).0 == 12 && at(&none, 256).0 == 12, "{none:?}");
+    // with one, thinning as paint's end does
+    assert!(at(&long, 252).0 <= 8 && at(&long, 256).0 <= 6, "{long:?}");
+    for x in (248..=262).step_by(2) {
+        assert!(at(&long, x).0.abs_diff(at(&paint, x).0) <= 2, "{x}: {long:?} {paint:?}");
+    }
+    // and fading: lighter than the untapered end at the same place
+    assert!(at(&long, 258).1 >= at(&none, 258).1 + 10, "{long:?} {none:?}");
+}
+
 /// The ink across a pen stroke (black on white, along y = 100) at columns 42, 46 and 50 (its start),
 /// 200 (its middle) and 330, 334 and 338 (its end), drawn by the current brush with its pressure
 /// taper set as `taper` says (start, end, tip, pressure; no taper size), at pressure 0.8 and 240
