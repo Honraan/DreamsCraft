@@ -776,6 +776,7 @@ fun GalleryScreen(vm: CanvasViewModel) {
                         }
                     }
                 },
+                onShareLog = { shareLog(context, vm.viewModelScope) { vm.message = LOG_NOT_READY } },
             ) { about = false }
         }
         RecoveryProgress(recovery, recovered)
@@ -820,13 +821,16 @@ fun GalleryScreen(vm: CanvasViewModel) {
         },
     )
     // an artwork whose opening closed the app last time: opened again only when asked to (it can
-    // be shared, duplicated or deleted from the gallery meanwhile)
+    // be shared, duplicated or deleted from the gallery meanwhile); its log (that run's, kept for
+    // it) shared from here, with no canvas to open for Help's
     Alert(
         vm.openingEndedApp,
         title = { "This artwork closed the app" },
         message = { "ProCraft closed while this artwork was opening last time, perhaps for want of memory. Closing other apps first may help." },
         action = "Open Anyway",
         destructive = false,
+        extra = "Share Log",
+        onExtra = { shareLog(context, vm.viewModelScope) { vm.message = LOG_NOT_READY } },
         onCancel = { vm.openingEndedApp = null },
         onAction = { o ->
             vm.openingEndedApp = null
@@ -2012,10 +2016,11 @@ private fun Chip(text: String, modifier: Modifier = Modifier) {
 
 /**
  * What the app is, over the gallery (blurred and dimmed under it): its icon 300 across, its name,
- * its version; a round button at the top right closes it, as back does.
+ * its version; a round button at the top right closes it, as back does. The version held shares the
+ * app's log ([onShareLog]): the gallery's way to it with no canvas open, and nothing added to see.
  */
 @Composable
-private fun AboutApp(onRecover: () -> Unit, onClose: () -> Unit) {
+private fun AboutApp(onRecover: () -> Unit, onShareLog: () -> Unit, onClose: () -> Unit) {
     BackHandler(onBack = onClose)
     val context = androidx.compose.ui.platform.LocalContext.current
     val version = remember {
@@ -2035,7 +2040,13 @@ private fun AboutApp(onRecover: () -> Unit, onClose: () -> Unit) {
                 )
             }
             Text("ProCraft", color = Color.White, fontSize = 64.sp, fontWeight = FontWeight.Bold, maxLines = 1, modifier = Modifier.padding(top = 12.dp))
-            Text(version, color = AboutInk, fontSize = 13.sp, maxLines = 1, modifier = Modifier.padding(top = 14.dp))
+            Text(
+                version,
+                color = AboutInk,
+                fontSize = 13.sp,
+                maxLines = 1,
+                modifier = Modifier.padding(top = 14.dp).pointerInput(Unit) { detectTapGestures(onLongPress = { onShareLog() }) },
+            )
         }
         Box(
             Modifier.align(Alignment.TopCenter).padding(top = AboutButtonTop).size(220.dp, 38.dp).clip(RoundedCornerShape(8.dp))

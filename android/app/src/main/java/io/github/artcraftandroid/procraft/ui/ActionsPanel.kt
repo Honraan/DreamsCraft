@@ -352,13 +352,7 @@ fun ActionsPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier)
                 },
                 Act("Share log") {
                     // made outside the panel, which may be closed meanwhile
-                    vm.viewModelScope.launch {
-                        val log = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                            io.github.artcraftandroid.procraft.AppLog.toShare(context)
-                        }
-                        if (log == null) dialog = "Share log" to "The log couldn't be made ready to share."
-                        else runCatching { shareFile(context, log, "text/plain") }
-                    }
+                    shareLog(context, vm.viewModelScope) { dialog = "Share log" to LOG_NOT_READY }
                 },
             ),
         )
@@ -1415,6 +1409,21 @@ internal fun shareFiles(context: Context, files: List<File>, mime: String) {
     val uris = ArrayList(files.map { FileProvider.getUriForFile(context, context.packageName + ".files", it) })
     val send = Intent(Intent.ACTION_SEND_MULTIPLE).setType(mime).putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     context.startActivity(shareSheet(context, send, files, mime))
+}
+
+/** What is said when the log couldn't be made ready to share (the storage full, say). */
+internal const val LOG_NOT_READY = "The log couldn't be made ready to share."
+
+/**
+ * The app's log made ready to share (off the main thread, in [scope]) and offered through the share
+ * sheet: Help's Share log, the gallery's question about an artwork that closed the app, and the
+ * app's own settings page. [failed] hears when it couldn't be made ready.
+ */
+internal fun shareLog(context: Context, scope: kotlinx.coroutines.CoroutineScope, failed: () -> Unit) {
+    scope.launch {
+        val log = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { io.github.artcraftandroid.procraft.AppLog.toShare(context) }
+        if (log == null) failed() else runCatching { shareFile(context, log, "text/plain") }
+    }
 }
 
 /** Offers [file] to other apps through the share sheet. */

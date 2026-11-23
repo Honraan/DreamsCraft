@@ -11,7 +11,10 @@
 //! files is left out of every line (see [`redact`]).
 //!
 //! Help's Share log hands both logs on as one text file, with the GPU start record the device
-//! module keeps (see [`write_log_to_share`]).
+//! module keeps (see [`write_log_to_share`]); so does the gallery's question about an artwork whose
+//! opening closed the app. Each log begins with its run's process, so that the log of a run that
+//! closed while it opened an artwork is kept apart as well (see [`keep_log_of_ended_runs`]): the
+//! starts after it would otherwise push it out before it is shared.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -22,6 +25,8 @@ use std::time::Instant;
 /// The log, and the run before's, in the app's own folder.
 const LOG: &str = "procraft.log";
 const PREVIOUS_LOG: &str = "procraft-previous.log";
+/// The log of a run that closed while it opened an artwork, kept while the open marks name it.
+const CRASHED_LOG: &str = "procraft-crashed.log";
 
 /// How large a log grows, bytes.
 const MOST: usize = 1 << 20;
@@ -89,6 +94,7 @@ pub fn start_log_file(dir: String, header: String) {
         kept.is_some()
     };
     if begun {
+        write(&process_line(std::process::id()));
         write(&header);
     } else {
         log::warn!("the log's file couldn't be made");
@@ -130,12 +136,55 @@ pub fn write_log_to_share(dir: String, to: String) -> bool {
     fs::write(to, text).map_err(|e| log::warn!("the log to share: {e}")).is_ok()
 }
 
+/// The line a log begins with: the run (process) it is of.
+fn process_line(run: u32) -> String {
+    format!("process {run}\n")
+}
+
+/// The run a log is of, by its first line; none for a log from before logs said.
+fn process_of(log: &[u8]) -> Option<u32> {
+    let first = log.split(|&b| b == b'\n').next()?;
+    std::str::from_utf8(first).ok()?.trim().strip_prefix("process ")?.parse().ok()
+}
+
+/// Keeps the run before's log apart as [`CRASHED_LOG`] when that run closed while it opened an
+/// artwork (`ended`: the runs that did, as the open marks say), so that it is still there to share
+/// after later starts; one kept for a run the marks no longer name (its artwork opened since) goes.
+pub(crate) fn keep_log_of_ended_runs(ended: &[u32]) {
+    // (the lock let go first: a line logged meanwhile takes it)
+    let dir = kept().as_ref().and_then(|f| f.path.parent().map(Path::to_path_buf));
+    if let Some(dir) = dir {
+        keep_ended_in(&dir, ended);
+    }
+}
+
+fn keep_ended_in(dir: &Path, ended: &[u32]) {
+    let crashed = dir.join(CRASHED_LOG);
+    if let Ok(before) = fs::read(dir.join(PREVIOUS_LOG))
+        && process_of(&before).is_some_and(|run| ended.contains(&run))
+    {
+        let written = crate::project::write_atomically(&crashed, |p| {
+            fs::write(p, &before).map_err(|e| crate::project::file_error("keeping the log", e))
+        });
+        if let Err(e) = written {
+            log::warn!("{e}");
+        }
+        return;
+    }
+    if fs::read(&crashed).ok().and_then(|log| process_of(&log)).is_some_and(|run| !ended.contains(&run)) {
+        let _ = fs::remove_file(&crashed);
+    }
+}
+
 /// The log to share, from `dir` (see [`write_log_to_share`]), with what could name the person left
 /// out once more: the logs were written so, but a log from another version may not have been.
 fn shared_log(dir: &Path) -> String {
     use std::fmt::Write as _;
     let read = |name: &str| fs::read(dir.join(name)).ok().map(|b| String::from_utf8_lossy(&b).into_owned());
     let (now, before) = (read(LOG), read(PREVIOUS_LOG));
+    // a run that closed while it opened an artwork, unless that is the run before
+    let run_before = before.as_deref().and_then(|b| process_of(b.as_bytes()));
+    let crashed = read(CRASHED_LOG).filter(|c| process_of(c.as_bytes()) != run_before);
     let record = read(crate::device::RECORD).map(|r| r.trim().to_owned()).filter(|r| !r.is_empty());
     let mut out = String::from("ProCraft's log\n\n");
     // "<backend> trying|made|drew", and on a second line the build it was kept for
@@ -161,6 +210,13 @@ fn shared_log(dir: &Path) -> String {
     }
     for (run, name, log) in [("This run", LOG, &now), ("The run before", PREVIOUS_LOG, &before)] {
         let _ = write!(out, "\n===== {run} ({name}) =====\n{}", log.as_deref().unwrap_or("(none)"));
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if let Some(log) = crashed {
+        let _ =
+            write!(out, "\n===== An earlier run, which closed while it opened an artwork ({CRASHED_LOG}) =====\n{log}");
         if !out.ends_with('\n') {
             out.push('\n');
         }
@@ -746,6 +802,46 @@ mod tests {
         LogFile::begin(&dir).unwrap();
         assert_eq!(fs::read_to_string(dir.join(PREVIOUS_LOG)).unwrap(), "the second run\n");
         assert_eq!(fs::read_to_string(dir.join(LOG)).unwrap(), "");
+        fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    /// The log of a run that closed while it opened an artwork outlasts the starts after it, until
+    /// that artwork opens: shared with this run's and the run before's, as itself, once.
+    #[test]
+    fn the_log_of_a_run_that_closed_opening_an_artwork_outlasts_the_starts_after_it() {
+        let dir = folder("crashed");
+        let run = |pid: u32, said: &str| {
+            let mut log = LogFile::begin(&dir).unwrap();
+            log.write(&process_line(pid));
+            log.write(said);
+        };
+        // run 7 closes while it opens an artwork (its mark stays); run 8 starts
+        run(7, "opening the artwork that closes the app\n");
+        run(8, "the gallery, once\n");
+        keep_ended_in(&dir, &[7]);
+        let kept = fs::read(dir.join(CRASHED_LOG)).unwrap();
+        assert_eq!(process_of(&kept), Some(7));
+        assert_eq!(kept, fs::read(dir.join(PREVIOUS_LOG)).unwrap());
+        // the run before is it: shared once, not twice
+        let shared = shared_log(&dir);
+        assert_eq!(shared.matches("opening the artwork that closes the app").count(), 1, "{shared}");
+        // run 9 starts: run 7's log is no longer the run before's, and is still shared
+        run(9, "the gallery again\n");
+        keep_ended_in(&dir, &[7]);
+        let shared = shared_log(&dir);
+        assert_eq!(process_of(&fs::read(dir.join(PREVIOUS_LOG)).unwrap()), Some(8));
+        assert!(shared.contains("===== An earlier run, which closed while it opened an artwork"), "{shared}");
+        assert_eq!(shared.matches("opening the artwork that closes the app").count(), 1, "{shared}");
+        assert!(shared.contains("the gallery, once") && shared.contains("the gallery again"));
+        // its artwork opened since (no mark names run 7): it goes
+        run(10, "opened it anyway\n");
+        keep_ended_in(&dir, &[]);
+        assert!(!dir.join(CRASHED_LOG).exists());
+        assert!(!shared_log(&dir).contains("opening the artwork that closes the app"));
+        // a log from before logs said their run is never taken for one that closed
+        fs::write(dir.join(PREVIOUS_LOG), "no process line\n").unwrap();
+        keep_ended_in(&dir, &[7]);
+        assert!(!dir.join(CRASHED_LOG).exists());
         fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 

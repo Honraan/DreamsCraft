@@ -9,10 +9,16 @@ use std::sync::Mutex;
 /// The file the marks are kept in, once the app has said where.
 static FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
-/// Where the app keeps the marks: a file of its own, outside the gallery.
+/// Where the app keeps the marks: a file of its own, outside the gallery. The log of a run before
+/// this one that closed while it opened an artwork is kept apart from now on, to share (see
+/// `app_log.rs`).
 #[uniffi::export]
 pub fn set_open_marks_file(path: String) {
-    *FILE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PathBuf::from(path));
+    let file = PathBuf::from(path);
+    *FILE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(file.clone());
+    let this_run = std::process::id();
+    let ended: Vec<u32> = read(&file).into_iter().map(|(run, _)| run).filter(|&run| run != this_run).collect();
+    crate::app_log::keep_log_of_ended_runs(&ended);
 }
 
 /// Whether the artwork in folder `dir` was being opened when the app last ended: its opening
