@@ -298,12 +298,15 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         session?.setSecondaryColor(((c shr 16) and 0xFF) / 255f, ((c shr 8) and 0xFF) / 255f, (c and 0xFF) / 255f)
     }
 
-    /** Colours painted with recently (0xRRGGBB), newest first, as the shared core keeps them. */
-    var history by mutableStateOf<List<Int>>(emptyList())
-        private set
+    /**
+     * The colour history, kept by the shared core across artworks and, in its file, from one run of
+     * the app to the next: each canvas's paint strokes add to it.
+     */
+    private val colourHistory = io.github.artcraftandroid.procraft.core.ColourHistory.open(File(app.filesDir, "colour-history.json").path)
 
-    /** The colour history, kept by the shared core across artworks: each canvas's paint strokes add to it. */
-    private val colourHistory = io.github.artcraftandroid.procraft.core.ColourHistory()
+    /** Colours painted with recently (0xRRGGBB), newest first, as the shared core keeps them. */
+    var history by mutableStateOf(colourHistory.colours().map { it.toInt() })
+        private set
 
     /** Whether the size and opacity side bar shows. */
     var showSideBar by mutableStateOf(true)

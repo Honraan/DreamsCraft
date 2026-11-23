@@ -2465,6 +2465,10 @@ impl CanvasSession {
         out.push(TouchCommand::CursorGone);
         match mode {
             Mode::Pen | Mode::Finger => {
+                // a stroke erasing or smudging in place of the tool (a touch or the pen set to
+                // erase or smudge) ends as one, the tool put back only after: it puts no colour
+                // into the history
+                let before = t.tool_before.take();
                 self.end_stroke_tools(&mut t);
                 drop(t);
                 if cancelled {
@@ -2473,6 +2477,9 @@ impl CanvasSession {
                     self.stroke_end(samples);
                     // a snapped shape the pen moved: its handles where it now is
                     out.push(TouchCommand::StrokeEnded);
+                }
+                if let Some(before) = before {
+                    self.put_tool(before);
                 }
             }
             Mode::Pick => {
@@ -3398,6 +3405,32 @@ mod tests {
         s.touch_down(1, PointerKind::Finger, at(10.0, 10.0, 3000.0));
         s.touch_move(1, at(60.0, 10.0, 3020.0));
         assert!(s.touch_up(1, at(60.0, 10.0, 3040.0)).contains(&TouchCommand::StrokeEnded));
+    }
+
+    /// A stroke erasing or smudging in place of the brush (a touch set to erase or smudge) ends as
+    /// that stroke, the brush put back only after: it puts no colour into the colour history, as
+    /// the eraser and smudge tools don't (the brush came back first, so it added the brush's
+    /// colour), while the pen's paint strokes add theirs.
+    #[test]
+    fn a_stroke_erasing_in_place_of_the_brush_puts_no_colour_in_the_history() {
+        let s = session();
+        let history = crate::ColourHistory::new();
+        s.use_colour_history(history.clone());
+        s.set_tool(ToolKind::Paint);
+        s.set_color(1.0, 0.0, 0.0);
+        for does in [GestureAction::Erase, GestureAction::Smudge] {
+            s.set_touch_settings(TouchSettings { touch: Some(does), ..TouchSettings::default() });
+            s.touch_down(1, PointerKind::Finger, at(10.0, 10.0, 0.0));
+            s.touch_move(1, at(60.0, 10.0, 20.0));
+            assert!(s.touch_up(1, at(60.0, 10.0, 40.0)).contains(&TouchCommand::StrokeEnded), "{does:?}");
+            assert_eq!(history.colours(), Vec::<u32>::new(), "{does:?}");
+            assert_eq!(s.info().tool, ToolKind::Paint, "{does:?}: the brush back after");
+        }
+        // the pen painting with the brush: its colour goes in
+        s.touch_down(2, PointerKind::Stylus, at(10.0, 30.0, 100.0));
+        s.touch_move(2, at(60.0, 30.0, 120.0));
+        assert!(s.touch_up(2, at(60.0, 30.0, 140.0)).contains(&TouchCommand::StrokeEnded));
+        assert_eq!(history.colours(), vec![0xFF0000]);
     }
 
     #[test]

@@ -148,8 +148,14 @@ final class CanvasModel {
     /// When time on the artwork last started counting; none while away.
     @ObservationIgnored private var activeSince: Date?
 
-    /// The colour history, kept across artworks: each canvas's paint strokes add to it.
-    static let colourHistory = ColourHistory()
+    /// The colour history, kept across artworks and, in its file, from one run of the app to the
+    /// next: each canvas's paint strokes add to it.
+    static let colourHistory: ColourHistory = {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        return ColourHistory.open(path: support.appendingPathComponent("colour-history.json").path)
+    }()
 
     /// The modify button was pressed: the next touch on the canvas picks a colour (the touches
     /// know too).

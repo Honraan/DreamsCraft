@@ -1,11 +1,13 @@
 //! The colours painted with lately, newest first, the same in every app: the app keeps them (they
-//! outlast an artwork) and hands them to each canvas, whose paint strokes add their colour as they
-//! end. Colours are 0xRRGGBB.
+//! outlast an artwork, and in a file it names they outlast the app being closed) and hands them to
+//! each canvas, whose paint strokes add their colour as they end. Colours are 0xRRGGBB.
 //!
 //! It keeps the previous colour too, which holding the colour button goes back to: the colour
 //! before the last one chosen (with the eyedropper, the colour panel closed on a new one, or the
 //! hold itself), the brush's and a mask's apart, as masks paint with a colour of their own.
 
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// How many colours the history keeps.
@@ -24,6 +26,11 @@ pub fn colour_hold_ms() -> u32 {
 pub struct ColourHistory {
     colours: Mutex<Vec<u32>>,
     previous: Mutex<Previous>,
+    /// Where the colours are kept from one run of the app to the next, if anywhere: written whole
+    /// as they change.
+    file: Option<PathBuf>,
+    /// Writing them there failed, and was logged: not again until a write works.
+    failing: AtomicBool,
 }
 
 /// The previous colours, the brush's and a mask's, and the colour the colour panel opened on (and
@@ -36,9 +43,20 @@ struct Previous {
 
 #[uniffi::export]
 impl ColourHistory {
+    /// A history kept only while the app runs.
     #[uniffi::constructor]
     pub fn new() -> Arc<ColourHistory> {
         Arc::new(ColourHistory::default())
+    }
+
+    /// The history kept at `path`, as the app was last left (none there yet, or a file that
+    /// can't be read, starts it empty; what can be read of one is kept); each change is written
+    /// there whole.
+    #[uniffi::constructor]
+    pub fn open(path: String) -> Arc<ColourHistory> {
+        let file = PathBuf::from(path);
+        let colours = std::fs::read_to_string(&file).map(|t| read_kept(&t)).unwrap_or_default();
+        Arc::new(ColourHistory { colours: Mutex::new(colours), file: Some(file), ..ColourHistory::default() })
     }
 
     /// Newest first.
@@ -47,7 +65,11 @@ impl ColourHistory {
     }
 
     pub fn clear(&self) {
-        self.kept().clear();
+        let mut kept = self.kept();
+        if !kept.is_empty() {
+            kept.clear();
+            self.write(&kept);
+        }
     }
 
     /// The last colour painted with other than `current`, to go back to.
@@ -115,14 +137,64 @@ impl ColourHistory {
         self.previous.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// A stroke was painted in `rgb`: it goes to the front.
+    /// A stroke was painted in `rgb`: it goes to the front (written out only if that changed
+    /// anything, so strokes in the colour at the front write nothing).
     pub(crate) fn painted(&self, rgb: u32) {
         let rgb = rgb & 0xFF_FFFF;
         let mut kept = self.kept();
+        if kept.first() == Some(&rgb) {
+            return;
+        }
         kept.retain(|&c| c != rgb);
         kept.insert(0, rgb);
         kept.truncate(HISTORY_SIZE);
+        self.write(&kept);
     }
+
+    /// `colours` written to the history's file, if it has one.
+    fn write(&self, colours: &[u32]) {
+        let Some(file) = &self.file else { return };
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let text = write_kept(colours);
+        let written = crate::project::write_atomically(file, |tmp| {
+            std::fs::write(tmp, &text).map_err(|e| crate::project::file_error("saving", e))
+        });
+        match written {
+            Ok(()) => self.failing.store(false, Ordering::Relaxed),
+            Err(e) => {
+                if !self.failing.swap(true, Ordering::Relaxed) {
+                    log::error!("saving the colour history: {e}");
+                }
+            }
+        }
+    }
+}
+
+/// The colours as the history's file keeps them: a JSON list of "#RRGGBB", newest first.
+fn write_kept(colours: &[u32]) -> String {
+    let list: Vec<String> = colours.iter().map(|c| format!("#{:06X}", c & 0xFF_FFFF)).collect();
+    serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_owned())
+}
+
+/// The colours a history's file keeps, leniently: those that read as "#RRGGBB" (or "RRGGBB"),
+/// each once, no more than the history keeps; none from a file that isn't such a list.
+fn read_kept(text: &str) -> Vec<u32> {
+    let list: Vec<serde_json::Value> = serde_json::from_str(text).unwrap_or_default();
+    let mut colours = Vec::new();
+    for c in list.iter().filter_map(serde_json::Value::as_str) {
+        let hex = c.trim().trim_start_matches('#');
+        if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let Ok(rgb) = u32::from_str_radix(hex, 16) else { continue };
+        if !colours.contains(&rgb) {
+            colours.push(rgb);
+        }
+    }
+    colours.truncate(HISTORY_SIZE);
+    colours
 }
 
 /// An sRGB colour (0..1) as 0xRRGGBB.
@@ -207,5 +279,59 @@ mod tests {
         s.set_color(0.0, 0.0, 1.0);
         s.stroke_end(at(10.0));
         assert_eq!(h.colours(), vec![0xFF0000]);
+    }
+
+    /// The history in the file the app names comes back as it was left when the app opens it
+    /// again (it was kept only while the app ran, so every start found it empty), written whole
+    /// as it changes and not when a stroke's colour is already at its front; cleared, it comes
+    /// back empty.
+    #[test]
+    fn a_history_kept_in_a_file_comes_back_as_the_app_left_it() {
+        let dir = std::env::temp_dir().join(format!("procraft-colour-history-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("colour-history.json");
+        let path = file.to_string_lossy().into_owned();
+        // none there yet: empty
+        let h = ColourHistory::open(path.clone());
+        assert!(h.colours().is_empty());
+        for c in [0x0A0507, 0xFF0000, 0x00FF00, 0xFF0000] {
+            h.painted(c);
+        }
+        assert_eq!(h.colours(), vec![0xFF0000, 0x00FF00, 0x0A0507]);
+        assert_eq!(ColourHistory::open(path.clone()).colours(), h.colours(), "as left");
+        // twelve painted: the newest ten come back
+        for c in 1..=12 {
+            h.painted(c);
+        }
+        let again = ColourHistory::open(path.clone()).colours();
+        assert_eq!(again.len(), HISTORY_SIZE);
+        assert_eq!(again, (3..=12).rev().collect::<Vec<u32>>());
+        // the colour at the front painted again writes nothing
+        std::fs::remove_file(&file).unwrap();
+        h.painted(12);
+        assert!(!file.exists(), "nothing written");
+        h.painted(11);
+        assert_eq!(ColourHistory::open(path.clone()).colours().first(), Some(&11));
+        // cleared: empty when opened again
+        h.clear();
+        assert!(ColourHistory::open(path.clone()).colours().is_empty());
+        // read leniently: each colour that reads once, at most ten; nothing from what isn't a list
+        let mixed = r##"["#ff0000", 5, "nothex", "00FF00", "#FF0000", "#12345", "+12345", " #0000ff "]"##;
+        std::fs::write(&file, mixed).unwrap();
+        assert_eq!(ColourHistory::open(path.clone()).colours(), vec![0xFF0000, 0x00FF00, 0x0000FF]);
+        let many: Vec<String> = (0..15).map(|c| format!("#{c:06X}")).collect();
+        std::fs::write(&file, serde_json::to_string(&many).unwrap()).unwrap();
+        assert_eq!(ColourHistory::open(path.clone()).colours(), (0..10).collect::<Vec<u32>>());
+        std::fs::write(&file, b"   not json").unwrap();
+        assert!(ColourHistory::open(path.clone()).colours().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+        // where it can't be written (a file in its folder's place): kept while the app runs
+        let blocked = std::env::temp_dir().join(format!("procraft-colour-history-blocked-{}", std::process::id()));
+        std::fs::write(&blocked, b"not a folder").unwrap();
+        let h = ColourHistory::open(blocked.join("colour-history.json").to_string_lossy().into_owned());
+        h.painted(0x123456);
+        h.painted(0x654321);
+        assert_eq!(h.colours(), vec![0x654321, 0x123456]);
+        let _ = std::fs::remove_file(&blocked);
     }
 }

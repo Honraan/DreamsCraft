@@ -321,7 +321,13 @@ impl Default for Colours {
             other: kept.1,
             on_mask: false,
             secondary: [1.0, 1.0, 1.0],
-            history: ColourHistory::new(),
+            // kept from one run to the next, as the palettes are (a test's strokes leave the
+            // file be)
+            history: if cfg!(test) {
+                ColourHistory::new()
+            } else {
+                ColourHistory::open(crate::files::app_dir().join("colour-history.json").to_string_lossy().into_owned())
+            },
             palettes: Palettes::open(crate::files::app_dir().join("palettes.json").to_string_lossy().into_owned()),
             pickers: Pickers::default(),
             steps: false,
