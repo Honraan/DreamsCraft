@@ -1829,6 +1829,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val s = withContext(Dispatchers.IO) {
                 CanvasSession.newCustom(p.width.toUInt(), p.height.toUInt(), p.dpi, rgb, !p.backgroundHidden, "Untitled Artwork").also {
+                    it.madeWithScreenTurned(screenTurns().toUInt())
                     it.setNewProfile(p.profile)
                     loadBrushes(it)
                 }
@@ -1838,6 +1839,20 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             timeLapse?.settings = p.timeLapse
             startedNew()
         }
+    }
+
+    /**
+     * How far (quarter turns clockwise) the screen is turned now from upright, held as a portrait
+     * screen is: a new canvas is made so (its brushes' shapes lie as that upright screen has them).
+     * A screen whose own way is landscape counts as an upright one turned back a quarter turn.
+     */
+    private fun screenTurns(): Int {
+        val display = getApplication<Application>().getSystemService(android.hardware.display.DisplayManager::class.java)
+            ?.getDisplay(android.view.Display.DEFAULT_DISPLAY) ?: return 0
+        val turned = (4 - display.rotation.coerceIn(0, 3)) % 4
+        val mode = display.mode
+        val ownWayPortrait = mode.physicalWidth <= mode.physicalHeight
+        return if (ownWayPortrait) turned else (turned + 3) % 4
     }
 
     /** Says the canvas holds no more layers, and how many it holds. */
@@ -1858,6 +1873,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val s = withContext(Dispatchers.IO) {
                 val made = CanvasSession(width.coerceAtLeast(1).toUInt(), height.coerceAtLeast(1).toUInt()).also {
+                    it.madeWithScreenTurned(screenTurns().toUInt())
                     it.setNewProfile(io.github.artcraftandroid.procraft.gallery.CanvasPreset.P3)
                     loadBrushes(it)
                 }

@@ -647,6 +647,17 @@ pub struct Document {
     /// The look of the text last edited (see [`LayerText::look`]), which new text starts with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_style: Option<LayerText>,
+    /// How far (quarter turns clockwise, 0..3) the screen was turned from upright when the canvas
+    /// was made: a canvas made with the screen on its side, kept as the screen held upright keeps
+    /// it, is shown turned so. Its brushes' shapes and moving grains fixed to the canvas lie as
+    /// that upright screen has them, turned with it (see `StrokeBuilder::on_canvas_made_turned`).
+    #[serde(default, deserialize_with = "or_default", skip_serializing_if = "is_upright")]
+    pub made_turns: u8,
+}
+
+/// Whether a canvas was made with the screen upright (see [`Document::made_turns`]).
+fn is_upright(turns: &u8) -> bool {
+    turns.is_multiple_of(4)
 }
 
 /// The layers a file lists, as many as can be read: in a damaged file a layer with fields that
@@ -730,6 +741,7 @@ impl Document {
             icc: None,
             solo: None,
             text_style: None,
+            made_turns: 0,
         };
         doc.add_layer();
         doc

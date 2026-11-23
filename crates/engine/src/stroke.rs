@@ -1030,6 +1030,9 @@ pub struct StrokeBuilder {
     stroke_turn: f32,
     /// How far the canvas is turned on screen, for a brush whose shapes keep to the screen.
     screen_turn: f32,
+    /// How far (quarter turns clockwise) the screen was turned from upright when the canvas was
+    /// made (see [`StrokeBuilder::on_canvas_made_turned`]).
+    made_turns: u8,
     /// The brush's input style is azimuth and barrel roll: its stamps turn as the pen's barrel
     /// does; set relative to the stroke, from how it was turned as the stroke began, else from
     /// the barrel's own zero (a turn held from before the stroke counts).
@@ -1220,6 +1223,27 @@ impl StrokeBuilder {
         self
     }
 
+    /// The stroke drawn on a canvas made with the screen turned `turns` quarter turns clockwise
+    /// from upright (see `Document::made_turns`): kept as the screen held upright keeps it, so a
+    /// brush's shapes and its moving grain, fixed to the canvas, lie as they would on that upright
+    /// screen, turned with the canvas as it is shown. What follows the stroke's way or the pen
+    /// turns with them as they go; a brush oriented to the screen keeps to the screen instead.
+    pub fn on_canvas_made_turned(mut self, turns: u8) -> StrokeBuilder {
+        self.made_turns = turns % 4;
+        self
+    }
+
+    /// How far (radians, clockwise) the canvas's own frame lies turned on it: the upright screen's
+    /// it was made on (see [`StrokeBuilder::on_canvas_made_turned`]), none for a brush oriented to
+    /// the screen.
+    fn made_turn(&self) -> f32 {
+        if self.brush.setting("orient_to_screen") >= 0.5 {
+            0.0
+        } else {
+            f32::from(self.made_turns) * std::f32::consts::FRAC_PI_2
+        }
+    }
+
     /// The stroke drawn with the canvas shown at `points_per_pixel` screen points a canvas pixel:
     /// the speed dynamics go by how fast the pen moves on screen.
     pub fn seen_at(mut self, points_per_pixel: f32) -> StrokeBuilder {
@@ -1337,6 +1361,7 @@ impl StrokeBuilder {
     pub fn drawn_like(mut self, like: &StrokeBuilder) -> StrokeBuilder {
         self.input = like.input.clone();
         self.screen_turn = like.screen_turn;
+        self.made_turns = like.made_turns;
         self.points_per_pixel = like.points_per_pixel;
         self.pad = like.pad;
         self
@@ -1460,6 +1485,7 @@ impl StrokeBuilder {
             stroke_secondary: 0.0,
             stroke_turn: 0.0,
             screen_turn: 0.0,
+            made_turns: 0,
             points_per_pixel: 1.0,
             input: InputSettings::default(),
             weights: None,
@@ -3275,6 +3301,7 @@ impl StrokeBuilder {
         // a pen turns the stamp as it is held (its azimuth, and roll), in place of following the
         // stroke, which is for touch; relative to the stroke, it turns from the stroke's way
         let follow = self.follow();
+        let made_turn = self.made_turn();
         for _ in 0..count {
             let size = 1.0 - shape.size_jitter.clamp(0.0, 1.0) * size_jitter_by * self.random.next();
             let fade = 1.0 - shape.opacity_jitter.clamp(0.0, 1.0) * opacity_jitter_by * self.random.next();
@@ -3294,7 +3321,11 @@ impl StrokeBuilder {
                 let r = self.random.next().sqrt() * shape.throw * diameter;
                 center = center + Vec2::new(a.cos() * r, a.sin() * r);
             }
-            let turned = self.stroke_turn - self.screen_turn + follow * self.direction;
+            // (in the canvas's own frame: its fixed turn turned with it, all but the share that
+            // follows the stroke's way or the pen's, which are told as they go on the canvas)
+            let by_pen = if shape.follow_azimuth && !self.no_azimuth { 1.0 } else { 0.0 };
+            let turned =
+                self.stroke_turn - self.screen_turn + follow * self.direction + (1.0 - follow - by_pen) * made_turn;
             let mut own = shape.rotation;
             if shape.follow_azimuth && !self.no_azimuth {
                 own += p.azimuth;
@@ -3369,14 +3400,14 @@ impl StrokeBuilder {
                 None => center,
             };
             let start = self.grain_last.map_or(self.grain_start, |(read, _)| read);
-            let grain_read = start + turned_by(moved, self.screen_turn) * rolled;
+            let grain_read = start + turned_by(moved, self.screen_turn - made_turn) * rolled;
             self.grain_last = Some((grain_read, center));
             // the patch read takes the rotation control's share of the stamp's whole turn, which
             // counts from an eighth of a turn, from a pen's lean the other way (kept to the
             // screen, the grain is too)
             let held = if self.turned_by_pen() { std::f32::consts::PI } else { 0.0 };
             let from_eighth = wrapped(std::f32::consts::FRAC_PI_4 + turned) + own - held;
-            let grain_turn = x.grain_rotation * from_eighth + self.screen_turn;
+            let grain_turn = x.grain_rotation * from_eighth + self.screen_turn - made_turn;
             let placed = Placed {
                 center,
                 thrown,
@@ -6474,6 +6505,45 @@ mod tests {
         };
         assert_eq!(turned(0.0), 0.0);
         assert!((turned(1.0) + 0.5).abs() < 1e-6);
+    }
+
+    /// A canvas made with the screen on its side is kept as the screen held upright keeps it: a
+    /// shape fixed to the canvas lies a quarter turn on as the canvas shows it (made with the
+    /// screen turned one way, three, or upside down), and its moving grain turns with it, rolling
+    /// along the canvas's own way; what follows the stroke's way doesn't turn, and a brush oriented
+    /// to the screen keeps to the screen.
+    #[test]
+    fn a_canvas_made_turned_lays_fixed_shapes_and_moving_grain_turned_with_it() {
+        let quarter = std::f32::consts::FRAC_PI_2;
+        let laid = |turns: u8, set: &[(&str, f32)]| {
+            let mut b = plain();
+            b.grain.mode = crate::brush::GrainMode::Moving;
+            for (key, value) in set {
+                b.set_setting(key, *value);
+            }
+            let mut s = StrokeBuilder::new(b, 10.0, Pointer::Finger).on_canvas_made_turned(turns);
+            s.add(&line(8, 40.0));
+            s.finish()
+        };
+        let angle_off = |turns: u8, set: &[(&str, f32)]| {
+            let (turned, upright) = (laid(turns, set), laid(0, set));
+            (turned[3].angle - upright[3].angle).rem_euclid(std::f32::consts::TAU)
+        };
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-4;
+        // fixed: as far as the screen was turned
+        for turns in 0..4u8 {
+            let off = angle_off(turns, &[]);
+            assert!(near(off, f32::from(turns) * quarter), "made {turns} turns: {off}");
+        }
+        // the moving grain turns with it (its patch read turned back by as much)
+        let (turned, upright) = (laid(1, &[]), laid(0, &[]));
+        let grain_off = (turned[3].grain_turn - upright[3].grain_turn).rem_euclid(std::f32::consts::TAU);
+        assert!(near(grain_off, 3.0 * quarter), "{grain_off}");
+        // following the stroke's way: none; oriented to the screen: none
+        assert!(near(angle_off(1, &[("shape_rotation", 1.0)]), 0.0));
+        assert!(near(angle_off(3, &[("orient_to_screen", 1.0)]), 0.0));
+        let oriented = laid(1, &[("orient_to_screen", 1.0)]);
+        assert!(near(oriented[3].grain_turn, laid(0, &[("orient_to_screen", 1.0)])[3].grain_turn));
     }
 
     #[test]

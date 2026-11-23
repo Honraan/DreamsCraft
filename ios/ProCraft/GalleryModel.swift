@@ -240,6 +240,7 @@ final class GalleryModel {
     /// A new artwork of `width` x `height` pixels (the screen's size), in Display P3.
     func newCanvas(width: UInt32, height: UInt32) {
         let session = CanvasSession(width: max(width, 1), height: max(height, 1))
+        session.madeWithScreenTurned(turns: Self.screenTurns())
         _ = session.setNewProfile(name: p3Name)
         onOpen(OpenArtwork(session: session, dir: Gallery.store.newFolder(folder: folder)))
     }
@@ -251,12 +252,25 @@ final class GalleryModel {
             width: presetWidth(preset: p), height: presetHeight(preset: p), dpi: p.dpi, background: rgb,
             backgroundVisible: !p.backgroundHidden, name: "Untitled Artwork"
         )
+        session.madeWithScreenTurned(turns: Self.screenTurns())
         _ = session.setNewProfile(name: p.profile)
         let dir = Gallery.store.newFolder(folder: folder)
         ArtworkTimeLapse(dir: dir).settings = TimeLapseSettings(
             resolution: p.timeLapseResolution, quality: p.timeLapseQuality, hevc: p.timeLapseHevc
         )
         onOpen(OpenArtwork(session: session, dir: dir))
+    }
+
+    /// How far (quarter turns clockwise) the screen is turned from upright now: a new canvas is
+    /// made so (its brushes' shapes lie as the upright screen has them).
+    private static func screenTurns() -> UInt32 {
+        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        switch scene?.interfaceOrientation {
+        case .landscapeRight: return 3
+        case .landscapeLeft: return 1
+        case .portraitUpsideDown: return 2
+        default: return 0
+        }
     }
 
     private func savePresets(_ list: [CanvasPreset]) {

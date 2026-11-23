@@ -2458,6 +2458,7 @@ impl CanvasSession {
                 .scaled(st.brush_scale())
                 .with_input(st.input.clone())
                 .on_view_turned(st.view.map_or(0.0, |v| v.rotation()))
+                .on_canvas_made_turned(st.doc.made_turns)
                 .seen_at(st.view.map_or(1.0, |v| v.zoom()) / st.display_scale);
             let mut builder = st.pressing.applied(builder, st.canvas_per_point());
             if let Some(zoom) = whole_pixels {
@@ -3130,6 +3131,21 @@ impl CanvasSession {
     /// at, and the gallery shows it at) follows its canvas's; off, it stays as it is. On at first.
     pub fn set_orientation_memory(&self, on: bool) {
         self.shared.lock().turns_follow_view = on;
+    }
+
+    /// A new artwork's canvas was made with the screen turned `turns` quarter turns clockwise from
+    /// upright (held as a portrait screen is): one made with the screen on its side lays its
+    /// brushes' shapes and moving grains as the upright screen would, turned with it (see
+    /// `Document::made_turns`). Told as it is made, before anything is drawn.
+    pub fn made_with_screen_turned(&self, turns: u32) {
+        let mut st = self.shared.lock();
+        st.doc.made_turns = u8::try_from(turns % 4).unwrap_or(0);
+    }
+
+    /// How far (quarter turns clockwise) the screen was turned from upright when the artwork's
+    /// canvas was made (see [`CanvasSession::made_with_screen_turned`]).
+    pub fn made_turns(&self) -> u32 {
+        u32::from(self.shared.lock().doc.made_turns)
     }
 
     /// How many quarter turns clockwise the gallery shows the artwork turned by, as it would be

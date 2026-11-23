@@ -3943,6 +3943,57 @@ fn paint_laid_in_place_whose_end_taper_reaches_back_lays_it_again() {
     }
 }
 
+/// A canvas made with the screen on its side (as the device told it was turned when the canvas was
+/// made) lays a brush's shape fixed to the canvas a quarter turn on, as the screen held upright had
+/// it, keeps that when saved and opened again, and a brush oriented to the screen doesn't turn: a
+/// squashed tip four times as wide as tall paints a dot that wide on an upright canvas, that tall
+/// on one made turned.
+#[test]
+fn a_canvas_made_with_the_screen_on_its_side_lays_fixed_shapes_turned() {
+    let side = 128;
+    // the painted dot's width and height (pixels whose alpha is past half)
+    let dot = |turns: u32, oriented: bool| -> Option<(u32, u32, u32)> {
+        let s = session(side, side)?;
+        s.made_with_screen_turned(turns);
+        s.studio_begin();
+        s.set_studio_setting("roundness".to_owned(), 0.25);
+        s.set_studio_setting("shape_rotation".to_owned(), 0.0);
+        s.set_studio_setting("shape_angle".to_owned(), 0.0);
+        s.set_studio_setting("scatter".to_owned(), 0.0);
+        s.set_studio_setting("orient_to_screen".to_owned(), if oriented { 1.0 } else { 0.0 });
+        s.studio_end(true);
+        s.set_brush_size(0.6);
+        s.stroke_begin(PointerKind::Finger, vec![sample(64.0, 64.0, 0.0)]);
+        s.stroke_end(vec![]);
+        picture(&s);
+        let current = s.layers().iter().find(|l| l.current).map_or(0, |l| l.id);
+        let px = layer_rgba(&s, current);
+        let (mut x0, mut y0, mut x1, mut y1) = (side, side, 0, 0);
+        for (i, p) in px.chunks(4).enumerate() {
+            if p[3] > 127 {
+                let (x, y) = (i as u32 % side, i as u32 / side);
+                (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+            }
+        }
+        Some((x1.saturating_sub(x0) + 1, y1.saturating_sub(y0) + 1, s.made_turns()))
+    };
+    let (Some((w, h, _)), Some((tw, th, turns))) = (dot(0, false), dot(1, false)) else { return };
+    println!("upright {w} x {h}, made turned {tw} x {th}");
+    assert_eq!(turns, 1);
+    assert!(w > 3 * h && th > 3 * tw, "upright {w} x {h}, made turned {tw} x {th}");
+    let Some((ow, oh, _)) = dot(3, true) else { return };
+    assert!(ow > 3 * oh, "oriented to the screen, made turned: {ow} x {oh}");
+    // kept with the artwork
+    let Some(s) = session(side, side) else { return };
+    s.made_with_screen_turned(3);
+    let dir = std::env::temp_dir().join(format!("procraft-made-turned-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    s.save(dir.to_string_lossy().into_owned()).unwrap();
+    let opened = CanvasSession::open(dir.to_string_lossy().into_owned()).unwrap();
+    assert_eq!(opened.made_turns(), 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// What a stroke's end costs the pen and the next stroke, with the canvas drawn on its own thread a
 /// frame every 8 ms as the apps draw it: a pen event's work (its samples and their prediction),
 /// the lift, the next stroke's start (begun and its first samples taken) and how long after the

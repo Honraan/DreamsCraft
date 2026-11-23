@@ -191,6 +191,7 @@ impl State {
         let builder = StrokeBuilder::with_seed(brush.clone(), brush.diameter(sliders.size), pointer.into(), seed)
             .with_input(self.input.clone())
             .on_view_turned(self.view.map_or(0.0, |v| v.rotation()))
+            .on_canvas_made_turned(self.doc.made_turns)
             .seen_at(self.view.map_or(1.0, |v| v.zoom()) / self.display_scale);
         let mut builder = self.pressing.applied(builder, self.canvas_per_point());
         if let Some(zoom) = self.whole_pixels(samples) {
