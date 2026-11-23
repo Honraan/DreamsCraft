@@ -2713,6 +2713,10 @@ fn named_grain(n: &str) -> Option<u32> {
         (&["hatch"], grain::HATCHING),
         (&["crumple", "crease", "fold"], grain::CRUMPLED),
         (&["stipple"], grain::STIPPLE),
+        // water lit from above: light refracted into a web of bright lines on the dark
+        (&["refract", "caustic"], grain::CAUSTICS),
+        // a sea's face: long bright ripples running across, as our wood's rings do (not its foam)
+        (&["artery-ocean", "ripple"], grain::WOOD),
         (&["wash", "water", "wet"], grain::WASH),
         // ink dried in patches, most of it bare
         (&["dry"], grain::DRY_PATCHES),
@@ -2909,6 +2913,35 @@ mod tests {
         assert_eq!(named_grain("leopard-print.png"), Some(grain::SPOTS));
         assert_eq!(named_grain("brush-preset-hard.png"), Some(grain::DISC));
         assert_eq!(named_grain("brush-preset-floral.png"), Some(grain::SCROLLS));
+    }
+
+    #[test]
+    fn stock_water_grains_stand_in_as_water_not_a_speckle() {
+        // light refracted through water (the stock Water brush's grain, and the water brushes
+        // people make from it): our caustics, a web of bright lines on the dark. Its name said
+        // nothing we knew, so it stood in as the dark speckle a faint preview takes
+        let stock = |name: &str| Texture::Stock { name: name.into(), inverted: false };
+        let (image, source) = grain_for(&stock("Brush-Artery-Refract.png"), None);
+        assert_eq!(image, Some(grain::CAUSTICS));
+        assert!(source.is_some());
+        assert_eq!(named_grain("pool-caustics.png"), Some(grain::CAUSTICS));
+        // the sea's ripples running across (the stock Oceans brush's): our wood's rings, not a speckle
+        assert_eq!(grain_for(&stock("Brush-Artery-Ocean.jpg"), None).0, Some(grain::WOOD));
+        assert_eq!(named_grain("ripples.png"), Some(grain::WOOD));
+        // its foam is no ripple: it goes by its preview as before
+        assert_ne!(named_grain("ocean-foam.jpg"), Some(grain::WOOD));
+        // the stock library's own brushes drawn with it stand in the same
+        let picks = |name: &str| -> Vec<Pick> {
+            let key = textures::stock_key(name);
+            crate::stock_brushes::SETS
+                .iter()
+                .flat_map(|set| set.brushes.iter())
+                .flat_map(|b| std::iter::once(b).chain(b.second))
+                .filter_map(|b| b.grain.filter(|g| g.key == key).map(|g| g.pick))
+                .collect()
+        };
+        assert_eq!(picks("Brush-Artery-Refract.png"), [Pick::Ours(Some(grain::CAUSTICS))]);
+        assert_eq!(picks("Brush-Artery-Ocean.jpg"), [Pick::Ours(Some(grain::WOOD))]);
     }
 
     #[test]
