@@ -24,9 +24,13 @@ const MANIFEST: &str = "craft-extension.json";
 /// The manifest format read here: a newer one may mean anything, so it is refused.
 const SCHEMA: u64 = 1;
 /// What a plugin's code is written to, see [`crate::plugin_run`]: a newer one is refused too.
-const INTERFACE: u32 = 16;
+const INTERFACE: u32 = 18;
 /// The first interface with features (several plugins' worth in one, each a switch of its own).
 const FEATURES_FROM: u32 = 16;
+/// The interface filter layers came in.
+const FILTER_LAYERS_FROM: u32 = 17;
+/// The interface filter layers' editors (curves, a gradient) came in.
+const FILTER_EDITORS_FROM: u32 = 18;
 /// A plugin of features: so many features, controls under each (besides its own switch) and
 /// actions under each; and in all so many controls (files among them), hooks and actions.
 const MOST_FEATURES: usize = 16;
@@ -57,6 +61,11 @@ const MOST_SET_BRUSHES: usize = 64;
 const FILTERS_FOLDER: &str = "filters";
 /// The most filters a plugin lists, and plugins it takes the place of.
 const MOST_FILTERS: usize = 8;
+/// How many filter layers a plugin can offer (interface 17), how many values each keeps, and the
+/// longest heading one is listed under.
+const MOST_LAYER_FILTERS: usize = 64;
+const MOST_LAYER_FILTER_VALUES: usize = procraft_gpu::MOST_LAYER_FILTER_VALUES;
+const MOST_GROUP: usize = 24;
 const MOST_REPLACES: usize = 16;
 /// How far an entry may shrink in the archive, from this size on: text never gets near it.
 const MOST_RATIO: usize = 100;
@@ -241,6 +250,31 @@ pub(crate) struct ListedFilter {
     pub code: String,
     pub controls: Vec<usize>,
     pub under: Option<usize>,
+    /// Offered as a filter layer (interface 17), not under Adjustments: what it is made of.
+    pub layer: Option<LayerShape>,
+}
+
+/// A filter layer's filter (interface 17): its values, each kept with each layer of it (sliders and
+/// switches, keyed `<id>.<filter>.<key>`), how far from a pixel it reads what is below, and the
+/// heading it is listed under in the Layers panel's +.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct LayerShape {
+    pub values: Vec<PluginControl>,
+    pub reach: procraft_gpu::FilterReach,
+    pub group: String,
+    /// What a touch on the canvas sets while its settings are open.
+    pub touch: Option<crate::filter_layers::FilterTouch>,
+    /// The app's editor its settings open in, if any (interface 18).
+    pub editor: Option<crate::filter_layers::FilterEditor>,
+}
+
+impl LayerShape {
+    /// The names its code reads its values by, in their order: its values', then its touch's.
+    pub(crate) fn code_keys(&self) -> Vec<String> {
+        let mut keys = value_names(&self.values);
+        keys.extend(self.touch.iter().flat_map(|t| t.keys()).map(|k| (*k).to_owned()));
+        keys
+    }
 }
 
 /// A plugin another takes the place of, by its id: the switch its being on turns on, each of its
@@ -473,6 +507,103 @@ struct RawFilter {
     controls: Vec<String>,
     #[serde(default)]
     under: Option<String>,
+    /// A filter layer's (interface 17): it is one, its values, how far it reads, its heading.
+    #[serde(default)]
+    layer: bool,
+    #[serde(default)]
+    values: Vec<RawControl>,
+    #[serde(default)]
+    reach: Option<Value>,
+    #[serde(default)]
+    group: Option<String>,
+    /// What a touch on the canvas sets: `point`, `angle` or `seed`.
+    #[serde(default)]
+    touch: Option<String>,
+    /// The app's editor its settings open in: `curves` or `gradient` (interface 18).
+    #[serde(default)]
+    editor: Option<String>,
+}
+
+/// How far a filter layer's filter reads (interface 17): canvas pixels, `"whole"` for anywhere, or
+/// `{ "value": <a slider's key>, "times": .., "plus": .. }` by one of its values.
+fn reach_of(raw: Option<&Value>, values: &[PluginControl]) -> Result<procraft_gpu::FilterReach, Refusal> {
+    use procraft_gpu::FilterReach;
+    let number = |v: Option<&Value>| v.and_then(Value::as_f64).filter(|n| n.is_finite() && n.abs() <= 1e6);
+    match raw {
+        None => Ok(FilterReach::Within(0.0)),
+        Some(Value::String(s)) if s == "whole" => Ok(FilterReach::Whole),
+        Some(n @ Value::Number(_)) => match number(Some(n)) {
+            Some(n) if n >= 0.0 => Ok(FilterReach::Within(n as f32)),
+            _ => Err(Refusal::Described),
+        },
+        Some(Value::Object(o)) => {
+            let fields = o.keys().all(|k| matches!(k.as_str(), "value" | "times" | "plus"));
+            let key = o.get("value").and_then(Value::as_str).ok_or(Refusal::Described)?;
+            let slider = |c: &PluginControl| matches!(c, PluginControl::Slider { control } if control.key.rsplit('.').next() == Some(key));
+            let at = values.iter().position(slider);
+            let times = if o.contains_key("times") { number(o.get("times")) } else { Some(1.0) };
+            let plus = if o.contains_key("plus") { number(o.get("plus")) } else { Some(0.0) };
+            match (fields, at, times, plus) {
+                (true, Some(value), Some(times), Some(plus)) => {
+                    Ok(FilterReach::ByValue { value, times: times as f32, plus: plus as f32 })
+                }
+                _ => Err(Refusal::Described),
+            }
+        }
+        Some(_) => Err(Refusal::Described),
+    }
+}
+
+/// Filter `f` of plugin `id` as a filter layer offers it (interface 17), if it holds up: a few
+/// values of its own, each a slider or a switch shown nowhere else, and a heading to show.
+fn layer_shape_of(id: &str, f: &RawFilter, interface: Option<u32>) -> Result<Option<LayerShape>, Refusal> {
+    if !f.layer {
+        let plain =
+            f.values.is_empty() && f.reach.is_none() && f.group.is_none() && f.touch.is_none() && f.editor.is_none();
+        return if plain { Ok(None) } else { Err(Refusal::Described) };
+    }
+    let group = f.group.as_deref().unwrap_or_default();
+    let editor = match f.editor.as_deref() {
+        None => None,
+        Some(name) => Some(crate::filter_layers::FilterEditor::named(name).ok_or(Refusal::Described)?),
+    };
+    // with an editor, its values may be none; editors came with interface 18
+    let least = usize::from(editor.is_none());
+    let editors_fit = editor.is_none() || interface.is_some_and(|i| i >= FILTER_EDITORS_FROM);
+    let fits = interface.is_some_and(|i| i >= FILTER_LAYERS_FROM)
+        && editors_fit
+        && f.controls.is_empty()
+        && (least..=MOST_LAYER_FILTER_VALUES).contains(&f.values.len())
+        && !group.trim().is_empty()
+        && shows_plainly(group, MOST_GROUP);
+    if !fits {
+        return Err(Refusal::Described);
+    }
+    let mut keys = HashSet::new();
+    let mut values = Vec::new();
+    for raw in &f.values {
+        let elsewhere = raw.keeps.is_some()
+            || raw.under.is_some()
+            || raw.place.is_some()
+            || raw.press.is_some()
+            || raw.artwork.is_some();
+        if elsewhere || !matches!(raw.kind.as_str(), "slider" | "switch") || !keys.insert(raw.key.as_str()) {
+            return Err(Refusal::Described);
+        }
+        values.push(checked_control(&format!("{id}.{}", f.key), raw.clone())?);
+    }
+    let reach = reach_of(f.reach.as_ref(), &values)?;
+    let touch = match f.touch.as_deref() {
+        None => None,
+        Some(name) => Some(crate::filter_layers::FilterTouch::named(name).ok_or(Refusal::Described)?),
+    };
+    let shape = LayerShape { values, reach, group: group.to_owned(), touch, editor };
+    // its touch's values are its code's too, and none of its own is called as they are
+    let keys = shape.code_keys();
+    if keys.len() > MOST_LAYER_FILTER_VALUES || keys.iter().collect::<HashSet<_>>().len() != keys.len() {
+        return Err(Refusal::Described);
+    }
+    Ok(Some(shape))
 }
 
 /// A plugin this one takes the place of: its id, the key of the switch its being on turns on, its
@@ -671,7 +802,7 @@ struct RawFile {
     size: usize,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct RawControl {
     key: String,
     #[serde(rename = "type")]
@@ -1377,7 +1508,8 @@ fn shape_of(
     if controls.iter().zip(&artwork).any(|(c, &kept)| kept && unkeepable(c)) {
         return Err(Refusal::Described);
     }
-    if listed.len() > MOST_FILTERS || replacing.len() > MOST_REPLACES {
+    let layered = listed.iter().filter(|f| f.layer).count();
+    if listed.len() - layered > MOST_FILTERS || layered > MOST_LAYER_FILTERS || replacing.len() > MOST_REPLACES {
         return Err(Refusal::Described);
     }
     let mut keys = HashSet::new();
@@ -1399,6 +1531,7 @@ fn shape_of(
             code: format!("{FILTERS_FOLDER}/{}.wgsl", f.key),
             controls,
             under: under_of(f.under.as_deref())?,
+            layer: layer_shape_of(id, f, interface)?,
         });
     }
     let space = |id: &str| id.rsplit_once('.').map(|(space, _)| space.to_owned());
@@ -1504,12 +1637,17 @@ fn code_refused(manifest: &Manifest, path: &str, data: &[u8]) -> Option<Refusal>
         let refused = read.map_err(|why| log::warn!("a filter's code was refused: {why}")).is_err();
         return refused.then_some(Refusal::FilterCode);
     }
-    // one of several, given its own controls
+    // one of several, given its own controls; a filter layer's, its own values, joined to what a
+    // filter layer's filter is
     if let Some(listed) = manifest.shape.filters.iter().find(|f| f.code == path) {
         let controls: Vec<PluginControl> =
             listed.controls.iter().filter_map(|&at| manifest.controls.get(at).cloned()).collect();
         let text = std::str::from_utf8(data).map_err(|e| e.to_string());
-        let read = text.and_then(|text| procraft_gpu::read_filter(text, &value_names(&controls)));
+        let read = text.and_then(|text| match &listed.layer {
+            Some(layer) if layer.editor.is_some() => procraft_gpu::read_layer_table_filter(text, &layer.code_keys()),
+            Some(layer) => procraft_gpu::read_layer_filter(text, &layer.code_keys()),
+            None => procraft_gpu::read_filter(text, &value_names(&controls)),
+        });
         let refused = read.map_err(|why| log::warn!("a filter's code was refused: {why}")).is_err();
         return refused.then_some(Refusal::FilterCode);
     }
@@ -1859,6 +1997,19 @@ pub(crate) fn read_filter_code(dir: &Path, id: &str, version: &str, path: &str) 
     let listed = path == FILTER_CODE || manifest.shape.filters.iter().any(|f| f.code == path);
     let text = String::from_utf8(read_capped(&folder.join(path), MOST_SHADER)?).ok()?;
     listed.then_some((manifest, text))
+}
+
+/// The code of each filter layer's filter (interface 17) plugin `id` at `version` in `dir`
+/// offers, by its path, if all of the plugin holds up as it did.
+pub(crate) fn read_layer_filter_codes(dir: &Path, id: &str, version: &str) -> Option<Vec<(String, String)>> {
+    let folder = dir.join(id).join(version);
+    let manifest = read_folder(&folder, id, version)?;
+    let mut out = Vec::new();
+    for f in manifest.shape.filters.iter().filter(|f| f.layer.is_some()) {
+        let text = String::from_utf8(read_capped(&folder.join(&f.code), MOST_SHADER)?).ok()?;
+        out.push((f.code.clone(), text));
+    }
+    Some(out)
 }
 
 /// Where it is written down which filter is on trial: compiling, or not yet drawn. It is there on
@@ -2814,7 +2965,7 @@ pub(crate) mod tests {
         };
         // a hook or an interface this app doesn't have is for a newer one
         assert_eq!(of("/hooks", json!(["position", "layers"])), Refusal::Newer);
-        assert_eq!(of("/compat/procraft/interface", json!(17)), Refusal::Newer);
+        assert_eq!(of("/compat/procraft/interface", json!(19)), Refusal::Newer);
         assert_eq!(of("/hooks", json!([])), Refusal::Described);
         assert_eq!(of("/hooks", json!(["position", "position"])), Refusal::Described);
         assert_eq!(of("/compat/procraft", json!({ "min_app": "0.0.1" })), Refusal::Described);
@@ -2827,7 +2978,7 @@ pub(crate) mod tests {
     #[test]
     fn plugins_written_to_every_interface_so_far_still_load_and_a_new_hook_needs_its_function() {
         let module = a_module();
-        for interface in 1..=16 {
+        for interface in 1..=18 {
             let manifest = with(coded("org.example.plugin", &module), "/compat/procraft/interface", json!(interface));
             assert!(read_package(&a_coded_file(&manifest, &module)).is_ok(), "interface {interface}");
         }
@@ -3358,6 +3509,112 @@ pub(crate) mod tests {
         coded_too["compat"]["procraft"]["interface"] = json!(5);
         coded_too["filters"] = json!([{ "key": "tint", "label": "Tint" }]);
         assert_eq!(refusal(&a_coded_file(&coded_too, &module)), Refusal::Described);
+    }
+
+    /// A filter layer's filter: what is below, warmer by its value; and one that blurs by its value.
+    pub(crate) const WARM: &str = "fn pixel(colour: vec4<f32>, at: vec2<f32>) -> vec4<f32> { return vec4<f32>(colour.r + v.value * 0.1, colour.g, colour.b - v.value * 0.1, colour.a); }";
+    pub(crate) const SMEAR: &str = "fn pixel(colour: vec4<f32>, at: vec2<f32>) -> vec4<f32> {
+        let r = v.value * 4.0;
+        return (layer_at(at - vec2<f32>(r, 0.0)) + layer_at(at + vec2<f32>(r, 0.0))) * 0.5 + vec4<f32>(v.touch_x * 0.0);
+    }";
+
+    /// A manifest offering [`WARM`] and [`SMEAR`] as filter layers, under a switch, and its file.
+    pub(crate) fn two_filter_layers(id: &str) -> (Value, Vec<u8>) {
+        let listed =
+            |path: &str, code: &str| json!({ "path": path, "sha256": sha256(code.as_bytes()), "size": code.len() });
+        let mut manifest = filter(id);
+        manifest["compat"]["procraft"]["interface"] = json!(17);
+        manifest["files"] = json!([listed("filters/warm.wgsl", WARM), listed("filters/smear.wgsl", SMEAR)]);
+        manifest["controls"] = json!([{ "key": "layers", "type": "switch", "label": "Filter layers", "starts": true }]);
+        let value = |starts: f64| json!({ "key": "value", "type": "slider", "label": "Amount", "least": -1, "most": 1, "step": 0.02, "starts": starts });
+        manifest["filters"] = json!([
+            { "key": "warm", "label": "Warm", "layer": true, "group": "Colour", "values": [value(0.0)], "under": "layers" },
+            { "key": "smear", "label": "Smear", "layer": true, "group": "Filters", "values": [value(0.5)],
+              "reach": { "value": "value", "times": 4, "plus": 1 }, "touch": "point", "under": "layers" },
+        ]);
+        let file = pack(&manifest, &[("filters/warm.wgsl", WARM.as_bytes()), ("filters/smear.wgsl", SMEAR.as_bytes())]);
+        (manifest, file)
+    }
+
+    #[test]
+    fn a_plugin_can_offer_filter_layers_each_with_values_of_its_own_and_how_far_it_reads() {
+        use crate::filter_layers::FilterTouch;
+        use procraft_gpu::FilterReach;
+        let (manifest, file) = two_filter_layers("org.example.layers");
+        let package = read_package(&file).unwrap();
+        let filters = &package.manifest.shape.filters;
+        let layers: Vec<&LayerShape> = filters.iter().filter_map(|f| f.layer.as_ref()).collect();
+        assert_eq!(layers.len(), 2);
+        assert_eq!(
+            (layers[0].group.as_str(), layers[0].reach, layers[0].touch),
+            ("Colour", FilterReach::Within(0.0), None)
+        );
+        assert_eq!(layers[1].reach, FilterReach::ByValue { value: 0, times: 4.0, plus: 1.0 });
+        assert_eq!(layers[1].touch, Some(FilterTouch::Point));
+        assert_eq!(layers[1].code_keys(), ["value", "touch_x", "touch_y"]);
+        // its value is the layer's own: keyed under the filter, starting where it says
+        assert_eq!(layers[1].values[0].key(), "org.example.layers.smear.value");
+        assert!((layers[1].values[0].number() - 0.5).abs() < 1e-5);
+        let of = |path: &str, value: Value| {
+            let files = [("filters/warm.wgsl", WARM.as_bytes()), ("filters/smear.wgsl", SMEAR.as_bytes())];
+            refusal(&pack(&with(manifest.clone(), path, value), &files))
+        };
+        // they came with interface 17; an older app says it needs a newer one
+        assert_eq!(of("/compat/procraft/interface", json!(16)), Refusal::Described);
+        assert_eq!(of("/compat/procraft/interface", json!(19)), Refusal::Newer);
+        // a heading, a value or few, of their own; none of the plugin's controls
+        assert_eq!(of("/filters/0/group", json!(" ")), Refusal::Described);
+        assert_eq!(of("/filters/0/group", json!("A heading much longer than it can be")), Refusal::Described);
+        assert_eq!(of("/filters/0/values", json!([])), Refusal::Described);
+        let mut reading = manifest.clone();
+        reading["filters"][0]["controls"] = json!(["layers"]);
+        let files = [("filters/warm.wgsl", WARM.as_bytes()), ("filters/smear.wgsl", SMEAR.as_bytes())];
+        assert_eq!(refusal(&pack(&reading, &files)), Refusal::Described);
+        let shown_elsewhere =
+            json!([{ "key": "value", "type": "slider", "label": "A", "least": 0, "most": 1, "under": "layers" }]);
+        assert_eq!(of("/filters/0/values", shown_elsewhere), Refusal::Described);
+        let picked = json!([{ "key": "value", "type": "file", "label": "A", "accepts": "picture" }]);
+        assert_eq!(of("/filters/0/values", picked), Refusal::Described);
+        // how far it reads: a number, "whole", or by a slider of its own
+        assert_eq!(of("/filters/1/reach", json!(-1)), Refusal::Described);
+        assert_eq!(of("/filters/1/reach", json!("far")), Refusal::Described);
+        assert_eq!(of("/filters/1/reach", json!({ "value": "gone" })), Refusal::Described);
+        assert!(
+            read_package(&pack(
+                &with(manifest.clone(), "/filters/1/reach", json!("whole")),
+                &[("filters/warm.wgsl", WARM.as_bytes()), ("filters/smear.wgsl", SMEAR.as_bytes())]
+            ))
+            .is_ok()
+        );
+        // a touch it doesn't have, or its code reading what its touch doesn't give
+        assert_eq!(of("/filters/1/touch", json!("pinch")), Refusal::Described);
+        assert_eq!(of("/filters/1/touch", json!("angle")), Refusal::FilterCode);
+        // a filter under Adjustments keeps to what it had
+        assert_eq!(of("/filters/0/layer", json!(false)), Refusal::Described);
+        // an editor of the app's (interface 18): its values may be none, and its code reads tables
+        let curves = "fn pixel(colour: vec4<f32>, at: vec2<f32>) -> vec4<f32> { return vec4<f32>(table(1, colour.r).r, colour.g, colour.b, colour.a); }";
+        let listed =
+            json!({ "path": "filters/curves.wgsl", "sha256": sha256(curves.as_bytes()), "size": curves.len() });
+        let mut editing = manifest.clone();
+        editing["compat"]["procraft"]["interface"] = json!(18);
+        editing["files"].as_array_mut().unwrap().push(listed);
+        editing["filters"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "key": "curves", "label": "Curves", "layer": true, "group": "Colour", "editor": "curves" }));
+        let files = [
+            ("filters/warm.wgsl", WARM.as_bytes()),
+            ("filters/smear.wgsl", SMEAR.as_bytes()),
+            ("filters/curves.wgsl", curves.as_bytes()),
+        ];
+        let package = read_package(&pack(&editing, &files)).unwrap();
+        let shape = package.manifest.shape.filters[2].layer.clone().unwrap();
+        assert_eq!((shape.editor, shape.values.len()), (Some(crate::filter_layers::FilterEditor::Curves), 0));
+        let at = |path: &str, value: Value| refusal(&pack(&with(editing.clone(), path, value), &files));
+        assert_eq!(at("/compat/procraft/interface", json!(17)), Refusal::Described);
+        assert_eq!(at("/filters/2/editor", json!("levels")), Refusal::Described);
+        // without one, its code can't read tables, and its values can't be none
+        assert_eq!(at("/filters/2/editor", json!(null)), Refusal::Described);
     }
 
     #[test]

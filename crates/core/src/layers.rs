@@ -53,6 +53,10 @@ pub struct LayerInfo {
     pub can_merge: bool,
     pub can_combine: bool,
     pub can_clip: bool,
+    /// A filter layer's filter, by the name its plugin gives it (its id while no plugin on offers
+    /// it): it has no paint, and shows what is below it through the filter (interface 17).
+    #[uniffi(default = None)]
+    pub filter: Option<String>,
 }
 
 /// A layer's pixels' version: new whenever they may have changed.
@@ -110,6 +114,8 @@ pub enum LayerOption {
     Reference,
     EditText,
     Rasterize,
+    /// A filter layer: its filter's values, in its panel.
+    FilterSettings,
     /// A plugin's layer: the strokes the selection takes (every one with nothing selected) given
     /// the paint colour.
     Recolour,
@@ -270,6 +276,18 @@ fn layer_options(l: &LayerInfo, masked: bool, guided: bool) -> Vec<LayerOptionRo
                 row(O::Fill, "Fill Layer", None);
                 row(O::Clear, "Clear", None);
                 row(O::Invert, "Invert", None);
+            }
+        }
+        // a filter layer: its settings; it has no paint to select, copy, fill or invert
+        LayerType::Paint if l.filter.is_some() => {
+            if unlocked {
+                row(O::FilterSettings, "Filter Settings", None);
+            }
+            if !masked {
+                row(O::Mask, "Mask", None);
+            }
+            if l.can_clip {
+                row(O::ClippingMask, "Clipping Mask", Some(l.clipped));
             }
         }
         LayerType::Paint => {
@@ -531,10 +549,15 @@ impl CanvasSession {
                 collapsed: l.collapsed,
                 text: l.text.is_some(),
                 plugin_kind: l.plugin.as_ref().map(|p| p.kind.clone()),
-                plugin_badge: l.plugin.as_ref().map(|p| {
-                    let badge = st.hooks.as_ref().and_then(|hooks| hooks.layer_kind_badge(&p.kind));
-                    badge.unwrap_or_else(crate::PluginBadge::plug)
-                }),
+                // a filter layer's shows it is one
+                plugin_badge: l
+                    .plugin
+                    .as_ref()
+                    .map(|p| {
+                        let badge = st.hooks.as_ref().and_then(|hooks| hooks.layer_kind_badge(&p.kind));
+                        badge.unwrap_or_else(crate::PluginBadge::plug)
+                    })
+                    .or_else(|| l.filter.as_ref().map(|_| crate::PluginBadge::filter())),
                 label: st.hooks.as_ref().and_then(|hooks| hooks.layer_label(&l.marks)),
                 depth: u32::try_from(st.doc.depth(l.id)).unwrap_or(u32::MAX),
                 soloed_out: st.doc.soloed_out(l.id),
@@ -542,6 +565,7 @@ impl CanvasSession {
                 can_merge: st.doc.merge_target(l.id).is_some_and(|b| !st.doc.is_locked(b)),
                 can_combine: l.kind != LayerKind::Mask && st.doc.below(l.id).is_some_and(|b| !st.doc.is_locked(b)),
                 can_clip: st.doc.can_clip(l.id),
+                filter: l.filter.as_ref().map(|f| st.filter_label(f)),
             })
             .collect()
     }
@@ -970,15 +994,17 @@ impl CanvasSession {
         }
         let before = st.doc.clone();
         // a layer changes the one below only where it is painted: only that much is kept for undo
-        // (none at all for an empty one), not a copy of the whole of it
-        let within = st.painted_box(upper).unwrap_or(procraft_engine::geom::IRect::new(0, 0, 0, 0));
+        // (none at all for an empty one), not a copy of the whole of it; a filter layer, painted
+        // nowhere, changes it wherever it is, all of it kept
+        let filter = st.doc.layer(upper).is_some_and(|l| l.filter.is_some());
+        let within = (!filter).then(|| st.painted_box(upper).unwrap_or(procraft_engine::geom::IRect::new(0, 0, 0, 0)));
         if let Some(canvas) = st.canvas.as_mut() {
             // each mask applied to its layer first, as one step; a hidden layer below gives up
             // what it holds (the merge keeps what showed)
             let masks = [upper, lower].into_iter().filter_map(|l| st.doc.mask_of(l).map(|m| (l, m))).collect();
             let drop_lower = st.doc.layer(lower).is_some_and(|l| !l.visible);
             canvas.name_next_step("merge down");
-            canvas.merge_down_with_masks(upper, lower, masks, drop_lower, before, Some(within));
+            canvas.merge_down_with_masks(upper, lower, masks, drop_lower, before, within);
         }
         st.doc.finish_merge_down(id);
         st.revision += 1;
@@ -1413,7 +1439,10 @@ impl CanvasSession {
                 if st.doc.layer(u).is_some_and(|l| l.kind == LayerKind::Group) { st.doc.contents(u) } else { vec![u] }
             })
             .collect();
+        // (a filter layer among them changes it wherever it is: all of it kept)
+        let filters = painted.iter().any(|&l| st.doc.layer(l).is_some_and(|l| l.filter.is_some()));
         let within = match (st.canvas.as_ref(), st.gpu.as_ref()) {
+            _ if filters => None,
             (Some(canvas), Some(gpu)) => canvas
                 .painted_boxes_or_why(gpu, &painted)
                 .into_iter()

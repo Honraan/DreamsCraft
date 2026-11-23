@@ -20,6 +20,7 @@ use wgpu::util::DeviceExt;
 
 use crate::{Gpu, GpuError};
 
+pub(crate) mod filter_layers;
 mod fragments;
 pub(crate) mod plugin_filter;
 pub(crate) mod plugin_picture;
@@ -3015,6 +3016,8 @@ pub(crate) struct Pipelines {
     /// A normal layer clipped to its base, drawn onto it in their clipping group.
     layer_atop: wgpu::RenderPipeline,
     blend: wgpu::RenderPipeline,
+    /// A filter layer's filtered picture onto what it was made from.
+    filter_layer: wgpu::RenderPipeline,
     solid: wgpu::RenderPipeline,
     commit_paint: wgpu::RenderPipeline,
     commit_erase: wgpu::RenderPipeline,
@@ -3125,6 +3128,15 @@ pub struct Canvas {
     /// first time it is wanted. One pair serves every depth: a clipping group holds no group.
     clip_group: OnDemand,
     clip_group_second: OnDemand,
+    /// The filters filter layers run, by their names (`<plugin id>.<key>`), as the app gives them;
+    /// what a filter layer's filter makes, before it goes onto what is below; and what the
+    /// composite held about what is made again, while filter layers reach past what changed. The
+    /// two made the first time they are wanted.
+    layer_filters: HashMap<String, filter_layers::LayerFilterProgram>,
+    filter_out: OnDemand,
+    filter_keep: OnDemand,
+    /// Each filter layer's table (interface 18), as last baked.
+    filter_tables: HashMap<LayerId, filter_layers::TableTexture>,
     /// Animation Assist playing: the frame shown (alone, no onion skins).
     play_frame: Option<usize>,
     /// Where a stroke of a blend mode, or one on a locked layer, and a merge are drawn before
@@ -3639,6 +3651,10 @@ impl Canvas {
             groups: Vec::new(),
             clip_group: OnDemand::new("clip group", width, height, LAYER_FORMAT),
             clip_group_second: OnDemand::new("clip group 2", width, height, LAYER_FORMAT),
+            layer_filters: HashMap::new(),
+            filter_out: OnDemand::new("filter layer", width, height, LAYER_FORMAT),
+            filter_keep: OnDemand::new("filter layer surround", width, height, LAYER_FORMAT),
+            filter_tables: HashMap::new(),
             play_frame: None,
             scratch: OnDemand::new("scratch", width, height, LAYER_FORMAT),
             second_stroke: OnDemand::new("second stroke", width, height, stroke_format),
@@ -3847,6 +3863,9 @@ impl Canvas {
         self.groups.clear();
         self.clip_group.let_go();
         self.clip_group_second.let_go();
+        // made again as a filter layer is next drawn
+        self.filter_out.let_go();
+        self.filter_keep.let_go();
         // what the screen shows while traced: drawn whole again at the next render
         self.trace = None;
     }
@@ -7840,9 +7859,12 @@ impl Canvas {
             gpu.queue.write_buffer(&self.wet_params, 0, &wet_uniforms.data);
         }
         self.make_groups(device, group_levels(doc));
+        // what filter layers' editors set, for their filters to read
+        self.prepare_filter_tables(gpu, doc);
         self.ensure_caches(gpu, doc, &mut encoder, &mut uniforms);
-        // after the caches: caches just made want the whole picture composited again
-        let dirty = self.dirty.intersect(self.full());
+        // after the caches: caches just made want the whole picture composited again; and what
+        // filter layers carry a change to round it
+        let dirty = self.reached(doc, self.dirty.intersect(self.full()));
         let device = &gpu.device;
         // while caches are remade, or a stroke laid again over several renders, the composite stays
         // as it was, what changed kept for after
@@ -8862,6 +8884,10 @@ impl Canvas {
             Some(b) if doc.clip_base(lower) == Some(b) => CLIP_NONE,
             Some(_) => CLIP_BY_BASE,
         };
+        // a filter layer: its filter run over the layer below alone, and that into it
+        if settings.filter.is_some() {
+            return self.filter_into(device, encoder, uniforms, doc, settings, lower, clipped);
+        }
         let clip = base.filter(|_| clipped == CLIP_BY_BASE).and_then(|id| self.layers.get(&id));
         let up = self.layers.get(&upper)?;
         let uniform = LayerUniform {
@@ -9683,6 +9709,28 @@ impl Canvas {
         doc: &Document,
         encoder: &mut wgpu::CommandEncoder,
         uniforms: &mut UniformData,
+        shown: IRect,
+    ) {
+        // filter layers read what is below them about each pixel: that is made again further
+        // round, and what the composite held there put back after
+        let rect = self.filter_work(doc, shown);
+        if rect != shown {
+            self.keep_around(device, encoder, rect, shown);
+        }
+        self.composite_within(device, doc, encoder, uniforms, rect);
+        if rect != shown {
+            self.put_back_around(device, encoder, rect, shown);
+        }
+    }
+
+    /// The composite made again within `rect`, as it shows there if nothing reaches into it from
+    /// outside.
+    fn composite_within(
+        &self,
+        device: &wgpu::Device,
+        doc: &Document,
+        encoder: &mut wgpu::CommandEncoder,
+        uniforms: &mut UniformData,
         rect: IRect,
     ) {
         {
@@ -10267,13 +10315,17 @@ impl Canvas {
                     break;
                 }
                 at += n;
-                let painted = self.painted(&more).intersect(full);
+                // a filter layer (or a group holding one) changes what is below it wherever that
+                // is, though it has no paint
+                let filters =
+                    item_layers(doc, item).iter().any(|id| doc.layer(*id).is_some_and(|l| l.filter.is_some()));
+                let painted = if filters { full } else { self.painted(&more).intersect(full) };
                 if painted.is_empty() {
                     continue;
                 }
-                // a normal item draws in place; another mode writes the stack's other texture, which
-                // has to be whole
-                let normal = doc.layer(item).is_some_and(|l| l.blend == BlendMode::Normal);
+                // a normal item draws in place; another mode, or a filter layer, writes the stack's
+                // other texture, which has to be whole
+                let normal = !filters && doc.layer(item).is_some_and(|l| l.blend == BlendMode::Normal);
                 let rect = if normal { painted } else { full };
                 // brought back now (the slow part, so the time taken counts), the staged pixels sent
                 // on now and then so they don't pile up
@@ -10540,6 +10592,10 @@ impl Canvas {
             let Some(look) = look_of(id) else { continue };
             match layer.kind {
                 LayerKind::Mask => {}
+                // what is below it through its filter (it is no base: it has no paint)
+                LayerKind::Paint if layer.filter.is_some() => self.composite_filter_layer(
+                    device, doc, encoder, uniforms, rect, layer, look, CLIP_NONE, stack, current,
+                ),
                 LayerKind::Paint => {
                     // with the layers clipped to it just above, a clipping group (a layer clipped
                     // to one not shown goes through that one's alpha on its own)
@@ -10643,6 +10699,12 @@ impl Canvas {
                 continue;
             }
             let Some(look) = looks(id) else { continue };
+            if layer.filter.is_some() {
+                self.composite_filter_layer(
+                    device, doc, encoder, uniforms, rect, layer, look, CLIP_ATOP, &inner, &mut at,
+                );
+                continue;
+            }
             self.composite_layer(device, doc, encoder, uniforms, rect, layer, look, CLIP_ATOP, &inner, &mut at);
         }
         let view = if at == 0 { view } else { inner.second().1 };
@@ -12219,6 +12281,8 @@ impl Canvas {
         all.extend(self.second_stroke.made());
         all.extend(self.groups.iter().flat_map(|(pair, _)| pair));
         all.extend(self.clip_group.made().into_iter().chain(self.clip_group_second.made()));
+        all.extend(self.filter_out.made().into_iter().chain(self.filter_keep.made()));
+        all.extend(self.table_textures());
         all.push(self.everything.texture());
         all.extend(self.pencil.as_ref().map(|p| p.view.texture()));
         all.extend(self.liquify.as_ref().map(|l| l.view.texture()));
@@ -12783,6 +12847,7 @@ impl Pipelines {
             layer: full("layer", "fs_layer", Some(PREMULTIPLIED_OVER)),
             layer_atop: full("layer atop", "fs_layer", Some(ATOP)),
             blend: full("blend", "fs_blend", None),
+            filter_layer: full("filter layer", "fs_filter", None),
             solid: full("solid", "fs_solid", None),
             commit_paint: full("commit paint", "fs_commit", Some(PREMULTIPLIED_OVER)),
             commit_erase: full("commit erase", "fs_commit", Some(DESTINATION_OUT)),
@@ -13714,6 +13779,8 @@ fn plain(doc: &Document, id: LayerId) -> bool {
     match doc.layer(id) {
         Some(l) if l.kind == LayerKind::Mask => true,
         Some(l) if l.blend != BlendMode::Normal => false,
+        // a filter layer runs its filter over what is below it
+        Some(l) if l.filter.is_some() => false,
         Some(l) if l.passes_through() => doc.members(Some(id)).iter().all(|m| plain(doc, *m)),
         _ => true,
     }

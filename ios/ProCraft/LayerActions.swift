@@ -174,6 +174,22 @@ extension CanvasModel {
         refresh()
     }
 
+    /// The filter layers the plugins on offer (interface 17): the plus lists them.
+    func layerFilters() -> [PluginLayerFilter] {
+        PluginsModel.shared.store.layerFilters()
+    }
+
+    /// A new filter layer running filter `id` over the current layer, its settings opened at once.
+    func addFilterLayer(_ id: String) {
+        if session.addFilterLayer(id: id) == 0 {
+            noRoomForLayers()
+            refresh()
+            return
+        }
+        refresh()
+        startFilterLayerSettings()
+    }
+
     // MARK: the picked layers
 
     /// Picks layer `l` to act on with the current one, or unpicks it.

@@ -22,6 +22,7 @@ mod curve;
 mod custom_canvas;
 mod export_card;
 mod files;
+mod filter_list;
 #[cfg(target_os = "macos")]
 mod finder;
 mod floating_panels;

@@ -157,6 +157,8 @@ impl State {
         }
         // while a transform is open the selection shows no bands: its box shows what moves
         let banded = self.transform.is_none();
+        // what filter layers run, before they are drawn
+        self.give_layer_filters();
         // a model is drawn in place of the flat canvas, and the drawing pad may be a sphere
         if self.scene_shown() {
             let convert = colours_to(self.doc.profile, screen);

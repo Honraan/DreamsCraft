@@ -42,7 +42,8 @@ once was: `colour-tools`, `interface-look`, `view-tools`, `brush-extras` and `la
   offset moves samples on the `position` hook, Brush sounds plays sounds with files picked for it and
   a row in the brush studio, and Randomise and QuickShape curves answer a hook each.
 - `layer-toolbox`: Layer tools answers three hooks, one for each of its switches; Layer fills has an
-  action beside a filter; and Effects lists three filters, each under a switch of its own.
+  action beside a filter; Effects lists three filters, each under a switch of its own; and Filter
+  layers offers 38 filter layers, eleven of colour and the rest filters (interfaces 17 and 18).
 
 `keyboard-shortcuts` rebinds keys from a panel of its own and keeps what it binds, `paper` has
 controls kept with each artwork, `pop-up-palette` has an action a pen's button runs, which shows a ring
@@ -1976,6 +1977,88 @@ A filter with no loop is drawn in one go. One with a loop is drawn in bands, so 
 going. If a whole draw takes more than about 0.15 seconds, sliders stop following the finger and
 redraw as it lets go. If it takes more than 4 seconds, the filter is closed and the layer put back.
 
+## Filter layers
+
+A filter can be offered as a layer instead (interface 17): a layer with no paint of its own that shows
+what is below it run through the filter, and goes on doing so as what is below changes. While its
+plugin is on, the Layers panel's + offers Filter Layer, which lists the filters the plugins on offer
+under their headings. One picked is added above the current layer, named after the filter, and its
+settings open at once in the filter's panel, as an adjustment is open: what is set there shows as it
+is set, Apply keeps it as one step, and Cancel puts it back. Its options offer Filter Settings to open
+them again.
+
+```json
+"filters": [
+  { "key": "warm", "label": "Warm", "layer": true, "group": "Colour",
+    "values": [
+      { "key": "value", "type": "slider", "label": "Warm", "least": -1, "most": 1, "step": 0.02,
+        "starts": 0, "shown_times": 100, "unit": "%", "live": true }
+    ] },
+  { "key": "soften", "label": "Soften", "layer": true, "group": "Filters",
+    "values": [
+      { "key": "value", "type": "slider", "label": "Soften", "least": 0, "most": 1, "step": 0.01,
+        "starts": 0.5, "shown_times": 100, "unit": "%", "live": true }
+    ],
+    "reach": { "value": "value", "times": 16, "plus": 1 } },
+  { "key": "swirl", "label": "Swirl", "layer": true, "group": "Filters",
+    "values": [ { "key": "value", "type": "slider", "label": "Swirl", "least": 0, "most": 1, "step": 0.01 } ],
+    "reach": "whole", "touch": "point" }
+]
+```
+
+- `"layer": true` makes it a filter layer's, offered in the Layers panel and not under Adjustments.
+  A plugin can offer up to 64, beside the eight filters it can list under Adjustments.
+- `group` is the heading it is listed under, 24 characters at most. Filters with the same heading
+  come together under it, in the order they are listed.
+- `values` are its own, kept with each layer of it: one to eight sliders and switches, written as a
+  plugin's controls are (no `under`, `place`, `press`, `artwork` or `keeps`). A new layer's start where
+  the manifest says. They aren't the plugin's controls and don't show on its card. A filter layer's
+  filter lists no `controls`.
+- `reach` says how far from the pixel it makes its code reads what is below, in canvas pixels: a
+  number (0, its own pixel alone, if it's left out), `{ "value": <one of its sliders>, "times": ..,
+  "plus": .. }` by one of its values, or `"whole"` for anywhere. `layer_at` is held to it: past it, it
+  reads the nearest point within it. When anything changes, the canvas is drawn again that much
+  further round, as many times over as filter layers show, so a filter that reads anywhere has the
+  whole canvas drawn again for any change.
+- `touch` says what a touch on the canvas sets while its settings are open: `"point"`, where the
+  touch is (a tap or a drag; starting in the canvas's middle), `"angle"`, the drag's (radians, 0 along
+  the canvas's top and a quarter turn down; starting at 0), or `"seed"`, a whole number below 1024 for
+  its randomness, drawn afresh by each tap (starting at 0). Its code reads them as `v.touch_x` and
+  `v.touch_y`, `v.touch_angle`, or `v.touch_seed`, after its own values, eight in all at most.
+
+- `editor` (interface 18) has its settings open in one of the app's own editors in place of its
+  values' panel, on the layer: `"curves"`, the Curves panel, five curves (Gamma, Red, Green, Blue
+  and Alpha, each starting straight); or `"gradient"`, the Gradient Map panel, a gradient of stops
+  (starting black, grey and white). The layer keeps what is set there, as `curves.0` to `curves.4`
+  (x and y points) or `gradient` (place, red, green, blue). Its code reads it with
+  `table(row, x)`, x from 0 to 1: a curve's height in red, row 0 to 4; or the gradient's colour,
+  row 0. A filter with an editor may have no values of its own.
+
+Its code is `filters/<key>.wgsl`, the same one function as a filter's (`pixel`, given `v`,
+`layer_at` and `canvas_size`), joined to a template of its own:
+
+- `colour` and `layer_at` are the picture below the layer, as it stands where the layer comes: what
+  is below it in its group (all of it, in a group passing through); clipped to a layer, that layer and
+  what is clipped to it below. Colour is straight, not premultiplied; it hands one back the same way.
+- Its loops have an eighth of a filter's budget (about 8,000 simple operations a pixel), as what it
+  makes is made again whenever that part of the canvas is drawn. One that runs out of it on the
+  pixels it is tried on, before it is first drawn, is left out, and its layers show nothing.
+
+What it makes takes the place of what is below as far as the layer's mask shows it; by a blend mode
+other than Normal, that is blended with what is below (the filtered colour as it is where nothing was
+below); then it is taken as far as the layer's opacity says. Clipped to a layer, it shows only as
+much as that layer does. Hidden, it does nothing.
+
+- It saves, undoes, duplicates, groups, masks and clips as any layer. The artwork keeps its filter
+  as `<plugin id>.<key>` and its values by their keys. With its plugin off or gone, it shows nothing,
+  its values kept as they are, until the plugin is on again.
+- It takes no paint, and nothing that changes a layer's pixels (a fill, Clear, an adjustment, a
+  transform). Nothing merges into it. Merged down, its filter is run over the layer below alone and
+  goes into it as its mask, opacity and blend mode say.
+- Its row shows a filter badge on an empty thumbnail; the app tells it as `filter` in `LayerInfo` (its
+  filter's name).
+- A flattened file has it, as the canvas shows it. A layered file has it as an empty layer.
+
 ## When a plugin stops
 
 It's switched off at once, all of it, and its card says why. It stays off through a restart until
@@ -2083,9 +2166,10 @@ actions at the pen, panels' rows of brushes and rings, the `interface_colour` ho
 the `paper` hook's tooth and picture, actions in the Layers panel, `set_control` and the
 `colour_panel` hook, interface 13 the `view_dim_others` hook, interface 14 sets of brushes a
 plugin comes with, interface 15 `texture` controls, panels' rows of a control and the `paper`
-hook's grain, and interface 16 features (each running in a copy of the code of its own), a row in
+hook's grain, interface 16 features (each running in a copy of the code of its own), a row in
 the brush studio kept as a plugin it takes the place of kept it (`from`), and the marks and picked
-files of a plugin it takes the place of. What comes under a switch at the top of the list (a menu and
+files of a plugin it takes the place of, interface 17 filter layers, and interface 18 filter
+layers' editors. What comes under a switch at the top of the list (a menu and
 a row in the brush studio too), taking the place of other plugins, a menu of its own, and controls in
 the Canvas tab, on a key or kept with each artwork need no newer interface: an older app shows every
 control, leaves the others where they are, shows no menu and keeps every control with the plugin. What a

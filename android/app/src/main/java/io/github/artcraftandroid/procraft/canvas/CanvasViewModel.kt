@@ -1273,6 +1273,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         private set
     /** Curves: the channel shown (all, red, green, blue) and each channel's points (0..1). */
     var curveChannel by mutableStateOf(0)
+    /** How many curves the Curves panel offers: 4, or 5 (alpha last) for a filter layer's. */
+    var curveChannels by mutableStateOf(4)
         private set
     var curves by mutableStateOf(List(4) { listOf(Offset(0f, 0f), Offset(1f, 1f)) })
         private set
@@ -7590,6 +7592,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         balanceTone = a.balanceTone.toInt()
         balance = a.balance
         curveChannel = a.curveChannel.toInt()
+        curveChannels = a.curveChannels.toInt()
         curves = a.curves.map { c -> List(c.size / 2) { Offset(c[it * 2], c[it * 2 + 1]) } }
         gradientIndex = a.gradient.toInt()
         noiseKind = a.noiseKind
@@ -9054,6 +9057,33 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     /** A new layer of a plugin's [kind] above the current one. */
     fun addPluginLayer(kind: String) = layerChange { if (it.addPluginLayer(kind) == 0uL) message = noRoom() }
+
+    /** The filter layers the plugins on offer (interface 17): the Layers panel's + lists them. */
+    fun layerFilters(): List<io.github.artcraftandroid.procraft.core.PluginLayerFilter> = plugins.layerFilters()
+
+    /** A new filter layer running [id] above the current layer, its settings opened at once. */
+    fun addFilterLayer(id: String) {
+        var added = false
+        layerChange {
+            added = it.addFilterLayer(id) != 0uL
+            if (!added) message = noRoom()
+        }
+        if (added) startFilterLayerSettings()
+    }
+
+    /** The current filter layer's settings ([l]'s, made current, if given) in its filter's panel, as an adjustment is open. */
+    fun startFilterLayerSettings(l: LayerInfo? = null) {
+        val s = session ?: return
+        if (l != null) s.selectLayer(l.id)
+        switchModes(ModeButton.Adjustment)
+        if (panel == Panel.ADJUSTMENTS) panelFading = true
+        panel = Panel.NONE
+        if (!s.filterLayerSettings()) return
+        adjustModesOpen = false
+        liquifyPopup = 0
+        readAdjust()
+        refresh()
+    }
 
     // no layer's pixels change, so the thumbnails stay (an artwork's hundreds would load again)
     fun selectLayer(id: ULong) = layerChange(thumbs = false) { it.selectLayer(id) }

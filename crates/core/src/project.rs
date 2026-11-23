@@ -2499,6 +2499,7 @@ pub fn import_pages(
             private: false,
             assisted: false,
             plugin: None,
+            filter: None,
             marks: Default::default(),
         });
     }

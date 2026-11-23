@@ -4,7 +4,9 @@
 //! the brush's colour, from its action ([`fills`]), and paper behind a layer's paint, a filter
 //! (`filters/paper.wgsl`). Effects: filters under Adjustments, each under a switch of its own
 //! (`filters/extract_lines.wgsl`, `filters/outline.wgsl` and `filters/posterise.wgsl`); it has no
-//! code. It's a plugin made of those features, not part of the app: `tools/pack_plugin.py` makes a
+//! code. Filter layers (interface 17): layers the Layers panel's + adds, each showing what is below
+//! it through one of the filters in `filters/` the manifest lists as a layer's, its value kept with
+//! the layer; it has no code either. It's a plugin made of those features, not part of the app: `tools/pack_plugin.py` makes a
 //! `.procraft-plugin` file of it.
 //!
 //! The app runs each feature that is on in a copy of this code of its own, and tells that copy the
@@ -17,12 +19,13 @@ mod tools;
 
 /// The controls by their place in the manifest, as they start: each feature's switch off. The
 /// filters' sliders are here too, though only the filters read them.
-const STARTS: [f32; 21] = [
+const STARTS: [f32; 22] = [
     0.0, 0.0, 0.0, 0.0, // Layer tools
     0.0, 0.0, 100.0, 2.0, 0.0, 0.5, 3.0, 0.3, // Layer fills
     0.0, 0.0, 0.15, 0.1, 0.0, 0.0, 3.0, 0.0, 4.0, // Effects
+    0.0, // Filter layers
 ];
-static CONTROLS: kit::Controls<21> = kit::Controls::new(STARTS);
+static CONTROLS: kit::Controls<22> = kit::Controls::new(STARTS);
 kit::controls!(CONTROLS);
 
 /// Layer tools' switch, then its own: the picked layers' opacity, Paste into masks and the
@@ -51,6 +54,8 @@ pub const OUTLINE: usize = 17;
 pub const REACH: usize = 18;
 pub const POSTERISE: usize = 19;
 pub const STEPS: usize = 20;
+/// Filter layers' switch: the layers' filters each keep their own value, not the plugin.
+pub const FILTER_LAYERS: usize = 21;
 
 /// The actions by their place in the manifest: Add a grid layer.
 const ADD_GRID: usize = 0;
@@ -63,7 +68,7 @@ kit::actions!(|index| {
 
 /// Each feature's switch, in order: what comes after one, up to the next, is its own.
 #[cfg(test)]
-const FEATURES: [usize; 3] = [LAYER_TOOLS, LAYER_FILLS, EFFECTS];
+const FEATURES: [usize; 4] = [LAYER_TOOLS, LAYER_FILLS, EFFECTS, FILTER_LAYERS];
 
 /// The tests one at a time, as they share the controls.
 #[cfg(test)]

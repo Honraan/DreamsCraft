@@ -73,6 +73,8 @@ private final class LayersUi {
     var titleMenu = false
     /// The plus's menu, with the kinds of layer the plugins on add.
     var addKinds: [PluginKind]?
+    /// The filter layers' list its Filter Layer opens (interface 17), while open.
+    var filterList: [PluginLayerFilter]?
     /// A row held and dragged, and how far; the row its middle is over and since when (held there
     /// a moment, what is let go goes onto it).
     var dragId: UInt64?
@@ -170,9 +172,10 @@ struct LayersPanel: View {
                     .frame(width: 40, height: 41)
                     .contentShape(Rectangle())
                     .onTapGesture {
-                        // with plugins' kinds of layer on, a menu of them under a plain layer
+                        // with plugins' kinds of layer or filter layers on, a menu of them under a
+                        // plain layer
                         let kinds = model.layerKinds()
-                        if kinds.isEmpty {
+                        if kinds.isEmpty && model.layerFilters().isEmpty {
                             model.addLayer()
                         } else {
                             withAnimation(Motion.menuOpen) { ui.addKinds = kinds }
@@ -217,6 +220,12 @@ struct LayersPanel: View {
         .background(RowFingers(model: model, ui: ui).frame(width: 0, height: 0))
         .onPreferenceChange(LayerFrames.self) { ui.rows = $0 }
         .overlay(alignment: .topLeading) { LayersMenus(model: model, ui: ui, maxHeight: maxHeight) }
+        .sheet(isPresented: Binding(get: { ui.filterList != nil }, set: { if !$0 { ui.filterList = nil } })) {
+            FilterLayerList(filters: ui.filterList ?? [], onPick: { id in
+                ui.filterList = nil
+                model.addFilterLayer(id)
+            }, onClose: { ui.filterList = nil })
+        }
         #if DEBUG
         .onAppear {
             guard let current = model.layers.first(where: { $0.current }) else { return }
@@ -631,6 +640,17 @@ private struct LayersMenus: View {
                         .frame(width: menuBadgeWidth, height: menuBadgeHeight)
                 }
             }
+            // the filter layers the plugins offer, in a list of their own
+            let filters = model.layerFilters()
+            if !filters.isEmpty {
+                GlyphMenuRow(label: "Filter Layer", action: {
+                    closeAll()
+                    ui.filterList = filters
+                }) {
+                    PluginBadgeView(badge: filterLayerBadge(), ink: Pc.menuInk, width: menuBadgeLine)
+                        .frame(width: menuBadgeWidth, height: menuBadgeHeight)
+                }
+            }
         }
         .offset(x: plus.x - glassMenuWidth, y: plus.y)
         .menuTransition(.topTrailing)
@@ -742,6 +762,8 @@ private struct LayerOptionsMenu: View {
             model.toggleReference(l)
         case .editText:
             model.text.edit(l)
+        case .filterSettings:
+            model.startFilterLayerSettings(l)
         case .rasterize:
             model.rasterize(l)
         case .recolour:

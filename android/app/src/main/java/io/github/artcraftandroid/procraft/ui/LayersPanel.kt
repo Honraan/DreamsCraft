@@ -188,6 +188,8 @@ fun LayersPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier, 
     var titleMenu by remember { mutableStateOf(false) }
     // the + offering plugins' kinds of layer beside a plain one
     var addMenu by remember { mutableStateOf(false) }
+    // the filter layers' list the +'s Filter Layer opens
+    var filterList by remember { mutableStateOf(false) }
     var deletingChosen by remember { mutableStateOf(false) }
     val context = androidx.compose.ui.platform.LocalContext.current
     val scope = rememberCoroutineScope()
@@ -239,12 +241,17 @@ fun LayersPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier, 
                 },
             ) {
                 val kinds = vm.layerKinds()
+                val filters = vm.layerFilters()
+                val asks = kinds.isNotEmpty() || filters.isNotEmpty()
                 Box(
-                    Modifier.padding(top = 12.dp).size(40.dp, 41.dp).clickable { if (kinds.isEmpty()) vm.addLayer() else addMenu = true },
+                    Modifier.padding(top = 12.dp).size(40.dp, 41.dp).clickable { if (!asks) vm.addLayer() else addMenu = true },
                     contentAlignment = Alignment.Center,
                 ) {
                     Icon(PcIcons.PlusMedium, contentDescription = "New layer", tint = Pc.PanelGlyph, modifier = Modifier.requiredSize(41.dp))
-                    NewLayerMenu(addMenu && kinds.isNotEmpty(), kinds, vm, onDismiss = { addMenu = false })
+                    NewLayerMenu(addMenu && asks, kinds, filters.isNotEmpty(), vm, onDismiss = { addMenu = false }, onFilters = { filterList = true })
+                }
+                if (filterList) {
+                    FilterLayerList(filters, onPick = { filterList = false; vm.addFilterLayer(it) }, onClose = { filterList = false })
                 }
             }
             // hanging from its button, its grabber tears it off into a window of its own, while a plugin lets it
@@ -603,9 +610,19 @@ private fun LayersTitleMenu(open: Boolean, vm: CanvasViewModel, onDismiss: () ->
     }
 }
 
-/** The + with plugins' kinds of layer on: a plain layer, or one of each kind, named as the plugin names it. */
+/**
+ * The + with plugins' kinds of layer on: a plain layer, or one of each kind, named as the plugin names it; with
+ * filter layers offered ([filters]), a Filter Layer that lists them ([onFilters]).
+ */
 @Composable
-private fun NewLayerMenu(open: Boolean, kinds: List<io.github.artcraftandroid.procraft.core.PluginKind>, vm: CanvasViewModel, onDismiss: () -> Unit) {
+private fun NewLayerMenu(
+    open: Boolean,
+    kinds: List<io.github.artcraftandroid.procraft.core.PluginKind>,
+    filters: Boolean,
+    vm: CanvasViewModel,
+    onDismiss: () -> Unit,
+    onFilters: () -> Unit,
+) {
     LibraryMenu(
         open,
         androidx.compose.ui.graphics.TransformOrigin(1f, 0f),
@@ -624,6 +641,16 @@ private fun NewLayerMenu(open: Boolean, kinds: List<io.github.artcraftandroid.pr
             MenuItem(kind.label, ink, null, onClick = {
                 onDismiss()
                 vm.addPluginLayer(kind.key)
+            }) {
+                androidx.compose.foundation.Canvas(Modifier.size(MenuBadgeWidth, MenuBadgeHeight)) { badgeDrawing(badge, ink, MenuBadgeLine.toPx()) }
+            }
+        }
+        if (filters) {
+            val badge = remember { io.github.artcraftandroid.procraft.core.filterLayerBadge() }
+            val ink = Pc.MenuInk
+            MenuItem("Filter Layer", ink, null, onClick = {
+                onDismiss()
+                onFilters()
             }) {
                 androidx.compose.foundation.Canvas(Modifier.size(MenuBadgeWidth, MenuBadgeHeight)) { badgeDrawing(badge, ink, MenuBadgeLine.toPx()) }
             }
@@ -1385,6 +1412,7 @@ private fun LayerOptions(open: Boolean, vm: CanvasViewModel, l: LayerInfo, rowY:
                         LayerOption.INVERT -> { { vm.invertLayer(l) } }
                         LayerOption.REFERENCE -> { { vm.toggleReference(l) } }
                         LayerOption.EDIT_TEXT -> { { vm.editText(l) } }
+                        LayerOption.FILTER_SETTINGS -> { { vm.startFilterLayerSettings(l) } }
                         LayerOption.RASTERIZE -> { { vm.rasterize(l) } }
                         LayerOption.RECOLOUR -> { { vm.restyleStrokes(l, colour = true) } }
                         LayerOption.APPLY_BRUSH -> { { vm.restyleStrokes(l, colour = false) } }

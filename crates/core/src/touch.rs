@@ -1681,6 +1681,12 @@ impl CanvasSession {
                     return out;
                 }
                 match open {
+                    // a filter layer's point or angle follows the drag, once past the slop
+                    Some(Adjustment::Plugin) if self.filter_layer_touched() => {
+                        if !self.touches().adjust_moved || !self.filter_layer_drag(from, at) {
+                            return out;
+                        }
+                    }
                     // a motion blur follows the drag: along it, longer the further it goes
                     Some(Adjustment::MotionBlur) => self.adjustment_motion(at.0 - from.0, at.1 - from.1),
                     // displacing, the drag moves the fringes
@@ -2556,7 +2562,15 @@ impl CanvasSession {
                     let going = !cancelled && self.adjustment_liquify_lift();
                     self.touches().liquify_due = going.then_some(now + LIQUIFY_HELD_STEP_MS);
                 } else if !cancelled && !t.adjust_moved && now - t.tap_start <= TAP_MS {
-                    out.push(TouchCommand::AdjustMenu { x: at.0, y: at.1 });
+                    drop(t);
+                    // a filter layer's point goes where it is tapped, or its seed is drawn afresh
+                    if self.filter_layer_touched() {
+                        if self.filter_layer_tap(at) {
+                            out.push(TouchCommand::AdjustChanged);
+                        }
+                    } else {
+                        out.push(TouchCommand::AdjustMenu { x: at.0, y: at.1 });
+                    }
                 }
             }
             Mode::Select => {

@@ -37,6 +37,7 @@ mod crop_edit;
 mod cursor_turn;
 mod device;
 mod drawn_previews;
+mod filter_layers;
 mod floating;
 mod frame;
 mod frame_loop;
@@ -183,6 +184,7 @@ pub use colour_press::{ColourPress, PressTurn};
 pub use crop_edit::{CropReadout, CropShown};
 pub use cursor_turn::CursorPen;
 pub use device::keep_device;
+pub use filter_layers::PluginLayerFilter;
 pub use floating::{
     FloatingPanel, FloatingRoom, FloatingSizes, FloatingWindow, floating_at, floating_fitted, floating_kept,
     floating_key, floating_moved, floating_read, floating_resized, floating_sizes,
@@ -857,6 +859,8 @@ pub(crate) struct State {
     /// The open adjustment's values, as the apps show them (adjusting.rs).
     adjust: adjusting::Adjusting,
     filters: plugin_filter::Filters,
+    /// Filter layers' filters: what the plugins on offer, and what the canvas was given.
+    filter_layers: filter_layers::FilterLayers,
     /// Crop and Resize as it is edited.
     crop_edit: crop_edit::CropEdit,
     last_filter: Option<procraft_gpu::Filter>,
@@ -1057,6 +1061,8 @@ impl State {
     /// Runs the queued canvas work now (without drawing), so the document already reflects an
     /// undo or redo when the call returns.
     fn flush(&mut self) {
+        // what filter layers run, before they are drawn
+        self.give_layer_filters();
         if let (Some(canvas), Some(gpu)) = (self.canvas.as_mut(), self.gpu.as_ref()) {
             canvas.render(gpu, &mut self.doc, None);
         }
@@ -1343,6 +1349,8 @@ impl State {
                 self.layers_unread(unread);
                 self.canvas = Some(c);
                 self.put_opened_stores(&hashes);
+                // what its filter layers run, as the plugins on offer them
+                self.give_layer_filters();
             }
             Err(e) => {
                 log::error!("canvas: {e}");
@@ -2244,6 +2252,7 @@ impl CanvasSession {
             adjusting: false,
             adjust: adjusting::Adjusting::default(),
             filters: plugin_filter::Filters::default(),
+            filter_layers: filter_layers::FilterLayers::default(),
             crop_edit: crop_edit::CropEdit::default(),
             last_filter: None,
             liquify: liquify::LiquifyRun::default(),
@@ -2439,10 +2448,9 @@ impl CanvasSession {
         if st.doc.is_locked(current)
             || st.plugin_layer_off(current)
             || st.doc.unseen(current).is_some()
-            || st
-                .doc
-                .layer(current)
-                .is_none_or(|l| l.kind == procraft_engine::document::LayerKind::Group || l.text.is_some())
+            || st.doc.layer(current).is_none_or(|l| {
+                l.kind == procraft_engine::document::LayerKind::Group || l.text.is_some() || l.filter.is_some()
+            })
         {
             return;
         }

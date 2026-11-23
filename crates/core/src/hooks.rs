@@ -1210,6 +1210,8 @@ impl CanvasSession {
         let hooks = plugins.hooks();
         // where the brush cursor shows goes through them too, as a stroke's samples do
         *self.shared.cursor.hooks.lock() = Some(Arc::clone(&hooks));
+        // the filter layers they offer, their code read now rather than as it is drawn
+        let layer_filters = plugins.layer_filter_defs();
         // how the plugins have the window show the canvas, and the paper they give, asked now
         // rather than as it is drawn
         let look = hooks.view_look();
@@ -1244,6 +1246,7 @@ impl CanvasSession {
         });
         let mut st = self.shared.lock();
         st.paper_picture = paper_picture;
+        st.offer_layer_filters(layer_filters);
         st.hooks = Some(hooks);
         st.plugin_sets = sets;
         let mut changed = false;

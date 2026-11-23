@@ -692,6 +692,12 @@ impl CanvasSession {
     pub fn adjust_end(&self, commit: bool) {
         let mut guard = self.shared.lock();
         let st = &mut *guard;
+        // a filter layer's settings: kept as a step, or put back
+        if st.filters.layer.is_some() {
+            st.end_layer_edit(commit);
+            self.shared.frame(st);
+            return;
+        }
         if st.adjusting {
             st.end_adjustment(commit);
             st.flush();

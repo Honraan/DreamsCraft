@@ -651,6 +651,7 @@ fn add_item(
                 private: false,
                 assisted: false,
                 plugin: None,
+                filter: None,
                 marks: Default::default(),
             });
         }
@@ -684,6 +685,7 @@ fn add_item(
                 private: item.bool("private").unwrap_or(false),
                 assisted: item.bool("perspectiveAssisted").unwrap_or(false),
                 plugin: None,
+                filter: None,
                 marks: Default::default(),
             });
             if !uuid.is_empty() {
@@ -709,6 +711,7 @@ fn add_item(
                     private: false,
                     assisted: false,
                     plugin: None,
+                    filter: None,
                     marks: Default::default(),
                 });
                 if let Some(m) = mask.string("UUID") {

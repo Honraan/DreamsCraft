@@ -474,13 +474,15 @@ impl Toolbars {
                 let at = to_screen(*p);
                 delete_at = Some(Rect::from_min_size(pos2(at.x - 39.0, at.y - 14.0 - 44.0), vec2(78.0, 44.0)));
             }
-            // the channels
+            // the channels (a filter layer's curves have alpha too)
             let column = Rect::from_min_max(pos2(inner.right() - 111.0, inner.top()), inner.max);
-            let h = (column.height() - 3.0) / 4.0;
-            for (i, name) in ["Gamma", "Red", "Green", "Blue"].iter().enumerate() {
+            let names = ["Gamma", "Red", "Green", "Blue", "Alpha"];
+            let count = (shown.curve_channels as usize).clamp(1, names.len());
+            let h = (column.height() - (count as f32 - 1.0)) / count as f32;
+            for (i, name) in names.iter().take(count).enumerate() {
                 let top = column.top() + i as f32 * (h + 1.0);
                 let cell = Rect::from_min_size(pos2(column.left(), top), vec2(column.width(), h));
-                let (upper, lower) = (if i == 0 { 13 } else { 0 }, if i == 3 { 13 } else { 0 });
+                let (upper, lower) = (if i == 0 { 13 } else { 0 }, if i + 1 == count { 13 } else { 0 });
                 let corners = egui::CornerRadius { nw: upper, ne: upper, sw: lower, se: lower };
                 let chosen = channel as usize == i;
                 ui.painter().rect_filled(cell, corners, if chosen { argb(pc::ACCENT) } else { argb(PANEL_BUTTON) });

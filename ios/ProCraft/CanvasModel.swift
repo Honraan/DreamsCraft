@@ -1339,6 +1339,21 @@ final class CanvasModel {
         }
     }
 
+    /// The current filter layer's settings (`l`'s, made current, if given) in its filter's panel,
+    /// as an adjustment is open (interface 17).
+    func startFilterLayerSettings(_ l: LayerInfo? = nil) {
+        if let l {
+            selectLayer(l.id)
+        }
+        _ = switchModes(.adjustment)
+        closeForAdjustment()
+        guard session.filterLayerSettings() else { return }
+        adjustModesOpen = false
+        liquifyPopup = 0
+        readAdjust()
+        refresh()
+    }
+
     /// Ends the adjustment: `commit` keeps it as one undo step, otherwise the layer goes back.
     func endAdjustment(commit: Bool) {
         guard adjustment != nil else { return }

@@ -163,6 +163,8 @@ pub struct Interface {
     plugin_panel_held: Option<(usize, f32)>,
     /// A plugin's texture control's Textures sheet, while open (interface 15).
     textures: Option<crate::textures::Textures>,
+    /// The list of filter layers the Layers panel's + opened, while open (interface 17).
+    filter_list: Option<crate::filter_list::FilterList>,
     /// A plugin's panel took Space as the key press it asked for: let go, it is no tap.
     space_to_panel: bool,
     layers: Layers,
@@ -298,6 +300,7 @@ impl Interface {
             actions_panel: Actions::default(),
             plugin_panel_held: None,
             textures: None,
+            filter_list: None,
             space_to_panel: false,
             layers: Layers::default(),
             look: Look::default(),
@@ -958,6 +961,21 @@ impl Interface {
             if changed {
                 self.prefs.apply(session);
                 self.prefs.keep();
+            }
+        }
+        // the filter layers' list, over everything: one picked is added, and its settings open
+        if let Some(sheet) = self.filter_list.as_mut() {
+            match sheet.show(&ctx) {
+                crate::filter_list::Picked::Open => {}
+                crate::filter_list::Picked::Cancelled => self.filter_list = None,
+                crate::filter_list::Picked::Filter(id) => {
+                    self.filter_list = None;
+                    if session.add_filter_layer(id) == 0 {
+                        crate::files::no_room(session);
+                    } else {
+                        self.start_filter_layer_settings(session);
+                    }
+                }
             }
         }
         crate::model_picture::show(&ctx, &mut self.look, session);
@@ -2100,6 +2118,14 @@ impl Interface {
         }
     }
 
+    /// The current filter layer's settings, in its filter's panel, as an adjustment is open.
+    fn start_filter_layer_settings(&mut self, session: &CanvasSession) {
+        self.switch_modes(session, ModeButton::Adjustment);
+        self.open = None;
+        session.set_pick_next(false);
+        session.filter_layer_settings();
+    }
+
     /// Ends the open adjustment: `commit` keeps it (and says so), otherwise the layer goes back.
     fn end_adjustment(&mut self, session: &CanvasSession, commit: bool) {
         self.adjustments.menu_at = None;
@@ -2729,6 +2755,7 @@ impl Interface {
                 self.layers.plugin_actions = self.prefs.plugins.actions_in(procraft_core::PluginPlace::Layer);
                 self.layers.panel_actions = self.prefs.plugins.actions_in(procraft_core::PluginPlace::Layers);
                 self.layers.layer_kinds = self.prefs.plugins.layer_kinds();
+                self.layers.layer_filters = self.prefs.plugins.layer_filters();
                 self.layers.floats = self.floating.allowed(procraft_core::FloatingPanel::Layers);
                 let hang = crate::panel::Hang::Button(button);
                 let shown = self.layers.show(ctx, &mut self.look, session, &mut self.colours, hang, backdrops);
@@ -2972,6 +2999,12 @@ impl Interface {
         if std::mem::take(&mut self.layers.layer_opacity) {
             self.start_layer_opacity(session);
         }
+        if std::mem::take(&mut self.layers.filter_list) {
+            self.filter_list = Some(crate::filter_list::FilterList::new(self.layers.layer_filters.clone()));
+        }
+        if std::mem::take(&mut self.layers.filter_settings) {
+            self.start_filter_layer_settings(session);
+        }
         // its background row tapped: the colour panel in its place (hanging from the Layers
         // button, from a floating one too), on the background's
         if std::mem::take(&mut self.layers.pick_background) {
@@ -2998,6 +3031,7 @@ impl Interface {
                     self.layers.plugin_actions = self.prefs.plugins.actions_in(procraft_core::PluginPlace::Layer);
                     self.layers.panel_actions = self.prefs.plugins.actions_in(procraft_core::PluginPlace::Layers);
                     self.layers.layer_kinds = self.prefs.plugins.layer_kinds();
+                    self.layers.layer_filters = self.prefs.plugins.layer_filters();
                     self.layers.show(ctx, &mut self.look, session, &mut self.colours, hang, backdrops);
                     self.layers_asked(ctx, session);
                     std::mem::take(&mut self.layers.chrome)

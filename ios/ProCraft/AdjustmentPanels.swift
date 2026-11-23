@@ -457,7 +457,8 @@ private struct CurvesPanel: View {
             }
             .padding(8)
             VStack(spacing: 1) {
-                ForEach(Array(["Gamma", "Red", "Green", "Blue"].enumerated()), id: \.offset) { i, name in
+                // a filter layer's curves have alpha too
+                ForEach(Array(["Gamma", "Red", "Green", "Blue", "Alpha"].prefix(max(1, min(5, Int(shown.curveChannels)))).enumerated()), id: \.offset) { i, name in
                     let chosen = channel == i
                     Text(verbatim: name)
                         .font(.system(size: 16))

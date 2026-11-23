@@ -315,6 +315,37 @@ fn fs_blend(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     return select(r, c, lu.clipped == CLIP_BASE);
 }
 
+// A filter layer: what is below it (the backdrop) run through its filter (layer_tex), taken as far
+// as the layer's mask shows it; by a mode other than normal, that blended with the backdrop (the
+// filtered colour as it is where nothing was below); then taken as far as the layer's opacity, and
+// the base it is clipped to, say. Clipped in a clipping group, it shows only as much as the base
+// does.
+@fragment
+fn fs_filter(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let p = vec2<i32>(pos.xy);
+    let b = textureLoad(backdrop_tex, p, 0);
+    var m = textureLoad(layer_tex, p, 0);
+    if (lu.masked > 0.5) {
+        m = mix(b, m, clamp(dot(textureLoad(mask_tex, p, 0).rgb, vec3<f32>(0.299, 0.587, 0.114)), 0.0, 1.0));
+    }
+    var r = m;
+    if (lu.blend != 0u && m.a > 0.0 && b.a > 0.0) {
+        r = vec4<f32>(clamp(blend_rgb(unpremultiply(b), unpremultiply(m), lu.blend), vec3<f32>(0.0), vec3<f32>(1.0)) * m.a, m.a);
+    }
+    if (lu.clipped == CLIP_ATOP) {
+        r = vec4<f32>(unpremultiply(r) * b.a, b.a);
+    }
+    var k = lu.opacity;
+    if (lu.clipped == CLIP_BY_BASE) {
+        var base = textureLoad(clip_tex, p, 0).a;
+        if (lu.clip_masked > 0.5) {
+            base = base * clamp(dot(textureLoad(clip_mask_tex, p, 0).rgb, vec3<f32>(0.299, 0.587, 0.114)), 0.0, 1.0);
+        }
+        k = k * base;
+    }
+    return mix(b, r, clamp(k, 0.0, 1.0));
+}
+
 // how far below the strength a paper's tooth begins to take paint, and is half way
 const TOOTH_EDGE: f32 = 0.04;
 

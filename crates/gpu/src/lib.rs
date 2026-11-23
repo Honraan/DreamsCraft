@@ -16,7 +16,10 @@ mod sphere;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-pub use canvas::plugin_filter::{FilterCode, FilterProgram, FilterRun, read_filter};
+pub use canvas::filter_layers::{FilterReach, FilterTable, LayerFilterProgram, MOST_LAYER_FILTER_VALUES};
+pub use canvas::plugin_filter::{
+    FilterCode, FilterProgram, FilterRun, read_filter, read_layer_filter, read_layer_table_filter,
+};
 pub use canvas::plugin_picture::{PictureCode, PictureProgram, PictureStop, read_picture, read_picture_given};
 pub use canvas::{
     Backdrop, Canvas, DisplayLut, FillPreview, Filter, FineThumbnail, LayerStore, LayerThumbnailStep, LiquifyMode,

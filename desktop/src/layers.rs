@@ -270,6 +270,11 @@ pub struct Layers {
     pub panel_actions: Vec<procraft_core::PluginAction>,
     /// The kinds of layer the plugins on add, which the + offers beside a plain layer.
     pub layer_kinds: Vec<procraft_core::PluginKind>,
+    /// The filter layers the plugins on offer (interface 17): the + offers a Filter Layer that
+    /// lists them; asked to list them, and asked for the current filter layer's settings.
+    pub layer_filters: Vec<procraft_core::PluginLayerFilter>,
+    pub filter_list: bool,
+    pub filter_settings: bool,
     pub run_action: Option<String>,
     /// Layer Opacity asked for the current layer (two fingers tapped on its row).
     pub layer_opacity: bool,
@@ -520,8 +525,8 @@ impl Layers {
             plus = Rect::from_min_size(pos2(body.right() - 18.0 - 40.0, body.top() + 12.0), vec2(40.0, 41.0));
             look.icon(ui, &icons::PLUS_MEDIUM, plus.center(), 41.0, argb(PANEL_GLYPH));
             if ui.interact(plus, ui.scope_id().with("new layer"), Sense::click()).clicked() {
-                // with plugins' kinds of layer on, it asks which
-                if !self.layer_kinds.is_empty() {
+                // with plugins' kinds of layer or filter layers on, it asks which
+                if !self.layer_kinds.is_empty() || !self.layer_filters.is_empty() {
                     self.add_menu.open();
                 } else if session.add_layer() == 0 {
                     crate::files::no_room(session);
@@ -808,10 +813,10 @@ impl Layers {
         plus: Rect,
         backdrops: &mut Vec<f32>,
     ) {
-        if self.layer_kinds.is_empty() {
+        if self.layer_kinds.is_empty() && self.layer_filters.is_empty() {
             self.add_menu.close();
         }
-        let entries = add_entries(&self.layer_kinds);
+        let entries = add_entries(&self.layer_kinds, !self.layer_filters.is_empty());
         let size = vec2(menu::LIBRARY_WIDTH, menu::entries_height(&entries));
         let screen = panel::screen(ctx);
         let left = (plus.right() - size.x).clamp(screen.left(), (screen.right() - size.x).max(screen.left()));
@@ -830,6 +835,11 @@ impl Layers {
         );
         let Some(at) = tapped.filter(|i| *i < entries.len()) else { return };
         self.add_menu.close();
+        // the last, with filter layers offered: their list
+        if !self.layer_filters.is_empty() && at + 1 == entries.len() {
+            self.filter_list = true;
+            return;
+        }
         let added = match at.checked_sub(1).and_then(|k| self.layer_kinds.get(k)) {
             Some(kind) => session.add_plugin_layer(kind.key.clone()),
             None => session.add_layer(),
@@ -1594,6 +1604,10 @@ impl Layers {
             LayerOption::DrawingAssist => _ = session.set_guide_assisted(!l.assisted),
             LayerOption::Reference => _ = session.set_layer_reference(l.id, !l.reference),
             LayerOption::EditText => self.edit_text = Some(l.id),
+            LayerOption::FilterSettings => {
+                session.select_layer(l.id);
+                self.filter_settings = true;
+            }
             LayerOption::Rasterize => {
                 session.rasterize_layer(l.id);
                 self.notice =
@@ -2092,10 +2106,14 @@ impl Layers {
 
 /// The +'s menu's rows: a plain layer, then each kind of layer, named as its plugin names it, beside
 /// its badge (or a plug, when it draws none).
-fn add_entries(kinds: &[procraft_core::PluginKind]) -> Vec<Entry<'_>> {
+fn add_entries(kinds: &[procraft_core::PluginKind], filters: bool) -> Vec<Entry<'_>> {
     let mut entries = vec![Entry::Item(&icons::MENU_NEW_LAYER, "Layer", menu::INK)];
     let badged = |k: &procraft_core::PluginKind| procraft_core::plugin_kind_badge(k.clone());
     entries.extend(kinds.iter().map(|k| Entry::Badge(badged(k), k.label.as_str(), menu::INK)));
+    // the filter layers the plugins offer, in a list of their own
+    if filters {
+        entries.push(Entry::Badge(procraft_core::PluginBadge::filter(), "Filter Layer", menu::INK));
+    }
     entries
 }
 
@@ -2890,7 +2908,11 @@ mod tests {
             kind("org.example.curves.curve", "Curves", Some(badge.clone())),
             kind("org.example.plain.plain", "Plain", None),
         ];
-        let entries = add_entries(&kinds);
+        // with filter layers offered, Filter Layer last, beside the filter badge
+        let with_filters = add_entries(&kinds, true);
+        let filter = procraft_core::PluginBadge::filter();
+        assert!(matches!(with_filters.last(), Some(Entry::Badge(b, "Filter Layer", _)) if *b == filter));
+        let entries = add_entries(&kinds, false);
         assert_eq!(entries.len(), 3);
         let first = matches!(&entries[0], Entry::Item(icon, "Layer", _) if icon.name == "menunewlayer");
         assert!(first, "a plain layer first, beside the new layer glyph");

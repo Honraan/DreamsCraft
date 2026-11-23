@@ -432,10 +432,89 @@ pub struct Layer {
     /// its pixels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin: Option<PluginLayer>,
+    /// A filter layer's filter: it has no paint of its own, and shows what is below it run through
+    /// a plugin's filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<LayerFilter>,
     /// Numbers plugins keep with the layer, each by the plugin's id (a colour label's, say): saved
     /// and undone with it, gone with it, and kept as they are while their plugin is off or gone.
     #[serde(default, deserialize_with = "or_default", skip_serializing_if = "BTreeMap::is_empty")]
     pub marks: BTreeMap<String, i64>,
+}
+
+/// What makes a layer a filter layer: the filter it runs over what is below it, as
+/// `<plugin id>.<key>`, and the filter's values, each by its control's key. The layer's own pixels
+/// stay empty; its mask, opacity, blend mode and clipping say where and how much the filtered
+/// picture shows. With its plugin off or gone it shows nothing, its values kept as they are.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LayerFilter {
+    pub filter: String,
+    #[serde(default)]
+    pub values: BTreeMap<String, f32>,
+    /// What an editor of its filter's sets (interface 18), each a list of numbers by its key: a
+    /// curve's points (x, y, in 0..1), or a gradient's stops (place, red, green, blue, in 0..1).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tables: BTreeMap<String, Vec<f32>>,
+}
+
+/// The most values a filter layer keeps, and the longest key and filter name.
+pub const MOST_FILTER_VALUES: usize = 16;
+const MOST_FILTER_KEY: usize = 64;
+const MOST_FILTER_NAME: usize = 256;
+/// The most lists an editor sets on a filter layer, and the most numbers in each.
+pub const MOST_FILTER_TABLES: usize = 8;
+pub const MOST_TABLE_NUMBERS: usize = 512;
+
+impl LayerFilter {
+    /// `filter` with `values`, those that are numbers and of keys short enough, the first so many.
+    pub fn new(filter: &str, values: impl IntoIterator<Item = (String, f32)>) -> LayerFilter {
+        let mut kept = LayerFilter {
+            filter: filter.chars().take(MOST_FILTER_NAME).collect(),
+            values: BTreeMap::new(),
+            tables: BTreeMap::new(),
+        };
+        for (key, value) in values {
+            kept.set(&key, value);
+        }
+        kept
+    }
+
+    /// Sets value `key`; false, changing nothing, for a value that isn't a number, a key too long,
+    /// or a new key past the most kept.
+    pub fn set(&mut self, key: &str, value: f32) -> bool {
+        let fits = value.is_finite()
+            && !key.is_empty()
+            && key.len() <= MOST_FILTER_KEY
+            && (self.values.contains_key(key) || self.values.len() < MOST_FILTER_VALUES);
+        if fits {
+            self.values.insert(key.to_owned(), value);
+        }
+        fits
+    }
+
+    /// Value `key`, if it keeps one.
+    pub fn value(&self, key: &str) -> Option<f32> {
+        self.values.get(key).copied()
+    }
+
+    /// Sets list `key` (interface 18); false, changing nothing, for one with a number that isn't
+    /// one, too many numbers, a key too long, or a new key past the most kept.
+    pub fn set_table(&mut self, key: &str, numbers: &[f32]) -> bool {
+        let fits = numbers.iter().all(|n| n.is_finite())
+            && numbers.len() <= MOST_TABLE_NUMBERS
+            && !key.is_empty()
+            && key.len() <= MOST_FILTER_KEY
+            && (self.tables.contains_key(key) || self.tables.len() < MOST_FILTER_TABLES);
+        if fits {
+            self.tables.insert(key.to_owned(), numbers.to_vec());
+        }
+        fits
+    }
+
+    /// List `key`, if it keeps one.
+    pub fn table(&self, key: &str) -> Option<&[f32]> {
+        self.tables.get(key).map(Vec::as_slice)
+    }
 }
 
 /// The most plugins' marks a layer keeps, and the longest id one goes by.
@@ -476,6 +555,7 @@ impl Layer {
             private: false,
             assisted: false,
             plugin: None,
+            filter: None,
             marks: BTreeMap::new(),
         }
     }
@@ -485,11 +565,11 @@ impl Layer {
         self.marks.get(owner).copied().unwrap_or(0)
     }
 
-    /// Whether its pixels are drawn from what it holds besides them (its text, or a plugin's items):
-    /// only that changes them, so edits to its pixels alone (a fill, an adjustment, a transform)
-    /// wait until it is rasterized.
+    /// Whether its pixels are drawn from what it holds besides them (its text, or a plugin's items),
+    /// or it has none (a filter layer): only that changes them, so edits to its pixels alone (a
+    /// fill, an adjustment, a transform) wait until it is rasterized.
     pub fn drawn_from_data(&self) -> bool {
-        self.text.is_some() || self.plugin.is_some()
+        self.text.is_some() || self.plugin.is_some() || self.filter.is_some()
     }
 
     /// A group as groups are made (normal, fully opaque): its members blend with what is below
@@ -1552,6 +1632,35 @@ impl Document {
         id
     }
 
+    /// Adds a filter layer running `filter` above the current one (in its group), named `name`,
+    /// and makes it current.
+    pub fn add_filter_layer(&mut self, filter: LayerFilter, name: &str) -> LayerId {
+        let id = self.add_layer();
+        if let Some(l) = self.layer_mut(id) {
+            l.name = name.chars().take(256).collect();
+            l.filter = Some(filter);
+        }
+        id
+    }
+
+    /// Layer `id`'s filter value `key` set to `value`; false, changing nothing, if it isn't a
+    /// filter layer or the value isn't kept (see [`LayerFilter::set`]).
+    pub fn set_filter_value(&mut self, id: LayerId, key: &str, value: f32) -> bool {
+        self.layer_mut(id).and_then(|l| l.filter.as_mut()).is_some_and(|f| f.set(key, value))
+    }
+
+    /// Layer `id`'s filter list `key` set to `numbers`; false, changing nothing, if it isn't a filter
+    /// layer or the list isn't kept (see [`LayerFilter::set_table`]).
+    pub fn set_filter_table(&mut self, id: LayerId, key: &str, numbers: &[f32]) -> bool {
+        self.layer_mut(id).and_then(|l| l.filter.as_mut()).is_some_and(|f| f.set_table(key, numbers))
+    }
+
+    /// Filter layer `id`'s filter put back as `filter` (its values as they were); false, changing
+    /// nothing, if it isn't a filter layer.
+    pub fn put_filter(&mut self, id: LayerId, filter: LayerFilter) -> bool {
+        self.layer_mut(id).and_then(|l| l.filter.as_mut()).map(|f| *f = filter).is_some()
+    }
+
     /// Keeps `data` as the plugin's data for its layer `id`; false if `id` isn't a plugin's layer.
     pub fn set_plugin_data(&mut self, id: LayerId, data: Option<std::sync::Arc<Vec<u8>>>) -> bool {
         self.layer_mut(id).and_then(|l| l.plugin.as_mut()).map(|p| p.data = data).is_some()
@@ -1900,9 +2009,14 @@ impl Document {
     /// group, what its top layer merges into (see [`Document::group_merge_pair`]). A layer's mask
     /// and the one below's are each applied to its layer first.
     pub fn merge_target(&self, id: LayerId) -> Option<LayerId> {
+        // a filter layer takes nothing merged into it; merged down itself, its filter goes into the
+        // layer below
+        let paint = |id: LayerId| self.layer(id).is_some_and(|l| l.kind == LayerKind::Paint && l.filter.is_none());
         match self.layer(id)?.kind {
-            LayerKind::Paint => self.below(id).filter(|b| self.layer(*b).is_some_and(|l| l.kind == LayerKind::Paint)),
-            LayerKind::Group => self.group_merge_pair(id).map(|(_, into)| into),
+            LayerKind::Paint => self.below(id).filter(|b| paint(*b)),
+            LayerKind::Group => {
+                self.group_merge_pair(id).filter(|(top, into)| paint(*top) && paint(*into)).map(|(_, into)| into)
+            }
             LayerKind::Mask => None,
         }
     }
@@ -1961,8 +2075,13 @@ impl Document {
 
     /// Whether paint layer `id` can be clipped: a paint layer is just below it in its group.
     pub fn can_clip(&self, id: LayerId) -> bool {
+        // onto a filter layer, which has no paint to show it through, only while that is clipped
+        // itself (and so passed over for the one below)
         self.layer(id).is_some_and(|l| l.kind == LayerKind::Paint)
-            && self.below(id).and_then(|b| self.layer(b)).is_some_and(|b| b.kind == LayerKind::Paint)
+            && self
+                .below(id)
+                .and_then(|b| self.layer(b))
+                .is_some_and(|b| b.kind == LayerKind::Paint && (b.filter.is_none() || b.clipped))
     }
 
     /// The layer `id` is clipped to: the nearest unclipped paint layer below it in its group.
@@ -2385,6 +2504,51 @@ mod tests {
         assert!(d.finish_merge_down(copy));
         assert!(d.layer(t).unwrap().text.is_none());
         assert!(!d.rasterize(t));
+    }
+
+    #[test]
+    fn a_filter_layer_keeps_its_filter_and_values_in_the_file_and_takes_no_paint_or_merge() {
+        let mut d = Document::new(100, 100);
+        let base = d.current();
+        let values = [("value".to_owned(), 0.25), ("touch_x".to_owned(), 50.0), ("bad".to_owned(), f32::NAN)];
+        let f = d.add_filter_layer(LayerFilter::new("org.example.f.warm", values), "Warm 2");
+        assert_eq!(d.current(), f);
+        let layer = d.layer(f).unwrap();
+        assert_eq!((layer.kind, layer.name.as_str()), (LayerKind::Paint, "Warm 2"));
+        let kept = layer.filter.clone().unwrap();
+        assert_eq!((kept.value("value"), kept.value("touch_x"), kept.value("bad")), (Some(0.25), Some(50.0), None));
+        assert!(layer.drawn_from_data(), "no fill, adjustment or transform of its pixels");
+        // set, within what it keeps
+        assert!(d.set_filter_value(f, "value", -0.5));
+        assert!(!d.set_filter_value(f, "value", f32::INFINITY));
+        assert!(!d.set_filter_value(base, "value", 0.1), "an ordinary layer keeps none");
+        for k in 0..20 {
+            d.set_filter_value(f, &format!("k{k}"), 1.0);
+        }
+        assert_eq!(d.layer(f).unwrap().filter.as_ref().unwrap().values.len(), MOST_FILTER_VALUES);
+        // the file keeps it; one from before has none, and an ordinary layer writes none
+        let text = serde_json::to_string(&d).unwrap();
+        let back: Document = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.layer(f).unwrap().filter, d.layer(f).unwrap().filter);
+        assert!(!serde_json::to_string(d.layer(base).unwrap()).unwrap().contains("filter"));
+        // a duplicate runs it too; it neither merges nor is merged into
+        let copy = d.duplicate_layer(f).unwrap();
+        assert_eq!(d.layer(copy).unwrap().filter, d.layer(f).unwrap().filter);
+        assert_eq!(d.merge_target(copy), None);
+        let above = d.add_layer();
+        assert_eq!(d.merge_target(above), None);
+        assert!(!d.rasterize(f), "nothing to rasterize");
+        assert!(d.layer(f).unwrap().filter.is_some());
+        // an editor's lists (interface 18), kept with it
+        assert!(d.set_filter_table(f, "curves.1", &[0.0, 1.0, 1.0, 0.0]));
+        assert!(!d.set_filter_table(f, "bad", &[f32::NAN]));
+        assert!(!d.set_filter_table(f, "long", &vec![0.5; MOST_TABLE_NUMBERS + 1]));
+        let back: Document = serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
+        assert_eq!(back.layer(f).unwrap().filter.as_ref().unwrap().table("curves.1"), Some(&[0.0, 1.0, 1.0, 0.0][..]));
+        // put back whole
+        assert!(d.put_filter(f, kept.clone()));
+        assert_eq!(d.layer(f).unwrap().filter.as_ref(), Some(&kept));
+        assert!(!d.put_filter(base, kept));
     }
 
     #[test]

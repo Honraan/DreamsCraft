@@ -341,6 +341,16 @@ impl PluginControl {
         }
     }
 
+    /// Starting as it is now: a filter layer's panel opening at the values the layer keeps.
+    pub(crate) fn make_starting(&mut self) {
+        match self {
+            PluginControl::Switch { control } => control.starts = control.on,
+            PluginControl::Slider { control } => control.starts = control.value,
+            PluginControl::Texture { control } => control.starts = control.value,
+            PluginControl::File { .. } => {}
+        }
+    }
+
     /// It as it is, and starting so: a filter's panel opening at the values on its card.
     fn starting_as_it_is(mut self) -> PluginControl {
         match &mut self {
@@ -457,7 +467,12 @@ pub fn plugin_slider_shown(slider: PluginSlider, value: f32) -> String {
     } else {
         2
     };
-    format!("{:.*}{}", places, value * slider.shown_times, slider.unit)
+    // a value that reads as nothing reads without a sign: a step from a range below 0 lands a
+    // hair under 0 (-1 and fifty steps of .02 in f32's doubles), which would read "-0%"
+    let shown = value * slider.shown_times;
+    let at = 10f32.powi(places as i32);
+    let shown = if (shown * at).round() == 0.0 { 0.0 } else { shown };
+    format!("{:.*}{}", places, shown, slider.unit)
 }
 
 impl Plugins {
@@ -1520,7 +1535,7 @@ impl Plugins {
             if listed.is_empty() {
                 (p.id == id).then_some((p, None))
             } else {
-                listed.iter().find(|f| f.id == id).map(|f| (p, Some(f)))
+                listed.iter().find(|f| f.id == id && f.layer.is_none()).map(|f| (p, Some(f)))
             }
         });
         let (plugin, listed) = found.ok_or_else(|| FILTER_DAMAGED.to_owned())?;
@@ -1544,6 +1559,45 @@ impl Plugins {
             FILTER_DAMAGED.to_owned()
         })?;
         Ok(FilterToOpen { plugin: plugin.id.clone(), name, controls, code })
+    }
+
+    /// What each filter layer the plugins on offer is made of, by its id, its code read from the
+    /// plugin's folder (once for each plugin), which must hold up as it did.
+    pub(crate) fn layer_filter_defs(&self) -> std::collections::HashMap<String, crate::filter_layers::LayerFilterDef> {
+        let list = self.listed();
+        let mut out = std::collections::HashMap::new();
+        let Some(store) = self.store.as_deref() else { return out };
+        for plugin in list.files.iter().filter(|p| p.on && p.problem.is_none()) {
+            let Some(shape) = list.shapes.get(&plugin.id) else { continue };
+            let offered: Vec<&plugin_file::ListedFilter> =
+                shape.filters.iter().filter(|f| f.layer.is_some() && shape.shows(f.under, &plugin.controls)).collect();
+            if offered.is_empty() {
+                continue;
+            }
+            let Some(codes) = plugin_file::read_layer_filter_codes(store, &plugin.id, &plugin.version) else {
+                log::warn!("a plugin's filter layers didn't hold up: {}", plugin.id);
+                continue;
+            };
+            for f in offered {
+                let (Some(layer), Some((_, text))) = (&f.layer, codes.iter().find(|(path, _)| *path == f.code)) else {
+                    continue;
+                };
+                out.insert(
+                    f.id.clone(),
+                    crate::filter_layers::LayerFilterDef {
+                        plugin: plugin.id.clone(),
+                        label: f.label.clone(),
+                        values: layer.values.clone(),
+                        reach: layer.reach,
+                        touch: layer.touch,
+                        editor: layer.editor,
+                        text: Arc::from(text.as_str()),
+                        store: Some(store.to_path_buf()),
+                    },
+                );
+            }
+        }
+        out
     }
 
     /// Filter `id` is on trial: if the app ends before it has drawn, it is put down to it.
@@ -1713,7 +1767,11 @@ impl Plugins {
                 filters.push(plugin.clone());
             }
             let shape = list.shapes.get(&plugin.id);
-            for filter in listed.iter().filter(|f| shape.is_none_or(|shape| shape.shows(f.under, &plugin.controls))) {
+            // (a filter layer's is offered in the Layers panel instead)
+            let shown = |f: &&plugin_file::ListedFilter| {
+                f.layer.is_none() && shape.is_none_or(|shape| shape.shows(f.under, &plugin.controls))
+            };
+            for filter in listed.iter().filter(shown) {
                 filters.push(PluginInfo {
                     id: filter.id.clone(),
                     name: filter.label.clone(),
@@ -2050,6 +2108,24 @@ impl Plugins {
         let list = self.listed();
         let on = list.files.iter().filter(|p| p.on && p.problem.is_none());
         on.flat_map(|p| p.kinds.iter().cloned()).collect()
+    }
+
+    /// The filter layers the plugins on offer (interface 17), for the Layers panel's +: each by
+    /// its id (`<plugin id>.<key>`), its name and the heading it comes under, in the order the
+    /// plugins list them.
+    pub fn layer_filters(&self) -> Vec<crate::PluginLayerFilter> {
+        let list = self.listed();
+        let mut out = Vec::new();
+        for plugin in list.files.iter().filter(|p| p.on && p.problem.is_none()) {
+            let Some(shape) = list.shapes.get(&plugin.id) else { continue };
+            for f in shape.filters.iter().filter(|f| shape.shows(f.under, &plugin.controls)) {
+                if let Some(layer) = &f.layer {
+                    let (id, label, group) = (f.id.clone(), f.label.clone(), layer.group.clone());
+                    out.push(crate::PluginLayerFilter { id, label, group });
+                }
+            }
+        }
+        out
     }
 
     /// The kinds of layer the plugins on add, for the Layers panel's +.
@@ -2753,6 +2829,25 @@ mod tests {
         assert_eq!(plugin_slider_shown(control.clone(), 2.5), "2.5 px");
         let hundredths = PluginSlider { step: 0.05, ..control };
         assert_eq!(plugin_slider_shown(hundredths, 2.25), "2.25 px");
+    }
+
+    #[test]
+    fn a_slider_from_below_0_reads_0_at_0_without_a_sign() {
+        // a filter layer's Hue, -100% to 100% in steps of 2: its 0 lands a hair under 0
+        let hue = PluginSlider { least: -1.0, most: 1.0, step: 0.02, starts: 0.0, ..size_slider() };
+        let zero = hue.stepped(0.0);
+        assert!(zero <= 0.0 && zero.abs() < 1e-6, "{zero}");
+        assert_eq!(plugin_slider_shown(hue.clone(), zero), "0%");
+        assert_eq!(plugin_slider_shown(hue.clone(), -0.0), "0%");
+        assert_eq!(plugin_slider_shown(hue.clone(), plugin_slider_at(hue.clone(), 0.5)), "0%");
+        // anything that reads as a number still has its sign
+        assert_eq!(plugin_slider_shown(hue.clone(), hue.stepped(-0.02)), "-2%");
+        assert_eq!(plugin_slider_shown(hue.clone(), hue.stepped(0.58)), "58%");
+        assert_eq!(plugin_slider_shown(hue.clone(), -1.0), "-100%");
+        // in tenths too
+        let tenths = PluginSlider { step: 0.001, ..hue };
+        assert_eq!(plugin_slider_shown(tenths.clone(), -0.0004), "0.0%");
+        assert_eq!(plugin_slider_shown(tenths, -0.0006), "-0.1%");
     }
 
     #[test]
@@ -3634,7 +3729,8 @@ mod tests {
         assert!(plugins.set_switch(format!("{LAYER_TOOLBOX}.effects"), true));
         assert!(plugins.set_switch(format!("{EFFECTS}.extract_lines"), true));
         let lines = ["Effects", "Extract lines", "Paper", "Softness", "Keep the colour", "Outline", "Posterise"];
-        assert_eq!(labels(&plugins, LAYER_TOOLBOX)[5..], lines);
+        assert_eq!(labels(&plugins, LAYER_TOOLBOX)[5..12], lines);
+        assert_eq!(labels(&plugins, LAYER_TOOLBOX)[12], "Filter layers");
         // an action too, and it doesn't run with its switch off
         assert!(plugins.set_switch(format!("{LAYER_TOOLBOX}.layer_fills"), true));
         assert_eq!(labels(&plugins, LAYER_TOOLBOX)[4..7], ["Layer fills", "Grid layer", "Paper texture"]);
@@ -3658,6 +3754,129 @@ mod tests {
         assert_eq!(plugins.set_slider(format!("{LAYER_FILLS}.spacing"), 50.0), Some(50.0));
         assert!(plugins.set_switch(format!("{LAYER_FILLS}.grid"), false));
         assert!(plugins.kept_lines().contains(&format!("{LAYER_FILLS}.spacing 50")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bundled_filter_layers_show_what_is_below_changed_and_keep_their_values_with_the_layer() {
+        const INVERT: &str = "io.github.artcraftandroid.layer-toolbox.invert";
+        let dir = store("bundled-filter-layers");
+        let plugins = app_at(&dir);
+        // off as it comes, and with its feature off: none offered
+        assert!(plugins.layer_filters().is_empty());
+        assert!(plugins.set_on(LAYER_TOOLBOX.to_owned(), true));
+        assert!(plugins.layer_filters().is_empty());
+        assert!(plugins.set_switch(format!("{LAYER_TOOLBOX}.filter_layers"), true));
+        let offered = plugins.layer_filters();
+        assert_eq!(offered.len(), 38);
+        assert_eq!(offered.iter().filter(|f| f.group == "Colour").count(), 11);
+        let names = |range: std::ops::Range<usize>| offered[range].iter().map(|f| f.label.clone()).collect::<Vec<_>>();
+        assert_eq!(names(0..3), ["Brightness", "Contrast", "Exposure"]);
+        assert_eq!(names(8..11), ["Hue", "Curves", "Gradient Map"]);
+        assert_eq!(names(35..38), ["Direction", "Zoom", "Spin"]);
+        // each offered as a layer, none under Adjustments
+        assert!(plugins.filters().iter().all(|f| !offered.iter().any(|o| o.id == f.id)));
+        let Some(s) = crate::tests::session(32, 32) else { return };
+        s.use_plugins(Arc::clone(&plugins));
+        s.set_color(1.0, 0.0, 0.0);
+        let base = s.layers().last().unwrap().id;
+        assert!(s.fill_layer(base));
+        let shown = |s: &crate::CanvasSession| crate::tests::pixel(s, 16, 16);
+        assert_eq!(shown(&s), [255, 0, 0, 255]);
+        // an Invert layer: all of it as it starts, red to cyan
+        let layer = s.add_filter_layer(INVERT.to_owned());
+        assert_ne!(layer, 0);
+        let row = s.layers().into_iter().find(|l| l.id == layer).unwrap();
+        assert_eq!((row.current, row.filter.as_deref()), (true, Some("Invert")));
+        assert_eq!(shown(&s), [0, 255, 255, 255]);
+        // its settings: the value shows as it is set, Apply keeps it as one step
+        assert!(s.filter_layer_settings());
+        let panel = s.adjustment_shown().plugin.unwrap();
+        assert_eq!((panel.name.as_str(), panel.controls.len()), ("Invert", 1));
+        let key = format!("{INVERT}.value");
+        let landed = s.plugin_filter_slider(key.clone(), 0.0, false).unwrap();
+        assert!(landed.abs() < 1e-5, "{landed}");
+        let grey = shown(&s);
+        assert!(grey[..3].iter().all(|c| c.abs_diff(128) <= 1), "half inverted: {grey:?}");
+        assert!(s.adjustment_end(true));
+        assert_eq!(s.undo().as_deref(), Some("Filter Settings"));
+        assert_eq!(shown(&s), [0, 255, 255, 255], "undone, as it was");
+        // Cancel puts it back
+        assert!(s.filter_layer_settings());
+        let landed = s.plugin_filter_slider(key, -1.0, true).unwrap();
+        assert!((landed + 1.0).abs() < 1e-5, "{landed}");
+        assert_eq!(shown(&s), [255, 0, 0, 255]);
+        assert!(s.adjustment_end(false));
+        assert_eq!(shown(&s), [0, 255, 255, 255]);
+        // merged down, its filter goes into the layer below
+        assert!(row.can_merge);
+        // with the feature off, the layer shows nothing, its value kept
+        assert!(plugins.set_switch(format!("{LAYER_TOOLBOX}.filter_layers"), false));
+        s.use_plugins(Arc::clone(&plugins));
+        assert_eq!(shown(&s), [255, 0, 0, 255]);
+        assert!(!s.filter_layer_settings());
+        assert!(plugins.set_switch(format!("{LAYER_TOOLBOX}.filter_layers"), true));
+        s.use_plugins(Arc::clone(&plugins));
+        assert_eq!(shown(&s), [0, 255, 255, 255]);
+        // merged down: the layer below inverted, the filter layer gone, all as shown before
+        let own = |s: &crate::CanvasSession| {
+            let px = s.shared.lock().layer_pixels(procraft_engine::document::LayerId(base)).unwrap();
+            px[4 * (16 * 32 + 16)..4 * (16 * 32 + 16) + 4].to_vec()
+        };
+        assert_eq!(own(&s), [255, 0, 0, 255]);
+        assert!(s.merge_down(layer));
+        assert!(s.layers().iter().all(|l| l.id != layer));
+        assert_eq!(own(&s), [0, 255, 255, 255], "the layer below took the filter");
+        assert_eq!(shown(&s), [0, 255, 255, 255]);
+        // undone, the layer below as it was and the filter layer over it again
+        s.undo();
+        assert_eq!(own(&s), [255, 0, 0, 255], "the layer below as it was");
+        assert_eq!(shown(&s), [0, 255, 255, 255]);
+        // Curves: the app's Curves panel on the layer, with alpha; red turned over shows black
+        s.delete_layer(layer);
+        assert_eq!(shown(&s), [255, 0, 0, 255]);
+        let curves = s.add_filter_layer("io.github.artcraftandroid.layer-toolbox.curves".to_owned());
+        assert_ne!(curves, 0);
+        assert_eq!(shown(&s), [255, 0, 0, 255], "straight curves change nothing");
+        assert!(s.filter_layer_settings());
+        let open = s.adjustment_shown();
+        assert_eq!((open.adjustment, open.curve_channels, open.plugin), (Some(crate::Adjustment::Curves), 5, None));
+        s.adjustment_curve_channel(1);
+        s.adjustment_curve_move(0, 0.0, 1.0);
+        s.adjustment_curve_move(1, 1.0, 0.0);
+        assert_eq!(shown(&s), [0, 0, 0, 255]);
+        assert!(s.adjustment_end(true));
+        assert_eq!(s.undo().as_deref(), Some("Filter Settings"));
+        assert_eq!(shown(&s), [255, 0, 0, 255]);
+        // Gradient Map: red's lightness (0.30) through black, grey and white
+        s.delete_layer(curves);
+        let mapped = s.add_filter_layer("io.github.artcraftandroid.layer-toolbox.gradient_map".to_owned());
+        assert_ne!(mapped, 0);
+        let grey = shown(&s);
+        assert!(grey[..3].iter().all(|c| c.abs_diff(77) <= 2), "{grey:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn each_bundled_filter_layer_s_code_holds_up_and_reads_within_its_reach() {
+        let dir = store("bundled-filter-layer-codes");
+        let plugins = app_at(&dir);
+        assert!(plugins.set_on(LAYER_TOOLBOX.to_owned(), true));
+        assert!(plugins.set_switch(format!("{LAYER_TOOLBOX}.filter_layers"), true));
+        let defs = plugins.layer_filter_defs();
+        assert_eq!(defs.len(), 38);
+        for (name, def) in &defs {
+            let keys = crate::plugin_file::value_names(&def.values);
+            let mut keys = keys;
+            keys.extend(def.touch.iter().flat_map(|t| t.keys()).map(|k| (*k).to_owned()));
+            let read = if def.editor.is_some() {
+                procraft_gpu::read_layer_table_filter
+            } else {
+                procraft_gpu::read_layer_filter
+            };
+            let code = read(&def.text, &keys);
+            assert!(code.is_ok(), "{name}: {:?}", code.err());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3835,7 +4054,7 @@ mod tests {
         assert_eq!(next.plugins().len(), crate::bundled::BUNDLED.len() - 2);
         let mut newer = all_bundled();
         newer.retain(|(name, _)| *name != "layer-toolbox");
-        newer.push(("layer-toolbox", bundled_file("layer-toolbox", "1.1.0")));
+        newer.push(("layer-toolbox", bundled_file("layer-toolbox", "9.0.0")));
         assert!(!has(&app_with(&dir, &newer), EFFECTS));
         // imported again, it is as any import: off until turned on, and on once it is
         assert_eq!(next.install(bundled_file("layer-toolbox", "1.0.0")), None);
@@ -3857,21 +4076,21 @@ mod tests {
         assert!(plugins.set_on(COLORDROP.to_owned(), true));
         assert_eq!(plugins.set_slider("fill_gap".to_owned(), 7.0), Some(7.0));
         let lines = plugins.kept_lines();
-        // the next comes with touch offset, and newer ones of these two
+        // the next comes with touch offset, and newer ones of these two (newer than any the app has come with)
         let mut next = all_bundled();
         next.retain(|(name, _)| !["layer-toolbox", "colour-tools"].contains(name));
-        next.push(("layer-toolbox", bundled_file("layer-toolbox", "1.1.0")));
-        next.push(("colour-tools", bundled_file("colour-tools", "1.0.1")));
+        next.push(("layer-toolbox", bundled_file("layer-toolbox", "9.0.0")));
+        next.push(("colour-tools", bundled_file("colour-tools", "9.0.1")));
         let updated = app_with(&dir, &next);
         read_lines(&updated, &lines);
         assert!(!card(&updated, TOUCH).on);
         let (effects, colordrop) = (card(&updated, EFFECTS), card(&updated, COLORDROP));
-        assert_eq!((effects.version.as_str(), effects.on), ("1.1.0", true));
-        assert_eq!((colordrop.version.as_str(), colordrop.on), ("1.0.1", true));
+        assert_eq!((effects.version.as_str(), effects.on), ("9.0.0", true));
+        assert_eq!((colordrop.version.as_str(), colordrop.on), ("9.0.1", true));
         assert_eq!(slider_value(&updated, "fill_gap"), 7.0);
         // one newer than the app's stays as it is
         let older = app_at(&dir);
-        assert_eq!(card(&older, EFFECTS).version, "1.1.0");
+        assert_eq!(card(&older, EFFECTS).version, "9.0.0");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
