@@ -1449,11 +1449,13 @@ fn draw_samples(
     guide: &procraft_engine::guide::Guide,
     ahead_later: bool,
 ) -> bool {
-    // a dual brush's second, as its stamps come (no tip of its own); holding its start, laid again
-    // once that is known
+    // a dual brush's second, as its stamps come (no tip of its own); laid again once its first
+    // stamps turn to the way it goes, or (holding its start) once that is known, as the stroke's
+    // own are: else its end found them changed and laid all of it again, a second or more after
+    // a long stroke's lift on a tablet
     if let Some(second) = second {
         let added = second.add(samples);
-        if second.holds_start() && second.take_turned() {
+        if second.take_turned() {
             canvas.replace_second_stamps(&guide::mirrored(guide, &second.placed_stamps()));
         } else {
             canvas.add_second_stamps(&guide::mirrored(guide, &added));

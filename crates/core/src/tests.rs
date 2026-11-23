@@ -3771,6 +3771,82 @@ fn a_dual_brush_built_up_by_its_rule_ends_a_long_stroke_laying_only_the_rest_as_
     }
 }
 
+/// A dual brush whose second turns its stamps the way the stroke goes (57 of the library's 140) ends
+/// a long stroke laying only what follows what it laid, as laid whole: its second's first stamps,
+/// laid before the stroke had a way to go, turned with it once it had one, and the stroke's end
+/// found them changed and laid all of the second again. On a tablet that held the screen up for
+/// half a second after a big brush's lift (Verbena: some 4700 stamps laid again, frames 67 to 128
+/// ms apart). Dry ones (a second built up by its rule, carried from lot to lot) come out bit for
+/// bit; one whose paint is laid in place first lays its second by its rule in lots rounded apart,
+/// as such a dual brush's second always ended: within a level, here and there.
+#[test]
+fn a_dual_brush_whose_second_turns_with_the_stroke_ends_laying_only_the_rest() {
+    let side = 384;
+    let point = |k: usize| PenSample {
+        pressure: 0.4 + 0.5 * (k as f32 * 0.05).sin().abs(),
+        ..sample(
+            20.0 + (k % 220) as f32 * 1.6,
+            70.0 + (k / 220) as f32 * 120.0 + (k as f32 * 0.04).sin() * 40.0,
+            k as f64 * 4.17,
+        )
+    };
+    let samples = 700;
+    for name in ["Verbena", "Torrent", "Quinn", "Easterly"] {
+        let ended = |whole: bool| -> Option<(Vec<u8>, u64, u64, bool)> {
+            let s = session(side, side)?;
+            let (set, index) = library_brush(&s, |b| b.name == name)?;
+            let wet = {
+                let mut st = s.shared.lock();
+                let brush = &mut st.library[set as usize].brushes[index as usize];
+                assert!(brush.secondary.as_deref().is_some_and(|b| b.shape.follow > 0.0), "{name}'s second turns");
+                // (an end taper reaching back over what was laid lays that again)
+                brush.pen_taper.end = 0.0;
+                if let Some(second) = brush.secondary.as_deref_mut() {
+                    second.pen_taper.end = 0.0;
+                }
+                brush.mixes_wet() || brush.laid_in_place()
+            };
+            assert!(s.select_brush(set, index));
+            s.set_brush_size(0.45);
+            s.set_color(0.2, 0.3, 0.7);
+            s.shared.lock().canvas.as_mut()?.lay_ends_whole(whole);
+            s.stroke_begin(PointerKind::Stylus, vec![point(0)]);
+            for e in 1..samples / 2 {
+                s.stroke_add(vec![point(2 * e - 1), point(2 * e)]);
+                if e.is_multiple_of(2) {
+                    picture(&s);
+                }
+            }
+            picture(&s);
+            assert!(s.shared.lock().second.is_some(), "{name} is a dual brush");
+            let before = s.shared.lock().canvas.as_ref()?.stamps_queued();
+            s.stroke_end(vec![point(samples - 1)]);
+            picture(&s);
+            let sent = s.shared.lock().canvas.as_ref()?.stamps_queued() - before;
+            let current = s.layers().iter().find(|l| l.current).map_or(0, |l| l.id);
+            Some((layer_rgba(&s, current), sent, before, wet))
+        };
+        let (Some((whole, sent_whole, _, wet)), Some((rest, sent_rest, during, _))) = (ended(true), ended(false))
+        else {
+            continue;
+        };
+        let (most, count) = differ(&whole, &rest);
+        println!(
+            "{name}: at its end {sent_rest} stamps laid against {sent_whole} laid whole ({during} while drawn); \
+             {count} channels differ, by {most} at most"
+        );
+        assert!(whole.iter().skip(3).step_by(4).any(|&a| a > 0), "{name} drew nothing");
+        if wet {
+            // (a level here and there: at most one channel in five hundred)
+            assert!(most <= 1 && count * 500 <= whole.len(), "{name}: {count} channels differ, by {most} at most");
+        } else {
+            assert_eq!((most, count), (0, 0), "{name}: ended unlike laid whole");
+        }
+        // the end lays a few stamps, not the stroke again
+        assert!(sent_rest * 10 < sent_whole, "{name}: {sent_rest} stamps laid at its end, against {sent_whole} whole");
+    }
+}
+
 /// A stroke shown with a tip whose start taper is a classic one (its first stamps eased over the
 /// points around them, so they change as the next points come) holds those back until they no
 /// longer change, showing them in its tip meanwhile: the stroke shows as far as the pen has come,
@@ -4352,8 +4428,9 @@ fn an_autosave_after_a_stroke_waits_for_the_frames_to_lay_its_end() {
     let Some((set, index)) = library_brush(&s, |b| b.name == "Easterly") else { return };
     assert!(s.select_brush(set, index));
     s.set_brush_size(1.0);
-    // the end laid a piece at each frame
+    // the end laid whole again (as one its end taper reaches back over is), a piece at each frame
     s.shared.lock().canvas.as_mut().unwrap().set_relay_at_once(Duration::ZERO);
+    s.shared.lock().canvas.as_mut().unwrap().lay_ends_whole(true);
     let gpu = s.shared.lock().gpu.clone().unwrap();
     let view = window_view(&s, 512);
     let frame = || {
@@ -8016,8 +8093,9 @@ fn a_time_lapse_frame_is_taken_by_the_frame_that_lays_a_strokes_end() {
     let Some((set, index)) = library_brush(&s, |b| b.name == "Easterly") else { return };
     assert!(s.select_brush(set, index));
     s.set_brush_size(1.0);
-    // the end laid a piece at each frame
+    // the end laid whole again (as one its end taper reaches back over is), a piece at each frame
     s.shared.lock().canvas.as_mut().unwrap().set_relay_at_once(Duration::ZERO);
+    s.shared.lock().canvas.as_mut().unwrap().lay_ends_whole(true);
     let gpu = s.shared.lock().gpu.clone().unwrap();
     let view = window_view(&s, 512);
     let frame = || {
@@ -8088,11 +8166,13 @@ fn a_time_lapse_frame_waits_on_slow_frames_and_lays_nothing_at_once() {
     let Some((set, index)) = library_brush(&s, |b| b.name == "Easterly") else { return };
     assert!(s.select_brush(set, index));
     s.set_brush_size(0.5);
-    // the end laid a stamp at each frame, the frames drawn slowly
+    // the end laid whole again (as one its end taper reaches back over is), a stamp at each frame,
+    // the frames drawn slowly
     {
         let mut st = s.shared.lock();
         let canvas = st.canvas.as_mut().unwrap();
         canvas.set_relay_at_once(Duration::ZERO);
+        canvas.lay_ends_whole(true);
         canvas.set_work_at_once(1);
     }
     let gpu = s.shared.lock().gpu.clone().unwrap();
@@ -8160,8 +8240,9 @@ fn the_reference_windows_read_of_the_canvas_leaves_a_strokes_end_to_the_frames()
     let Some((set, index)) = library_brush(&s, |b| b.name == "Easterly") else { return };
     assert!(s.select_brush(set, index));
     s.set_brush_size(1.0);
-    // the end laid a piece at each frame
+    // the end laid whole again (as one its end taper reaches back over is), a piece at each frame
     s.shared.lock().canvas.as_mut().unwrap().set_relay_at_once(Duration::ZERO);
+    s.shared.lock().canvas.as_mut().unwrap().lay_ends_whole(true);
     let gpu = s.shared.lock().gpu.clone().unwrap();
     let view = window_view(&s, 512);
     let frame = || {
@@ -8211,8 +8292,9 @@ fn a_time_lapse_frame_waits_for_an_ended_strokes_end_not_the_stroke_begun_after_
     let Some((set, index)) = library_brush(&s, |b| b.name == "Easterly") else { return };
     assert!(s.select_brush(set, index));
     s.set_brush_size(1.0);
-    // the end laid a piece at each frame
+    // the end laid whole again (as one its end taper reaches back over is), a piece at each frame
     s.shared.lock().canvas.as_mut().unwrap().set_relay_at_once(Duration::ZERO);
+    s.shared.lock().canvas.as_mut().unwrap().lay_ends_whole(true);
     let gpu = s.shared.lock().gpu.clone().unwrap();
     let view = window_view(&s, 512);
     let frame = || {
