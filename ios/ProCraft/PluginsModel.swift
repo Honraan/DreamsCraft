@@ -92,6 +92,8 @@ final class PluginsModel {
     private(set) var movedNotice: String?
     /// A plugin file waiting on the one screen that asks about it, and what it holds.
     private(set) var offer: PluginOffer?
+    /// A plugin whose Remove was tapped, waiting on the alert that asks first.
+    var removing: PluginInfo?
     @ObservationIgnored private var offered: Data?
     @ObservationIgnored private var kept: [String: String]
     /// What the artwork open does about a change.

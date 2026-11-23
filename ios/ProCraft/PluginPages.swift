@@ -167,11 +167,8 @@ private struct PluginCard: View {
             RowView(row: .act(plugin.on ? "Turn off" : "Turn on", action: { plugins.setOn(plugin, !plugin.on) }))
             if plugin.source == .file {
                 line
-                RowView(row: .act("Remove", action: {
-                    if !plugins.remove(plugin) {
-                        model.showNotice("This plugin couldn't be removed.", warning: true)
-                    }
-                }))
+                // asked first, as on the other apps: the plugin and its settings go
+                RowView(row: .act("Remove", action: { plugins.removing = plugin }))
             }
         }
         .background(shape.fill(Pc.actionsGroup))
@@ -288,6 +285,8 @@ struct PluginAlerts: View {
     @State private var plugins = PluginsModel.shared
     /// What went wrong keeping a file.
     @State private var failed: String?
+    /// A plugin asked about that couldn't be removed.
+    @State private var notRemoved = false
 
     var body: some View {
         ZStack {
@@ -311,6 +310,30 @@ struct PluginAlerts: View {
                 },
                 onCancel: { failed = nil },
                 onAction: { failed = nil }
+            )
+            AlertView(
+                content: plugins.removing.map {
+                    AlertContent(
+                        title: "Remove this plugin?",
+                        message: "“\($0.name)” goes, and its settings with it.",
+                        action: "Remove",
+                        icon: PcIcons.trash
+                    )
+                },
+                onCancel: { plugins.removing = nil },
+                onAction: {
+                    if let plugin = plugins.removing, !plugins.remove(plugin) {
+                        notRemoved = true
+                    }
+                    plugins.removing = nil
+                }
+            )
+            AlertView(
+                content: notRemoved
+                    ? AlertContent(title: "This plugin couldn't be removed.", action: "OK", destructive: false, alone: true)
+                    : nil,
+                onCancel: { notRemoved = false },
+                onAction: { notRemoved = false }
             )
         }
     }
