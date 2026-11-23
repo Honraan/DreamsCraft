@@ -877,9 +877,111 @@ pub fn zip_file_kind(path: String) -> ZipKind {
     }
 }
 
+/// Whether `name` is one of the files an artwork as one file holds (see [`unpack_artwork_file`]),
+/// inside its folder.
+fn artwork_file_entry(name: &str) -> bool {
+    let inside =
+        !name.contains('\\') && !name.contains(':') && name.split('/').all(|p| !p.is_empty() && p != "." && p != "..");
+    inside
+        && (name == ARTWORK_FILE
+            || name == "thumbnail.png"
+            || (name.starts_with("layers/") && name.ends_with(".png"))
+            || (name.starts_with("timelapse/") && (name.ends_with(".jpg") || name == "timelapse/off"))
+            || name == "about/photo.jpg"
+            || name == "about/signature.json")
+}
+
+/// An artwork as one file, as early versions of the app shared it (its folder: the document, every
+/// layer, the thumbnail and the time-lapse, in a zip at `path`), unzipped into the empty folder
+/// `dir`: only the files an artwork has are taken, read an entry at a time, none outside the
+/// folder. False if it isn't one (no `artwork.json` in it), or couldn't be written (nothing then
+/// kept in `dir`). Still read; artworks are shared as packages now.
+#[uniffi::export]
+pub fn unpack_artwork_file(path: String, dir: String) -> bool {
+    let Some(zip) = procraft_engine::zip::ZipReader::open(Path::new(&path)) else { return false };
+    if !zip.names().any(|n| n == ARTWORK_FILE) {
+        return false;
+    }
+    let root = Path::new(&dir);
+    // the folder isn't an artwork until it is whole (taken away if the app stops meanwhile)
+    let importing = Importing::begin(root);
+    let wrote = zip.names().filter(|n| artwork_file_entry(n)).try_for_each(|name| {
+        let bytes = zip.read(name).ok_or(())?;
+        let to = root.join(name);
+        to.parent().map_or(Ok(()), fs::create_dir_all).map_err(|_| ())?;
+        fs::write(to, bytes).map_err(|_| ())
+    });
+    if wrote.is_err() {
+        if let Ok(entries) = fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let _ = if path.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) };
+            }
+        }
+        return false;
+    }
+    importing.done();
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_artwork_file_unzips_only_an_artworks_files() {
+        let dir = std::env::temp_dir().join(format!("procraft-artwork-file-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str, entries: &[(&str, &str)]| {
+            let mut w = procraft_engine::zip::ZipWriter::new();
+            for (n, b) in entries {
+                w.add(n, b.as_bytes());
+            }
+            let path = dir.join(name);
+            fs::write(&path, w.finish()).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        let old = file(
+            "old.zip",
+            &[
+                ("artwork.json", "{}"),
+                ("layers/1.png", "one"),
+                ("layers/2.png", "two"),
+                ("thumbnail.png", "thumb"),
+                ("timelapse/0001.jpg", "frame"),
+                ("../escaped.png", "no"),
+                ("layers/../../up.png", "no"),
+                ("notes.txt", "no"),
+            ],
+        );
+        let into = dir.join("artwork");
+        fs::create_dir_all(&into).unwrap();
+        assert!(unpack_artwork_file(old, into.to_string_lossy().into_owned()));
+        let mut kept: Vec<String> = Vec::new();
+        for sub in ["", "layers", "timelapse"] {
+            for e in fs::read_dir(into.join(sub)).unwrap().flatten() {
+                if e.path().is_file() {
+                    kept.push(format!("{sub}/{}", e.file_name().to_string_lossy()));
+                }
+            }
+        }
+        kept.sort();
+        assert_eq!(kept, ["/artwork.json", "/thumbnail.png", "layers/1.png", "layers/2.png", "timelapse/0001.jpg"]);
+        assert_eq!(fs::read(into.join("layers/2.png")).unwrap(), b"two");
+        assert!(!dir.join("escaped.png").exists() && !dir.join("up.png").exists());
+        // a package, or any other zip, isn't one: nothing written
+        let package = file("package.zip", &[("Document.archive", "x"), ("1A2B/Chunk.lz4", "x")]);
+        let empty = dir.join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        assert!(!unpack_artwork_file(package, empty.to_string_lossy().into_owned()));
+        assert_eq!(fs::read_dir(&empty).unwrap().count(), 0);
+        assert!(!unpack_artwork_file(
+            dir.join("missing.zip").to_string_lossy().into_owned(),
+            empty.to_string_lossy().into_owned()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_zip_file_is_told_by_its_names() {

@@ -6,6 +6,11 @@ import UIKit.UIGestureRecognizerSubclass
 /// further than this.
 private let editTapSeconds = 0.3
 private let editTapSlop: CGFloat = 10
+/// Taps on the text count on from the last when they come this soon after it and this near it; one
+/// held longer than `longestTap` is no tap.
+private let tapsApart = 0.3
+private let tapsReach: CGFloat = 100
+private let longestTap = 0.5
 import UniformTypeIdentifiers
 
 private func themed(_ dark: UInt32, _ light: UInt32) -> Color {
@@ -327,7 +332,36 @@ final class TextTool {
         guard let bytes = url.readPicked(), let typeface = importTextFont(bytes: bytes, fileName: url.lastPathComponent) else { return }
         families = textTypefaces()
         restyle(.font(family: typeface.family))
-        model.showNotice("Font imported")
+        model.showDone("Font imported")
+    }
+
+    /// Letters chosen by `taps` quick taps in a row at window point `p` on the text: one puts the
+    /// caret at the place nearest it, two choose the word there, three all of it; the field's too, so
+    /// what is typed goes there.
+    func tap(at p: CGPoint, taps: Int) {
+        let pixels = model.pixels
+        guard let at = model.windowToCanvas(CGPoint(x: p.x * pixels, y: p.y * pixels)),
+              let chosen = model.session.textTap(x: Float(at.x), y: Float(at.y), taps: UInt32(max(taps, 1))),
+              chosen.count == 2 else { return }
+        let start = Int(textIndexToUtf16(text: field, index: chosen[0]))
+        let end = Int(textIndexToUtf16(text: field, index: chosen[1]))
+        selection = NSRange(location: min(start, end), length: abs(end - start))
+        refreshLook()
+    }
+
+    /// The text's box on the window in UIKit's own points, the smallest upright rectangle around it:
+    /// what the Pencil writes into.
+    func boxOnWindow() -> CGRect? {
+        guard let info else { return nil }
+        let b = bounds(info)
+        let corners = [
+            CGPoint(x: b.minX, y: b.minY), CGPoint(x: b.maxX, y: b.minY),
+            CGPoint(x: b.maxX, y: b.maxY), CGPoint(x: b.minX, y: b.maxY),
+        ].map { model.canvasToWindow($0) }
+        let xs = corners.map(\.x)
+        let ys = corners.map(\.y)
+        guard let left = xs.min(), let right = xs.max(), let top = ys.min(), let bottom = ys.max() else { return nil }
+        return Interface.shared.onWindow(CGRect(x: left, y: top, width: right - left, height: bottom - top))
     }
 
     /// Moves the text by a drag between two window points.
@@ -373,7 +407,7 @@ final class TextTool {
             info = text
         }
         render()
-        model.showNotice((undo ? "Undo " : "Redo ") + name)
+        model.showNotice((undo ? "Undo " : "Redo ") + name, kind: .step)
         model.refresh()
         return true
     }
@@ -416,9 +450,19 @@ private struct TextInputHost: UIViewRepresentable {
     let onRedo: () -> Void
 
     /// Undo and redo are the app's, not the field's (a width change goes back a step at a time).
+    /// Handwriting with the Pencil over the text's box comes here too: the interaction for it is on
+    /// the window, where the box is drawn.
     final class Field: UITextView {
         var onUndo: () -> Void = {}
         var onRedo: () -> Void = {}
+        var scribble: UIInteraction?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            guard let scribble else { return }
+            scribble.view?.removeInteraction(scribble)
+            window?.addInteraction(scribble)
+        }
 
         override var keyCommands: [UIKeyCommand]? {
             let commands = [
@@ -442,9 +486,12 @@ private struct TextInputHost: UIViewRepresentable {
         let tool: TextTool
         /// The field is being told what the tool holds: what it says back is its own doing.
         var updating = false
+        /// What the Pencil's handwriting asks of the text (its interaction keeps it weakly).
+        let scribble: TextScribble
 
         init(tool: TextTool) {
             self.tool = tool
+            scribble = TextScribble(tool: tool)
         }
 
         func textViewDidChange(_ view: UITextView) {
@@ -491,7 +538,16 @@ private struct TextInputHost: UIViewRepresentable {
         view.autocorrectionType = .no
         view.delegate = context.coordinator
         view.inputAccessoryView = bar(context.coordinator)
+        context.coordinator.scribble.field = view
+        view.scribble = UIIndirectScribbleInteraction(delegate: context.coordinator.scribble)
         return view
+    }
+
+    static func dismantleUIView(_ view: UITextView, coordinator _: Coordinator) {
+        if let field = view as? Field, let scribble = field.scribble {
+            scribble.view?.removeInteraction(scribble)
+            field.scribble = nil
+        }
     }
 
     func updateUIView(_ view: UITextView, context: Context) {
@@ -530,6 +586,14 @@ struct TextEditing: View {
     @State private var outside = false
     @State private var dragging = false
     @State private var last = CGPoint.zero
+    /// Where and when the touch began, and whether the text has followed it (past the slop).
+    @State private var start = CGPoint.zero
+    @State private var downAt = Date()
+    @State private var moving = false
+    /// Quick taps on the text one after another: how many, and when and where the last was let go.
+    @State private var taps = 0
+    @State private var lastUp = Date.distantPast
+    @State private var lastAt = CGPoint.zero
 
     /// The text's box in the window, as the smallest upright rectangle around it.
     private func windowBox(_ tool: TextTool, _ info: TextInfo) -> CGRect {
@@ -549,9 +613,13 @@ struct TextEditing: View {
     }
 
     private func touched(_ drag: DragGesture.Value, _ tool: TextTool, _ info: TextInfo) {
-        if !touching {
+        // (a touch taken away, as the Pencil's handwriting does, never ends: the next one begins anew)
+        if !touching || drag.startLocation != start {
             touching = true
             dragging = false
+            moving = false
+            start = drag.startLocation
+            downAt = Date()
             last = drag.startLocation
             side = tool.side(at: drag.startLocation)
             outside = side == nil && !windowBox(tool, info).contains(drag.startLocation)
@@ -564,11 +632,30 @@ struct TextEditing: View {
                 tool.dragSide(to: drag.location)
             }
         } else if !outside {
-            // a touch on the text brings the keyboard back if it was put away
+            // a touch on the text brings the keyboard back if it was put away; dragged past the
+            // slop the text follows, let go before that it is a tap that chooses letters
             tool.keyboard = true
-            tool.move(from: last, to: drag.location)
-            last = drag.location
+            if !moving, hypot(drag.translation.width, drag.translation.height) > editTapSlop {
+                moving = true
+            }
+            if moving {
+                tool.move(from: last, to: drag.location)
+                last = drag.location
+            }
         }
+    }
+
+    /// A tap on the text, counted on from the last: one puts the caret there, two choose the word,
+    /// three all of it.
+    private func tappedText(_ tool: TextTool) {
+        let now = Date()
+        guard now.timeIntervalSince(downAt) <= longestTap else { return }
+        let again = (1 ... 2).contains(taps) && downAt.timeIntervalSince(lastUp) <= tapsApart
+            && hypot(start.x - lastAt.x, start.y - lastAt.y) <= tapsReach
+        taps = again ? taps + 1 : 1
+        lastUp = now
+        lastAt = start
+        tool.tap(at: start, taps: taps)
     }
 
     private func letGo(_ tool: TextTool) {
@@ -579,10 +666,13 @@ struct TextEditing: View {
             } else {
                 // a tap on the dot is a tap on the text
                 tool.keyboard = true
+                tappedText(tool)
             }
         } else if outside, fingers.most <= 1 {
             // one finger there ends the edit, keeping it
             tool.end(keep: true)
+        } else if !outside, !moving, fingers.most <= 1 {
+            tappedText(tool)
         }
         side = nil
     }
@@ -1146,4 +1236,60 @@ private struct DesignRow: View {
         .padding(.horizontal, 16)
         .frame(height: 58.5)
     }
+}
+
+/// Handwriting with the Pencil over the text being edited (Scribble): the box on the canvas is what
+/// is written into, and the hidden field takes the letters, as it takes the keyboard's.
+final class TextScribble: NSObject, UIIndirectScribbleInteractionDelegate {
+    typealias ElementIdentifier = String
+
+    private static let element = "text"
+    let tool: TextTool
+    weak var field: UITextView?
+
+    init(tool: TextTool) {
+        self.tool = tool
+    }
+
+    func indirectScribbleInteraction(
+        _: UIInteraction, requestElementsIn rect: CGRect, completion: @escaping ([String]) -> Void
+    ) {
+        // not while the style sheet has the keyboard's place
+        guard !tool.styleOpen, let box = tool.boxOnWindow(), box.intersects(rect) else {
+            completion([])
+            return
+        }
+        completion([Self.element])
+    }
+
+    func indirectScribbleInteraction(_: UIInteraction, isElementFocused _: String) -> Bool {
+        field?.isFirstResponder == true
+    }
+
+    func indirectScribbleInteraction(_: UIInteraction, frameForElement _: String) -> CGRect {
+        tool.boxOnWindow() ?? .zero
+    }
+
+    func indirectScribbleInteraction(
+        _: UIInteraction, focusElementIfNeeded _: String, referencePoint _: CGPoint,
+        completion: @escaping ((UIResponder & UITextInput)?) -> Void
+    ) {
+        guard let field else {
+            completion(nil)
+            return
+        }
+        tool.keyboard = true
+        if !field.isFirstResponder {
+            field.becomeFirstResponder()
+        }
+        completion(field)
+    }
+
+    func indirectScribbleInteraction(_: UIInteraction, shouldDelayFocusForElement _: String) -> Bool {
+        false
+    }
+
+    func indirectScribbleInteraction(_: UIInteraction, willBeginWritingInElement _: String) {}
+
+    func indirectScribbleInteraction(_: UIInteraction, didFinishWritingInElement _: String) {}
 }

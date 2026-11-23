@@ -12,6 +12,12 @@
 #   IOS_CERTIFICATE_PASSWORD   that .p12's password
 #   IOS_PROVISIONING_PROFILE   base64 of a .mobileprovision whose App ID covers the app's bundle id
 #
+# and, for an app built with its Recent artwork widget (PROCRAFT_WIDGET=YES, see ios/widget.yml):
+#
+#   IOS_WIDGET_PROVISIONING_PROFILE   base64 of the widget's own .mobileprovision (its App ID
+#                                     io.github.artcraftandroid.procraft.RecentWidget); without it
+#                                     the widget is left out and the app signed alone
+#
 # Usage: ios/sign-ipa.sh   (VERSION and DIST as ios/build-ipa.sh has them; the signed .ipa goes
 # to SIGNED_DIST, DIST if unset)
 #
@@ -78,8 +84,33 @@ plist "Set :application-identifier $TEAM.$BUNDLE" "$WORK/entitlements.plist"
 plist 'Delete :keychain-access-groups' "$WORK/entitlements.plist" 2>/dev/null || true
 
 cp "$WORK/profile.mobileprovision" "$APP/embedded.mobileprovision"
-# what is inside first, then the app with its entitlements
-find "$APP" -depth \( -name '*.framework' -o -name '*.dylib' -o -name '*.appex' \) -print0 |
+# the Recent artwork widget, an extension with a profile of its own: signed with it, or left out
+WIDGET="$APP/PlugIns/RecentWidget.appex"
+if [ -d "$WIDGET" ]; then
+  if [ -n "${IOS_WIDGET_PROVISIONING_PROFILE:-}" ]; then
+    printf '%s' "$IOS_WIDGET_PROVISIONING_PROFILE" | base64 --decode >"$WORK/widget.mobileprovision"
+    security cms -D -i "$WORK/widget.mobileprovision" >"$WORK/widget.plist"
+    WIDGET_APP_ID="$(plist 'Print :Entitlements:application-identifier' "$WORK/widget.plist")"
+    WIDGET_BUNDLE="$(plist 'Print :CFBundleIdentifier' "$WIDGET/Info.plist")"
+    case "$WIDGET_APP_ID" in
+      "$TEAM.$WIDGET_BUNDLE") ;;
+      *'.*') [[ "$TEAM.$WIDGET_BUNDLE" == "${WIDGET_APP_ID%\*}"* ]] || { echo "error: the widget's profile ($WIDGET_APP_ID) doesn't cover $WIDGET_BUNDLE" >&2; exit 1; } ;;
+      *) echo "error: the widget's profile ($WIDGET_APP_ID) doesn't cover $WIDGET_BUNDLE" >&2; exit 1 ;;
+    esac
+    /usr/libexec/PlistBuddy -x -c 'Print :Entitlements' "$WORK/widget.plist" >"$WORK/widget-entitlements.plist"
+    plist "Set :application-identifier $TEAM.$WIDGET_BUNDLE" "$WORK/widget-entitlements.plist"
+    plist 'Delete :keychain-access-groups' "$WORK/widget-entitlements.plist" 2>/dev/null || true
+    cp "$WORK/widget.mobileprovision" "$WIDGET/embedded.mobileprovision"
+    codesign --force --sign "$IDENTITY" --keychain "$KEYCHAIN" --timestamp=none \
+      --entitlements "$WORK/widget-entitlements.plist" "$WIDGET"
+  else
+    echo "no IOS_WIDGET_PROVISIONING_PROFILE: the app signed without its widget"
+    rm -rf "$WIDGET"
+    rmdir "$APP/PlugIns" 2>/dev/null || true
+  fi
+fi
+# what is inside first (the widget is signed above), then the app with its entitlements
+find "$APP" -depth \( -name '*.framework' -o -name '*.dylib' -o \( -name '*.appex' ! -name RecentWidget.appex \) \) -print0 |
   while IFS= read -r -d '' nested; do
     codesign --force --sign "$IDENTITY" --keychain "$KEYCHAIN" --timestamp=none "$nested"
   done

@@ -65,9 +65,35 @@ struct TopBar: View {
         // frosted: what the canvas has under it shows blurred
         .background {
             ZStack {
+                // the interface's frost (dark unless Light interface) whatever the system's
+                // appearance: a light one shows through the tint lighter than measured
                 Rectangle().fill(.ultraThinMaterial)
+                    .environment(\.colorScheme, Look.shared.light ? .light : .dark)
                 Pc.bar
             }
+        }
+        .modifier(ScaledAcross(k: Look.shared.scale(.topBar), height: Pc.barHeight))
+    }
+}
+
+/// A bar laid out at its own points `height` tall across the room it is given less its size, and
+/// shown `k` times as big from its top left (a plugin sizing that part of the interface): it takes
+/// the room it shows in.
+private struct ScaledAcross: ViewModifier {
+    let k: CGFloat
+    let height: CGFloat
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if k == 1 {
+            content
+        } else {
+            GeometryReader { room in
+                content
+                    .frame(width: room.size.width / k, height: height)
+                    .scaleEffect(k, anchor: .topLeading)
+            }
+            .frame(height: height * k)
         }
     }
 }
@@ -168,22 +194,32 @@ struct SideBar: View {
         // its glass reaches back to the window's edge however far it is stretched
         let reach = max(stretch, 0)
         let back: CGFloat = right ? 0 : -reach
+        // the slider tracks' windows in the glass, where it is laid (from `back`)
+        let windows = [sizeTrackTop, opacityTrackTop].map {
+            CGRect(x: x(sliderLeft, Pc.sliderWidth) - back, y: $0, width: Pc.sliderWidth, height: Pc.sliderHeight)
+        }
         ZStack(alignment: .topLeading) {
-            // frosted, as the top bar is
-            UnevenRoundedRectangle(cornerRadii: corners, style: .circular)
-                .fill(.ultraThinMaterial)
+            // frosted, as the top bar is; the tracks show what is behind them barely softened (not
+            // frosted), unless a plugin has them frosted as the bar is
+            SideBarGlass(corners: corners, windows: Look.shared.tracksFrosted ? [] : windows)
+                .fill(.ultraThinMaterial, style: FillStyle(eoFill: true))
+                .environment(\.colorScheme, Look.shared.light ? .light : .dark)
                 .frame(width: Pc.sideBarWidth + reach, height: Pc.sideBarHeight)
                 .offset(x: back)
                 .allowsHitTesting(false)
-            // translucent, with windows where the slider tracks are: they show what is behind
+            // translucent, with windows where the slider tracks are: they show what is behind,
+            // each with a darker hairline round it
             Canvas { context, size in
-                var shape = Path()
-                shape.addRoundedRect(in: CGRect(origin: .zero, size: size), cornerRadii: corners, style: .circular)
-                for top in [sizeTrackTop, opacityTrackTop] {
-                    let track = CGRect(x: x(sliderLeft, Pc.sliderWidth) - back, y: top, width: Pc.sliderWidth, height: Pc.sliderHeight)
-                    shape.addRoundedRect(in: track, cornerSize: CGSize(width: Pc.sliderCorner, height: Pc.sliderCorner), style: .circular)
+                let body = SideBarGlass(corners: corners, windows: windows).path(in: CGRect(origin: .zero, size: size))
+                context.fill(body, with: .color(fill), style: FillStyle(eoFill: true))
+                let edge = Pc.sliderEdgeWidth
+                var ring = Path()
+                for w in windows {
+                    let r = Pc.sliderCorner
+                    ring.addRoundedRect(in: w.insetBy(dx: -edge, dy: -edge), cornerSize: CGSize(width: r + edge, height: r + edge), style: .circular)
+                    ring.addRoundedRect(in: w, cornerSize: CGSize(width: r, height: r), style: .circular)
                 }
-                context.fill(shape, with: .color(fill), style: FillStyle(eoFill: true))
+                context.fill(ring, with: .color(Pc.sliderEdge), style: FillStyle(eoFill: true))
             }
             .frame(width: Pc.sideBarWidth + reach, height: Pc.sideBarHeight)
             .offset(x: back)
@@ -221,6 +257,7 @@ struct SideBar: View {
             }
         }
         .frame(width: Pc.sideBarWidth, height: Pc.sideBarHeight, alignment: .topLeading)
+        .modifier(ScaledSideBar(k: Look.shared.scale(.sideBar), right: right))
     }
 
     private func hooks(_ which: SliderPanel) -> SliderPanelHooks {
@@ -229,6 +266,35 @@ struct SideBar: View {
             hide: { model.sliderPanel = nil },
             up: { model.sliderPanel != nil }
         )
+    }
+}
+
+/// The side bar shown `k` times as big from its top corner against the screen's edge (`right`),
+/// as a plugin sizes it: it takes the room it shows in.
+private struct ScaledSideBar: ViewModifier {
+    let k: CGFloat
+    let right: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .scaleEffect(k, anchor: right ? .topTrailing : .topLeading)
+            .frame(width: Pc.sideBarWidth * k, height: Pc.sideBarHeight * k, alignment: right ? .topTrailing : .topLeading)
+    }
+}
+
+/// The side bar's glass: its body, square against the screen's edge and round on the far side
+/// (`corners`), with `windows` cut out of it (the slider tracks).
+private struct SideBarGlass: Shape {
+    let corners: RectangleCornerRadii
+    let windows: [CGRect]
+
+    func path(in rect: CGRect) -> Path {
+        var shape = Path()
+        shape.addRoundedRect(in: rect, cornerRadii: corners, style: .circular)
+        for w in windows {
+            shape.addRoundedRect(in: w, cornerSize: CGSize(width: Pc.sliderCorner, height: Pc.sliderCorner), style: .circular)
+        }
+        return shape
     }
 }
 
@@ -262,10 +328,11 @@ private struct ModifyButton: View {
         drag.time.timeIntervalSinceReferenceDate * 1000
     }
 
-    /// The touch at `drag` (on the window), in the bar's own points.
+    /// The touch at `drag` (on the window), in the bar's own points (a plugin may size it).
     private static func at(_ location: CGPoint) -> (x: Float, y: Float) {
         let p = Interface.shared.point(location)
-        return (Float(p.x), Float(p.y))
+        let k = Look.shared.scale(.sideBar)
+        return (Float(p.x / k), Float(p.y / k))
     }
 
     /// The touch moved: the bar moves if the core says so; moving it, or off the button, the press
@@ -342,16 +409,28 @@ extension CanvasModel {
     /// A touch on the modify button at (`x`, `y`) at `ms` (the side bar's points, on the window) in
     /// a window `windowHeight` tall: the core's drag, which says when it moves the bar.
     func sideBarDrag(x: Float, y: Float, ms: Double, windowHeight: CGFloat) -> SideBarDrag {
-        SideBarDrag(
-            x: x, y: y, ms: ms, right: AppSettings.shared.rightHanded, height: Float(windowHeight),
-            topBar: Float(Pc.barHeight), centre: sideBarCentre
+        // (in the bar's own points, as a plugin may size it)
+        let k = Look.shared.scale(.sideBar)
+        return SideBarDrag(
+            x: x, y: y, ms: ms, right: AppSettings.shared.rightHanded, height: Float(windowHeight / k),
+            topBar: Float(Pc.barShown / k), centre: sideBarCentre
         )
     }
 
-    /// The modify button's drag moved: the bar follows while it moves it.
+    /// Where the side bar goes down a window `height` tall, at its kept place: on the window, as
+    /// big as it shows.
+    func sideBarPlace(height: CGFloat) -> SideBarFit {
+        let k = Float(Look.shared.scale(.sideBar))
+        let fit = sideBarFit(height: Float(height) / k, topBar: Float(Pc.barShown) / k, centre: sideBarCentre)
+        return SideBarFit(top: fit.top * k, track: fit.track * k, highest: fit.highest * k, lowest: fit.lowest * k)
+    }
+
+    /// The modify button's drag moved: the bar follows while it moves it (on the window, as big as
+    /// it shows).
     func sideBarDragged(_ shown: SideBarShown) {
         if shown.state == .moving {
-            sideBarMoving = shown
+            let k = Float(Look.shared.scale(.sideBar))
+            sideBarMoving = SideBarShown(state: shown.state, top: shown.top * k, stretch: shown.stretch * k, centre: shown.centre)
         }
     }
 
@@ -469,7 +548,9 @@ private struct SliderPanelView: View {
             if Look.shared.light {
                 shape22.fill(sliderPanelFill)
             } else {
-                shape22.fill(.ultraThinMaterial).overlay(shape22.fill(sliderPanelFill))
+                shape22.fill(.ultraThinMaterial)
+                    .environment(\.colorScheme, .dark)
+                    .overlay(shape22.fill(sliderPanelFill))
             }
         }
         // a hairline rim, as measured
@@ -490,6 +571,14 @@ private final class SliderTouch {
     var moved = false
     var held = false
     var hold: DispatchWorkItem?
+    /// The notch the thumb was last pulled onto, if it is on one.
+    var notch: Float?
+    /// Where the slider is on the window, as last laid out.
+    var frame = CGRect.zero
+
+    func placed(_ frame: CGRect) {
+        self.frame = frame
+    }
 }
 
 /// An upright slider moved by dragging anywhere on it: the thumb follows the finger (relative,
@@ -512,7 +601,9 @@ struct BrushSlider: View {
 
     private static let notchWidth: CGFloat = 20
     private static let notchHeight: CGFloat = 4
-    private static let notchMark = Color(argb: 0x1AFF_FFFF)
+    /// How the thumb's shadow is drawn, the widest step first: worked out once, the same on either
+    /// look.
+    private static let thumbShadow = sideThumbShadow()
     /// A touch held this long without moving brings the panel up (seconds).
     private static let holdSeconds = 0.5
     /// A touch let go within this far of where it went down (points) is a tap: a finger's wobble
@@ -555,7 +646,14 @@ struct BrushSlider: View {
             for n in notches {
                 let y = inset + thumb.height / 2 + travel * CGFloat(1 - n)
                 let mark = CGRect(x: (size.width - bar.width) / 2, y: y - bar.height / 2, width: bar.width, height: bar.height)
-                context.fill(Path(roundedRect: mark, cornerRadius: bar.height / 2, style: .circular), with: .color(Self.notchMark))
+                context.fill(Path(roundedRect: mark, cornerRadius: bar.height / 2, style: .circular), with: .color(Pc.notchMark))
+            }
+            // the thumb's soft shadow, a point below it: under the thumb, only its rim shows
+            for step in Self.thumbShadow {
+                let grow = CGFloat(step.grow)
+                let shade = knobRect.insetBy(dx: -grow, dy: -grow).offsetBy(dx: 0, dy: CGFloat(step.down))
+                let r = max(thumb.height / 2 + grow, 0)
+                context.fill(Path(roundedRect: shade, cornerRadius: r, style: .circular), with: .color(Color.black.opacity(Double(step.alpha))))
             }
             context.fill(knob, with: .color(thumbColour))
             if notches.contains(where: { abs($0 - value) < 1e-4 }) {
@@ -564,6 +662,13 @@ struct BrushSlider: View {
             }
         }
         .frame(width: Pc.sliderWidth, height: Pc.sliderHeight)
+        // where it is on the window, for a notch to be felt where it is
+        .background {
+            GeometryReader { place in
+                let _ = touch.placed(place.frame(in: .global))
+                Color.clear
+            }
+        }
         .contentShape(Rectangle())
         .gesture(
             DragGesture(minimumDistance: 0)
@@ -578,6 +683,7 @@ struct BrushSlider: View {
                         t.panelWasUp = panel?.up() ?? false
                         t.moved = false
                         t.held = false
+                        t.notch = notches.first { abs($0 - value) < 1e-4 }
                         let hold = DispatchWorkItem { [panel] in
                             if t.began, !t.moved {
                                 t.held = true
@@ -597,7 +703,14 @@ struct BrushSlider: View {
                         // the farther out to the side the finger is, the finer the thumb follows
                         let across = Float(drag.location.x - Pc.sliderWidth / 2)
                         t.raw = min(max(t.raw - Float(dy / travel) * sideSliderDragShare(across: across), 0), 1)
-                        onChange(near(t.raw) ?? t.raw)
+                        let notch = near(t.raw)
+                        onChange(notch ?? t.raw)
+                        // pulled onto a notch, it is felt there (Apple Pencil Pro)
+                        if let notch, notch != t.notch {
+                            let y = Pc.thumbInset + Pc.thumbHeight / 2 + travel * CGFloat(1 - notch)
+                            PencilFeedback.canvas?.aligned(onWindow: CGPoint(x: t.frame.midX, y: t.frame.minY + y))
+                        }
+                        t.notch = notch
                     }
                 }
                 .onEnded { drag in

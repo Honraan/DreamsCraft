@@ -161,7 +161,7 @@ struct BrushStudio: View {
 
 /// The pages a dual brush's second part has: the first alone has the rest, which go for the pair.
 private let secondPages: Set<String> = [
-    "Stroke path", "Stabilization", "Taper", "Shape", "Grain", "Rendering", "Dynamics", "Stylus", "Properties",
+    "Stroke path", "Stabilization", "Taper", "Shape", "Grain", "Rendering", "Dynamics", "Apple Pencil", "Properties",
 ]
 
 /// The pages listed, by their place among all of them: fewer while a dual brush's second shows.
@@ -775,7 +775,8 @@ private struct StudioNameHeading: View {
 }
 
 /// The drawing pad's settings: preview size, the pad's colour, and clearing or resetting. It opens
-/// under the Drawing Pad button, centred on it but kept 14 in from the screen's sides (`width`).
+/// under the Drawing Pad button, centred on it but kept 14 in from the screen's sides (`width`),
+/// its arrow pointing up at the button.
 private struct PadMenu: View {
     let studio: StudioModel
     let width: CGFloat
@@ -784,6 +785,19 @@ private struct PadMenu: View {
     private let group = Color(argb: 0xFFD3_D3D3)
     private let ink = Color(argb: 0xFF39_3939)
     private let rule = Color(argb: 0xFFBD_BDBD)
+    /// A switch's track when off, on the light menu.
+    private let switchOff = Color(argb: 0xFFC1_C0C4)
+    /// The body's top, below the screen's, and its corners.
+    private let top: CGFloat = 78
+    private let corner: CGFloat = 26
+
+    /// The pencil the pad's strokes stand for: the newest this iPad's system knows.
+    private var pencil: String {
+        if #available(iOS 17.5, *) {
+            return "Apple Pencil Pro"
+        }
+        return "Apple Pencil"
+    }
 
     private func row(_ label: String, height: CGFloat, action: @escaping () -> Void) -> some View {
         Text(verbatim: label)
@@ -799,6 +813,8 @@ private struct PadMenu: View {
     var body: some View {
         let settings = AppSettings.shared
         let left = min(max(studio.padButtonCentre - 160, 14), max(width - 334, 14))
+        // the arrow's tip a little right of the button's middle, as the panels' are
+        let arrowX = min(max(studio.padButtonCentre + Pc.arrowShift - left, corner + Pc.arrowHeight), 320 - corner - Pc.arrowHeight)
         let size = studio.value("preview_size")
         VStack(alignment: .leading, spacing: 0) {
             Text(verbatim: "Settings")
@@ -834,7 +850,7 @@ private struct PadMenu: View {
             }
             Color.clear.frame(height: 18)
             VStack(spacing: 0) {
-                Text(verbatim: "Stylus")
+                Text(verbatim: pencil)
                     .font(.system(size: 17))
                     .foregroundStyle(ink)
                     .lineLimit(1)
@@ -847,7 +863,7 @@ private struct PadMenu: View {
                         .foregroundStyle(ink)
                         .lineLimit(1)
                     Spacer(minLength: 0)
-                    PcSwitch(on: settings.pad3d)
+                    PcSwitch(on: settings.pad3d, offTrack: switchOff)
                 }
                 .padding(.leading, 16)
                 .padding(.trailing, 8)
@@ -868,8 +884,9 @@ private struct PadMenu: View {
         .padding(.top, 17)
         .padding(.bottom, 10)
         .frame(width: 320)
-        .background(RoundedRectangle(cornerRadius: 26, style: .circular).fill(fill))
-        .offset(x: left, y: 79)
+        .padding(.top, Pc.arrowHeight)
+        .background(PopoverShape(side: .top, arrowX: arrowX, corner: corner).fill(fill))
+        .offset(x: left, y: top - Pc.arrowHeight)
     }
 }
 
@@ -883,7 +900,7 @@ private struct PadSizeSlider: View {
             let w = g.size.width
             let y = g.size.height / 2
             let x = w * CGFloat(min(max(value, 0), 1))
-            let kx = min(max(x, 14), max(w - 14, 14))
+            let kx = min(max(x, 8), max(w - 8, 8))
             ZStack(alignment: .topLeading) {
                 Capsule().fill(Color(argb: 0xFFA9_A9A9))
                     .frame(width: w, height: 3)
@@ -892,11 +909,11 @@ private struct PadSizeSlider: View {
                     .frame(width: x, height: 3)
                     .offset(y: y - 1.5)
                 Capsule().fill(Color(argb: 0x3300_0000))
-                    .frame(width: 28, height: 17)
-                    .offset(x: kx - 14, y: y - 7.5)
+                    .frame(width: 16, height: 10)
+                    .offset(x: kx - 8, y: y - 4)
                 Capsule().fill(Color.white)
-                    .frame(width: 28, height: 17)
-                    .offset(x: kx - 14, y: y - 8.5)
+                    .frame(width: 16, height: 10)
+                    .offset(x: kx - 8, y: y - 5)
             }
             .frame(width: w, height: g.size.height, alignment: .topLeading)
             .contentShape(Rectangle())

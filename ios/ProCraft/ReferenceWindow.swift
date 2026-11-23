@@ -15,6 +15,8 @@ private var segmentTrack: Color { Look.shared.light ? Color(argb: 0xFFD7_D7D7) :
 private var importFill: Color { Look.shared.light ? Color(argb: 0xFFD7_D7D7) : Color(argb: 0xFF4D_4D4D) }
 private var muted: Color { Look.shared.light ? Color(argb: 0xFF3B_3B3B) : Color(argb: 0xFFAA_AAAA) }
 private let topBarHeight: CGFloat = 64
+/// Showing a picture or a face the top bar is taller: what goes with them sits under the title.
+private let tallTopBar: CGFloat = 74
 private let bottomBarHeight: CGFloat = 45
 private let windowCorner: CGFloat = 24
 private let handleSide: CGFloat = 60
@@ -30,21 +32,106 @@ private let modelPixels: UInt32 = 720
 /// How long between reads of the canvas for the window (each at the size the window shows it: the
 /// core's referenceCanvasSide).
 private let readEvery = 0.3
-/// The longest side a picture imported keeps.
-private let mostPicture = 4096
 /// The window the eyedropper shows, points across.
 private let pickWindow: CGFloat = 54
+/// How far down and right of the window it was opened from another opens.
+private let nextStep: CGFloat = 24
 
 /// What the window shows: on a model, the model itself through a camera of its own.
 enum ReferenceMode {
     case canvas, image, face, model
 }
 
-/// The reference window: where it is, what it shows, and how each picture sits in it. Each artwork
-/// has its own, kept by the core with the artwork: it comes back as it was left.
+/// The artwork's Reference windows: its own first (Reference in the Canvas tab shows and hides
+/// it), then those opened besides it while a plugin lets more than one be open. Each is kept by the
+/// core with the artwork: they come back as they were left.
 @Observable
 final class ReferenceTool {
     private unowned let model: CanvasModel
+    /// Its own first, then those opened besides it.
+    private(set) var windows: [ReferencePane]
+
+    init(model: CanvasModel) {
+        self.model = model
+        let count = max(model.session.referenceWindowCount(), 1)
+        windows = (0 ..< count).map { ReferencePane(model: model, index: $0) }
+    }
+
+    /// The artwork's own window shows.
+    var on: Bool {
+        windows.first?.on == true
+    }
+
+    /// Those showing, the last opened on top.
+    var shown: [ReferencePane] {
+        windows.filter(\.on)
+    }
+
+    /// Whether another may be opened: as many as the plugins say may be open (one without them).
+    var canAdd: Bool {
+        _ = PluginsModel.shared.changes
+        return windows.count < max(Int(PluginsModel.shared.store.referenceWindows()), 1)
+    }
+
+    func setOn(_ on: Bool) {
+        windows.first?.setOn(on)
+    }
+
+    func setMode(_ next: ReferenceMode) {
+        windows.first?.setMode(next)
+    }
+
+    func toggleBars() {
+        windows.first?.toggleBars()
+    }
+
+    /// Reads the canvas again for the windows that show it.
+    func refresh() {
+        windows.forEach { $0.refresh() }
+    }
+
+    /// Another window opened besides those open, a little down and right of `from`, showing the
+    /// canvas.
+    func add(from: ReferencePane) {
+        guard canAdd else { return }
+        var state = from.state()
+        state.shown = true
+        state.shows = .canvas
+        if let at = from.offset {
+            state.placed = true
+            state.x = Float(at.x + nextStep)
+            state.y = Float(at.y + nextStep)
+        } else {
+            state.placed = false
+        }
+        state.canvasView = ReferenceView(zoom: 1, x: 0, y: 0)
+        state.imageView = ReferenceView(zoom: 1, x: 0, y: 0)
+        guard let index = model.session.addReferenceWindow(state: state) else { return }
+        let next = ReferencePane(model: model, index: index)
+        withAnimation(Motion.referenceFadeIn) { windows.append(next) }
+    }
+
+    /// `window` closed: the artwork's own hides; one opened besides it goes, with its picture, and
+    /// those after it take the place before theirs (as the core numbers them).
+    func close(_ window: ReferencePane) {
+        guard window.index > 0 else {
+            window.setOn(false)
+            return
+        }
+        model.session.removeReferenceWindow(index: window.index)
+        for w in windows where w.index > window.index {
+            w.index -= 1
+        }
+        withAnimation(Motion.referenceFadeOut) { windows.removeAll { $0 === window } }
+    }
+}
+
+/// One Reference window: where it is, what it shows, and how each picture sits in it.
+@Observable
+final class ReferencePane: Identifiable {
+    private unowned let model: CanvasModel
+    /// Its place among the artwork's windows, as the core numbers them: 0 the artwork's own.
+    fileprivate(set) var index: UInt32
 
     private(set) var on = false
     private(set) var mode = ReferenceMode.canvas
@@ -69,20 +156,22 @@ final class ReferenceTool {
     /// The side the canvas was last read at (0: not yet).
     @ObservationIgnored private var readSide: UInt32 = 0
 
-    init(model: CanvasModel) {
+    init(model: CanvasModel, index: UInt32) {
         self.model = model
+        self.index = index
         restore()
     }
 
     /// The window as the artwork left it, or none if it never had one.
     private func restore() {
         let session = model.session
-        let w = session.referenceWindow()
+        guard let w = session.referenceWindowAt(index: index) else { return }
         mode = switch w.shows {
         case .image: .image
         case .face: .face
         case .canvas: .canvas
-        case .model: .model
+        // only the artwork's own window looks at the model
+        case .model: index == 0 ? ReferenceMode.model : ReferenceMode.canvas
         }
         if w.sized {
             size = CGSize(width: CGFloat(w.width), height: CGFloat(w.height))
@@ -93,30 +182,36 @@ final class ReferenceTool {
         canvasView = w.canvasView
         imageView = w.imageView
         on = w.shown
+        let index = index
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let picture = session.referencePicture().flatMap { Self.decode($0) }
+            let picture = session.referencePictureAt(index: index).flatMap { Self.decode($0) }
             DispatchQueue.main.async {
-                guard let self, let picture, self.model.session === session else { return }
+                guard let self, let picture, self.model.session === session, self.index == index else { return }
                 self.image = picture
             }
         }
         refresh()
     }
 
-    /// The window as it now is, kept with the artwork.
-    private func keep() {
+    /// The window as it now is, for the core.
+    func state() -> ReferenceWindowState {
         let shows: ReferenceShows = switch mode {
         case .canvas: .canvas
         case .image: .image
         case .face: .face
         case .model: .model
         }
-        model.session.setReferenceWindow(state: ReferenceWindowState(
+        return ReferenceWindowState(
             shown: on, shows: shows, sized: size != firstSize,
             width: Float(size.width), height: Float(size.height),
             placed: offset != nil, x: Float(offset?.x ?? 0), y: Float(offset?.y ?? 0),
             canvasView: canvasView, imageView: imageView
-        ))
+        )
+    }
+
+    /// The window as it now is, kept with the artwork.
+    private func keep() {
+        model.session.setReferenceWindowAt(index: index, state: state())
     }
 
     /// The picture's size as the window shows it: as big as it was sized, within the window's least
@@ -165,8 +260,9 @@ final class ReferenceTool {
         }
     }
 
+    /// Shown, it fades in where it is; hidden, it fades out.
     func setOn(_ on: Bool) {
-        withAnimation(Motion.referenceFade) { self.on = on }
+        withAnimation(on ? Motion.referenceFadeIn : Motion.referenceFadeOut) { self.on = on }
         keep()
         if on {
             refresh()
@@ -217,12 +313,18 @@ final class ReferenceTool {
         sharpen()
     }
 
+    /// A picture read at the size the core keeps a window's picture at (no bigger: its longer side
+    /// within the core's most), turned upright.
     private static func decode(_ data: Data) -> UIImage? {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+        let width = (properties?[kCGImagePropertyPixelWidth] as? NSNumber)?.uint32Value ?? .max
+        let height = (properties?[kCGImagePropertyPixelHeight] as? NSNumber)?.uint32Value ?? .max
+        let kept = referencePictureSize(width: max(width, 1), height: max(height, 1))
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: mostPicture,
+            kCGImageSourceThumbnailMaxPixelSize: Int(max(kept.width, kept.height)),
         ]
         return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary).map { UIImage(cgImage: $0) }
     }
@@ -237,9 +339,10 @@ final class ReferenceTool {
         keep()
         // kept with the artwork as a PNG, whatever kind of file it came from
         let session = model.session
+        let index = index
         DispatchQueue.global(qos: .utility).async {
             if let png = picture.pngData() {
-                session.setReferencePicture(png: png)
+                session.setReferencePictureAt(index: index, png: png)
             }
         }
     }
@@ -247,7 +350,7 @@ final class ReferenceTool {
     func clear() {
         image = nil
         imageView = ReferenceView(zoom: 1, x: 0, y: 0)
-        model.session.clearReferencePicture()
+        model.session.clearReferencePictureAt(index: index)
         keep()
     }
 
@@ -346,11 +449,11 @@ final class ReferenceTool {
         stale = false
         let session = model.session
         // as sharp as the window shows it, zoomed as it is (not a few hundred pixels blown up); a
-        // model through its own camera
+        // model through its own camera. Windows showing the canvas at one size share one read.
         let side = canvasSide()
         let ofModel = mode == .model
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let read = ofModel ? session.referenceModelPicture(side: modelPixels) : session.canvasThumbnail(maxSide: side)
+            let read = ofModel ? session.referenceModelPicture(side: modelPixels) : session.referenceCanvas(maxSide: side)
             let picture = read.flatMap { CanvasModel.image($0) }
             let whole = read?.width == session.info().width
             DispatchQueue.main.async {
@@ -373,11 +476,13 @@ final class ReferenceTool {
     }
 }
 
-/// The reference window: the whole canvas as it is, or a picture to work from, floating over the
+/// A reference window: the whole canvas as it is, or a picture to work from, floating over the
 /// canvas. Its grab line drags it; the round button closes it; handles over its bottom corners size
-/// it. Its bars lie over the picture, and a tap on it slides them away and back.
+/// it. Its bars lie over the picture, and a tap on it slides them away and back. While a plugin lets
+/// more than one be open, + opens another.
 struct ReferenceWindow: View {
     let model: CanvasModel
+    let window: ReferencePane
     let screen: CGSize
 
     @State private var choosing = false
@@ -385,8 +490,8 @@ struct ReferenceWindow: View {
     /// How far the drag under way has been told.
     @State private var dragged = CGSize.zero
 
-    private var tool: ReferenceTool {
-        model.reference
+    private var tool: ReferencePane {
+        window
     }
 
     /// The picture's area and `picture`'s size, for the core's view of it.
@@ -482,36 +587,58 @@ struct ReferenceWindow: View {
         Text(verbatim: label)
             .font(.system(size: 15))
             .foregroundStyle(Pc.accent)
-            .padding(6)
+            .lineLimit(1)
+            .padding(.horizontal, 3)
+            .frame(height: 30)
             .contentShape(Rectangle())
             .onTapGesture(perform: action)
+    }
+
+    /// The top bar's height: taller for a picture or a face.
+    private var topTall: CGFloat {
+        tool.mode == .image || tool.mode == .face ? tallTopBar : topBarHeight
     }
 
     private var topBar: some View {
         ZStack(alignment: .topLeading) {
             Text(verbatim: "Reference")
-                .font(.system(size: 22, weight: .bold))
+                .font(.system(size: 23, weight: .bold))
                 .foregroundStyle(titleInk)
                 .lineLimit(1)
                 .padding(.leading, 20)
                 .padding(.top, 10)
-            HStack(spacing: 0) {
-                Spacer(minLength: 0)
-                if tool.mode == .image, tool.image != nil {
+            // the picture's Clear and Import under the title
+            if tool.mode == .image, tool.image != nil {
+                HStack(spacing: 0) {
                     word("Clear") { tool.clear() }
                     word("Import") { choosing = true }
+                }
+                .padding(.leading, 12)
+                .padding(.top, 39.5)
+            }
+            HStack(spacing: 0) {
+                Spacer(minLength: 0)
+                // another window, while a plugin lets more be open
+                if model.reference.canAdd {
+                    PcIconView(PcIcons.add, size: 28, color: closeInk)
+                        .frame(width: 43, height: 43)
+                        .background(Circle().fill(closeFill))
+                        .overlay(Circle().strokeBorder(closeEdge, lineWidth: 1))
+                        .contentShape(Circle())
+                        .onTapGesture { model.reference.add(from: tool) }
+                        .padding(.trailing, 8)
                 }
                 PcIconView(PcIcons.cross, size: 20, color: closeInk)
                     .frame(width: 43, height: 43)
                     .background(Circle().fill(closeFill))
                     .overlay(Circle().strokeBorder(closeEdge, lineWidth: 1))
                     .contentShape(Circle())
-                    .onTapGesture { tool.setOn(false) }
+                    .onTapGesture { model.reference.close(tool) }
             }
             .padding(.trailing, 10)
-            .frame(maxHeight: .infinity)
+            .frame(height: topBarHeight)
         }
-        .frame(height: topBarHeight)
+        .frame(height: topTall, alignment: .top)
         .background(glass)
         // touches here go no further: not to the picture under it
         .contentShape(Rectangle())
@@ -534,8 +661,8 @@ struct ReferenceWindow: View {
         HStack(spacing: 11) {
             segment(.canvas, "Canvas")
             segment(.image, "Image")
-            // on a model the third is the model itself
-            if model.scene.open {
+            // on a model the third is the model itself, in the artwork's own window
+            if model.scene.open, tool.index == 0 {
                 segment(.model, "3D")
             } else {
                 segment(.face, "Face")
@@ -595,7 +722,7 @@ struct ReferenceWindow: View {
                 empty
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 topBar
-                    .offset(y: hidden ? -topBarHeight : 0)
+                    .offset(y: hidden ? -topTall : 0)
                     .allowsHitTesting(!hidden)
                 bottomBar
                     .offset(y: hidden ? bottomBarHeight + 1 : 0)

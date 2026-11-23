@@ -7,6 +7,11 @@
 # (not kept in git, nor is the project). To run it on an iPad, pick a team under Signing &
 # Capabilities; build-ipa.sh makes an unsigned .ipa instead.
 name: ProCraft
+# the home screen's Recent artwork widget, an extension needing signing of its own (an App ID, the
+# app group and a profile: see widget.yml): built only when PROCRAFT_WIDGET=YES
+include:
+  - path: widget.yml
+    enable: ${PROCRAFT_WIDGET}
 options:
   bundleIdPrefix: io.github.artcraftandroid
   deploymentTarget:
@@ -69,6 +74,10 @@ targets:
         UILaunchScreen: {}
         UIRequiresFullScreen: false
         NSCameraUsageDescription: A photo you take can become a palette of its colours.
+        # the Recent artwork widget's tap: procraft://recent opens the artwork worked on last
+        CFBundleURLTypes:
+          - CFBundleURLName: io.github.artcraftandroid.procraft
+            CFBundleURLSchemes: [procraft]
         # what other apps can open here: copied in for the gallery to bring in, as Import does
         LSSupportsOpeningDocumentsInPlace: false
         CFBundleDocumentTypes:

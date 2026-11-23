@@ -8,8 +8,11 @@ private let thumbShadowDrop: CGFloat = 5
 private var thumbShadow: Color { Look.shared.light ? Color(argb: 0x1D00_0000) : Color(argb: 0x4500_0000) }
 private var thumbRim: Color { Look.shared.light ? Color(argb: 0xFFBE_BEBE) : Color(argb: 0xFF42_4242) }
 
-private let swipePillWidth: CGFloat = 94
-private let swipePillHeight: CGFloat = 56
+/// A swiped cell's three actions share its width, 3 apart (as measured, 81 x 55 on a 249 pitch),
+/// never narrower than their names need.
+private let swipePillGap: CGFloat = 3
+private let swipePillLeast: CGFloat = 74
+private let swipePillHeight: CGFloat = 55
 private var swipePillFill: Color { Look.shared.light ? Color(argb: 0xFFF5_F5F5) : Color(argb: 0xDB1C_1C1C) }
 private var swipePillInk: Color { Look.shared.light ? Color(argb: 0xFF57_5757) : Color(argb: 0xFFA9_A9A9) }
 private let swipeDeleteFill = Color(argb: 0xFFFE_604D)
@@ -37,6 +40,17 @@ private struct CellSize {
         pitch = screenWidth / CGFloat(columns)
         width = pitch - 40
         thumb = pitch - 82
+    }
+
+    /// The square an artwork's picture is fitted in, in the middle of the box: as measured, 165
+    /// across on a 248 pitch, as wide for a wide picture as for a square one.
+    var side: CGFloat {
+        thumb - 1
+    }
+
+    /// How wide each of a swiped cell's actions is.
+    var pill: CGFloat {
+        max((pitch - swipePillGap * 2) / 3, swipePillLeast)
     }
 
     /// Where a touch on the cell is on its name rather than its picture.
@@ -157,9 +171,12 @@ struct GalleryView: View {
         }
     }
 
+    /// Select ends: its marks fade out and the title row changes back (0.15 s, as measured).
     private func endSelecting() {
-        selecting = false
-        selected = []
+        withAnimation(Motion.selectMode) {
+            selecting = false
+            selected = []
+        }
         moreOpen = false
     }
 
@@ -187,9 +204,10 @@ struct GalleryView: View {
         }
     }
 
-    /// Nothing is open over the gallery, so a touch on a cell can be taken for a drag or a spread.
+    /// Nothing is open over the gallery, so a touch on a cell can be taken for a drag or a spread; nor
+    /// is it zooming into an artwork or out of one.
     private func quiet() -> Bool {
-        guard !selecting, !newCanvasOpen, !model.customOpen, sharing == nil, renaming == nil, deleting == nil,
+        guard GalleryZoomer.shared.zoom == nil, !selecting, !newCanvasOpen, !model.customOpen, sharing == nil, renaming == nil, deleting == nil,
               deletingStack == nil, model.endedOpening == nil, pdfFor == nil, previewing == nil, opening == nil, !about
         else { return false }
         return true
@@ -221,7 +239,7 @@ struct GalleryView: View {
     /// How far a swiped cell's actions shift to stay on the screen: they are wider than a narrow
     /// cell, so the first and last columns' would run off it.
     private func pillShift(_ dir: String, cell: CellSize, columns: Int) -> CGFloat {
-        let over = max((swipePillWidth * 3 + 6 - cell.pitch) / 2, 0)
+        let over = max((cell.pill * 3 + swipePillGap * 2 - cell.pitch) / 2, 0)
         let column = (model.entries.firstIndex { $0.dir == dir } ?? 0) % columns
         return column == 0 ? over : column == columns - 1 ? -over : 0
     }
@@ -255,6 +273,7 @@ struct GalleryView: View {
         .overlay(alignment: .top) {
             if open {
                 SwipeActions(
+                    width: cell.pill,
                     onShare: { at in sharing = GalleryShare(artworks: [a], from: at) },
                     onDuplicate: {
                         swiped = nil
@@ -291,6 +310,7 @@ struct GalleryView: View {
             if open {
                 // a stack's act on every artwork in it
                 SwipeActions(
+                    width: cell.pill,
                     onShare: { at in sharing = GalleryShare(artworks: artworks, from: at, group: name) },
                     onDuplicate: {
                         swiped = nil
@@ -337,10 +357,13 @@ struct GalleryView: View {
                     }
                 }
             }
+            .scrollTargetLayout()
             .padding(.bottom, 24)
         }
         .scrollIndicators(.hidden)
         .scrollDisabled(opening != nil)
+        // back from an artwork, the gallery is where it was
+        .scrollPosition(id: Binding(get: { model.scrolledTo }, set: { model.scrolledTo = $0 }), anchor: .top)
         // a stack left: the gallery grows back into place, fading in
         .scaleEffect(Motion.stackPopScale + (1 - Motion.stackPopScale) * regrown)
         .opacity(Double(regrown))
@@ -393,7 +416,8 @@ struct GalleryView: View {
         switch action {
         case .select:
             swiped = nil
-            selecting = true
+            // the marks fade in and the title row changes over 0.15 s, as measured
+            withAnimation(Motion.selectMode) { selecting = true }
         case .`import`:
             importAsked = true
         case .photo:
@@ -611,7 +635,8 @@ struct GalleryView: View {
     }
 
     var body: some View {
-        cards(catchers(GeometryReader { place in screenContent(place) }))
+        // from the screen's top to its bottom: the grid runs under where the home indicator was
+        cards(catchers(GeometryReader { place in screenContent(place) }.ignoresSafeArea(.container, edges: .vertical)))
             .onAppear {
                 model.onOpen = onOpen
                 model.reload()
@@ -651,8 +676,10 @@ struct GalleryView: View {
     private func catchers<Content: View>(_ content: Content) -> some View {
         content
             .background(Pc.galleryBackground.ignoresSafeArea())
-            // Preview has the whole screen, its close button where the status bar's battery is
-            .statusBarHidden(previewing != nil)
+            // as measured: no status bar and no home indicator over the gallery (its title sits 11
+            // from the screen's top), Preview's close button where the battery would be
+            .statusBarHidden()
+            .persistentSystemOverlays(.hidden)
             .background {
                 PinchCatcher(
                     onBegin: startOpening(at:),
@@ -859,8 +886,9 @@ private struct CapsuleLabel: View {
         if button.action == .more, alone {
             PcIconView(PcIcons.more, size: 24, color: ink)
         } else {
+            // as measured: medium 15 (16 regular reads taller and lighter than the iPad's)
             Text(verbatim: button.label)
-                .font(.system(size: 16))
+                .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(ink)
         }
     }
@@ -888,6 +916,8 @@ private struct HeaderCapsule: View {
                     }
             }
         }
+        // its edge outside the buttons: 208 round Select, Import and Photo, as measured
+        .padding(.horizontal, 1)
         .background(Capsule().fill(Pc.capsule))
         .overlay(Capsule().strokeBorder(Pc.capsuleEdge, lineWidth: 1))
     }
@@ -941,9 +971,10 @@ private struct GalleryHeader: View {
             HStack(spacing: 0) {
                 Spacer()
                 HeaderCapsule(fit: fit, ink: Pc.galleryText, onAction: onAction)
+                // as measured: a circle 44 across
                 ZStack {
-                    Circle().fill(Pc.capsule).frame(width: 42, height: 42)
-                    Circle().strokeBorder(Pc.capsuleEdge, lineWidth: 1).frame(width: 42, height: 42)
+                    Circle().fill(Pc.capsule).frame(width: 44, height: 44)
+                    Circle().strokeBorder(Pc.capsuleEdge, lineWidth: 1).frame(width: 44, height: 44)
                     PcIconView(PcIcons.add, size: 40, color: Pc.galleryText)
                 }
                 .frame(width: 44, height: 45)
@@ -994,6 +1025,8 @@ private struct SelectHeader: View {
 
 /// A swiped artwork's actions, over its thumbnail.
 private struct SwipeActions: View {
+    /// Each action's width.
+    let width: CGFloat
     let onShare: (CGRect) -> Void
     let onDuplicate: () -> Void
     let onDelete: () -> Void
@@ -1002,17 +1035,17 @@ private struct SwipeActions: View {
 
     private func pill(_ label: String, delete: Bool = false, action: @escaping () -> Void) -> some View {
         Text(verbatim: label)
-            .font(.system(size: 15, weight: .semibold))
+            .font(.system(size: 13, weight: .bold))
             .foregroundStyle(delete ? Color.white : swipePillInk)
             .lineLimit(1)
-            .frame(width: swipePillWidth, height: swipePillHeight)
+            .frame(width: width, height: swipePillHeight)
             .background(RoundedRectangle(cornerRadius: 12, style: .circular).fill(delete ? swipeDeleteFill : swipePillFill))
             .contentShape(Rectangle())
             .onTapGesture(perform: action)
     }
 
     var body: some View {
-        HStack(spacing: 3) {
+        HStack(spacing: swipePillGap) {
             pill("Share") { onShare(shareAt) }
                 .background {
                     GeometryReader { place in
@@ -1024,7 +1057,7 @@ private struct SwipeActions: View {
             pill("Duplicate", action: onDuplicate)
             pill("Delete", delete: true, action: onDelete)
         }
-        .frame(width: swipePillWidth * 3 + 6)
+        .frame(width: width * 3 + swipePillGap * 2)
     }
 }
 
@@ -1075,7 +1108,8 @@ private struct CellPlace: ViewModifier {
     }
 }
 
-/// An artwork's picture in its thumbnail box, as large as fits, with a soft shadow under it.
+/// An artwork's picture in the middle of its thumbnail box, as large as fits its square, with a
+/// soft shadow under it.
 private struct Thumbnail: View {
     let artwork: GalleryArtwork
     let cell: CellSize
@@ -1087,8 +1121,8 @@ private struct Thumbnail: View {
 
     var body: some View {
         let ratio = artwork.shownRatio
-        let tall = ratio <= cell.width / cell.thumb
-        let size = tall ? CGSize(width: cell.thumb * ratio, height: cell.thumb) : CGSize(width: cell.width, height: cell.width / ratio)
+        let side = cell.side
+        let size = ratio <= 1 ? CGSize(width: side * ratio, height: side) : CGSize(width: side, height: side / ratio)
         let corner = RoundedRectangle(cornerRadius: 8, style: .circular)
         ZStack(alignment: .topTrailing) {
             // a picture with its background hidden shows the gallery through it (white while it
@@ -1112,8 +1146,9 @@ private struct Thumbnail: View {
                         Circle().strokeBorder(Color(argb: 0xFFCC_CCCC), lineWidth: 1)
                     }
                 }
+                // as measured: 10 in from the thumbnail's top right
                 .frame(width: 14, height: 14)
-                .padding(12)
+                .padding(10)
             }
         }
         .frame(width: size.width, height: size.height)
@@ -1155,11 +1190,12 @@ private struct ArtworkCell: View {
                             .onDisappear { model.thumbAt[artwork.dir] = nil }
                     }
                 }
-                .frame(width: cell.width, height: cell.thumb, alignment: .bottom)
+                .frame(width: cell.width, height: cell.thumb)
                 .scaleEffect(lift)
                 .padding(.top, 39)
+            // as measured: bold 12 (13 semibold reads wider and lighter than the iPad's)
             Text(verbatim: artwork.name)
-                .font(.system(size: 13, weight: .semibold))
+                .font(.system(size: 12, weight: .bold))
                 .foregroundStyle(chosen == true ? Color.white : Pc.galleryText)
                 .lineLimit(1)
                 .truncationMode(.tail)
@@ -1185,7 +1221,7 @@ private struct StackCell: View {
     var body: some View {
         VStack(spacing: 0) {
             if let top = artworks.first {
-                ZStack(alignment: .bottom) {
+                ZStack {
                     // the top artwork drawn again on two cards under it, a little turned (none for one)
                     if artworks.count > 1 {
                         ForEach([5.0, -4.0], id: \.self) { turn in
@@ -1195,11 +1231,11 @@ private struct StackCell: View {
                     }
                     Thumbnail(artwork: top, cell: cell, version: version, chosen: chosen, wash: wash)
                 }
-                .frame(width: cell.width, height: cell.thumb, alignment: .bottom)
+                .frame(width: cell.width, height: cell.thumb)
                 .padding(.top, 39)
             }
             Text(verbatim: name)
-                .font(.system(size: 13, weight: .semibold))
+                .font(.system(size: 12, weight: .bold))
                 .foregroundStyle(chosen == true ? Color.white : Pc.galleryText)
                 .lineLimit(1)
                 .truncationMode(.tail)

@@ -347,7 +347,9 @@ private func readFrames(_ dir: String, side: UInt32) -> PlayedFrames? {
     let pictures = (0 ..< count).compactMap { i in
         session.animationFrame(index: i, transparent: false, maxSide: min(side, fit)).flatMap { CanvasModel.image($0) }
     }
-    return PlayedFrames(pictures: pictures, order: session.animationSequence(), fps: Int(settings.fps), playback: settings.playback)
+    // the played frames in order, each as often as it is held (a background or foreground frame is
+    // drawn with each, not on its own)
+    return PlayedFrames(pictures: pictures, order: session.animationPlayOrder(), fps: Int(settings.fps), playback: settings.playback)
 }
 
 /// A model going round, opened in `session`, at no more than `side` pixels.

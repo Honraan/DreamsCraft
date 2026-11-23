@@ -1,4 +1,5 @@
 import Foundation
+import os
 import QuickLook
 import UIKit
 
@@ -84,5 +85,30 @@ extension URL {
             }
         }
         return try? Data(contentsOf: self)
+    }
+
+    /// A copy of a file the system's picker gave, in the app's temporary folder, made with the
+    /// access it gave: the system copies it, so a file of gigabytes is never held in memory. None if
+    /// it couldn't be copied.
+    func copyPicked() -> URL? {
+        let scoped = startAccessingSecurityScopedResource()
+        defer {
+            if scoped {
+                stopAccessingSecurityScopedResource()
+            }
+        }
+        let copy = FileManager.default.temporaryDirectory.appendingPathComponent("picked-\(UUID().uuidString)-\(lastPathComponent)")
+        return (try? FileManager.default.copyItem(at: self, to: copy)) != nil ? copy : nil
+    }
+}
+
+/// The memory the app may still take before the system ends it.
+enum DeviceMemory {
+    /// Told to the core before a plugin's brush engine imports a file, for what that may take.
+    static func tell() {
+        let available = os_proc_available_memory()
+        if available > 0 {
+            setMemoryAvailable(bytes: UInt64(available))
+        }
     }
 }

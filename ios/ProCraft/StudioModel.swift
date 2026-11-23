@@ -104,6 +104,11 @@ final class StudioModel {
     /// Opens on the current tool's brush. The brush library stays open under it, so Cancel and Done
     /// go back to it.
     func open() {
+        // a brush a plugin's brush engine draws opens in that plugin's own studio
+        if let action = session.brushStudioAction() {
+            model.runPluginAction(action)
+            return
+        }
         if model.panel != .brushes {
             model.closePanels()
         }
@@ -336,7 +341,9 @@ final class StudioModel {
         var row: [SourceKind: UIImage] = [:]
         var big: [SourceKind: UIImage] = [:]
         for kind in SourceImages.kinds {
-            guard let image = SourceImages.image(session.studioSource(kind: kind), shape: kind == .shape) else { continue }
+            // at all the size it has (a brush file's shape or grain may hold more than a brush
+            // paints with), so the bigger picture shows sharp
+            guard let image = SourceImages.image(session.studioSourcePicture(kind: kind), shape: kind == .shape) else { continue }
             row[kind] = SourceImages.small(image, side: sourceRowPixels)
             big[kind] = SourceImages.small(image, side: sourceBoxPixels)
         }
@@ -344,10 +351,11 @@ final class StudioModel {
         sourcesBig = big
     }
 
-    /// The image the brush's `kind` of source uses now: square greyscale, white = paint; empty for
-    /// the round tip, no grain or the amount all over.
+    /// The image the brush's `kind` of source uses now, at all the size it has: square greyscale,
+    /// white = paint; empty for the round tip, no grain or the amount all over. Kept as it is, it
+    /// stays as big as it came.
     func sourcePixels(_ kind: SourceKind) -> Data {
-        session.studioSource(kind: kind)
+        session.studioSourcePicture(kind: kind)
     }
 
     /// The editor's tick: the brush's `kind` of source becomes `pixels`, or shipped image `shipped`.
@@ -375,8 +383,12 @@ final class StudioModel {
         return made
     }
 
-    /// A picture on the clipboard as a source image; none if there isn't one.
+    /// What was cut or copied in the app (only where it is painted), or else a picture on the
+    /// clipboard, as a source image; none if there isn't one.
     func pastedSource() -> Data? {
+        if let own = model.copySource() {
+            return own
+        }
         guard let picture = UIPasteboard.general.image else {
             model.showNotice("There's no picture to paste.", warning: true)
             return nil

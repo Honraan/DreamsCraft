@@ -212,6 +212,8 @@ struct BrushLibrary: View {
     /// menus are kept on it.
     let origin: CGPoint
     let screen: CGSize
+    /// Floating in a window of its own (a plugin lets it): its frame; none while it hangs.
+    var floating: FloatingFrame?
     @State private var ui = LibraryUi()
     @FocusState private var searching: Bool
     /// Two fingers pinching on the lists: how far (their spread, a part of what it was). The lists
@@ -222,7 +224,7 @@ struct BrushLibrary: View {
         let shown = model.shownSet == CanvasModel.recentSet || model.brushSets.indices.contains(model.shownSet)
         // every library's card, or a library with no sets yet: a panel of their own
         if model.showingLibraries || model.brushSets.isEmpty || !shown {
-            LibrariesPanel(model: model, arrowX: arrowX, origin: origin, screen: screen)
+            LibrariesPanel(model: model, arrowX: arrowX, origin: origin, screen: screen, floating: floating)
         } else {
             library
         }
@@ -241,9 +243,13 @@ struct BrushLibrary: View {
 
     private var library: some View {
         let renaming = model.renamingLibrary == model.libraryPlace
-        return Popover(width: libraryWidth, arrowX: arrowX) {
+        // floating in a window of its own: as wide as the window, no arrow, a strip over it and under it
+        return Popover(width: floating?.width ?? libraryWidth, arrowX: arrowX, side: floating == nil ? .top : .none) {
+            if let floating {
+                FloatingTopStrip(frame: floating)
+            }
             PanelHeader(
-                title: model.libraryName, start: 20, end: 12, height: 52, chevronOn: ui.titleMenu,
+                title: model.libraryName, start: 20, end: 12, height: 52,
                 onTitle: { withAnimation(Motion.menuOpen) { ui.titleMenu.toggle() } },
                 rename: renaming ? { model.renameLibrary(model.libraryPlace, name: $0) } : nil
             ) {
@@ -303,6 +309,17 @@ struct BrushLibrary: View {
                         }
                     }
             )
+            if floating != nil {
+                FloatingBottomStrip()
+            }
+        }
+        // hanging from its button, its grabber tears it off into a window of its own, while a
+        // plugin lets it
+        .overlay(alignment: .top) {
+            if floating == nil, model.floating.allowed(.brushes) {
+                PanelGrabber(model: model, panel: .brushes)
+                    .padding(.top, Pc.arrowHeight)
+            }
         }
         .coordinateSpace(.named(librarySpace))
         .onPreferenceChange(SetFrames.self) { ui.setFrames = $0 }
@@ -422,9 +439,10 @@ private struct SearchResults: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         } else {
             ScrollView {
+                let tints = model.previewTints()
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 2), spacing: 6) {
                     ForEach(found, id: \.self) { b in
-                        ResultCell(model: model, brush: b)
+                        ResultCell(model: model, brush: b, tints: tints)
                     }
                 }
                 .padding(.horizontal, 12)
@@ -440,6 +458,7 @@ private struct SearchResults: View {
 private struct ResultCell: View {
     let model: CanvasModel
     let brush: BrushInfo
+    let tints: PreviewTints
 
     var body: some View {
         let key = CanvasModel.brushKey(brush)
@@ -449,7 +468,7 @@ private struct ResultCell: View {
         ZStack(alignment: .topLeading) {
             shape.fill(selected ? Pc.rowSelected : resultFill)
             if let preview {
-                SampleStroke(image: preview)
+                SampleStroke(image: preview, tint: selected ? tints.chosen : tints.other)
             }
             BrushName(name: brush.name, selected: selected, shaded: model.shadedNames[key] == true)
                 .padding(.leading, 14)
@@ -593,24 +612,30 @@ private struct HeldBrush: ViewModifier {
     }
 }
 
-/// The library's sets, the shown one lit, the Recent set above them.
+/// The library's sets, the shown one lit, the Recent set above them. It opens scrolled as little as
+/// brings the shown set into sight (the brushes in use may be in a set far down the list).
 private struct SetColumn: View {
     let model: CanvasModel
     let ui: LibraryUi
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 0) {
-                SearchScroll(ui: ui)
-                    .frame(height: 0)
-                LazyVStack(spacing: 12) {
-                    RecentRow(model: model, ui: ui)
-                    ForEach(Array(model.brushSets.enumerated()), id: \.offset) { i, set in
-                        SetRow(model: model, ui: ui, index: i, set: set)
+        ScrollViewReader { reader in
+            ScrollView {
+                VStack(spacing: 0) {
+                    SearchScroll(ui: ui)
+                        .frame(height: 0)
+                    LazyVStack(spacing: 12) {
+                        RecentRow(model: model, ui: ui)
+                            .id(CanvasModel.recentSet)
+                        ForEach(Array(model.brushSets.enumerated()), id: \.offset) { i, set in
+                            SetRow(model: model, ui: ui, index: i, set: set)
+                                .id(i)
+                        }
                     }
+                    .padding(12)
                 }
-                .padding(12)
             }
+            .onAppear { reader.scrollTo(model.shownSet) }
         }
         .scrollIndicators(.hidden)
         .scrollDisabled(ui.dragging || ui.holding)
@@ -809,8 +834,17 @@ private struct BrushColumn: View {
         return model.brushSets[model.shownSet].brushes.map { ListedBrush(brush: $0, pinned: false) }
     }
 
+    /// Whether `b` is lit as its row shows it: in the Recent set the current brush alone.
+    private func litInList(_ b: BrushInfo) -> Bool {
+        if model.shownSet == CanvasModel.recentSet {
+            return model.currentBrush.map { $0.set == b.set && $0.index == b.index } == true
+        }
+        return model.highlighted(b)
+    }
+
     var body: some View {
         let listed = listed
+        let tints = model.previewTints()
         ScrollViewReader { reader in
             ScrollView {
                 VStack(spacing: 0) {
@@ -818,7 +852,7 @@ private struct BrushColumn: View {
                         .frame(height: 0)
                     LazyVStack(spacing: brushGap) {
                         ForEach(listed) { item in
-                            BrushRow(model: model, ui: ui, brush: item.brush, pinned: item.pinned, listed: listed.map { $0.brush })
+                            BrushRow(model: model, ui: ui, brush: item.brush, pinned: item.pinned, listed: listed.map { $0.brush }, tints: tints)
                                 .id(item.id)
                         }
                     }
@@ -828,11 +862,14 @@ private struct BrushColumn: View {
                     .padding(.bottom, 12)
                 }
             }
-            // a brush found from the Recent set is scrolled to in its own
+            // a brush found from the Recent set is scrolled to in its own; else the set's lit
+            // brush is brought into sight as little as it takes
             .onChange(of: model.foundBrush, initial: true) { _, found in
                 if let found {
                     reader.scrollTo(found, anchor: .center)
                     model.foundBrush = nil
+                } else if let lit = listed.first(where: { litInList($0.brush) }) {
+                    reader.scrollTo(lit.id)
                 }
             }
         }
@@ -946,6 +983,7 @@ private struct BrushRow: View {
     let brush: BrushInfo
     let pinned: Bool
     let listed: [BrushInfo]
+    let tints: PreviewTints
 
     private var actions: [SwipeAction] {
         let b = brush
@@ -976,6 +1014,9 @@ private struct BrushRow: View {
         let selected = recent
             ? model.currentBrush.map { $0.set == brush.set && $0.index == brush.index } == true
             : model.highlighted(brush)
+        // a plugin may colour the sample strokes by the colour now; the samples are drawn white,
+        // dark on the light interface's cells otherwise
+        let tint = (selected ? tints.chosen : tints.other) ?? (Look.shared.light && !selected ? .black : nil)
         let preview = model.previews[key]
         let shape = RoundedRectangle(cornerRadius: 12, style: .circular)
         let picked = model.pickedBrushes.contains(key)
@@ -985,8 +1026,7 @@ private struct BrushRow: View {
             ZStack(alignment: .topLeading) {
                 shape.fill(selected ? Pc.rowSelected : picked ? pickedBrush : Color.clear)
                 if let preview {
-                    // the samples are drawn white: dark on the light interface's cells
-                    SampleStroke(image: preview, tint: Look.shared.light && !selected ? .black : nil)
+                    SampleStroke(image: preview, tint: tint)
                 }
                 if model.renamingBrush == key {
                     InlineName(name: brush.name, color: selected || picked ? Color.white : Pc.panelTitle, fontSize: 14) {
@@ -1085,7 +1125,7 @@ private struct DragGhost: View {
             ZStack(alignment: .topLeading) {
                 shape.fill(Pc.rowSelected.opacity(0.9))
                 if let preview = model.previews[key] {
-                    SampleStroke(image: preview)
+                    SampleStroke(image: preview, tint: model.previewTints().chosen)
                 }
                 Text(verbatim: d.name)
                     .font(.system(size: 14, weight: .semibold))
@@ -1389,3 +1429,23 @@ func libraryButton(_ tool: ToolKind) -> Int {
 
 /// The library's width.
 let brushLibraryWidth = libraryWidth
+
+extension CanvasModel {
+    /// What the library's sample strokes are tinted with as a plugin colours them by the colour
+    /// now: each brush's (`other`), and the brush in use's on the accent (`chosen`); none, as the
+    /// interface draws them. Read again as the colour or the plugins change.
+    func previewTints() -> PreviewTints {
+        _ = colorRgb()
+        _ = PluginsModel.shared.changes
+        let tint = { (chosen: Bool) -> Color? in
+            self.session.brushPreviewColour(chosen: chosen).map { Color(argb: 0xFF00_0000 | $0) }
+        }
+        return PreviewTints(other: tint(false), chosen: tint(true))
+    }
+}
+
+/// The colours a plugin gives the library's sample strokes: each brush's, and the brush in use's.
+struct PreviewTints {
+    var other: Color?
+    var chosen: Color?
+}

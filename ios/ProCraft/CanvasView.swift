@@ -93,6 +93,8 @@ final class CanvasView: UIView {
         let pointerHover = UIHoverGestureRecognizer(target: self, action: #selector(pointerHovered(_:)))
         pointerHover.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
         addGestureRecognizer(pointerHover)
+        // what lies over the canvas (a side slider's notch) is felt through it too
+        PencilFeedback.canvas = feedback
     }
 
     @available(*, unavailable)
@@ -169,6 +171,9 @@ final class CanvasView: UIView {
     private func attach(width: UInt32, height: UInt32) {
         guard let metal = layer as? CAMetalLayer else { return }
         session.setDisplayScale(pixelsPerPoint: Float(screenScale))
+        // frames no more often than the screen shows them (120 a second on a ProMotion iPad)
+        let fastest = window?.screen.maximumFramesPerSecond ?? 0
+        session.setRefreshRate(hertz: Float(fastest > 0 ? fastest : 60))
         // the core takes a retain of its own, let go with the window
         let pointer = UInt64(UInt(bitPattern: Unmanaged.passRetained(metal).toOpaque()))
         let id = acquireLayer(layer: pointer)
@@ -255,14 +260,20 @@ final class CanvasView: UIView {
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         var out: [TouchCommand] = []
+        // the fingers this event moves go together: the view goes by all of them at once, never by
+        // a spread only some of them have got to
+        var moves: [TouchMove] = []
         for touch in touches {
             guard let id = ids[ObjectIdentifier(touch)] else { continue }
             if pencil.holds(touch) {
                 pencil.add(coalesced(touch, in: event), sample: sample)
                 pencil.release(predicted: (event?.predictedTouches(for: touch) ?? []).map(sample))
             } else if !heldBack(touch) {
-                out += session.touchMove(id: id, samples: samples(of: touch, in: event))
+                moves.append(TouchMove(id: id, samples: samples(of: touch, in: event)))
             }
+        }
+        if !moves.isEmpty {
+            out += session.touchMoves(moves: moves)
         }
         // the stroke drawn ahead to where it is predicted to go, until the next move
         if let key = strokeTouch, heldTap?.touch != key,
@@ -424,6 +435,12 @@ final class CanvasView: UIView {
     /// A shape drawn snapped into place: Apple Pencil Pro feels it, where the Pencil is.
     func shapeSnapped() {
         feedback.completed(at: pencilAt ?? CGPoint(x: bounds.midX, y: bounds.midY))
+    }
+
+    /// What is moved lined up with something (a transformed box snapping onto a guide): Apple
+    /// Pencil Pro feels it, where the Pencil is.
+    func linedUp() {
+        feedback.aligned(at: pencilAt ?? CGPoint(x: bounds.midX, y: bounds.midY))
     }
 
     /// How the hovering Pencil is held, as the core takes it: the way its top leans, clockwise from

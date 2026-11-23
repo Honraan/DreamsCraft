@@ -6,6 +6,8 @@ import UniformTypeIdentifiers
 /// over another card, it takes that one's place.
 struct PluginsPage: View {
     let model: CanvasModel
+    /// As tall as its cards may be: past that they scroll.
+    var most: CGFloat = 760
     let onBack: () -> Void
 
     @State private var plugins = PluginsModel.shared
@@ -25,7 +27,7 @@ struct PluginsPage: View {
                     .frame(height: 34)
                     .contentShape(Rectangle())
                     .onTapGesture { importing = true }
-                    .padding(.top, 12)
+                    .padding(.top, 9)
             }
             ScrollView {
                 VStack(spacing: 20) {
@@ -52,7 +54,8 @@ struct PluginsPage: View {
                 .padding(.bottom, 13)
             }
             .scrollIndicators(.hidden)
-            .frame(maxHeight: 760)
+            .frame(maxHeight: max(most, 88))
+            .fixedSize(horizontal: false, vertical: true)
         }
         .fileImporter(isPresented: $importing, allowedContentTypes: [.item]) { result in
             if case let .success(url) = result {
@@ -393,6 +396,17 @@ extension CanvasModel {
         let session = session
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             _ = store.panelTouched(row: UInt32(max(row, 0)), value: value, session: session)
+            DispatchQueue.main.async { self?.afterPlugin(session) }
+        }
+    }
+
+    /// The key `press` the plugin's panel asked for: told to the plugin off the main thread (as a
+    /// touch on the panel is), and the panel shown as it answers.
+    func pluginPanelKey(_ press: KeyCombo) {
+        let store = PluginsModel.shared.store
+        let session = session
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            _ = store.panelKey(press: press, session: session)
             DispatchQueue.main.async { self?.afterPlugin(session) }
         }
     }

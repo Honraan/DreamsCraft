@@ -122,6 +122,9 @@ final class GalleryModel {
     var pressed: String?
     var lifted: String?
     @ObservationIgnored var gridAt = CGRect.zero
+    /// The first artwork or stack the grid shows, kept while an artwork is open: back from it the
+    /// gallery is where it was.
+    @ObservationIgnored var scrolledTo: String?
     @ObservationIgnored var backAt = CGRect.zero
     @ObservationIgnored var onOpen: (OpenArtwork) -> Void = { _ in }
 
@@ -156,6 +159,8 @@ final class GalleryModel {
             openStack = nil
             entries = Gallery.store.list(folder: nil)
         }
+        // the home screen's widget shows the artwork worked on last
+        RecentArtwork.refresh()
     }
 
     func artworkSaved() {
@@ -290,6 +295,10 @@ final class GalleryModel {
             var session: CanvasSession?
             if !ended {
                 session = try? CanvasSession.open(dir: a.dir)
+                // a plugin's own artwork goes to its plugin (on); else it shows what it last drew
+                if let session, session.pluginKind() != nil {
+                    _ = session.openPluginArtwork(plugins: PluginsModel.shared.store)
+                }
             }
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -325,6 +334,30 @@ final class GalleryModel {
         session.madeWithScreenTurned(turns: Self.screenTurns())
         _ = session.setNewProfile(name: p3Name)
         onOpen(OpenArtwork(session: session, dir: Gallery.store.newFolder(folder: folder)))
+    }
+
+    /// A new artwork of a plugin's `kind` (`<id>.<key>`), `width` x `height` pixels (the screen's
+    /// size), in Display P3, its plugin keeping it: made off the main thread, as the plugin's code
+    /// runs to make it.
+    func newCanvas(width: UInt32, height: UInt32, kind: String) {
+        let folder = folder
+        let turns = Self.screenTurns()
+        let plugins = PluginsModel.shared.store
+        work.async { [weak self] in
+            let session = CanvasSession(width: max(width, 1), height: max(height, 1))
+            session.madeWithScreenTurned(turns: turns)
+            _ = session.setNewProfile(name: p3Name)
+            let canvas = plugins.openCanvas(kind: kind, width: max(width, 1), height: max(height, 1), data: nil)
+            let made = canvas.map { session.attachPluginCanvas(kind: kind, canvas: $0) } == true
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if made {
+                    self.onOpen(OpenArtwork(session: session, dir: Gallery.store.newFolder(folder: folder)))
+                } else {
+                    self.message = "The plugin couldn't make this artwork."
+                }
+            }
+        }
     }
 
     /// A new artwork made as preset `p` says.
@@ -559,7 +592,8 @@ final class GalleryModel {
         var said: String?
         switch outcome {
         case let .said(text):
-            said = text
+            // an import cancelled says nothing
+            said = cancelled ? nil : text
         case let .made(dir):
             if cancelled {
                 Gallery.store.delete(dir: dir)
@@ -615,7 +649,7 @@ final class GalleryModel {
         let zip = head.starts(with: [0x50, 0x4B])
         let kind = zip ? zipFileKind(path: copy.path) : nil
         if kind == .brushes || otherBrushExtensions.contains(where: { lower.hasSuffix(".\($0)") }) {
-            return addBrushes(copy, name: name)
+            return addBrushes(copy, name: name, ours: kind == .brushes)
         }
         if foreign || kind == .swatches {
             guard let bytes = try? Data(contentsOf: copy),
@@ -648,6 +682,12 @@ final class GalleryModel {
             return bringPdf(copy, title: title, folder: folder)
         }
         if zip {
+            // an artwork as early versions shared it, one file of its folder; else a package
+            let dir = Gallery.store.newFolder(folder: folder)
+            if unpackArtworkFile(path: copy.path, dir: dir) {
+                return .made(dir)
+            }
+            Gallery.store.delete(dir: dir)
             return bringPackage(copy, folder: folder)
         }
         guard let data = try? Data(contentsOf: copy),
@@ -674,16 +714,40 @@ final class GalleryModel {
         }
     }
 
-    /// Brushes wait as files for the next artwork opened, which has the library.
-    private func addBrushes(_ copy: URL, name: String) -> Imported {
-        guard let bytes = try? Data(contentsOf: copy), readBrushes(bytes: bytes, fileName: name) != nil else {
-            return .said("This file has no brushes in it.")
+    /// Brushes wait as files for the next artwork opened, which has the library. Ours (a zip of
+    /// them) are told by the names in it; another app's file is read to see that it holds any, a
+    /// brush at a time (a set of gigabytes is never held whole), the card following and its Cancel
+    /// stopping it. The file is moved, not read again, to wait.
+    private func addBrushes(_ copy: URL, name: String, ours: Bool) -> Imported {
+        if !ours {
+            let reading = BrushFileReading()
+            follow(reading, name: name)
+            guard readBrushesFile(path: copy.path, fileName: name, reading: reading) != nil else {
+                return .said("This file has no brushes in it.")
+            }
         }
         let to = Gallery.pendingBrushes.appendingPathComponent("\(UUID().uuidString)-\(name)")
-        guard (try? bytes.write(to: to)) != nil else {
+        guard !cancelled, (try? FileManager.default.moveItem(at: copy, to: to)) != nil else {
             return .said("This file can't be opened.")
         }
         return .said("Brushes added to the library.")
+    }
+
+    /// The card's pie following `reading` from where the copy left it, its Cancel stopping it,
+    /// until the card is put away.
+    private func follow(_ reading: BrushFileReading, name: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.creep?.invalidate()
+            self.creep = Timer.scheduledTimer(withTimeInterval: cardPoll, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                if self.cancelled {
+                    reading.cancel()
+                    return
+                }
+                self.importShown = ProgressShown(progress: copyShare + (1 - copyShare) * reading.progress(), detail: name)
+            }
+        }
     }
 
     private func bringPsd(_ copy: URL, title: String, folder: String?) -> Imported {

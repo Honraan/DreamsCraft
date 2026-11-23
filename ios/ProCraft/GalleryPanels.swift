@@ -2,6 +2,8 @@ import SwiftUI
 import UIKit
 
 private let newCanvasWidth: CGFloat = 347
+/// In a window too narrow for it (Slide Over, 320 wide), New canvas keeps this far from either edge.
+private let narrowMargin: CGFloat = 12
 private let formatsWidth: CGFloat = 260
 private let formatsTitleHeight: CGFloat = 55
 private let formatsRow: CGFloat = 40
@@ -23,7 +25,8 @@ private let renameArtMargin: CGFloat = 12
 private let renameFieldGap: CGFloat = 20
 private let renameFieldWidth: CGFloat = 262
 private let renameFieldHeight: CGFloat = 38
-private let renameFieldFill = Color(argb: 0x14FF_FFFF)
+// as measured: 41 over the blur's 30, a 5% white
+private let renameFieldFill = Color(argb: 0x0CFF_FFFF)
 
 /// The new-canvas list hanging from the + button, 2 from the screen's edge: the screen's size
 /// first, then the presets, each with its colour profile and size; a preset row swiped left shows
@@ -70,8 +73,13 @@ struct NewCanvasPanel: View {
         // the screen as it is turned now
         let width = UInt32(max((screen.width * scale).rounded(), 1))
         let height = UInt32(max((screen.height * scale).rounded(), 1))
-        let left = screen.width - 2 - newCanvasWidth
-        Popover(width: newCanvasWidth, arrowX: screen.width - 49 - left, fill: Pc.lightPanel, corner: 32) {
+        // 2 from the window's edge, as measured; in a narrower window as wide as it leaves
+        let fits = screen.width >= newCanvasWidth + 2 + narrowMargin
+        let panelWidth = fits ? newCanvasWidth : max(screen.width - narrowMargin * 2, 1)
+        let left = fits ? screen.width - 2 - newCanvasWidth : narrowMargin
+        // the kinds of artwork plugins on add, each the screen's size, under the presets
+        let kinds = PluginsModel.shared.store.kinds()
+        Popover(width: panelWidth, arrowX: screen.width - 49 - left, fill: Pc.lightPanel, corner: 32) {
             VStack(spacing: 0) {
                 header
                 PresetRow(name: "Screen Size", label: "\(width) × \(height)px", profile: "Display P3") {
@@ -121,7 +129,19 @@ struct NewCanvasPanel: View {
                 .clipShape(RoundedRectangle(cornerRadius: 24, style: .circular))
                 .padding(.horizontal, 9)
                 .padding(.top, 9.5)
-                .padding(.bottom, 30)
+                .padding(.bottom, kinds.isEmpty ? 30 : 0)
+                ForEach(kinds.indices, id: \.self) { k in
+                    let kind = kinds[k]
+                    PresetRow(name: kind.label, label: "\(width) × \(height)px", profile: "Display P3") {
+                        onDone()
+                        model.newCanvas(width: width, height: height, kind: kind.key)
+                    }
+                    .frame(height: 38)
+                    .background(Capsule().fill(Pc.lightRowStrong))
+                    .padding(.horizontal, 9)
+                    .padding(.top, 9.5)
+                    .padding(.bottom, k == kinds.count - 1 ? 30 : 0)
+                }
             }
         }
         .contentShape(Rectangle())

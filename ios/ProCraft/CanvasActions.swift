@@ -8,6 +8,8 @@ import UniformTypeIdentifiers
 /// What the Share tab makes.
 enum ShareKind {
     case psd, pdf, tiff, jpeg, png, layersPdf, layerPngs
+    /// A plugin's artwork, its shapes kept.
+    case svg
 }
 
 /// What the Share tab makes of a model: the artwork whole, the model as USDZ or OBJ, pictures of
@@ -153,6 +155,9 @@ extension CanvasModel {
                 case .png:
                     try session.exportPng(path: file(".png").path)
                     return [file(".png")]
+                case .svg:
+                    try session.exportSvg(path: file(".svg").path)
+                    return [file(".svg")]
                 case .pdf:
                     try session.exportPdf(path: file(".pdf").path, layers: false, quality: quality)
                     return [file(".pdf")]
@@ -330,7 +335,7 @@ extension CanvasModel {
                 return false
             }
             refresh()
-            showNotice("Frames saved to timeline")
+            showDone("Frames saved to timeline")
             if done.full {
                 showNotice(noRoomSaid(), warning: true)
             }
@@ -389,7 +394,7 @@ extension CanvasModel {
                 } else {
                     self.refresh()
                 }
-                self.showNotice("Frames saved to timeline")
+                self.showDone("Frames saved to timeline")
                 if read.full {
                     self.showNotice(self.noRoomSaid(), warning: true)
                 }

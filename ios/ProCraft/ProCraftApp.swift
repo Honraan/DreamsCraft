@@ -17,18 +17,34 @@ struct ProCraftApp: App {
         if available > 0 {
             setResidentBudget(bytes: UInt64(available / 4))
         }
+        // the layers' pixels may take half the device's memory: it sets how many layers a canvas
+        // holds (set before Custom Canvas asks), more on a bigger iPad
+        setLayerBudget(bytes: ProcessInfo.processInfo.physicalMemory / 2)
+        // colour profiles imported (Custom Canvas's Import) are kept, and read again at each start
+        setProfileFolder(dir: Self.profiles.path)
         TextFonts.prepare()
         // artworks being opened, noted until they show: one the app ended while opening is asked
         // about when next picked, not opened at once into the same end
         setOpenMarksFile(path: Gallery.openMarks.path)
         // the GPU device and the canvases' pipelines made ahead of the first artwork
         DispatchQueue.global(qos: .userInitiated).async { warmGpu() }
+        // and the brushes read: with many brought in, reading them as an artwork opened took seconds
+        DispatchQueue.global(qos: .utility).async { prepareBrushes(dir: CanvasModel.brushesDir) }
+        // the home screen's widget shows the artwork worked on last
+        RecentArtwork.start()
     }
 
     var body: some Scene {
         WindowGroup {
             RootView()
         }
+    }
+
+    /// Where imported colour profiles are kept, in the app's own folder.
+    private static var profiles: URL {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        return support.appendingPathComponent("icc")
     }
 }
 
@@ -45,26 +61,55 @@ struct RootView: View {
     @State private var open: CanvasModel?
     /// The artwork open was opened for its animated export alone: when that ends, it closes.
     @State private var exportOnly = false
+    @Environment(\.displayScale) private var displayScale
+    @Environment(\.scenePhase) private var scenePhase
+    /// What the open artwork's session had done by itself when last logged, and when.
+    @State private var activityLogged: (at: Date, activity: Activity)?
 
     @ViewBuilder private var screens: some View {
-        if let open {
-            CanvasScreen(model: open)
-                .statusBarHidden()
-                .persistentSystemOverlays(.hidden)
-                .defersSystemGestures(on: .all)
-        } else {
-            GalleryView { artwork in
-                let model = CanvasModel(session: artwork.session, dir: artwork.dir)
-                model.onClose = {
-                    self.open = nil
-                    self.exportOnly = false
-                }
-                self.open = model
-                if let format = artwork.animated {
-                    exportOnly = true
-                    startExport(format, on: model)
-                }
+        let zoomer = GalleryZoomer.shared
+        ZStack {
+            if open == nil {
+                Pc.galleryBackground.ignoresSafeArea()
             }
+            if let open {
+                CanvasScreen(model: open)
+                    .statusBarHidden()
+                    .persistentSystemOverlays(.hidden)
+                    .defersSystemGestures(on: .all)
+            }
+            // the gallery, kept over the canvas while it zooms into it; the same gallery all the
+            // while, so it keeps its place
+            if open == nil || zoomer.zoom?.opening == true {
+                GalleryView(onOpen: opened)
+                    .modifier(ZoomedGallery(t: zoomer.at, zoom: zoomer.zoom))
+                    .opacity(zoomer.galleryShown)
+                    .allowsHitTesting(zoomer.zoom == nil)
+                    .ignoresSafeArea(.container)
+            }
+            // a canvas left fading away as it shrinks into its cell
+            if let zoom = zoomer.zoom, !zoom.opening {
+                ClosingPicture(t: zoomer.at, zoom: zoom)
+                    .ignoresSafeArea()
+            }
+        }
+    }
+
+    /// An artwork opened from the gallery (or made, or brought in): the gallery zooms into it from
+    /// its cell, if it has one showing.
+    private func opened(_ artwork: OpenArtwork) {
+        let model = CanvasModel(session: artwork.session, dir: artwork.dir)
+        model.onClose = {
+            self.open = nil
+            self.exportOnly = false
+        }
+        GalleryZoomer.shared.open(artwork.session, dir: artwork.dir, window: Interface.shared.window, pixels: displayScale)
+        activityLogged = nil
+        open = model
+        logActivity(front: true, of: model)
+        if let format = artwork.animated {
+            exportOnly = true
+            startExport(format, on: model)
         }
     }
 
@@ -82,6 +127,46 @@ struct RootView: View {
                 model.openAnimatedExport(format)
             }
         }
+    }
+
+    /// Puts in the log what the open artwork's session did by itself while the app was in front (now
+    /// going away, not `front`) or away (now back): frames drawn, the render thread's wakeups and
+    /// retries, the autosave's looks. Away, all should be none. An artwork just opened (`model`) is
+    /// only noted, for the next.
+    private func logActivity(front: Bool, of model: CanvasModel? = nil) {
+        guard let open = model ?? self.open else {
+            activityLogged = nil
+            return
+        }
+        let session = open.session
+        let now = Date()
+        let before = activityLogged
+        // off the main thread: the session may be drawing
+        DispatchQueue.global(qos: .utility).async {
+            let after = session.activity()
+            DispatchQueue.main.async {
+                if let before {
+                    let seconds = Int(now.timeIntervalSince(before.at))
+                    let b = before.activity
+                    AppLog.info(
+                        "activity",
+                        "\(front ? "away" : "in front") \(seconds) s: \(after.frames &- b.frames) frames drawn, "
+                            + "\(after.wakeups &- b.wakeups) render wakeups, \(after.retries &- b.retries) retries, "
+                            + "\(after.autosaveLooks &- b.autosaveLooks) autosave looks"
+                    )
+                }
+                if self.open === open {
+                    activityLogged = (now, after)
+                }
+            }
+        }
+    }
+
+    /// The system short of memory, or the app put away: the canvas lets go of what it keeps only to
+    /// be quicker (made again when next wanted).
+    private func trimMemory() {
+        guard let session = open?.session else { return }
+        DispatchQueue.global(qos: .utility).async { session.trimMemory() }
     }
 
     /// Whether `url` is a plugin file, by its name (the old ending still opens).
@@ -128,10 +213,26 @@ struct RootView: View {
                 .ignoresSafeArea()
             }
             .overlay { PluginAlerts() }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .background {
+                    logActivity(front: false)
+                    trimMemory()
+                } else if phase == .active {
+                    logActivity(front: true)
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
+                trimMemory()
+            }
             // a file opened with the app is brought into the gallery, which shows: an open artwork
             // is saved and closed first. A plugin is asked about where the app stands: it needs no
             // artwork closed
             .onOpenURL { url in
+                // the home screen's widget: straight into the artwork worked on last
+                if RecentArtwork.isOpenRecent(url) {
+                    RecentArtwork.openMostRecent(unlessOpen: open != nil)
+                    return
+                }
                 if Self.isPluginFile(url) {
                     offerPlugin(url)
                     return

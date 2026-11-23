@@ -9,25 +9,26 @@ enum ActionsPage {
     case main, cursor, pressure, plugins
 }
 
-/// A page's title with the way back.
+/// A page's title with the way back: the title as big as the panel's own, its baseline 35 under
+/// the panel's top (the main page's is 43.5 down), the chevron centred on its capitals.
 struct PageHeader: View {
     let title: String
     let onBack: () -> Void
 
     var body: some View {
         HStack(spacing: 0) {
-            PcIconView(PcIcons.chevronLeft, size: 22, color: Pc.panelTitle)
+            PcIconView(PcIcons.chevronLeft, size: 27, color: Pc.panelTitle)
                 .frame(width: 44, height: 34)
                 .contentShape(Rectangle())
                 .onTapGesture(perform: onBack)
             Text(verbatim: title)
-                .font(.system(size: 22, weight: .bold))
+                .font(.system(size: 24, weight: .bold))
                 .foregroundStyle(Pc.panelTitle)
                 .lineLimit(1)
         }
         .frame(height: 44)
         .padding(.leading, 8)
-        .padding(.top, 12)
+        .padding(.top, 4)
     }
 }
 
@@ -35,11 +36,13 @@ struct PageHeader: View {
 struct CursorPage: View {
     let onBack: () -> Void
 
+    /// A section's name, 16 bold: its capitals start 69.5 under the panel's top, its group 8 under
+    /// its line.
     private func heading(_ text: String, top: CGFloat) -> some View {
         Text(verbatim: text)
-            .font(.system(size: 17, weight: .bold))
+            .font(.system(size: 16, weight: .bold))
             .foregroundStyle(Look.shared.light ? Pc.tabIdle : Color(argb: 0xFFB5_B5B5))
-            .padding(.leading, 14)
+            .padding(.leading, 16)
             .padding(.top, top)
             .padding(.bottom, 8)
     }
@@ -49,25 +52,25 @@ struct CursorPage: View {
         VStack(alignment: .leading, spacing: 0) {
             PageHeader(title: "Advanced cursor", onBack: onBack)
             VStack(alignment: .leading, spacing: 0) {
-                heading("Brush cursor visibility", top: 6)
+                heading("Brush cursor visibility", top: 19)
                 ChoiceGroup(
                     choices: ["Show while hovering", "Show while painting", "Show both"],
                     chosen: settings.cursorShows.rawValue
                 ) { settings.cursorShows = CursorShows(rawValue: $0) ?? .hovering }
-                heading("Brush outline style", top: 28)
+                heading("Brush outline style", top: 33)
                 ChoiceGroup(
                     choices: ["High contrast", "Active color", "Per brush"],
                     chosen: settings.cursorStyle.rawValue
                 ) { settings.cursorStyle = CursorStyle(rawValue: $0) ?? .brush }
             }
             .padding(.horizontal, 12)
-            .padding(.top, 8)
-            .padding(.bottom, 13)
+            .padding(.bottom, 10)
         }
     }
 }
 
-/// Choices as rows of a rounded group, the chosen one a full blue row.
+/// Choices as 42-tall rows of a rounded group (15 semibold), a line between each two, the chosen
+/// one a full blue row.
 private struct ChoiceGroup: View {
     let choices: [String]
     let chosen: Int
@@ -76,11 +79,11 @@ private struct ChoiceGroup: View {
     var body: some View {
         VStack(spacing: 0) {
             ForEach(Array(choices.enumerated()), id: \.offset) { i, label in
-                if i > 0, i != chosen, i - 1 != chosen {
+                if i > 0 {
                     Pc.actionsSeparator.frame(height: 1)
                 }
                 Text(verbatim: label)
-                    .font(.system(size: 17))
+                    .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(i == chosen ? Color.white : Pc.panelTitle)
                     .lineLimit(1)
                     .padding(.leading, 16)
@@ -91,7 +94,7 @@ private struct ChoiceGroup: View {
             }
         }
         .background(Pc.actionsGroup)
-        .clipShape(RoundedRectangle(cornerRadius: 18, style: .circular))
+        .clipShape(RoundedRectangle(cornerRadius: 22, style: .circular))
     }
 }
 
@@ -148,6 +151,8 @@ private struct SlideRow: View {
 /// expression, Tip Attachment, the pressure curve every stroke goes through, and Reset all.
 struct PressurePage: View {
     let model: CanvasModel
+    /// As tall as its rows may be: past that they scroll.
+    var most: CGFloat = 760
     let onBack: () -> Void
 
     /// What the curve opens over the page, where the scroll can't cut it.
@@ -245,7 +250,7 @@ struct PressurePage: View {
                 .padding(.bottom, 13)
             }
             .scrollIndicators(.hidden)
-            .frame(maxHeight: 760)
+            .frame(maxHeight: max(most, 88))
             .fixedSize(horizontal: false, vertical: true)
         }
         .coordinateSpace(.named(studioSpace))

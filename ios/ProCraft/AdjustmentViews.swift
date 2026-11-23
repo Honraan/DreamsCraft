@@ -361,7 +361,8 @@ struct LiquifyPanel: View {
 
     private func popover<Content: View>(_ title: String, centre: CGFloat, buttonsTop: CGFloat, @ViewBuilder content: @escaping () -> Content) -> some View {
         let left = min(max(centre - 130, 0), max(screen.width - 260, 0))
-        return Popover(width: 260, arrowX: centre - left, fill: menuFill, corner: 26, side: .bottom) {
+        // frosted as the panels are, as the toolbars' popovers are
+        return Popover(width: 260, arrowX: centre - left, fill: Look.shared.light ? menuFill : nil, corner: 26, side: .bottom) {
             VStack(alignment: .leading, spacing: 0) {
                 Text(verbatim: title)
                     .font(.system(size: 24, weight: .bold))

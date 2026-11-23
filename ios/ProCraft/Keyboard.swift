@@ -69,8 +69,8 @@ extension CanvasModel {
             return
         }
         let right = AppSettings.shared.rightHanded
-        let side = showSideBar ? Float((Pc.sideBarWidth + Pc.popoverGap) * pixels) : 0
-        session.setFitInsets(left: right ? 0 : side, top: Float(Pc.barHeight * pixels), right: right ? side : 0, bottom: 0)
+        let side = showSideBar ? Float((Pc.sideBarShown + Pc.popoverGap) * pixels) : 0
+        session.setFitInsets(left: right ? 0 : side, top: Float(Pc.barShown * pixels), right: right ? side : 0, bottom: 0)
     }
 
     /// A new artwork just started: without time-lapse if it is turned off.
@@ -125,11 +125,22 @@ extension CanvasModel {
         )
     }
 
-    /// The key `name`'s shortcut, the shared shortcuts saying what it does; whether it has one.
+    /// The key `name`'s shortcut, the shared shortcuts saying what it does (as a plugin rebinding
+    /// keys takes the press), or a plugin's switch or action it is given to, or the key a plugin's
+    /// panel asked for; whether it did anything.
     func runShortcut(_ name: String, command: Bool, shift: Bool, alt: Bool) -> Bool {
+        let press = KeyCombo(key: name, command: command, shift: shift, alt: alt)
+        let plugins = PluginsModel.shared
+        // a plugin's panel asked for the next key: it is told it, and nothing else is done
+        if plugins.panel?.keyPress == true {
+            pluginPanelKey(press)
+            return true
+        }
         // the arrows move what is transformed, or the strokes the selection takes
         let nudges = transforming || !selection.takenBox.isEmpty
-        guard let shortcut = keyShortcut(key: name, command: command, shift: shift, alt: alt, transforming: nudges) else { return false }
+        guard let shortcut = plugins.store.keyShortcut(key: name, command: command, shift: shift, alt: alt, transforming: nudges) else {
+            return pluginPress(press)
+        }
         switch shortcut {
         case .undo: undo()
         case .redo: redo()
@@ -171,6 +182,23 @@ extension CanvasModel {
         case .fitView:
             _ = session.keyView(shortcut: shortcut)
             followView()
+        }
+        return true
+    }
+
+    /// A press none of the app's shortcuts take, as a plugin gives it one of its switches (flipped,
+    /// kept as its card keeps it) or actions (run as its row runs it); false if no plugin's.
+    private func pluginPress(_ press: KeyCombo) -> Bool {
+        let plugins = PluginsModel.shared
+        // as a plugin rebinding keys takes it (it may make it no press at all)
+        guard let taken = plugins.store.keyPress(press: press), let pressed = plugins.store.pluginPress(press: taken) else { return false }
+        switch pressed {
+        case let .switched(control):
+            if case let .switch(one) = control {
+                plugins.setSwitch(one.key, one.on)
+            }
+        case let .action(key):
+            runPluginAction(key)
         }
         return true
     }
@@ -227,13 +255,14 @@ extension CanvasModel {
 }
 
 /// The canvas's keyboard shortcuts as the system lists them while ⌘ is held: the shared shortcuts
-/// with an Apple keyboard's keys, each press a command that sends `action` (the key's name in its
+/// with an Apple keyboard's keys (as a plugin rebinding keys has them, and the presses plugins give
+/// their switches and actions), each press a command that sends `action` (the key's name in its
 /// property list), under the name of what it does (a brush size's with its group's). The modify
 /// button's key (⌥ held by itself) and ⌦ aren't listed: they come as presses, as before.
 func shortcutKeyCommands(action: Selector) -> [UIKeyCommand] {
-    keyShortcutList(desktop: false, mac: true).flatMap { group in
+    PluginsModel.shared.store.keyShortcutList(desktop: false, mac: true).flatMap { group in
         group.rows.flatMap { row in
-            row.combos.compactMap { combo -> UIKeyCommand? in
+            listedPresses(row.combos).compactMap { combo -> UIKeyCommand? in
                 guard let input = keyCommandInput(combo.key) else { return nil }
                 var flags: UIKeyModifierFlags = []
                 if combo.command {
@@ -255,6 +284,26 @@ func shortcutKeyCommands(action: Selector) -> [UIKeyCommand] {
             }
         }
     }
+}
+
+/// The presses the system lists for a row of shortcuts: a key alone that does with ⌘ what it does
+/// by itself is listed with ⌘, as the measured command table has it (⌘0, ⌘K, ⌘J, ⌘D, ⌘U); alone
+/// it still works, as a press.
+private func listedPresses(_ combos: [KeyCombo]) -> [KeyCombo] {
+    var listed: [KeyCombo] = []
+    for combo in combos {
+        var shown = combo
+        if !combo.command, !combo.shift, !combo.alt,
+           let does = keyShortcut(key: combo.key, command: false, shift: false, alt: false, transforming: false),
+           keyShortcut(key: combo.key, command: true, shift: false, alt: false, transforming: false) == does
+        {
+            shown = KeyCombo(key: combo.key, command: true, shift: false, alt: false)
+        }
+        if !listed.contains(shown) {
+            listed.append(shown)
+        }
+    }
+    return listed
 }
 
 /// The input a key command takes for a key the shared shortcuts name; none for one it can't.

@@ -8,8 +8,9 @@ let draggedAlpha = 0.3
 /// The blue over an artwork (or stack) a dragged artwork would be stacked with.
 let dropWash = Color(argb: 0x8000_64DC)
 
-/// How long a dragged artwork rests on a stack (or a stack's way back) before it opens (the gallery).
-private let restSeconds = 0.6
+/// How long a dragged artwork rests on a stack (or a stack's way back) before it opens (the shared
+/// core's, as every app's gallery).
+private let restSeconds = Double(gallerySpringMs()) / 1000
 /// How near the grid's top or bottom a drag scrolls it, and how far each frame.
 private let dragScrollEdge: CGFloat = 60
 private let dragScrollStep: CGFloat = 12
@@ -59,19 +60,6 @@ private extension GalleryEntry {
         case let .stack(_, _, artworks): artworks.first
         }
     }
-}
-
-/// The thumbnail's box in a cell at `cell` on the window.
-private func thumbnailBox(_ cell: CGRect) -> CGRect {
-    CGRect(x: cell.minX + 20, y: cell.minY + 39, width: cell.width - 40, height: cell.height - 82)
-}
-
-/// An artwork's picture as it sits in its thumbnail's `box`: fitted, standing on the box's bottom.
-private func fitted(_ box: CGRect, _ artwork: GalleryArtwork) -> CGRect {
-    let ratio = artwork.shownRatio
-    let width = ratio <= box.width / box.height ? box.height * ratio : box.width
-    let height = width / ratio
-    return CGRect(x: box.midX - width / 2, y: box.maxY - height, width: width, height: height)
 }
 
 /// A copy of a dropped file, which goes when its reader returns: in a folder of its own, as two may
@@ -177,7 +165,7 @@ final class GalleryDragger: NSObject, UIDragInteractionDelegate, UIDropInteracti
         guard let window = interaction.view, let entry = item.localObject as? GalleryEntry,
               let cell = model.cellAt[entry.dir], let top = entry.shownArtwork
         else { return nil }
-        let place = fitted(thumbnailBox(cell), top)
+        let place = galleryPicture(in: cell, ratio: top.shownRatio)
         let view = UIImageView(image: UIImage(contentsOfFile: (top.dir as NSString).appendingPathComponent("thumbnail.png")))
         let lifted = artworkLifted * Interface.shared.scale
         view.frame = CGRect(x: 0, y: 0, width: place.width * lifted, height: place.height * lifted)
@@ -232,9 +220,10 @@ final class GalleryDragger: NSObject, UIDragInteractionDelegate, UIDropInteracti
         let entries = model.entries
         for (i, entry) in entries.enumerated() {
             guard let cell = model.cellAt[entry.dir], cell.contains(point) else { continue }
-            var picture = thumbnailBox(cell)
+            // a stack's whole square
+            var picture = galleryPicture(in: cell, ratio: 1)
             if case let .artwork(artwork) = entry {
-                picture = fitted(picture, artwork)
+                picture = galleryPicture(in: cell, ratio: artwork.shownRatio)
             }
             if stacking, entry.dir != dragged, picture.contains(point) {
                 return DropAt(onto: entry.dir, slot: i)

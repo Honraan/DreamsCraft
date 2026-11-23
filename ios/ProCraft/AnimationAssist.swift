@@ -252,8 +252,10 @@ final class AnimationAssist {
     private func play() {
         guard let first = settings else { return }
         let session = model.session
-        // the frames in playing order, each as often as it is held (the core's)
-        let order = session.animationSequence().map { Int($0) }
+        // the timeline's places that play, in order, each frame as often as it is held (the core's):
+        // a background or foreground frame shows with each, never on its own
+        let places = session.animationSequence().map { Int($0) }
+        let order = session.animationPlayedPlaces().map { Int($0) }.filter { places.indices.contains($0) }
         guard !order.isEmpty else { return }
         settingsOpen = false
         frameOptionsOpen = false
@@ -263,9 +265,9 @@ final class AnimationAssist {
             var step: Int32 = 1
             while !Task.isCancelled {
                 guard let self else { return }
-                let frame = order[at]
+                let frame = places[order[at]]
                 self.playingFrame = frame
-                self.playingSlot = at
+                self.playingSlot = order[at]
                 session.setPlayFrame(frame: UInt32(frame))
                 let fps = max(Int(self.settings?.fps ?? first.fps), 1)
                 try? await Task.sleep(for: .milliseconds(1000 / fps))

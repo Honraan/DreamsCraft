@@ -98,7 +98,10 @@ struct Popover<Content: View>: View {
                 if let fill {
                     shape.fill(fill)
                 } else {
+                    // the dark frost whatever the system's appearance: a light one shows through
+                    // the tint lighter than measured
                     shape.fill(.ultraThinMaterial)
+                        .environment(\.colorScheme, Look.shared.light ? .light : .dark)
                     shape.fill(Pc.popoverFrost)
                 }
             }

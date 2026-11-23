@@ -10,6 +10,27 @@ final class Look {
     var accentGiven: UInt32?
     /// How opaque a plugin makes the side bar's slider tracks, if one does.
     var trackOpacity: Float?
+    /// A plugin has the tracks frosted as the bar's glass is, rather than barely softened.
+    var tracksFrosted = false
+    /// Whether the notices of what undo and redo did, and of anything else done, show: a plugin
+    /// may hide them (one of something gone wrong always shows).
+    var stepNotices = true
+    var doneNotices = true
+    /// How big each part of the interface shows next to the rest, as plugins say (1: as the rest).
+    var partScales: [InterfacePart: CGFloat] = [:]
+
+    func showsNotice(_ kind: NoticeKind) -> Bool {
+        switch kind {
+        case .step: stepNotices
+        case .done: doneNotices
+        case .problem: true
+        }
+    }
+
+    /// How big `part` shows next to the rest of the interface.
+    func scale(_ part: InterfacePart) -> CGFloat {
+        partScales[part] ?? 1
+    }
 }
 
 extension Color {
@@ -52,6 +73,9 @@ enum Pc {
     static var actionGlyph: Color { pick(0xFF96_9696, 0xFF64_6464) }
     static var colorRing: Color { pick(0xFF96_9696, 0xFF69_6969) }
     static let barHeight: CGFloat = 44
+    /// How far down the top bar reaches as it shows (a plugin may size it): what hangs from it
+    /// hangs from there.
+    static var barShown: CGFloat { barHeight * Look.shared.scale(.topBar) }
     static let barMargin: CGFloat = 40
     static let barButtonWidth: CGFloat = 44
     static let barButtonHeight: CGFloat = 38
@@ -92,9 +116,11 @@ enum Pc {
     static let saturationGrey = Color(argb: 0xFF7F_7F7F)
     static var clearText: Color { pick(0xFFB5_B5B5, 0xFF4A_4A4A) }
     static var emptySwatch: Color { pick(0xFF2A_2A2A, 0xFFD9_D9D9) }
-    static var valueGroup: Color { pick(0xFF43_4343, 0xFFD5_D5D5) }
-    static var hexRow: Color { pick(0xFF41_4141, 0xFFD8_D8D8) }
-    static var hexField: Color { pick(0xFF4B_4B4B, 0xFFCF_CFCF) }
+    /// Value's groups, its hex row and the field on it: white at 5% over the frost, the canvas
+    /// showing through (as measured: 11 levels over the panel wherever it is).
+    static var valueGroup: Color { pick(0x0DFF_FFFF, 0xFFD5_D5D5) }
+    static var hexRow: Color { pick(0x0DFF_FFFF, 0xFFD8_D8D8) }
+    static var hexField: Color { pick(0x0DFF_FFFF, 0xFFCF_CFCF) }
     static var menuFill: Color { pick(0xFF5A_5C5B, 0xFFF0_F0F0) }
     /// A menu's words: white, black on the light interface's menus.
     static var menuInk: Color { pick(0xFFFF_FFFF, 0xFF00_0000) }
@@ -161,13 +187,27 @@ enum Pc {
         let own = pick(0xC93E_3E3E, 0xBFF0_F0F0)
         return Look.shared.trackOpacity.map { own.opacity(Double(min(max($0, 0), 1))) } ?? own
     }
-    // a lighter rim round each track, more of what is behind showing through it
-    static var sliderRim: Color { pick(0xB96E_6E6E, 0xFFE9_E9E9) }
+    // a lighter rim round each track, more of what is behind showing through it (light 249 over
+    // white)
+    static var sliderRim: Color { pick(0xB96E_6E6E, 0xB9F7_F7F7) }
     static let sliderRimWidth: CGFloat = 0.8
-    static var sliderThumb: Color { pick(0xFFA6_A6A6, 0xFFF8_F8F8) }
-    static var sideGlyph: Color { pick(0xFF96_9696, 0xFF64_6464) }
-    static var sideGlyphDisabled: Color { pick(0x1AFF_FFFF, 0x3300_0000) }
+    // a hairline round each track's window in the bar, a little darker than the bar (38 against
+    // the dark bar's 45 over white, about 220 against the light bar's 235)
+    static var sliderEdge: Color { pick(0x2800_0000, 0x1000_0000) }
+    static let sliderEdgeWidth: CGFloat = 0.5
+    // white on the light look, as measured
+    static var sliderThumb: Color { pick(0xFFA6_A6A6, 0xFFFF_FFFF) }
+    /// A value saved on a slider (a notch): mid grey, see-through, so that it shows on either
+    /// look's track (119 over the dark track's 103, 162 over the light one's 244).
+    static let notchMark = Color(argb: 0xB380_8080)
+    // the modify outline and undo and redo: on the light look the dark look's grey turned over
+    // (105), greyed about 204 over the light bar
+    static var sideGlyph: Color { pick(0xFF96_9696, 0xFF69_6969) }
+    static var sideGlyphDisabled: Color { pick(0x1AFF_FFFF, 0x2200_0000) }
     static let sideBarWidth: CGFloat = 51
+    /// How wide the side bar is as it shows (a plugin may size it): what keeps clear of it keeps
+    /// clear of that.
+    static var sideBarShown: CGFloat { sideBarWidth * Look.shared.scale(.sideBar) }
     static let sideBarHeight: CGFloat = 519
     static let sideBarCorner: CGFloat = 20
     static let sliderWidth: CGFloat = 40

@@ -45,6 +45,10 @@ private let optionsTop: CGFloat = 57
 private let blendRowHeight: CGFloat = 38.8
 private let blendListHeight: CGFloat = 349
 private let blendGlyphInk = Color(argb: 0xFF80_8080)
+/// The opacity slider's thumb, a small white pill, and its value's ink, lighter than its label.
+private let opacityThumb = CGSize(width: 16, height: 10)
+private let opacityTouch: CGFloat = 30
+private let opacityValueInk = Color(argb: 0xFFED_EDED)
 /// How long the blend modes take to open and close, and the rows under them to come back.
 private let blendOpen = 0.25
 private let blendClose = 0.1
@@ -59,6 +63,8 @@ private let dragEdge: CGFloat = 56
 private let dragScroll: CGFloat = 480
 /// A row's thumbnail (a group's line) held over by a dragged row long enough to take it.
 private let heldOutline = Color.white
+/// How long a new row takes to fade in, as measured.
+private let newRowFade = 0.1
 /// The rows standing aside for a dragged row, and coming back: a 0.3 s spring, damping 0.75.
 private let rowAside = Animation.spring(duration: 0.3, bounce: 0.25)
 
@@ -184,6 +190,8 @@ private final class LayersUi {
     @ObservationIgnored private var placedFor: (y: CGFloat, held: UInt64?)?
     @ObservationIgnored private let dragLoop = FrameLoop()
     @ObservationIgnored private var blendJob: DispatchWorkItem?
+    /// The dragged row was lifted out of the panel: the finger holds its layers now.
+    @ObservationIgnored private var lifted = false
 
     /// The layer whose row is at `y` on the screen.
     func row(at y: CGFloat) -> UInt64? {
@@ -228,15 +236,28 @@ private final class LayersUi {
         over = nil
         heldOver = nil
         placedFor = nil
+        lifted = false
         dragLoop.start { [weak self, weak model] seconds in
             guard let self, let model else { return false }
             return self.dragFrame(model, l, seconds)
         }
     }
 
-    /// The dragged row's finger gone `way` down since it was picked up: the row stays under it,
-    /// however far the list has scrolled.
-    func dragged(_ way: CGFloat) {
+    /// The dragged row's finger gone `way` down since it was picked up, at `at` on the window: the
+    /// row stays under it, however far the list has scrolled. Taken out past the panel's side, the
+    /// row (with what goes with it) is lifted out, held by the finger from then on wherever it goes.
+    func dragged(_ way: CGFloat, at: CGPoint, _ model: CanvasModel, _ l: LayerInfo) {
+        guard !lifted else { return }
+        let reach = layersLiftReach * Interface.shared.scale
+        if at.x < listBox.minX - reach || at.x > listBox.maxX + reach, let frame = rows[l.id] {
+            let corner = CGPoint(x: frame.minX, y: frame.minY + dragOffset)
+            if HeldLayers.shared.lift(model, l, at: at, corner: corner, thumbnail: model.thumbnails[l.id]) {
+                lifted = true
+                // the rows settle back as they were
+                withAnimation(Motion.rowMove) { stopDrag() }
+                return
+            }
+        }
         fingerWay = way
         dragOffset = fingerWay + scrolled
     }
@@ -308,6 +329,11 @@ private final class LayersUi {
     /// rows settle into their new places.
     func drop(_ model: CanvasModel, _ l: LayerInfo) {
         dragLoop.stop()
+        // lifted out, where it lands is the held layers' to say
+        if lifted {
+            lifted = false
+            return
+        }
         let place = rows[l.id].map { model.rowDrop(l, rows: rows, y: $0.midY + dragOffset, held: heldOver) }
         withAnimation(Motion.rowMove) {
             dragId = nil
@@ -344,7 +370,9 @@ private struct ListScroller: UIViewRepresentable {
 
         override func didMoveToWindow() {
             super.didMoveToWindow()
-            guard window != nil else { return }
+            guard let window else { return }
+            // from now on a finger taking a row out of the panel can be followed anywhere
+            HeldLayers.shared.watch(window)
             var under = superview
             while let view = under, !(view is UIScrollView) {
                 under = view.superview
@@ -384,6 +412,8 @@ struct LayersPanel: View {
     let arrowX: CGFloat
     /// The most the panel may be tall: its list scrolls past that.
     let maxHeight: CGFloat
+    /// Floating in a window of its own (a plugin lets it): its frame; none while it hangs.
+    var floating: FloatingFrame?
     /// How tall the rows are together.
     @State private var listHeight: CGFloat = 0
     @State private var ui = LayersUi()
@@ -391,7 +421,11 @@ struct LayersPanel: View {
     var body: some View {
         let shown = model.layers.filter { !model.hidden($0) }
         let ids = shown.map(\.id)
-        Popover(width: layersWidth, arrowX: arrowX) {
+        // floating in a window of its own: as wide as the window, no arrow, a strip over it and under it
+        Popover(width: floating?.width ?? layersWidth, arrowX: arrowX, side: floating == nil ? .top : .none) {
+            if let floating {
+                FloatingTopStrip(frame: floating)
+            }
             PanelHeader(
                 title: "Layers",
                 chevronOn: model.anyPicked,
@@ -421,6 +455,8 @@ struct LayersPanel: View {
                             ForEach(Array(shown.enumerated()), id: \.element.id) { index, l in
                                 LayerItem(model: model, ui: ui, layer: l, index: index, shown: shown)
                                     .id(l.id)
+                                    // a new row fades in quickly as the rows under it slide down
+                                    .transition(.opacity.animation(.easeOut(duration: newRowFade)))
                             }
                             VStack(spacing: 0) {
                                 BackgroundRow(model: model)
@@ -452,19 +488,43 @@ struct LayersPanel: View {
                     }
                 }
             }
-            // as tall as its rows, up to what the screen leaves under the header
-            .frame(height: max(0, min(listHeight, maxHeight - 64 - Pc.arrowHeight)))
+            // as tall as its rows, up to what the screen leaves under the header; floating, it fills
+            // its window
+            .frame(height: floating.map { max(0, $0.height - floatingStrips - 64) } ?? max(0, min(listHeight, maxHeight - 64 - Pc.arrowHeight)))
             .background {
                 GeometryReader { list in
                     Color.clear
-                        .onAppear { ui.listBox = list.frame(in: .global) }
-                        .onChange(of: list.frame(in: .global)) { _, box in ui.listBox = box }
+                        .onAppear {
+                            ui.listBox = list.frame(in: .global)
+                            HeldLayers.shared.panelBox = ui.listBox
+                        }
+                        .onChange(of: list.frame(in: .global)) { _, box in
+                            ui.listBox = box
+                            HeldLayers.shared.panelBox = box
+                        }
                 }
+            }
+            if floating != nil {
+                FloatingBottomStrip()
+            }
+        }
+        // hanging from its button, its grabber tears it off into a window of its own, while a plugin
+        // lets it
+        .overlay(alignment: .top) {
+            if floating == nil, model.floating.allowed(.layers) {
+                PanelGrabber(model: model, panel: .layers)
+                    .padding(.top, Pc.arrowHeight)
             }
         }
         .background(RowFingers(model: model, ui: ui).frame(width: 0, height: 0))
-        .onDisappear { ui.stopDrag() }
-        .onPreferenceChange(LayerFrames.self) { ui.rows = $0 }
+        .onDisappear {
+            ui.stopDrag()
+            HeldLayers.shared.panelBox = nil
+        }
+        .onPreferenceChange(LayerFrames.self) {
+            ui.rows = $0
+            HeldLayers.shared.panelRows = $0
+        }
         // a model's meshes are pictured as the model is seen when the panel opens
         .onAppear { model.scene.refreshMeshThumbnails() }
         .overlay(alignment: .topLeading) { LayersMenus(model: model, ui: ui, maxHeight: maxHeight) }
@@ -594,7 +654,7 @@ private struct LayerItem: View {
             .modifier(RowDrag(
                 enabled: l.kind != .mask,
                 began: { ui.pickUp(model, l) },
-                moved: { ui.dragged($0) },
+                moved: { ui.dragged($0, at: $1, model, l) },
                 ended: { ui.drop(model, l) }
             ))
             if model.scene.open, model.scene.trayFor == l.id {
@@ -620,7 +680,8 @@ private struct LayerItem: View {
 private struct RowDrag: ViewModifier {
     let enabled: Bool
     let began: () -> Void
-    let moved: (CGFloat) -> Void
+    /// How far down the finger has gone, and where it is on the window.
+    let moved: (CGFloat, CGPoint) -> Void
     let ended: () -> Void
 
     @GestureState private var held = false
@@ -642,7 +703,7 @@ private struct RowDrag: ViewModifier {
                                 started = true
                                 began()
                             }
-                            moved(drag.translation.height)
+                            moved(drag.translation.height, drag.location)
                         }
                     },
                 including: enabled ? .all : .subviews
@@ -989,8 +1050,9 @@ private struct LayersMenus: View {
                 }
             }
         }
-        // under the title row, whose foot is 60 down with the arrow above it
-        .offset(x: 74 - glassMenuWidth / 2, y: 60)
+        // under the title row, whose foot is 60 down with the arrow above it; its left edge 43 left
+        // of the panel's, as measured
+        .offset(x: -43, y: 60)
         .menuTransition(.top)
     }
 }
@@ -1067,8 +1129,9 @@ private struct LayerOptionsMenu: View {
             ForEach(rows, id: \.option) { r in
                 let ink = r.enabled ? Pc.menuInk : Pc.menuDisabled
                 HStack(spacing: 0) {
+                    // 15 pt, as measured
                     Text(verbatim: r.label)
-                        .font(.system(size: 17))
+                        .font(.system(size: 15))
                         .foregroundStyle(ink)
                         .lineLimit(1)
                     Spacer(minLength: 0)
@@ -1089,7 +1152,7 @@ private struct LayerOptionsMenu: View {
             }
             ForEach(actions, id: \.key) { action in
                 Text(verbatim: action.label)
-                    .font(.system(size: 17))
+                    .font(.system(size: 15))
                     .foregroundStyle(Pc.menuInk)
                     .lineLimit(1)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -1110,6 +1173,7 @@ private struct LayerOptionsMenu: View {
             // empty (a locked group's or mask's), as measured, the frost alone, untinted
             ZStack {
                 shape.fill(.ultraThinMaterial)
+                    .environment(\.colorScheme, Look.shared.light ? .light : .dark)
                 if !rows.isEmpty || !actions.isEmpty {
                     shape.fill(Pc.glassMenu)
                 }
@@ -1351,15 +1415,18 @@ private struct BlendEditor: View {
 
     private func slider(_ width: CGFloat) -> some View {
         let part = CGFloat(min(max(opacity, 0), 1))
-        let x = min(max(width * part, 13), max(width - 13, 13))
+        let half = opacityThumb.width / 2
+        let x = min(max(width * part, half), max(width - half, half))
         return ZStack(alignment: .leading) {
             Capsule().fill(Pc.sliderRest).frame(height: 3)
             Capsule().fill(Pc.accent).frame(width: width * part, height: 3)
             Capsule().fill(Color.white)
-                .frame(width: 26, height: 15)
-                .offset(x: x - 13)
+                .frame(width: opacityThumb.width, height: opacityThumb.height)
+                .offset(x: x - half)
         }
-        .frame(width: width, height: 16)
+        .frame(width: width, height: opacityThumb.height)
+        // touched over the slider's whole 30 height
+        .frame(height: opacityTouch)
         .contentShape(Rectangle())
         .gesture(
             DragGesture(minimumDistance: 0)
@@ -1376,18 +1443,21 @@ private struct BlendEditor: View {
         VStack(spacing: 0) {
             HStack(spacing: 0) {
                 Text(verbatim: "Opacity")
+                    .foregroundStyle(Pc.panelTitle)
                 Spacer(minLength: 0)
+                // the value lighter than its label, as measured
                 Text(verbatim: opacity >= 0.995 ? "Max" : "\(wholeNumber(opacity * 100))%")
+                    .foregroundStyle(Look.shared.light ? Pc.panelTitle : opacityValueInk)
             }
             .font(.system(size: 17))
-            .foregroundStyle(Pc.panelTitle)
             .padding(.horizontal, 13)
             GeometryReader { g in
                 slider(g.size.width)
             }
-            .frame(height: 16)
+            .frame(height: opacityTouch)
             .padding(.horizontal, 13)
-            .padding(.vertical, 2)
+            // the track's middle 6.5 under the label's line, the touch reaching up over it
+            .padding(.top, 6.5 - opacityTouch / 2)
             let band = (blendListHeight - blendRowHeight) / 2
             ZStack(alignment: .top) {
                 Rectangle()
@@ -1415,10 +1485,11 @@ private struct BlendEditor: View {
             .background(Pc.layerRow)
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .circular))
             .overlay(BlendTouches(wheel: wheel))
-            .padding(.top, 11)
+            // the list 29.5 under the track's middle
+            .padding(.top, 29.5 - opacityTouch / 2)
         }
         .padding(.top, 22)
-        .padding(.bottom, 15)
+        .padding(.bottom, 13)
         .onAppear {
             opacity = layer.opacity
             wheel.open(model, layer)
@@ -1434,7 +1505,7 @@ private struct BlendEditor: View {
             ForEach(modes, id: \.id) { m in
                 HStack(spacing: 0) {
                     Text(verbatim: m.name)
-                        .font(.system(size: 17))
+                        .font(.system(size: 15))
                         .foregroundStyle(ink)
                         .lineLimit(1)
                     Spacer(minLength: 0)

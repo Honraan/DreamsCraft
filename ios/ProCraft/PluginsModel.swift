@@ -117,10 +117,27 @@ final class PluginsModel {
         followLooks()
     }
 
-    /// What the plugins change in how the interface looks: its accent, and the side bar's tracks.
+    /// What the plugins change in how the interface looks: its accent, the side bar's tracks, the
+    /// notices that show and how big each part of it is.
     private func followLooks() {
-        Look.shared.accentGiven = store.accentColour()
-        Look.shared.trackOpacity = store.sliderLook().trackOpacity
+        let look = Look.shared
+        look.accentGiven = store.accentColour()
+        let tracks = store.sliderLook()
+        look.trackOpacity = tracks.trackOpacity
+        look.tracksFrosted = tracks.frosted == true
+        look.stepNotices = store.showsNotice(kind: .step)
+        look.doneNotices = store.showsNotice(kind: .done)
+        var scales: [InterfacePart: CGFloat] = [:]
+        for part in [InterfacePart.floating, .menus, .sideBar, .topBar, .panels] {
+            let k = store.interfacePartScale(part: part)
+            if k.isFinite, k > 0, k != 1 {
+                scales[part] = CGFloat(min(max(k, 0.25), 4))
+            }
+        }
+        if scales != look.partScales {
+            look.partScales = scales
+        }
+        ColourLooks.shared.follow(store)
     }
 
     private func keep(_ key: String, _ value: String?) {

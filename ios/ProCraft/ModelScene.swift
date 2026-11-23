@@ -168,7 +168,7 @@ final class ModelScene {
         let hide = hiddenMeshes.indices.contains(index) ? !hiddenMeshes[index] : true
         session.setSubmeshHidden(index: UInt32(index), hidden: hide)
         readMeshes()
-        model.showNotice(hide ? "Hide Submesh" : "Show Submesh")
+        model.showDone(hide ? "Hide Submesh" : "Show Submesh")
     }
 
     /// Locks mesh `index` (or unlocks it), saying which.
@@ -176,7 +176,7 @@ final class ModelScene {
         let lock = lockedMeshes.indices.contains(index) ? !lockedMeshes[index] : true
         session.setSubmeshLocked(index: UInt32(index), locked: lock)
         readMeshes()
-        model.showNotice(lock ? "Lock mesh" : "Unlock mesh")
+        model.showDone(lock ? "Lock mesh" : "Unlock mesh")
     }
 
     /// Adds mesh `index` to those picked, or takes it away; meshes picked share a texture set.
@@ -288,7 +288,7 @@ final class ModelScene {
             return
         }
         if session.replaceMaterialMap(id: l.id, channel: UInt32(next), image: image) {
-            model.showNotice("Replace Material Map Content")
+            model.showDone("Replace Material Map Content")
         }
         follow()
         refreshChannelThumbnails(l.id)
@@ -323,7 +323,7 @@ final class ModelScene {
         guard open else { return }
         follow()
         readMeshes()
-        guard model.panel == .layers else { return }
+        guard model.layersShown else { return }
         if let id = trayFor {
             refreshChannelThumbnails(id)
         }

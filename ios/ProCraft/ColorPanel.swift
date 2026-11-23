@@ -163,6 +163,8 @@ struct ColorPanel: View {
     @State private var photo: PhotosPickerItem?
     /// Where the background's colour stands in the colour model.
     @State private var backgroundPlace = ColourPlace()
+    /// The colour as the panel opened, for a plugin's swatch of the colour before.
+    @State private var opened: UInt32?
 
     private var pick: any ColorPick {
         if let background {
@@ -202,9 +204,24 @@ struct ColorPanel: View {
                         }
                         HStack(spacing: 7) {
                             let swatch = RoundedRectangle(cornerRadius: 6, style: .circular)
-                            swatch.fill(canvasColor(model.colorRgb()))
+                            if ColourLooks.shared.before, let opened {
+                                // a plugin's: the colour as the panel opened (a tap goes back to it)
+                                // beside the colour now
+                                HStack(spacing: 0) {
+                                    Rectangle()
+                                        .fill(canvasColor(opened))
+                                        .contentShape(Rectangle())
+                                        .onTapGesture { BrushColor(model: model).setRgb(opened) }
+                                    Rectangle().fill(canvasColor(model.colorRgb()))
+                                }
+                                .clipShape(swatch)
                                 .overlay(swatch.strokeBorder(Pc.swatchEdge, lineWidth: 1))
                                 .frame(width: 43, height: 25)
+                            } else {
+                                swatch.fill(canvasColor(model.colorRgb()))
+                                    .overlay(swatch.strokeBorder(Pc.swatchEdge, lineWidth: 1))
+                                    .frame(width: 43, height: 25)
+                            }
                             swatch.fill(canvasColor(model.secondaryRgb))
                                 .frame(width: 43, height: 25)
                                 .contentShape(Rectangle())
@@ -246,7 +263,7 @@ struct ColorPanel: View {
         case .disc:
             DiscPicker(c: c, short: short, m: m)
         case .classic:
-            ClassicPicker(c: c, square: short ? min(max(screenHeight - shortClassicRest, 150), 344) : 344, m: m)
+            ClassicPicker(c: c, square: short ? min(max(screenHeight - shortClassicRest, 150), 344) : 344, m: m, session: model.session)
         case .harmony:
             HarmonyPicker(kind: model.harmonyKind, c: c, short: short)
         case .value:
@@ -305,6 +322,7 @@ struct ColorPanel: View {
                 model.drop.avoid = nil
             }
         }
+        .onAppear { opened = model.colorRgb() }
         .overlay(alignment: .topLeading) { ColorMenus(model: model, ui: ui) }
         .photosPicker(isPresented: photoAsked, selection: $photo, matching: .images)
         .onChange(of: photo) { _, item in
@@ -415,17 +433,27 @@ private struct Knob: View {
     }
 }
 
+/// How near either end of a slider a tap steps it, with a plugin's steps on.
+private let stepEnd: CGFloat = 18
+
 /// A 36-tall slider row: a 4 tall track through `colours` and a pill showing the colour under it.
-/// Touching anywhere on the row moves the pill there.
+/// Touching anywhere on the row moves the pill there. With a plugin's steps on, a tap within
+/// `stepEnd` of either end moves it one `unit` (of 0..1) down or up instead; a drag from anywhere
+/// still goes where the finger is.
 private struct SliderRow: View {
     let value: Float
     let colours: [UInt32]
+    var unit: Float = 0.01
     let onChange: (Float) -> Void
+
+    /// The end a touch began at (-1, 1; 0 between), and whether it has turned into a drag.
+    @State private var stepping: (side: Float, dragging: Bool)?
 
     var body: some View {
         GeometryReader { g in
             let w = g.size.width
             let x = min(max(CGFloat(value) * w, 8), max(w - 8, 8))
+            let at: (CGFloat) -> Float = { Float(min(max($0 / max(w, 1), 0), 1)) }
             ZStack(alignment: .leading) {
                 Capsule()
                     .fill(LinearGradient(colors: colours.map(canvasColor), startPoint: .leading, endPoint: .trailing))
@@ -437,9 +465,36 @@ private struct SliderRow: View {
             }
             .frame(width: w, height: 36)
             .contentShape(Rectangle())
-            .gesture(DragGesture(minimumDistance: 0).onChanged { drag in
-                onChange(Float(min(max(drag.location.x / max(w, 1), 0), 1)))
-            })
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { drag in
+                        guard ColourLooks.shared.steps else {
+                            onChange(at(drag.location.x))
+                            return
+                        }
+                        var now: (side: Float, dragging: Bool)
+                        if let held = stepping {
+                            now = held
+                        } else {
+                            let start = drag.startLocation.x
+                            let side: Float = start < stepEnd ? -1 : start > w - stepEnd ? 1 : 0
+                            now = (side: side, dragging: side == 0)
+                        }
+                        if !now.dragging, hypot(drag.translation.width, drag.translation.height) > 10 {
+                            now.dragging = true
+                        }
+                        stepping = now
+                        if now.dragging {
+                            onChange(at(drag.location.x))
+                        }
+                    }
+                    .onEnded { _ in
+                        if let ended = stepping, !ended.dragging {
+                            onChange(min(max(value + ended.side * unit, 0), 1))
+                        }
+                        stepping = nil
+                    }
+            )
         }
         .frame(height: 36)
     }
@@ -453,6 +508,8 @@ private struct ClassicPicker: View {
     var compact = false
     /// The colour in the colour model chosen; none or HSB, Classic is HSB's own.
     var m: ModelColor?
+    /// The canvas's session, which draws a picker plugin's square (none: the triangle shows).
+    var session: CanvasSession?
 
     var body: some View {
         if let m, m.model != .hsb {
@@ -467,38 +524,45 @@ private struct ClassicPicker: View {
         let pure = CanvasModel.rgb(hue: hue, saturation: 1, brightness: 1)
         let across: CGFloat = compact ? 248 : 344
         let down: CGFloat = compact ? 248 : square
+        let looks = ColourLooks.shared
+        // a picker plugin's (drawn by the canvas's session) or the triangle in the square's place
+        let plugin = looks.pickerOn && session != nil
+        // a picker plugin's with the hue on a ring of its own takes the hue slider's place
+        let ringed = plugin && PluginsModel.shared.store.pickerHuePoint(h: hue) != nil
         VStack(spacing: 0) {
-            ZStack(alignment: .topLeading) {
-                ZStack {
-                    LinearGradient(colors: [.white, canvasColor(pure)], startPoint: .leading, endPoint: .trailing)
-                    LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom)
-                }
-                .frame(width: across, height: down)
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .circular))
-                .contentShape(Rectangle())
-                .gesture(DragGesture(minimumDistance: 0).onChanged { drag in
-                    let x = Float(min(max(drag.location.x / across, 0), 1))
-                    let y = Float(min(max(drag.location.y / max(down, 1), 0), 1))
-                    c.setHsv(hue, x, 1 - y)
-                })
-                // the knob may hang over the square's edge
-                Knob(radius: 10.75, fill: canvasColor(c.rgb()))
-                    .offset(x: CGFloat(c.saturation) * across - 10.75, y: CGFloat(1 - c.brightness) * down - 10.75)
-                    .allowsHitTesting(false)
+            if looks.classicReplaced {
+                TrianglePicker(c: c, side: compact ? 248 : min(344, down), down: down, plugin: plugin, session: session)
+                    .frame(width: across, height: down)
+                    .overlay(alignment: .bottomLeading) {
+                        if !compact, !looks.classicChoices.isEmpty {
+                            ClassicCornerMenu(choices: looks.classicChoices)
+                        }
+                    }
+                    .padding(.horizontal, compact ? 6 : 16)
+            } else {
+                plainSquare(hue: hue, pure: pure, across: across, down: down)
+                    .overlay(alignment: .bottomLeading) {
+                        if !compact, !looks.classicChoices.isEmpty {
+                            ClassicCornerMenu(choices: looks.classicChoices)
+                        }
+                    }
+                    .padding(.horizontal, compact ? 6 : 16)
             }
-            .frame(width: across, height: down, alignment: .topLeading)
-            .padding(.horizontal, compact ? 6 : 16)
             if compact {
                 // the hue only, 240 wide under the 248 square
-                SliderRow(value: huePosition(control: .slider, hue: hue), colours: sliderHues) {
-                    c.setHsv(hueAt(control: .slider, position: $0), c.saturation, c.brightness)
+                if !ringed {
+                    SliderRow(value: huePosition(control: .slider, hue: hue), colours: sliderHues, unit: 1 / 360) {
+                        c.setHsv(hueAt(control: .slider, position: $0), c.saturation, c.brightness)
+                    }
+                    .padding(.horizontal, 10)
+                    .frame(height: 40, alignment: .top)
                 }
-                .padding(.horizontal, 10)
-                .frame(height: 40, alignment: .top)
             } else {
                 VStack(spacing: 0) {
-                    SliderRow(value: huePosition(control: .slider, hue: hue), colours: sliderHues) {
-                        c.setHsv(hueAt(control: .slider, position: $0), c.saturation, c.brightness)
+                    if !ringed {
+                        SliderRow(value: huePosition(control: .slider, hue: hue), colours: sliderHues, unit: 1 / 360) {
+                            c.setHsv(hueAt(control: .slider, position: $0), c.saturation, c.brightness)
+                        }
                     }
                     SliderRow(value: c.saturation, colours: [0x7F7F7F, pure]) { c.setHsv(hue, $0, c.brightness) }
                     SliderRow(value: c.brightness, colours: brightnessTrack) { c.setHsv(hue, c.saturation, $0) }
@@ -506,6 +570,187 @@ private struct ClassicPicker: View {
                 .padding(.horizontal, 20)
             }
         }
+    }
+
+    /// The square: saturation across from white to the pure hue, brightness up, with the knob.
+    private func plainSquare(hue: Float, pure: UInt32, across: CGFloat, down: CGFloat) -> some View {
+        ZStack(alignment: .topLeading) {
+            ZStack {
+                LinearGradient(colors: [.white, canvasColor(pure)], startPoint: .leading, endPoint: .trailing)
+                LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom)
+            }
+            .frame(width: across, height: down)
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .circular))
+            .contentShape(Rectangle())
+            .gesture(DragGesture(minimumDistance: 0).onChanged { drag in
+                let x = Float(min(max(drag.location.x / across, 0), 1))
+                let y = Float(min(max(drag.location.y / max(down, 1), 0), 1))
+                c.setHsv(hue, x, 1 - y)
+            })
+            // the knob may hang over the square's edge
+            Knob(radius: 10.75, fill: canvasColor(c.rgb()))
+                .offset(x: CGFloat(c.saturation) * across - 10.75, y: CGFloat(1 - c.brightness) * down - 10.75)
+                .allowsHitTesting(false)
+        }
+        .frame(width: across, height: down, alignment: .topLeading)
+    }
+}
+
+/// What a plugin's square's picture was drawn for.
+private struct TriangleKey: Equatable {
+    let hue: Float
+    let plugin: Bool
+    let version: Int
+    let side: Int
+}
+
+/// A plugin's picker in Classic's square, `side` across in the middle of the room `down` tall: a
+/// picker plugin's picture, touches and knob (drawn by `session`), or else a triangle (saturation
+/// and brightness between the pure hue at the right, white at the top left and black at the bottom
+/// left) as the core draws it. A picker plugin's may pick the hue too, on a ring of its own: a
+/// touch that starts where it says a hue moves the hue, and the hue's knob sits where it says.
+private struct TrianglePicker: View {
+    let c: any ColorPick
+    let side: CGFloat
+    let down: CGFloat
+    /// A picker plugin's, not the triangle.
+    let plugin: Bool
+    let session: CanvasSession?
+    @Environment(\.displayScale) private var displayScale
+    @State private var picture: (key: TriangleKey, image: UIImage)?
+    /// Whether the touch now held began on the plugin's hue ring.
+    @State private var onRing: Bool?
+
+    var body: some View {
+        let store = PluginsModel.shared.store
+        let hue = c.hue
+        let key = TriangleKey(hue: hue, plugin: plugin, version: ColourLooks.shared.version, side: Int((side * displayScale).rounded()))
+        let huePoint = plugin ? store.pickerHuePoint(h: hue) : nil
+        let at = (plugin ? store.pickerPoint(s: c.saturation, v: c.brightness) : nil) ?? trianglePoint(s: c.saturation, v: c.brightness)
+        ZStack(alignment: .topLeading) {
+            if let image = picture?.image {
+                Image(uiImage: image)
+                    .resizable()
+                    .frame(width: side, height: side)
+            }
+            if let p = huePoint, p.count >= 2 {
+                Knob(radius: 10.75, fill: canvasColor(CanvasModel.rgb(hue: hue, saturation: 1, brightness: 1)))
+                    .offset(x: CGFloat(p[0]) * side - 10.75, y: CGFloat(p[1]) * side - 10.75)
+                    .allowsHitTesting(false)
+            }
+            if at.count >= 2 {
+                Knob(radius: 10.75, fill: canvasColor(c.rgb()))
+                    .offset(x: CGFloat(at[0]) * side - 10.75, y: CGFloat(at[1]) * side - 10.75)
+                    .allowsHitTesting(false)
+            }
+        }
+        .frame(width: side, height: side, alignment: .topLeading)
+        .contentShape(Rectangle())
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { drag in
+                    let x = Float(drag.location.x / max(side, 1))
+                    let y = Float(drag.location.y / max(side, 1))
+                    if onRing == nil {
+                        let sx = Float(drag.startLocation.x / max(side, 1))
+                        let sy = Float(drag.startLocation.y / max(side, 1))
+                        onRing = plugin && store.pickerHue(x: sx, y: sy) != nil
+                    }
+                    if onRing == true {
+                        if let h = store.pickerHue(x: x, y: y) {
+                            c.setHsv(h, c.saturation, c.brightness)
+                        }
+                        return
+                    }
+                    let cx = min(max(x, 0), 1)
+                    let cy = min(max(y, 0), 1)
+                    let sv = (plugin ? store.pickerPick(x: cx, y: cy) : nil) ?? triangleSv(x: cx, y: cy)
+                    if sv.count >= 2 {
+                        c.setHsv(hue, sv[0], sv[1])
+                    }
+                }
+                .onEnded { _ in onRing = nil }
+        )
+        .frame(height: down)
+        .task(id: key) {
+            if picture?.key == key {
+                return
+            }
+            let drawer = plugin ? self.session : nil
+            let made = await Task.detached(priority: .userInitiated) { () -> UIImage? in
+                let n = UInt32(max(key.side, 1))
+                let rgba: Data
+                if let drawer {
+                    // a plugin's that couldn't be drawn shows nothing (the plugin goes off)
+                    rgba = drawer.pickerPicture(hue: key.hue, side: n) ?? Data(count: Int(n) * Int(n) * 4)
+                } else {
+                    rgba = trianglePicture(hue: key.hue, side: n)
+                }
+                return CanvasModel.image(ThumbnailImage(width: n, height: n, rgba: rgba))
+            }.value
+            if let made, !Task.isCancelled {
+                picture = (key, made)
+            }
+        }
+    }
+}
+
+/// The plugins' menus at Classic's corner: three dots on a dark disc in the square's lower left
+/// corner (its touch 36 across), opening a row of their choices' icons above it, those that stand
+/// now lit; picking one closes it.
+private struct ClassicCornerMenu: View {
+    let choices: [PluginChoice]
+    @State private var open = false
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(Color.black.opacity(0.45))
+                .frame(width: 26, height: 26)
+            HStack(spacing: 5.5 - 3.2) {
+                ForEach(0 ..< 3, id: \.self) { _ in
+                    Circle().fill(Color.white).frame(width: 3.2, height: 3.2)
+                }
+            }
+        }
+        .frame(width: 36, height: 36)
+        .contentShape(Rectangle())
+        .onTapGesture { withAnimation(Motion.menuOpen) { open.toggle() } }
+        .overlay(alignment: .bottomLeading) {
+            if open {
+                ZStack(alignment: .bottomLeading) {
+                    MenuDismissal { withAnimation(Motion.menuClose) { open = false } }
+                    choiceRow
+                        .offset(y: -(36 + 6))
+                        .menuTransition(.bottomLeading)
+                }
+            }
+        }
+    }
+
+    private var choiceRow: some View {
+        let shape = RoundedRectangle(cornerRadius: 17, style: .circular)
+        return HStack(spacing: 0) {
+            ForEach(choices, id: \.key) { choice in
+                // its path data on the icons' 24-unit grid, filled even-odd
+                let icon = PcIcon(name: "plugin-choice:" + choice.icon, width: 24, height: 24, parts: [
+                    PcIconPart(d: choice.icon, stroke: 0, fill: true, evenOdd: true),
+                ])
+                PcIconView(icon, size: 26, color: choice.chosen ? Pc.accent : Pc.menuInk)
+                    .frame(width: 48, height: 44)
+                    .background(RoundedRectangle(cornerRadius: 11, style: .circular).fill(choice.chosen ? Pc.accent.opacity(0.18) : Color.clear))
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        withAnimation(Motion.menuClose) { open = false }
+                        PluginsModel.shared.choose(choice.key)
+                    }
+                    .accessibilityLabel(Text(verbatim: choice.label))
+            }
+        }
+        .padding(6)
+        .background(shape.fill(Pc.glassMenuOverPanel))
+        .overlay(shape.strokeBorder(Pc.glassMenuEdge, lineWidth: 1))
+        .fixedSize()
     }
 }
 
@@ -663,7 +908,8 @@ private struct HarmonyPicker: View {
             })
             SliderRow(value: value, colours: brightnessTrack) { set(hsv[0], hsv[1], $0) }
                 .padding(.horizontal, compact ? 10 : 20)
-                .padding(.top, compact ? 8 : short ? 10 : 31)
+                // floating (its wheel's size given), the slider's middle 31 under the wheel
+                .padding(.top, across != nil ? 13 : compact ? 8 : short ? 10 : 31)
         }
         .frame(maxWidth: .infinity)
         // the header is 78 tall here, with the kind under the title
@@ -719,13 +965,13 @@ private struct ValuePicker: View {
                 ModelValueRows(c: c, m: m)
             }
             group {
-                ValueRow(letter: "R", value: Float(r) / 255, colours: [packed(0, g, b), packed(255, g, b)], shown: "\(r)") {
+                ValueRow(letter: "R", value: Float(r) / 255, colours: [packed(0, g, b), packed(255, g, b)], shown: "\(r)", unit: 1 / 255) {
                     c.setRgb(packed(byte($0), g, b))
                 }
-                ValueRow(letter: "G", value: Float(g) / 255, colours: [packed(r, 0, b), packed(r, 255, b)], shown: "\(g)") {
+                ValueRow(letter: "G", value: Float(g) / 255, colours: [packed(r, 0, b), packed(r, 255, b)], shown: "\(g)", unit: 1 / 255) {
                     c.setRgb(packed(r, byte($0), b))
                 }
-                ValueRow(letter: "B", value: Float(b) / 255, colours: [packed(r, g, 0), packed(r, g, 255)], shown: "\(b)") {
+                ValueRow(letter: "B", value: Float(b) / 255, colours: [packed(r, g, 0), packed(r, g, 255)], shown: "\(b)", unit: 1 / 255) {
                     c.setRgb(packed(r, g, byte($0)))
                 }
             }
@@ -827,7 +1073,7 @@ private struct ModelValueRows: View {
                 if tracks.indices.contains(i) {
                     ValueRow(
                         letter: letters.indices.contains(i) ? letters[i] : "", value: tracks[i].place, colours: tracks[i].colours,
-                        shown: i == 0 ? degreesShown(coords[0]) : percentShown(coords[i])
+                        shown: i == 0 ? degreesShown(coords[0]) : percentShown(coords[i]), unit: i == 0 ? 1 / 360 : 0.01
                     ) {
                         m.set(colourModelSlid(model: m.model, h: coords[0], s: coords[1], t: coords[2], channel: UInt32(i), to: $0))
                     }
@@ -835,7 +1081,7 @@ private struct ModelValueRows: View {
             }
         } else {
             let hue = c.hue
-            ValueRow(letter: "H", value: huePosition(control: .slider, hue: hue), colours: sliderHues, shown: degreesShown(hue)) {
+            ValueRow(letter: "H", value: huePosition(control: .slider, hue: hue), colours: sliderHues, shown: degreesShown(hue), unit: 1 / 360) {
                 c.setHsv(hueAt(control: .slider, position: $0), c.saturation, c.brightness)
             }
             ValueRow(letter: "S", value: c.saturation, colours: [0x7F7F7F, CanvasModel.rgb(hue: hue, saturation: 1, brightness: 1)], shown: percentShown(c.saturation)) {
@@ -854,6 +1100,8 @@ private struct ValueRow: View {
     let value: Float
     let colours: [UInt32]
     let shown: String
+    /// One step of a plugin's steps (of 0..1).
+    var unit: Float = 0.01
     let onChange: (Float) -> Void
 
     var body: some View {
@@ -862,7 +1110,7 @@ private struct ValueRow: View {
                 .font(.system(size: 15))
                 .foregroundStyle(Pc.panelTitle)
                 .padding(.leading, 13)
-            SliderRow(value: value, colours: colours, onChange: onChange)
+            SliderRow(value: value, colours: colours, unit: unit, onChange: onChange)
                 .frame(width: 264)
                 .padding(.leading, 32)
             Text(verbatim: shown)
@@ -966,10 +1214,14 @@ private struct HexPad: View {
     let onBack: () -> Void
 
     private let keyInk = Color(argb: 0xFFEE_EEEE)
+    /// Frosted, as measured: a grey tint at 77% over the blur (what is behind shows through), the
+    /// keys white at 7% over it.
+    private let padTint = Color(argb: 0xC53C_3C3C)
+    private let keyFill = Color.white.opacity(0.07)
 
     private func key<Label: View>(width: CGFloat, action: @escaping () -> Void, @ViewBuilder label: () -> Label) -> some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 21, style: .circular).fill(Color(argb: 0xFF6C_6C6C))
+            RoundedRectangle(cornerRadius: 21, style: .circular).fill(keyFill)
             label()
         }
         .frame(width: width, height: 50)
@@ -1004,7 +1256,13 @@ private struct HexPad: View {
         }
         .padding(10)
         .frame(width: 259, height: 340, alignment: .top)
-        .background(shape.fill(Color(argb: 0xFF61_6161)))
+        .background {
+            ZStack {
+                shape.fill(.ultraThinMaterial)
+                    .environment(\.colorScheme, .dark)
+                shape.fill(padTint)
+            }
+        }
         .overlay(shape.strokeBorder(Color(argb: 0xFF26_2626), lineWidth: 1))
     }
 }
@@ -2280,7 +2538,7 @@ struct FloatingColors: View {
             DiscPicker(c: c, short: false, compact: true, m: modelColor(c))
                 .padding(.top, 5)
         case .classic:
-            ClassicPicker(c: c, square: 248, compact: true, m: modelColor(c))
+            ClassicPicker(c: c, square: 248, compact: true, m: modelColor(c), session: model.session)
                 .padding(.top, 6)
         case .harmony:
             ZStack(alignment: .topLeading) {
@@ -2341,7 +2599,69 @@ struct FloatingColors: View {
             .overlay(alignment: .topLeading) { ColorMenus(model: model, ui: ui) }
             .offset(x: x, y: y)
             .onAppear { ui.harmonyAt = CGPoint(x: 0, y: 72) }
+            // a plugin showing Classic's picker alone: this window gives way to that one
+            .opacity(ColourLooks.shared.floatingPickerOnly ? 0 : 1)
+            .allowsHitTesting(!ColourLooks.shared.floatingPickerOnly)
         }
+        if model.floatingColorsAt != nil, ColourLooks.shared.floatingPickerOnly {
+            FloatingPicker(model: model, screen: screen)
+        }
+    }
+}
+
+/// How far down the floating picker's own picker starts: under its grabber.
+private let floatingPickerTop: CGFloat = 30
+
+/// The floating colour window as a plugin has it: Classic's picker alone, under the grabber that
+/// moves it, with its Close; no title, mode icons or other pickers.
+private struct FloatingPicker: View {
+    let model: CanvasModel
+    let screen: CGSize
+
+    /// Where the window was as the drag on its grabber began.
+    @State private var dragFrom: CGPoint?
+
+    var body: some View {
+        let c = BrushColor(model: model)
+        let m = ModelColor(c: c, model: AppSettings.shared.colourModel, place: model.colourPlace)
+        // a picker plugin's with the hue on a ring of its own has no hue slider under it
+        let ringed = m.model == .hsb && ColourLooks.shared.pickerOn && PluginsModel.shared.store.pickerHuePoint(h: c.hue) != nil
+        let height = floatingPickerTop + 248 + (ringed ? 0 : 40) + 6
+        let at = model.floatingColorsAt ?? .zero
+        // kept on the screen
+        let x = min(max(at.x, 0), max(screen.width - compactWidth, 0))
+        let y = min(max(at.y, 0), max(screen.height - height, 0))
+        Popover(width: compactWidth, arrowX: 0, side: .none) {
+            ZStack(alignment: .top) {
+                Capsule()
+                    .fill(Pc.grabber)
+                    .frame(width: 40, height: 4)
+                    .padding(.top, 5.5)
+                Color.clear
+                    .frame(width: 150, height: floatingPickerTop)
+                    .contentShape(Rectangle())
+                    .gesture(
+                        DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                            .onChanged { drag in
+                                let from = dragFrom ?? model.floatingColorsAt ?? .zero
+                                dragFrom = from
+                                let k = Interface.shared.scale
+                                model.floatingColorsAt = CGPoint(x: from.x + drag.translation.width / k, y: from.y + drag.translation.height / k)
+                            }
+                            .onEnded { _ in dragFrom = nil }
+                    )
+                ClassicPicker(c: c, square: 248, compact: true, m: m, session: model.session)
+                    .padding(.top, floatingPickerTop)
+                FloatingClose { model.floatingColorsAt = nil }
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            }
+            .frame(height: height, alignment: .top)
+        }
+        .frame(height: height, alignment: .top)
+        // the canvas under it takes no touch
+        .contentShape(Rectangle())
+        .onTapGesture {}
+        .offset(x: x, y: y)
     }
 }
 

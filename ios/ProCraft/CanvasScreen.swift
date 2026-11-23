@@ -29,22 +29,18 @@ struct CanvasScreen: View {
             let hidden = model.barsHidden
             // the side bar at its kept place down its edge; its modify button dragged, it follows
             // the finger up or down stretching a little toward it, and let go settles back
-            let sideFit = sideBarFit(height: Float(screen.size.height), topBar: Float(Pc.barHeight), centre: model.sideBarCentre)
+            let sideFit = model.sideBarPlace(height: screen.size.height)
             let sideMoving = model.sideBarMoving
             let sideStretch = CGFloat(sideMoving?.stretch ?? 0)
             ZStack(alignment: .topLeading) {
+                // (a touch on the canvas while a panel is open waits: a tap only closes the panel, a
+                // drag fades it and paints from where it came down, as the core's touches say)
                 CanvasHost(model: model)
-                if model.panel != .none {
-                    // a touch on the canvas while a panel is open closes it and goes no further
-                    Color.clear
-                        .contentShape(Rectangle())
-                        .onTapGesture { model.tapOutsidePanel() }
-                }
                 if let pick = model.picking {
                     Loupe(pick: pick, current: CanvasSpace.shared.color(model.colorRgb()), pixels: model.pixels)
                     if !hidden {
                         PickingBar(fromReference: pick.fromReference)
-                            .offset(y: Pc.barHeight)
+                            .offset(y: Pc.barShown)
                     }
                 }
                 // with the interface hidden, a button in the top left brings it back
@@ -76,6 +72,10 @@ struct CanvasScreen: View {
                     AnimationBar(model: model, screen: screen.size)
                         .frame(width: screen.size.width, height: screen.size.height, alignment: .bottom)
                 }
+                // the panels a plugin lets float, in windows of their own, under those hanging
+                if !hidden {
+                    FloatingPanelWindows(model: model, screen: screen.size)
+                }
                 if model.panel != .none || model.panelFading {
                     // the one view all the way, so a list fading keeps its place
                     PanelHost(model: model, screen: screen.size)
@@ -88,14 +88,14 @@ struct CanvasScreen: View {
                 QuickShapeHandles(model: model)
                 if !hidden {
                     QuickShapeBar(model: model)
-                        .offset(y: Pc.barHeight)
+                        .offset(y: Pc.barShown)
                 }
                 if model.recoloring {
                     RecolorReticle(model: model)
                 }
                 if model.opacityLayer != nil, !hidden {
                     LayerOpacityBar(value: model.opacityValue)
-                        .offset(y: Pc.barHeight)
+                        .offset(y: Pc.barShown)
                 }
                 if model.adjustment == .clone, !hidden {
                     ClonePuck(model: model)
@@ -105,7 +105,7 @@ struct CanvasScreen: View {
                 }
                 if model.adjusting, !hidden {
                     AdjustmentBar(model: model)
-                        .offset(y: Pc.barHeight)
+                        .offset(y: Pc.barShown)
                     AdjustModes(model: model)
                 }
                 // its brush's reach where it is on the canvas, under its panel
@@ -174,10 +174,12 @@ struct CanvasScreen: View {
                         .offset(x: left)
                 }
                 TextEditing(model: model, screen: screen.size)
-                // Crop and Resize puts it away while it is open, and it comes back after
-                if model.reference.on, model.crop.shown == nil {
-                    ReferenceWindow(model: model, screen: screen.size)
-                        .transition(.opacity)
+                // Crop and Resize puts them away while it is open, and they come back after
+                if model.crop.shown == nil {
+                    ForEach(model.reference.shown) { window in
+                        ReferenceWindow(model: model, window: window, screen: screen.size)
+                            .transition(.opacity)
+                    }
                 }
                 if model.singleTouchCompanion {
                     TouchCompanion(model: model, screen: screen.size)
@@ -235,7 +237,7 @@ struct CanvasScreen: View {
                         PluginRingView(model: model, panel: panel, screen: screen.size)
                     } else {
                         PluginPanelView(model: model, panel: panel)
-                            .padding(.top, Pc.barHeight + 12)
+                            .padding(.top, Pc.barShown + 12)
                             .padding(.trailing, 12)
                             .frame(width: screen.size.width, height: screen.size.height, alignment: .topTrailing)
                     }
@@ -381,7 +383,7 @@ struct CanvasScreen: View {
     /// mode taking the screen.
     private func sideBarShift(_ right: Bool) -> CGFloat {
         guard model.barsHidden || !model.sideBarShown else { return 0 }
-        return right ? Pc.sideBarWidth : -Pc.sideBarWidth
+        return right ? Pc.sideBarShown : -Pc.sideBarShown
     }
 }
 
@@ -461,59 +463,93 @@ private struct BlockedDialog: View {
     }
 }
 
-/// The open panel, hanging from its button under the bar, clear of the side bar.
+/// How much farther right than the others' (`Pc.arrowShift` past the button's centre) the Layers
+/// panel's arrow tip sits, and the Colors panel's, as measured (+3 and +1).
+private let layersArrowNudge: CGFloat = 1
+private let colorsArrowNudge: CGFloat = -1
+
+/// The open panel, hanging from its button under the bar, clear of the side bar. A plugin may size
+/// the panels and the top bar: each panel is laid out at its own points and shown as big as the
+/// panels are, from where it hangs.
 private struct PanelHost: View {
     let model: CanvasModel
     let screen: CGSize
 
-    /// Where a panel `width` wide goes under its button: clear of the side bar, on either side.
+    /// How big the panels show next to the rest of the interface, and the top bar.
+    private var k: CGFloat { Look.shared.scale(.panels) }
+    private var bar: CGFloat { Look.shared.scale(.topBar) }
+
+    /// Where a panel `width` wide (its own points) goes under its button, `buttonX` across the
+    /// window: clear of the side bar, on either side. Its arrow's tip is in its own points.
     private func place(_ width: CGFloat, _ buttonX: CGFloat) -> PopoverPlace {
-        let clear = Pc.sideBarWidth + Pc.popoverGap
-        return AppSettings.shared.rightHanded
-            ? popoverPlace(width: width, buttonCentreX: buttonX, screenWidth: screen.width, minRight: clear)
-            : popoverPlace(width: width, buttonCentreX: buttonX, screenWidth: screen.width, minLeft: clear)
+        let clear = Pc.sideBarShown + Pc.popoverGap
+        let at = AppSettings.shared.rightHanded
+            ? popoverPlace(width: width * k, buttonCentreX: buttonX, screenWidth: screen.width, minRight: clear)
+            : popoverPlace(width: width * k, buttonCentreX: buttonX, screenWidth: screen.width, minLeft: clear)
+        return PopoverPlace(left: at.left, arrowX: at.arrowX / k)
+    }
+
+    /// The room under the bar, `less` above the screen's edge, in a panel's own points.
+    private func room(less: CGFloat) -> CGFloat {
+        (screen.height - Pc.barShown - less) / k
+    }
+
+    /// Tool button `index`'s centre across the window (0 the colour button, counting leftwards),
+    /// and action button `index`'s (0 Actions, counting rightwards), as big as the bar shows.
+    private func toolX(_ index: Int) -> CGFloat {
+        screen.width - Pc.toolCentreFromRight(index, barWidth: screen.width / bar) * bar
+    }
+
+    private func actionX(_ index: Int) -> CGFloat {
+        Pc.actionCentre(index, barWidth: screen.width / bar) * bar
+    }
+
+    /// `panel` hung under the bar at `place`, as big as the panels show.
+    private func hung(_ panel: some View, _ place: PopoverPlace) -> some View {
+        panel
+            .scaleEffect(k, anchor: .topLeading)
+            .offset(x: place.left, y: Pc.barShown)
     }
 
     var body: some View {
         switch model.panel == .none ? model.lastPanel : model.panel {
         case .brushes:
-            let buttonX = screen.width - Pc.toolCentreFromRight(libraryButton(model.tool), barWidth: screen.width)
-            let place = place(brushLibraryWidth, buttonX)
+            let place = place(brushLibraryWidth, toolX(libraryButton(model.tool)))
             // ending 25 above the screen's edge, as measured
-            BrushLibrary(model: model, arrowX: place.arrowX, origin: CGPoint(x: place.left, y: Pc.barHeight), screen: screen)
-                .frame(height: screen.height - Pc.barHeight - 25)
-                .offset(x: place.left, y: Pc.barHeight)
+            hung(
+                BrushLibrary(
+                    model: model, arrowX: place.arrowX, origin: CGPoint(x: place.left / k, y: Pc.barShown / k),
+                    screen: CGSize(width: screen.width / k, height: screen.height / k)
+                )
+                .frame(height: room(less: 25))
+                // torn off by its grabber: unseen until let go, its window following the finger
+                .opacity(model.floating.undocking == .brushes ? 0 : 1),
+                place
+            )
         case .layers:
-            let buttonX = screen.width - Pc.toolCentreFromRight(1, barWidth: screen.width)
             if let held = model.backgroundPick {
-                let place = place(colorPanelWidth, buttonX)
-                ColorPanel(model: model, arrowX: place.arrowX, screenHeight: screen.height, background: held)
-                    .offset(x: place.left, y: Pc.barHeight)
+                let place = place(colorPanelWidth, toolX(1) + layersArrowNudge)
+                hung(ColorPanel(model: model, arrowX: place.arrowX, screenHeight: room(less: 0) + Pc.barHeight, background: held), place)
                     // closed any way at all, the colour is kept
                     .onDisappear { model.endBackgroundPick() }
             } else {
-                let place = place(layersPanelWidth, buttonX)
-                LayersPanel(model: model, arrowX: place.arrowX, maxHeight: screen.height - Pc.barHeight - Pc.popoverGap)
-                    .offset(x: place.left, y: Pc.barHeight)
+                let place = place(layersPanelWidth, toolX(1) + layersArrowNudge)
+                hung(
+                    LayersPanel(model: model, arrowX: place.arrowX, maxHeight: room(less: Pc.popoverGap))
+                        .opacity(model.floating.undocking == .layers ? 0 : 1),
+                    place
+                )
             }
         case .actions:
-            let buttonX = Pc.actionCentre(0, barWidth: screen.width)
-            let place = place(actionsPanelWidth, buttonX)
+            let place = place(actionsPanelWidth, actionX(0))
             // ending 25 above the screen's edge, its rows scrolling, as measured
-            ActionsPanel(model: model, arrowX: place.arrowX)
-                .frame(maxHeight: screen.height - Pc.barHeight - 25, alignment: .top)
-                .offset(x: place.left, y: Pc.barHeight)
+            hung(ActionsPanel(model: model, arrowX: place.arrowX, maxHeight: room(less: 25)).frame(maxHeight: room(less: 25), alignment: .top), place)
         case .adjustments:
-            let buttonX = Pc.actionCentre(1, barWidth: screen.width)
-            let place = place(adjustmentsPanelWidth, buttonX)
-            AdjustmentsPanel(model: model, arrowX: place.arrowX)
-                .frame(maxHeight: screen.height - Pc.barHeight - 25, alignment: .top)
-                .offset(x: place.left, y: Pc.barHeight)
+            let place = place(adjustmentsPanelWidth, actionX(1))
+            hung(AdjustmentsPanel(model: model, arrowX: place.arrowX).frame(maxHeight: room(less: 25), alignment: .top), place)
         case .color:
-            let buttonX = screen.width - Pc.toolCentreFromRight(0, barWidth: screen.width)
-            let place = place(colorPanelWidth, buttonX)
-            ColorPanel(model: model, arrowX: place.arrowX, screenHeight: screen.height)
-                .offset(x: place.left, y: Pc.barHeight)
+            let place = place(colorPanelWidth, toolX(0) + colorsArrowNudge)
+            hung(ColorPanel(model: model, arrowX: place.arrowX, screenHeight: room(less: 0) + Pc.barHeight), place)
         default:
             EmptyView()
         }
@@ -573,10 +609,13 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
         session.startAutosave(dir: dir)
         canvas.onCommands = { [weak self] in self?.obey($0) }
         canvas.beforeTouches = { [weak self] in
-            self?.model.prepareTouches()
+            guard let self else { return }
+            self.model.prepareTouches()
+            // with a panel open, the touch waits to be a tap (it closes the panel) or a drag
+            self.model.session.setTouchPanelOpen(open: self.model.panel != Panel.none)
             // a field that had the keys let them go: they come back here
-            if self?.isFirstResponder == false, self?.model.text.info == nil {
-                self?.becomeFirstResponder()
+            if !self.isFirstResponder, self.model.text.info == nil {
+                self.becomeFirstResponder()
             }
         }
         canvas.afterTouches = { [weak self] ended in self?.model.layerOpacityTouched(ended: ended) }
@@ -585,13 +624,23 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
         let pencil = UIPencilInteraction()
         pencil.delegate = self
         canvas.addInteraction(pencil)
-        // the app may be ended without a word once in the background: saved as it goes there
+        // Reduce Motion: a dropped colour's fill shows at once rather than spreading in
+        session.setReduceMotion(reduce: UIAccessibility.isReduceMotionEnabled)
+        observers.append(NotificationCenter.default.addObserver(
+            forName: UIAccessibility.reduceMotionStatusDidChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.model.session.setReduceMotion(reduce: UIAccessibility.isReduceMotionEnabled) })
+        // the app may be ended without a word once in the background: saved as it goes there; away,
+        // the canvas draws nothing and the autosave rests
         observers.append(NotificationCenter.default.addObserver(
             forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
-        ) { [weak self] _ in self?.saveInBackground() })
+        ) { [weak self] _ in
+            self?.model.session.setShown(shown: false)
+            self?.saveInBackground()
+        })
         observers.append(NotificationCenter.default.addObserver(
             forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main
         ) { [weak self] _ in
+            self?.model.session.setShown(shown: true)
             self?.model.resumeTracking()
             self?.model.followStrokeSound()
             self?.model.readAppSettings()
@@ -622,8 +671,9 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
         key.keyCode == .keyboardLeftAlt || key.keyCode == .keyboardRightAlt
     }
 
-    /// The shortcuts as key commands, which the system lists while ⌘ is held.
-    private lazy var shortcuts = shortcutKeyCommands(action: #selector(CanvasViewController.shortcutCommand(_:)))
+    /// The shortcuts as key commands, which the system lists while ⌘ is held, made again when the
+    /// plugins change (one may rebind keys or give its own).
+    private var shortcuts: (made: Int, commands: [UIKeyCommand])?
     /// The press a shortcut last ran for, and when: one press may come both as a key command and
     /// as a press, and is done once.
     private var lastShortcut: (press: String, at: CFTimeInterval)?
@@ -631,7 +681,13 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
     private static let samePress: CFTimeInterval = 0.05
 
     override var keyCommands: [UIKeyCommand]? {
-        shortcuts
+        let now = PluginsModel.shared.changes
+        if let made = shortcuts, made.made == now {
+            return made.commands
+        }
+        let commands = shortcutKeyCommands(action: #selector(CanvasViewController.shortcutCommand(_:)))
+        shortcuts = (now, commands)
+        return commands
     }
 
     /// Whether a shortcut just ran for `press`.
@@ -748,11 +804,25 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
                 model.strokeEnded()
             case .viewMoved:
                 model.refreshView()
+            // let go near a right angle, the view turns onto it by itself: what is over it follows
+            case .viewSettles:
+                model.followView()
             case let .cursor(x, y):
                 let pixels = model.pixels
                 canvas.showCursor(at: CGPoint(x: CGFloat(x) / pixels, y: CGFloat(y) / pixels), hovering: false)
             case .cursorGone:
                 canvas.showCursor(at: nil, hovering: false)
+            // a pen touching at no pressure before it presses: shown as it hovering there
+            case let .penHovers(x, y):
+                let pixels = model.pixels
+                canvas.showCursor(at: CGPoint(x: CGFloat(x) / pixels, y: CGFloat(y) / pixels), hovering: true)
+            // a touch on the canvas with a panel open: dragged, it fades the panel and goes on; tapped,
+            // it only closes it
+            case .panelFades:
+                model.swipedBrush = nil
+                model.fadePanels()
+            case .panelTapped:
+                model.tapOutsidePanel()
             case .textLayer:
                 model.askRasterize = true
             case let .recolorMoved(x, y):
@@ -764,7 +834,12 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
             case .transformTouched:
                 model.transform.popup = .none
             case let .transformMoved(transform):
+                // the box snapping onto a guide is felt (Apple Pencil Pro)
+                let wasSnapped = model.transform.box.map { !$0.snapLines.isEmpty } ?? false
                 model.transform.moved(transform)
+                if let transform, !transform.snapLines.isEmpty, !wasSnapped {
+                    canvas.linedUp()
+                }
             case let .transformHeld(handle, x, y):
                 model.transform.hold(handle, x: x, y: y)
             case let .transformLetGo(handle, x, y):
@@ -824,6 +899,8 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
         model.stopWatching()
         model.keepChoicesNow()
         StrokeSound.shared.follow(nil, on: false)
+        // the gallery zooms out of the artwork's cell, a picture of the canvas fading away over it
+        GalleryZoomer.shared.close(session, dir: dir, pixels: canvas.window?.screen.scale ?? canvas.traitCollection.displayScale)
         canvas.detach()
         observers.forEach { NotificationCenter.default.removeObserver($0) }
         observers.removeAll()
@@ -881,6 +958,8 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
                     model.saveFailed(failure)
                 } else {
                     model.saveSucceeded()
+                    // its new picture on the home screen's widget
+                    RecentArtwork.refresh()
                 }
                 if task != .invalid {
                     app.endBackgroundTask(task)

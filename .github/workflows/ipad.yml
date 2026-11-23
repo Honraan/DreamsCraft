@@ -53,6 +53,15 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+      # the app with its Recent artwork widget (ios/widget.yml) builds too: a check, its .ipa not
+      # kept (the widget needs signing of its own to install)
+      - name: The widget builds
+        continue-on-error: true
+        env:
+          PROCRAFT_WIDGET: "YES"
+          DIST: ${{ github.workspace }}/dist-widget
+        run: bash ios/build-ipa.sh
+
   # plugin filters' GPU path on Metal, which nothing else here runs it on. A test with no GPU says
   # "skipped" and passes, so this job's colour means nothing: its summary says what ran. The hostile
   # tests are ignored elsewhere to spare a machine's driver; a runner has none to spare, so they run

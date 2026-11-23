@@ -352,8 +352,6 @@ struct SelectionToolbar: View {
                 }
             }
         } buttons: { w in
-            // a long name smaller only where the buttons are narrow
-            let long: CGFloat = w < buttonRoomy ? 11 : 12.5
             ToolbarButton(icon: PcIcons.selectAdd, label: "Add", active: !joins || !tool.removes, width: w, iconSize: 44) {
                 if joins {
                     tool.chooseRemoves(false)
@@ -363,13 +361,13 @@ struct SelectionToolbar: View {
                 tool.chooseRemoves(true)
             }
             ToolbarButton(icon: PcIcons.invert, label: "Invert", enabled: has, width: w, iconSize: 44) { tool.invert() }
-            ToolbarButton(icon: PcIcons.selectCopyPaste, label: "Copy & Paste", enabled: has || drawing, width: w, iconSize: 44, labelSize: long) {
+            ToolbarButton(icon: PcIcons.selectCopyPaste, label: "Copy & Paste", enabled: has || drawing, width: w, iconSize: 44) {
                 tool.copyToLayer()
             }
             ToolbarButton(icon: PcIcons.feather, label: "Feather", active: tool.popup == .feather, enabled: has || drawing, width: w, iconSize: 44) {
                 tool.openPopup(.feather)
             }
-            ToolbarButton(icon: PcIcons.saveLoad, label: "Save & Load", active: tool.popup == .saved, enabled: has || drawing, width: w, iconSize: 44, labelSize: long) {
+            ToolbarButton(icon: PcIcons.saveLoad, label: "Save & Load", active: tool.popup == .saved, enabled: has || drawing, width: w, iconSize: 44) {
                 tool.openPopup(.saved)
             }
             ToolbarButton(icon: PcIcons.colorFill, label: "Color Fill", active: tool.colorFill, width: w, iconSize: 37) { tool.toggleColorFill() }

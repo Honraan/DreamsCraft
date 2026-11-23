@@ -25,6 +25,7 @@ struct GlassMenu<Content: View>: View {
                     shape.fill(Pc.glassMenuOverPanel)
                 } else {
                     shape.fill(.ultraThinMaterial)
+                        .environment(\.colorScheme, Look.shared.light ? .light : .dark)
                     shape.fill(Pc.glassMenu)
                 }
             }

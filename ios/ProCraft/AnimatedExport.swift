@@ -85,7 +85,9 @@ extension CanvasModel {
                 let (width, height) = VideoWriter.fit(
                     width: Int(info.width), height: Int(info.height), maxSide: choices.webReady ? webReadySide : mostVideoSide
                 )
-                let order = session.animationSequence()
+                // the played frames in order, each as often as it is held: a background or foreground
+                // frame is drawn with each, not as one of its own
+                let order = session.animationPlayOrder()
                 let made = VideoWriter.write(
                     to: url, width: width, height: height, count: order.count, hevc: format == .hevc,
                     bitsPerPixel: 4, fps: choices.fps

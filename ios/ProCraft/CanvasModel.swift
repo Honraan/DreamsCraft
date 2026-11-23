@@ -190,6 +190,9 @@ final class CanvasModel {
     var insertPrivate = false
     var pdfAsking: ShareKind?
     var saying: (title: String, message: String)?
+    /// The Layers panel and the brush library floating in windows of their own, while a plugin lets
+    /// them (FloatingPanels.swift).
+    @ObservationIgnored let floating = FloatingPanels()
     /// The size and opacity side bar shows.
     var showSideBar = true {
         didSet { applyFitInsets() }
@@ -274,6 +277,11 @@ final class CanvasModel {
     private(set) var previews: [String: UIImage] = [:]
     private(set) var shadedNames: [String: Bool] = [:]
     @ObservationIgnored private var previewsAsked: Set<String> = []
+    /// The sample strokes held, the last drawn last: past `previewsMost` (by the device's memory)
+    /// the first go, and a row showing one draws it again. Kept all, every set looked through would
+    /// hold some 100 MB of pictures.
+    @ObservationIgnored private var previewOrder: [String] = []
+    private static let previewsMost = Int(brushPreviewsKept(memory: ProcessInfo.processInfo.physicalMemory, width: 530, height: 162))
     /// Goes up as the library changes: a preview drawn for a place that has since moved is dropped.
     @ObservationIgnored private var previewsMade = 0
     /// The Recent set's place among the sets.
@@ -368,6 +376,8 @@ final class CanvasModel {
     init(session: CanvasSession, dir: String) {
         self.session = session
         self.dir = dir
+        // the artwork open: where layers held out of another's layers panel land
+        HeldLayers.shared.canvas = self
         _ = session.openBrushes(dir: Self.brushesDir)
         // the plugins on first: their brush engines make brushes of the files waiting too
         applyPlugins()
@@ -451,7 +461,7 @@ final class CanvasModel {
         case .smudge: doing = "Smudging"
         case .erase: doing = "Erasing"
         }
-        showNotice("\(doing) with the current brush")
+        showDone("\(doing) with the current brush")
     }
 
     func select(_ next: ToolKind) {
@@ -584,6 +594,7 @@ final class CanvasModel {
         previews = [:]
         shadedNames = [:]
         previewsAsked = []
+        previewOrder = []
         keepBrushLibrary()
     }
 
@@ -755,7 +766,7 @@ final class CanvasModel {
         let session = session
         let made = cardPreviewsMade
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let t = session.brushLibraryPreview(library: UInt32(library), set: set, index: index, width: 212, height: 65)
+            let t = session.brushLibraryPreview(library: UInt32(library), set: set, index: index, width: 240, height: 74)
             let image = t.flatMap { Self.image($0) }
             DispatchQueue.main.async {
                 guard let self, let image, self.cardPreviewsMade == made else { return }
@@ -819,20 +830,16 @@ final class CanvasModel {
     }
 
     /// The library in use written to a library file and handed to the share sheet; told if it
-    /// couldn't be (it has no brushes, say).
+    /// couldn't be (it has no brushes, say). It is written a brush at a time, so however big the
+    /// library, only one brush's pictures are held.
     func shareLibrary() {
         let session = session
         let name = libraryName
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            var made: URL?
-            if let bytes = session.brushLibraryAsFile() {
-                let file = Sharing.exportsDir
-                    .appendingPathComponent(Sharing.safeName(name, otherwise: "Brushes"))
-                    .appendingPathExtension("brushlibrary")
-                if (try? bytes.write(to: file, options: .atomic)) != nil {
-                    made = file
-                }
-            }
+            let file = Sharing.exportsDir
+                .appendingPathComponent(Sharing.safeName(name, otherwise: "Brushes"))
+                .appendingPathExtension("brushlibrary")
+            let made: URL? = (try? session.writeBrushLibraryFile(path: file.path, writing: nil)) != nil ? file : nil
             DispatchQueue.main.async {
                 if let made {
                     Sharing.share([made])
@@ -891,16 +898,17 @@ final class CanvasModel {
         guard b != nil || brushSets.indices.contains(set) else { return }
         let name = b?.name ?? brushSets[set].name
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let bytes = b.map { session.brushAsFile(set: $0.set, index: $0.index) } ?? session.brushSetAsFile(set: UInt32(set))
-            var made: URL?
-            if let bytes {
-                let file = Sharing.exportsDir
-                    .appendingPathComponent(Sharing.safeName(name, otherwise: "Brush"))
-                    .appendingPathExtension(b != nil ? "brush" : "brushset")
-                if (try? bytes.write(to: file, options: .atomic)) != nil {
-                    made = file
-                }
+            // written straight to the file, a set a brush at a time (whole, or not at all)
+            let file = Sharing.exportsDir
+                .appendingPathComponent(Sharing.safeName(name, otherwise: "Brush"))
+                .appendingPathExtension(b != nil ? "brush" : "brushset")
+            let written: Void?
+            if let b {
+                written = try? session.writeBrushFile(set: b.set, index: b.index, path: file.path)
+            } else {
+                written = try? session.writeBrushSetFile(set: UInt32(set), path: file.path, writing: nil)
             }
+            let made: URL? = written != nil ? file : nil
             DispatchQueue.main.async {
                 if let made {
                     Sharing.share([made])
@@ -922,19 +930,31 @@ final class CanvasModel {
         }
         importCancelled = false
         importShown = ProgressShown(progress: 0, detail: name)
-        var creep: Float = 0
+        // the pie follows the reading, a brush at a time, then a plugin's brush engine's; Cancel
+        // stops it
+        let reading = BrushFileReading()
         let creeping = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
-            guard let self, !self.importCancelled else { return }
-            creep += (0.95 - creep) * 0.03
-            self.importShown = ProgressShown(progress: creep, detail: name)
+            guard let self else { return }
+            if self.importCancelled {
+                reading.cancel()
+                return
+            }
+            let engine = reading.engineSize() > 0
+            self.importShown = ProgressShown(progress: engine ? reading.engineProgress() : reading.progress(), detail: name)
         }
         let session = session
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let bytes = url.readPicked()
-            let read = bytes.flatMap { readBrushes(bytes: $0, fileName: name) }
-            // plugins' brush engines make theirs of the file here too, off the main thread
+            // copied first and read from the copy, so a set of gigabytes is never held whole
+            let copy = url.copyPicked()
+            let read = copy.flatMap { readBrushesFile(path: $0.path, fileName: name, reading: reading) }
+            // plugins' brush engines make theirs of the file here too, off the main thread, with what
+            // the app may still take
             if let read {
-                session.makeEngineBrushes(read: read, reading: nil)
+                DeviceMemory.tell()
+                session.makeEngineBrushes(read: read, reading: reading)
+            }
+            if let copy {
+                try? FileManager.default.removeItem(at: copy)
             }
             then?()
             DispatchQueue.main.async {
@@ -950,11 +970,12 @@ final class CanvasModel {
                 } else {
                     self.importShown = nil
                 }
-                if bytes == nil {
+                if copy == nil {
                     self.showNotice("This file could not be read.", warning: true)
                 } else if let read {
                     self.brushesRead.append(read)
                     self.addBrushesRead()
+                    self.tellEngine(reading)
                 } else {
                     self.showNotice("This file has no brushes in it.", warning: true)
                 }
@@ -962,19 +983,50 @@ final class CanvasModel {
         }
     }
 
-    /// Brush files brought in with no artwork open join the library now.
+    /// What a plugin's brush engine said of a file it had: one that went wrong (a title of its own)
+    /// as an alert, else in passing.
+    private func tellEngine(_ reading: BrushFileReading) {
+        guard let notice = reading.notice() else { return }
+        if let title = reading.noticeTitle() {
+            saying = (title, notice)
+        } else {
+            showNotice(notice)
+        }
+    }
+
+    /// Brush files brought in with no artwork open join the library now: off the main thread, each
+    /// read a brush at a time (a big set is never held whole), oldest first. A file not read yet
+    /// stays for the next canvas if this one closes first.
     private func addPendingBrushes() {
-        let manager = FileManager.default
-        let dir = Gallery.pendingBrushes
-        let files = (try? manager.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
-        for file in files {
-            // the name it came with, after what kept it apart
-            let name = String(file.lastPathComponent.dropFirst(37))
-            if let bytes = try? Data(contentsOf: file), let read = readBrushes(bytes: bytes, fileName: name) {
-                session.makeEngineBrushes(read: read, reading: nil)
-                _ = session.addBrushesRead(read: read, shown: 0)
+        let session = session
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let manager = FileManager.default
+            let files = ((try? manager.contentsOfDirectory(at: Gallery.pendingBrushes, includingPropertiesForKeys: [.creationDateKey])) ?? [])
+                .sorted { a, b in
+                    let at = { (u: URL) in (try? u.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast }
+                    return at(a) < at(b)
+                }
+            for file in files {
+                guard self != nil else { return }
+                // the name it came with, after what kept it apart
+                let name = String(file.lastPathComponent.dropFirst(37))
+                let reading = BrushFileReading()
+                let read = readBrushesFile(path: file.path, fileName: name, reading: nil)
+                if let read {
+                    DeviceMemory.tell()
+                    session.makeEngineBrushes(read: read, reading: reading)
+                }
+                try? manager.removeItem(at: file)
+                DispatchQueue.main.async {
+                    guard let self, let read else { return }
+                    self.brushesRead.append(read)
+                    self.addBrushesRead()
+                    // only what went wrong: what came in is said as it joins
+                    if reading.noticeTitle() != nil {
+                        self.tellEngine(reading)
+                    }
+                }
             }
-            try? manager.removeItem(at: file)
         }
     }
 
@@ -1001,7 +1053,7 @@ final class CanvasModel {
         brushesRead = []
         libraryChanged()
         if joined {
-            showNotice("Brushes added to the library.")
+            showDone("Brushes added to the library.")
         }
     }
 
@@ -1045,9 +1097,22 @@ final class CanvasModel {
             let under = x1 > x0 && cover > 2 * (x1 - x0) * (y1 - y0)
             DispatchQueue.main.async {
                 guard self?.previewsMade == made else { return }
-                self?.previews[key] = image
-                self?.shadedNames[key] = under
+                self?.keepPreview(key, image, shaded: under)
             }
+        }
+    }
+
+    /// `image` kept as brush `key`'s sample stroke, the oldest let go past the most kept.
+    private func keepPreview(_ key: String, _ image: UIImage, shaded: Bool) {
+        previews[key] = image
+        shadedNames[key] = shaded
+        previewOrder.removeAll { $0 == key }
+        previewOrder.append(key)
+        while previewOrder.count > Self.previewsMost {
+            let old = previewOrder.removeFirst()
+            previews[old] = nil
+            shadedNames[old] = nil
+            previewsAsked.remove(old)
         }
     }
 
@@ -1095,6 +1160,12 @@ final class CanvasModel {
             panel = .none
         }
         panelFading = false
+        // as do the Layers and the brush library's buttons with theirs floating
+        let floatingPanel: FloatingPanel? = p == .layers ? .layers : p == .brushes ? .brushes : nil
+        if let floatingPanel, floating.shown(floatingPanel) != nil {
+            floating.close(floatingPanel)
+            panel = .none
+        }
         panel = panel == p ? .none : p
         if panel == .layers {
             refreshThumbnails()
@@ -1112,6 +1183,11 @@ final class CanvasModel {
             shownSet = Int(current.set)
         }
         recentBrushes = session.recentBrushes()
+    }
+
+    /// The Layers panel shows: hanging from its button, or floating.
+    var layersShown: Bool {
+        panel == .layers || floating.shown(.layers) != nil
     }
 
     func closePanels() {
@@ -1410,7 +1486,7 @@ final class CanvasModel {
         let painted = adjustShown?.pencil == true
         _ = session.adjustmentEnd(commit: commit)
         if commit {
-            showNotice("Adjustment applied")
+            showDone("Adjustment applied")
         }
         readAdjust()
         adjustment = nil
@@ -1424,7 +1500,7 @@ final class CanvasModel {
     func applyAdjustment() {
         guard adjustment != nil else { return }
         session.adjustmentApply()
-        showNotice("Adjustment applied")
+        showDone("Adjustment applied")
         readAdjust()
         refresh()
     }
@@ -1618,7 +1694,10 @@ final class CanvasModel {
             recolor.readPoint()
         }
         if could || name != nil {
-            showNotice("Undo" + (name.map { " \($0)" } ?? ""))
+            // (as the core words it, unless a plugin hides undo's notices)
+            if let said = session.stepNotice(undo: true, name: name) {
+                showNotice(said)
+            }
         }
         // a model's tile chosen before comes back, with its channel's colour
         scene.followStep()
@@ -1651,7 +1730,9 @@ final class CanvasModel {
         // recoloring, the core steps the open fill aside and makes it again over what comes back
         let name = recoloring ? recolor.afterFills { session.redo() } : session.redo()
         if could {
-            showNotice("Redo" + (name.map { " \($0)" } ?? ""))
+            if let said = session.stepNotice(undo: false, name: name) {
+                showNotice(said)
+            }
         }
         scene.followStep()
         if adjustment != nil {
@@ -1688,7 +1769,7 @@ final class CanvasModel {
         }
         // undoing may put the canvas back in another profile
         refreshCanvasSpace()
-        if panel == .layers {
+        if layersShown {
             refreshThumbnails()
         }
     }
@@ -1735,6 +1816,14 @@ final class CanvasModel {
         return clipboard == nil || (board.changeCount != clipboardCount && board.changeCount != clipboardOwnCount)
     }
 
+    /// What was last cut or copied here as a source image (only where it is painted, cut to that),
+    /// unless another app's picture went on the system's clipboard since; none if nothing was.
+    func copySource() -> Data? {
+        guard let clipboard, !systemPictureNewer else { return nil }
+        let made = sourceFromCopy(image: clipboard)
+        return made.isEmpty ? nil : made
+    }
+
     /// The picture on the system's clipboard as a file's bytes (its own kind first, which keeps
     /// its transparency); none if it can't be read.
     private func systemPictureBytes() -> Data? {
@@ -1749,7 +1838,7 @@ final class CanvasModel {
 
     /// The current layer within the selection, cut; none if nothing was.
     private func layerCut() -> ThumbnailImage? {
-        guard currentTakesChanges() else {
+        guard currentTakesChanges(cut: true) else {
             closePanels()
             return nil
         }
@@ -1757,17 +1846,21 @@ final class CanvasModel {
         closePanels()
         refresh()
         if cut != nil {
-            showNotice("Layer cut")
+            showDone("Layer cut")
         }
         return cut
     }
 
     /// The current layer within the selection, copied; none if nothing was.
     private func layerCopied() -> ThumbnailImage? {
+        guard currentTakesChanges(copy: true) else {
+            closePanels()
+            return nil
+        }
         let copied = session.copyLayer()
         closePanels()
         if copied != nil {
-            showNotice("Layer copied")
+            showDone("Layer copied")
         }
         return copied
     }
@@ -1799,7 +1892,7 @@ final class CanvasModel {
             DispatchQueue.main.async {
                 guard let self, let copied else { return }
                 self.keepCopy(copied)
-                self.showNotice("Canvas copied")
+                self.showDone("Canvas copied")
             }
         }
     }
@@ -1948,7 +2041,7 @@ final class CanvasModel {
     /// layer"), or, with a layer shown alone, every layer shows again (the core decides and words it).
     func toggleVisible(_ l: LayerInfo) {
         if let said = session.tapVisibility(id: l.id) {
-            showNotice(said)
+            showDone(said)
         }
         refresh()
     }
@@ -2089,7 +2182,7 @@ final class CanvasModel {
     func previousColor() {
         guard let before = Self.colourHistory.previous(current: colorRgb()) else { return }
         setRgb(before)
-        showNotice("Previous colour")
+        showDone("Previous colour")
     }
 
     func clearHistory() {
@@ -2186,7 +2279,7 @@ final class CanvasModel {
         timeLapse.record()
         // the stroke's colour went into the history
         history = Self.colourHistory.colours()
-        if panel == .layers {
+        if layersShown {
             refreshThumbnails()
         }
     }
@@ -2248,7 +2341,7 @@ final class CanvasModel {
         _ = session.selectLayer(id: l.id)
         session.clearLayer()
         refresh()
-        showNotice("Layer cleared")
+        showDone("Layer cleared")
     }
 
     /// Layer Select held at window point (`x`, `y`): the layer drawn there becomes current; more
@@ -2271,17 +2364,23 @@ final class CanvasModel {
 
     /// Whether the current layer takes a change (a stroke, a transform, an adjustment, clearing,
     /// cutting); if not (locked, hidden, or an empty group), a dialog says why. What was tried is
-    /// not done afterwards. With `paint` (a stroke or a fill) a group current says so too.
-    func currentTakesChanges(paint: Bool = false, adjustment: Adjustment? = nil) -> Bool {
+    /// not done afterwards. With `paint` (a stroke or a fill) a group current says so too; an
+    /// adjustment or a `copy` (or a cut, `cut`) takes one layer, so a group current or several
+    /// layers chosen say so.
+    func currentTakesChanges(paint: Bool = false, adjustment: Adjustment? = nil, copy: Bool = false, cut: Bool = false) -> Bool {
         // the shared core decides
         let asked: Blocked? = if paint {
             session.whyUnpainted()
         } else if let adjustment {
             session.whyNotAdjusted(adjustment: adjustment)
+        } else if copy || cut {
+            session.whyNotCopied(cut: cut)
         } else {
             session.whyBlocked()
         }
-        guard let l = layers.first(where: { $0.current }), let why = asked else { return true }
+        guard let current = layers.first(where: { $0.current }), let why = asked else { return true }
+        // Liquify's alert is about the layer chosen whose alpha is locked
+        let l = why == .alphaLocked ? session.alphaLockedChosen().flatMap { id in layers.first { $0.id == id } } ?? current : current
         blocked = BlockedLayer(why: why, layer: l, by: session.hiddenBy())
         return false
     }
@@ -2297,7 +2396,7 @@ final class CanvasModel {
             case .hidden, .groupHidden:
                 // its own box ticked (what else hides it stays)
                 if let said = session.showLayer(id: b.layer.id) {
-                    showNotice(said)
+                    showDone(said)
                 }
                 refresh()
             case .emptyGroup, .group, .several:
@@ -2321,7 +2420,7 @@ final class CanvasModel {
         let on = !l.locked
         let said = session.lockSaid(id: l.id, on: on)
         if session.setLayerLocked(id: l.id, on: on) {
-            showNotice(said)
+            showDone(said)
         }
         refresh()
     }
@@ -2442,7 +2541,7 @@ final class CanvasModel {
         guard let info = session.quickshapeInfo() else { return }
         quickShape = info
         quickShapeEditing = false
-        showNotice(snappedTo(info.kind))
+        showDone(snappedTo(info.kind))
     }
 
     /// The snapped shape changed (dragged, or a finger down while it is held).
@@ -2462,7 +2561,7 @@ final class CanvasModel {
         guard let info = session.quickshapeLast() else { return }
         quickShape = info
         quickShapeEditing = false
-        showNotice(snappedTo(info.kind))
+        showDone(snappedTo(info.kind))
         refreshFlags()
     }
 
@@ -2565,10 +2664,18 @@ final class CanvasModel {
     // MARK: messages
 
     /// Shows `text` in the band under the top bar, in place of any message there; a `warning`
-    /// stays longer.
-    func showNotice(_ text: String, warning: Bool = false) {
+    /// stays longer. Of `kind`: one of something gone wrong always shows, one of something done
+    /// unless a plugin hides it.
+    func showNotice(_ text: String, warning: Bool = false, kind: NoticeKind = .problem) {
+        guard kind == .problem || Look.shared.showsNotice(kind) else { return }
         notices += 1
         notice = Notice(text: text, id: notices, warning: warning)
+    }
+
+    /// Shows `text`, the notice of something done (copied, cleared, applied, switched on), unless a
+    /// plugin hides those.
+    func showDone(_ text: String, warning: Bool = false) {
+        showNotice(text, warning: warning, kind: .done)
     }
 
     /// The message under the top bar has gone.

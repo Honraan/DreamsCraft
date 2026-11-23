@@ -314,6 +314,9 @@ jobs:
       - name: Build the IPA
         env:
           VERSION: ${{ steps.v.outputs.version }}
+          # the Recent artwork widget comes along once the repository's variable IPAD_WIDGET is
+          # true (its signing set up: ios/widget.yml)
+          PROCRAFT_WIDGET: ${{ vars.IPAD_WIDGET == 'true' && 'YES' || 'NO' }}
         run: bash ios/build-ipa.sh
 
       - name: Sign the IPA for testers
@@ -328,6 +331,7 @@ jobs:
           IOS_CERTIFICATE_P12: ${{ secrets.IOS_CERTIFICATE_P12 }}
           IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
           IOS_PROVISIONING_PROFILE: ${{ secrets.IOS_PROVISIONING_PROFILE }}
+          IOS_WIDGET_PROVISIONING_PROFILE: ${{ secrets.IOS_WIDGET_PROVISIONING_PROFILE }}
         run: bash ios/sign-ipa.sh
 
       - name: Files

@@ -168,14 +168,14 @@ final class TransformTool {
     func toggleAdvancedMesh() {
         advancedMesh.toggle()
         UserDefaults.standard.set(advancedMesh, forKey: Self.meshKey)
-        model.showNotice("Advanced mesh " + (advancedMesh ? "on" : "off"))
+        model.showDone("Advanced mesh " + (advancedMesh ? "on" : "off"))
     }
 
     func changeGuides(_ g: GuideSettings) {
         if g.snapping != guides.snapping {
-            model.showNotice("Snapping " + (g.snapping ? "on" : "off"))
+            model.showDone("Snapping " + (g.snapping ? "on" : "off"))
         } else if g.magnetics != guides.magnetics {
-            model.showNotice("Magnetics " + (g.magnetics ? "on" : "off"))
+            model.showDone("Magnetics " + (g.magnetics ? "on" : "off"))
         }
         guides = g
         model.session.transformSetGuides(guides: g)
@@ -467,10 +467,8 @@ struct TransformToolbar: View {
             ToolbarSegment(icon: PcIcons.distort, label: "Distort", selected: tool.kind == .distort, iconSize: 43) { tool.choose(.distort) }
             ToolbarSegment(icon: PcIcons.warp, label: "Warp", selected: tool.kind == .warp, iconSize: 43) { tool.choose(.warp) }
         } buttons: { w in
-            // a long name smaller only where the buttons are narrow
-            let long: CGFloat = w < buttonRoomy ? 11 : 12.5
             if tool.kind == .warp {
-                ToolbarButton(icon: PcIcons.advancedMesh, label: "Advanced Mesh", active: tool.advancedMesh, width: w, iconSize: 28.8, labelSize: long) {
+                ToolbarButton(icon: PcIcons.advancedMesh, label: "Advanced Mesh", active: tool.advancedMesh, width: w, iconSize: 28.8) {
                     tool.toggleAdvancedMesh()
                 }
             } else {
@@ -478,10 +476,10 @@ struct TransformToolbar: View {
                     tool.popup = popup == .snapping ? .none : .snapping
                 }
             }
-            ToolbarButton(icon: PcIcons.flipHorizontal, label: "Flip Horizontal", width: w, iconSize: 50, labelSize: long) { tool.apply(.flipHorizontal) }
-            ToolbarButton(icon: PcIcons.flipVertical, label: "Flip Vertical", width: w, iconSize: 50, labelSize: long) { tool.apply(.flipVertical) }
+            ToolbarButton(icon: PcIcons.flipHorizontal, label: "Flip Horizontal", width: w, iconSize: 50) { tool.apply(.flipHorizontal) }
+            ToolbarButton(icon: PcIcons.flipVertical, label: "Flip Vertical", width: w, iconSize: 50) { tool.apply(.flipVertical) }
             ToolbarButton(icon: PcIcons.rotate45, label: "Rotate 45°", width: w, iconSize: 44) { tool.apply(.rotate45) }
-            ToolbarButton(icon: PcIcons.fitToCanvas, label: "Fit to Canvas", width: w, iconSize: 35, labelSize: long) { tool.apply(.fitToCanvas) }
+            ToolbarButton(icon: PcIcons.fitToCanvas, label: "Fit to Canvas", width: w, iconSize: 35) { tool.apply(.fitToCanvas) }
             ToolbarButton(icon: PcIcons.interpolation, label: interpolationName(tool.interpolation, short: true), active: popup == .interpolation, width: w, iconSize: 44) {
                 tool.popup = popup == .interpolation ? .none : .interpolation
             }
