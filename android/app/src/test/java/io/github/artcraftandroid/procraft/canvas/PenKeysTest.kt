@@ -253,7 +253,7 @@ class PenKeysTest {
         fingerPaint = fingerPaint, oneFingerPan = oneFingerPan, undoTaps = true, rotate = true, modelFingerPaint = modelFingerPaint,
         drawAndHold = true, touch = null, pen = null, hold = GestureAction.EYEDROPPER, modifyTouch = null, modifyPen = null,
         fourTap = null, threeSwipe = null, penButton = null, penSecondButton = null, scrub = true, hoverTouch = false,
-        holdMs = 400.0, quickshapeMs = 650.0, rapidUndoMs = 650.0,
+        holdMs = 400.0, quickshapeMs = 650.0, rapidUndoMs = 650.0, liquifyRoll = true,
     )
 
     @Test

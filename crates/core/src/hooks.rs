@@ -38,6 +38,14 @@ pub(crate) fn at_work(running: &Shared) -> MutexGuard<'_, Running> {
 struct OnHook {
     id: String,
     running: Shared,
+    /// Of a plugin of features (interface 16), a copy of its code for each feature that is on: the
+    /// feature this one is for (its switch's place among the controls), and every feature's switch,
+    /// which this copy is told as off but for its own, so it answers as the plugin it was.
+    feature: Option<usize>,
+    features: Arc<[usize]>,
+    /// The id the marks it keeps with layers go by: its own, or that of a plugin it took the place
+    /// of whose marks it keeps (interface 16).
+    marks: String,
     /// The hooks it is on, as bits (see [`Hook::bit`]).
     hooks: u64,
     /// The keys of its rows in the brush studio, in their order.
@@ -61,6 +69,16 @@ struct OnHook {
     no_looks: Vec<(String, u64)>,
     /// The looks (by engine and data) being made on threads of their own.
     making: Vec<(String, u64, Arc<crate::plugin_brushes::Making>)>,
+}
+
+/// Which copy of a plugin's code goes on the hooks: the plugin's id, the feature it is for (of a
+/// plugin of features, interface 16, its switch's place among the controls) with every feature's
+/// switch, and the id its layers' marks go by.
+pub(crate) struct OnCopy {
+    pub(crate) id: String,
+    pub(crate) feature: Option<usize>,
+    pub(crate) features: Arc<[usize]>,
+    pub(crate) marks: String,
 }
 
 /// The most brushes whose looks couldn't be made are remembered, the latest kept.
@@ -129,6 +147,16 @@ impl Hooks {
         self.changed();
     }
 
+    /// The plugin whose copy of its code is at `at` comes off, every copy, having stopped: where
+    /// what came after `at` is now.
+    fn stop_at(&self, working: &mut Working, at: usize, stop: Stop) -> usize {
+        let Some(id) = working.on.get(at).map(|p| p.id.clone()) else { return at };
+        let before = working.on.iter().take(at).filter(|p| p.id == id).count();
+        working.on.retain(|p| p.id != id);
+        self.note_stop(working, id, stop);
+        at - before
+    }
+
     fn has(&self, hook: Hook) -> bool {
         self.hooked.load(Ordering::Relaxed) & hook.bit() != 0
     }
@@ -176,10 +204,7 @@ impl Hooks {
                     at = to;
                     i += 1;
                 }
-                Err(stop) => {
-                    let gone = working.on.remove(i);
-                    self.note_stop(&mut working, gone.id, stop);
-                }
+                Err(stop) => i = self.stop_at(&mut working, i, stop),
             }
         }
         self.rehook(&working);
@@ -412,8 +437,7 @@ impl Hooks {
         match answer {
             Ok(said) => Some(said),
             Err(stop) => {
-                let gone = working.on.remove(at);
-                self.note_stop(&mut working, gone.id, stop);
+                self.stop_at(&mut working, at, stop);
                 self.rehook(&working);
                 None
             }
@@ -445,16 +469,19 @@ impl Hooks {
     pub(crate) fn give_kept(&self, id: &str, data: &[u8]) {
         {
             let mut working = self.working();
-            if let Some(at) = working.on.iter().position(|p| p.id == id) {
-                if let Some(events) = working.on.get(at).and_then(|p| p.events.as_ref()) {
+            let mut stopped = None;
+            for (at, plugin) in working.on.iter().enumerate().filter(|(_, p)| p.id == id) {
+                if let Some(events) = plugin.events.as_ref() {
                     let _ = at_work(events).give_kept(data);
                 }
-                let told = working.on.get(at).map(|p| at_work(&p.running).give_kept(data));
-                if let Some(Err(stop)) = told {
-                    let gone = working.on.remove(at);
-                    self.note_stop(&mut working, gone.id, stop);
-                    self.rehook(&working);
+                if let Err(stop) = at_work(&plugin.running).give_kept(data) {
+                    stopped = Some((at, stop));
+                    break;
                 }
+            }
+            if let Some((at, stop)) = stopped {
+                self.stop_at(&mut working, at, stop);
+                self.rehook(&working);
             }
         }
         for canvas in self.canvases_of(id) {
@@ -525,10 +552,19 @@ impl Hooks {
         self.working().on.iter().any(|p| p.id == id)
     }
 
+    #[cfg(test)]
     pub(crate) fn put_on(&self, id: String, running: Running, hooks: &[Hook]) {
+        let marks = id.clone();
+        self.put_on_copy(OnCopy { id, feature: None, features: Arc::from([]), marks }, running, hooks);
+    }
+
+    /// The copy of a plugin's code `copy` says (one feature's, interface 16) on `hooks`, in place of
+    /// the one there was. A plugin's copies go in their features' order.
+    pub(crate) fn put_on_copy(&self, copy: OnCopy, running: Running, hooks: &[Hook]) {
+        let OnCopy { id, feature, features, marks } = copy;
         let mut working = self.working();
-        working.on.retain(|p| p.id != id);
-        let at = working.on.partition_point(|p| p.id < id);
+        working.on.retain(|p| p.id != id || (feature.is_some() && p.feature != feature));
+        let at = working.on.partition_point(|p| p.id < id || (p.id == id && p.feature < feature));
         let hooks = hooks.iter().fold(0, |bits, hook| bits | hook.bit());
         let running = Arc::new(Mutex::new(running));
         working.on.insert(
@@ -536,6 +572,9 @@ impl Hooks {
             OnHook {
                 id,
                 running,
+                feature,
+                features,
+                marks,
                 hooks,
                 brush_keys: Vec::new(),
                 picture: None,
@@ -552,17 +591,20 @@ impl Hooks {
         self.changed();
     }
 
-    /// `id`'s copy of its code for its events (see [`OnHook::events`]).
-    pub(crate) fn give_events(&self, id: &str, running: Running) {
-        if let Some(plugin) = self.working().on.iter_mut().find(|p| p.id == id) {
+    /// `id`'s copy of its code for its events (see [`OnHook::events`]): for `feature`'s, of a
+    /// plugin of features.
+    pub(crate) fn give_events(&self, id: &str, feature: Option<usize>, running: Running) {
+        if let Some(plugin) = self.working().on.iter_mut().find(|p| p.id == id && p.feature == feature) {
             plugin.events = Some(Arc::new(Mutex::new(running)));
         }
     }
 
     /// `id`'s picture's code, for the picker hook, read by `keys` (if it reads its controls) at
-    /// its controls' `values`.
+    /// its controls' `values`: of the copy of its code on the hook.
     pub(crate) fn give_picture(&self, id: &str, text: String, keys: Option<Vec<String>>, values: Vec<f32>) {
-        if let Some(plugin) = self.working().on.iter_mut().find(|p| p.id == id) {
+        let mut working = self.working();
+        let on_it = |p: &&mut OnHook| p.id == id && (p.feature.is_none() || p.hooks & Hook::Picker.bit() != 0);
+        if let Some(plugin) = working.on.iter_mut().find(on_it) {
             plugin.picture = Some(Picture { text: text.into(), keys: keys.map(Into::into), values });
         }
     }
@@ -787,7 +829,10 @@ impl Hooks {
         if marks.is_empty() || !self.has(Hook::LayerLabel) {
             return None;
         }
-        self.through_by_id(Hook::LayerLabel, None, |id, running, said| match (said, marks.get(id)) {
+        // each told the mark kept under the id its marks go by
+        let by: Vec<(String, String)> = self.working().on.iter().map(|p| (p.id.clone(), p.marks.clone())).collect();
+        let marks_of = |id: &str| by.iter().find(|(of, _)| of == id).and_then(|(_, by)| marks.get(by));
+        self.through_by_id(Hook::LayerLabel, None, |id, running, said| match (said, marks_of(id)) {
             (Some(colour), _) => Ok(Some(colour)),
             (None, Some(&mark)) if mark != 0 => running.layer_label(mark),
             _ => Ok(None),
@@ -826,10 +871,7 @@ impl Hooks {
                     }
                     i += 1;
                 }
-                Err(stop) => {
-                    let gone = working.on.remove(i);
-                    self.note_stop(&mut working, gone.id, stop);
-                }
+                Err(stop) => i = self.stop_at(&mut working, i, stop),
             }
         }
         self.rehook(&working);
@@ -1036,21 +1078,28 @@ impl Hooks {
         }
     }
 
-    /// The keys of `id`'s rows in the brush studio, in their order.
+    /// The keys of `id`'s rows in the brush studio, in their order: each copy of its code's.
     pub(crate) fn brush_keys(&self, id: &str, keys: Vec<String>) {
-        if let Some(plugin) = self.working().on.iter_mut().find(|p| p.id == id) {
-            plugin.brush_keys = keys;
+        for plugin in self.working().on.iter_mut().filter(|p| p.id == id) {
+            plugin.brush_keys.clone_from(&keys);
         }
     }
 
-    /// The file picked for `id`'s control `index` (none: let go) handed to it: a long call. One
-    /// that stops is off its hooks.
-    pub(crate) fn give_file(&self, id: &str, index: usize, bytes: Option<&[u8]>) {
-        let found = self.working().on.iter().find(|p| p.id == id).map(|p| Arc::clone(&p.running));
-        if let Some(running) = found
-            && let Err(stop) = at_work(&running).give_file(index, bytes)
-        {
-            self.stopped(id, stop);
+    /// The file picked for `id`'s control `index` (none: let go) handed to it: a long call. Of a
+    /// plugin of features (interface 16), only to the copy of `feature`'s, the one the control comes
+    /// under: what one feature's files take is never another's memory. One that stops is off its
+    /// hooks.
+    pub(crate) fn give_file(&self, id: &str, feature: Option<usize>, index: usize, bytes: Option<&[u8]>) {
+        let found: Vec<Shared> = {
+            let working = self.working();
+            let theirs = working.on.iter().filter(|p| p.id == id && (p.feature.is_none() || p.feature == feature));
+            theirs.map(|p| Arc::clone(&p.running)).collect()
+        };
+        for running in found {
+            if let Err(stop) = at_work(&running).give_file(index, bytes) {
+                self.stopped(id, stop);
+                return;
+            }
         }
     }
 
@@ -1062,26 +1111,46 @@ impl Hooks {
         self.changed();
     }
 
-    /// Tells `id`, if it is on, control `index` has `value`.
+    /// Takes the copy of `id`'s code for `feature` off (interface 16): the feature is off, and on
+    /// none of its hooks from the next sample on.
+    pub(crate) fn take_off_feature(&self, id: &str, feature: usize) {
+        let mut working = self.working();
+        working.on.retain(|p| p.id != id || p.feature != Some(feature));
+        self.rehook(&working);
+        self.changed();
+    }
+
+    /// Whether the copy of `id`'s code for `feature` is on.
+    pub(crate) fn feature_on(&self, id: &str, feature: usize) -> bool {
+        self.working().on.iter().any(|p| p.id == id && p.feature == Some(feature))
+    }
+
+    /// Tells `id`, if it is on, control `index` has `value`: each copy of its code, a copy of a
+    /// plugin of features told another feature's switch as off.
     pub(crate) fn control(&self, id: &str, index: usize, value: f32) {
         self.changed();
         {
             let mut working = self.working();
-            if let Some(at) = working.on.iter().position(|p| p.id == id) {
+            let mut stopped = None;
+            for (at, plugin) in working.on.iter_mut().enumerate().filter(|(_, p)| p.id == id) {
+                let others = plugin.features.contains(&index) && plugin.feature != Some(index);
+                let told = if others { 0.0 } else { value };
                 // what its picture is drawn with
-                if let Some(kept) = working.on.get_mut(at).and_then(|p| p.picture.as_mut()?.values.get_mut(index)) {
-                    *kept = value;
+                if let Some(kept) = plugin.picture.as_mut().and_then(|p| p.values.get_mut(index)) {
+                    *kept = told;
                 }
                 // its events' copy too
-                if let Some(events) = working.on.get(at).and_then(|p| p.events.as_ref()) {
-                    let _ = at_work(events).control(index, value);
+                if let Some(events) = plugin.events.as_ref() {
+                    let _ = at_work(events).control(index, told);
                 }
-                let told = working.on.get(at).map(|p| at_work(&p.running).control(index, value));
-                if let Some(Err(stop)) = told {
-                    let gone = working.on.remove(at);
-                    self.note_stop(&mut working, gone.id, stop);
-                    self.rehook(&working);
+                if let Err(stop) = at_work(&plugin.running).control(index, told) {
+                    stopped = Some((at, stop));
+                    break;
                 }
+            }
+            if let Some((at, stop)) = stopped {
+                self.stop_at(&mut working, at, stop);
+                self.rehook(&working);
             }
         }
         // its artworks open too, once the list is let go (a canvas telling of a stop takes it)
@@ -1401,7 +1470,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_plugins_that_come_with_the_app_and_only_answer_answer_from_their_own_code() {
-        const ANSWERING: [&str; 4] = ["colordrop-tools", "interface", "layer-tools", "radial-segments"];
+        const ANSWERING: [&str; 4] = ["colour-tools", "interface-look", "layer-toolbox", "radial-segments"];
         let dir = store("answering");
         let plugins = Plugins::with_store(dir.clone());
         let hooks = plugins.hooks();
@@ -1426,16 +1495,23 @@ pub(crate) mod tests {
         for name in ANSWERING {
             assert!(plugins.set_on(id(name), true), "{name}");
         }
-        // each waits for its switch, and radial symmetry makes eight until its slider moves
+        // each waits for its feature and its switch, and radial symmetry makes eight until its
+        // slider moves
+        assert_eq!(said(&hooks), ([false; 5], Some(8)));
+        for (name, feature) in
+            [("colour-tools", "colordrop"), ("interface-look", "interface"), ("layer-toolbox", "layer_tools")]
+        {
+            assert!(plugins.set_switch(format!("{}.{feature}", id(name)), true), "{feature}");
+        }
         assert_eq!(said(&hooks), ([false; 5], Some(8)));
         // (the eyedropper's kept under the setting the app had before it was a plugin)
         assert!(plugins.set_switch("eyedropper_layer".to_owned(), true));
         assert_eq!(said(&hooks), ([true, false, false, false, false], Some(8)));
         for (name, switch) in [
-            ("colordrop-tools", "all_layers"),
-            ("interface", "hide_undo"),
-            ("layer-tools", "opacity"),
-            ("interface", "pin_panels"),
+            ("colour-tools", "all_layers"),
+            ("interface-look", "hide_undo"),
+            ("layer-toolbox", "opacity"),
+            ("interface-look", "pin_panels"),
         ] {
             assert!(plugins.set_switch(format!("{}.{switch}", id(name)), true), "{switch}");
         }
@@ -2166,10 +2242,11 @@ pub(crate) mod tests {
         let Some(s) = session() else { return };
         let dir = store("grid-layer");
         let plugins = Plugins::with_store(dir.clone());
-        let (_, file) = crate::bundled::BUNDLED.iter().find(|(name, _)| *name == "layer-fills").unwrap();
+        let (_, file) = crate::bundled::BUNDLED.iter().find(|(name, _)| *name == "layer-toolbox").unwrap();
         assert_eq!(plugins.install(file.to_vec()), None);
-        let id = "io.github.artcraftandroid.layer-fills";
+        let id = "io.github.artcraftandroid.layer-toolbox";
         assert!(plugins.set_on(id.to_owned(), true));
+        assert!(plugins.set_switch(format!("{id}.layer_fills"), true));
         // there while its switch is on
         let card = || plugins.plugins().into_iter().find(|p| p.id == id).unwrap();
         assert!(card().actions.is_empty());
@@ -2806,15 +2883,22 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir2);
     }
 
-    /// The Brush sounds plugin the app comes with, in a store of its own, not on yet.
-    fn brush_sounds(dir: &str) -> Arc<Plugins> {
+    /// Brush extras, which the app comes with, in a store of its own, `feature` on, the plugin not
+    /// on yet.
+    fn brush_extras(dir: &str, feature: &str) -> Arc<Plugins> {
         let plugins = Plugins::with_store(dir.to_owned());
-        let (_, bytes) = crate::bundled::BUNDLED.iter().find(|(name, _)| *name == "brush-sounds").unwrap();
+        let (_, bytes) = crate::bundled::BUNDLED.iter().find(|(name, _)| *name == "brush-extras").unwrap();
         assert_eq!(plugins.install(bytes.to_vec()), None);
+        assert!(plugins.set_switch(format!("{SOUNDS}.{feature}"), true));
         plugins
     }
 
-    const SOUNDS: &str = "io.github.artcraftandroid.brush-sounds";
+    /// Brush extras with Brush sounds on, as [`brush_extras`] has it.
+    fn brush_sounds(dir: &str) -> Arc<Plugins> {
+        brush_extras(dir, "brush_sounds")
+    }
+
+    const SOUNDS: &str = "io.github.artcraftandroid.brush-extras";
 
     fn rms(v: &[f32]) -> f32 {
         (v.iter().map(|x| x * x).sum::<f32>() / v.len().max(1) as f32).sqrt()
@@ -2880,8 +2964,8 @@ pub(crate) mod tests {
         let crossings = heard.windows(2).filter(|w| (w[0] < 0.0) != (w[1] < 0.0)).count();
         assert!((800..960).contains(&crossings), "the tone: {crossings}");
         s.stroke_end(vec![]);
-        // kept with the plugin, read back as it was, not among the settings
-        let again = Plugins::with_store(dir.clone());
+        // kept with the plugin, read back as it was (its feature on as kept), not among the settings
+        let again = restarted(&dir, &plugins);
         let chosen = again.plugins().into_iter().flat_map(|p| p.controls).find_map(|c| match c {
             crate::plugins::PluginControl::File { control } if control.key == key => control.chosen,
             _ => None,
@@ -2917,10 +3001,8 @@ pub(crate) mod tests {
     #[test]
     fn quickshape_curves_stay_on_for_dense_and_wavy_strokes() {
         let dir = store("curves-dense-samples");
-        let plugins = Plugins::with_store(dir.clone());
-        let (_, bundled) = crate::bundled::BUNDLED.iter().find(|(name, _)| *name == "quickshape-curves").unwrap();
-        assert_eq!(plugins.install(bundled.to_vec()), None);
-        const ID: &str = "io.github.artcraftandroid.quickshape-curves";
+        let plugins = brush_extras(&dir, "quickshape_curves");
+        const ID: &str = SOUNDS;
         assert!(plugins.set_on(ID.to_owned(), true));
         let hooks = plugins.hooks();
         // a curve that ran out of its budget would switch the plugin off, and every held stroke
@@ -2960,10 +3042,8 @@ pub(crate) mod tests {
         use crate::{QuickShapeAnchor, QuickShapeKind};
         let Some(s) = session() else { return };
         let dir = store("curves");
-        let plugins = Plugins::with_store(dir.clone());
-        let (_, bytes) = crate::bundled::BUNDLED.iter().find(|(name, _)| *name == "quickshape-curves").unwrap();
-        assert_eq!(plugins.install(bytes.to_vec()), None);
-        const ID: &str = "io.github.artcraftandroid.quickshape-curves";
+        let plugins = brush_extras(&dir, "quickshape_curves");
+        const ID: &str = SOUNDS;
         s.use_plugins(Arc::clone(&plugins));
         // a zigzag: across, back and across again, as a hand draws one
         let zigzag = |s: &CanvasSession, t0: f64| {
@@ -3013,9 +3093,7 @@ pub(crate) mod tests {
         use crate::QuickShapeKind;
         let Some(s) = session() else { return };
         let dir = store("closed-curves");
-        let plugins = Plugins::with_store(dir.clone());
-        let (_, bytes) = crate::bundled::BUNDLED.iter().find(|(name, _)| *name == "quickshape-curves").unwrap();
-        assert_eq!(plugins.install(bytes.to_vec()), None);
+        let plugins = brush_extras(&dir, "quickshape_curves");
         s.use_plugins(Arc::clone(&plugins));
         // a cloud: once round, bulging out and dipping in five times, ending where it began
         let cloud = |s: &CanvasSession, t0: f64| {
@@ -3034,7 +3112,7 @@ pub(crate) mod tests {
         assert_eq!(cloud(&s, 0.0).expect("it snaps").kind, QuickShapeKind::Ellipse);
         s.quickshape_done();
         s.stroke_end(vec![]);
-        assert!(plugins.set_on("io.github.artcraftandroid.quickshape-curves".to_owned(), true));
+        assert!(plugins.set_on(SOUNDS.to_owned(), true));
         let shape = cloud(&s, 2000.0).expect("it snaps");
         assert_eq!(shape.kind, QuickShapeKind::Curve, "{shape:?}");
         assert!(shape.choices.contains(&QuickShapeKind::Ellipse));
@@ -4277,7 +4355,7 @@ pub(crate) mod tests {
 
     #[test]
     fn finger_pressure_thins_a_fast_finger_and_tapers_it_and_leaves_pens_and_its_absence_as_they_were() {
-        const FINGER: &str = "io.github.artcraftandroid.finger-pressure";
+        const FINGER: &str = "io.github.artcraftandroid.brush-extras";
         let drawn = |plugins: Option<&Arc<Plugins>>, pointer: PointerKind, step: f32| {
             let s = pressing_session(0.35)?;
             if let Some(plugins) = plugins {
@@ -4290,9 +4368,11 @@ pub(crate) mod tests {
         let pen = drawn(None, PointerKind::Stylus, 12.0).unwrap();
         let dir = store("finger-pressure-strokes");
         let plugins = Plugins::with_bundled(dir.clone());
-        // as it comes (off), nothing differs at all
+        // as it comes (off), nothing differs at all, nor on with Finger pressure off
         assert!(drawn(Some(&plugins), PointerKind::Finger, 12.0).unwrap() == finger);
         assert!(plugins.set_on(FINGER.to_owned(), true));
+        assert!(drawn(Some(&plugins), PointerKind::Finger, 12.0).unwrap() == finger);
+        assert!(plugins.set_switch(format!("{FINGER}.finger_pressure"), true));
         // on: a pen's stroke is as it was
         assert!(drawn(Some(&plugins), PointerKind::Stylus, 12.0).unwrap() == pen);
         // a finger going 3,000 points a second presses lighter, so it is thinner
@@ -4524,6 +4604,308 @@ pub(crate) mod tests {
         assert_eq!(next.hooks().position(100.0, 100.0), (100.0, 100.0));
         assert!(next.remove(found.id).is_some());
         assert!(next.plugins().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- plugins made of features (interface 16)
+
+    const FEATURED: &str = "org.example.featured";
+
+    /// A plugin of two features: Offset (the position hook: x moved by its slider, plus 100 for each
+    /// of Press's switch it is told, y by the length of the file it was handed) and Press (the
+    /// pressure hook: its level, or 0.5 once handed a file, plus a quarter of Offset's switch it is
+    /// told; `press` its body's end, to make it go wrong). `grow` pages more memory each sample.
+    fn featured_module(press: &str, grow: u32) -> Vec<u8> {
+        let text = format!(
+            r#"(module
+            (memory (export "memory") 1)
+            (global $c0 (mut f32) (f32.const 0)) (global $c1 (mut f32) (f32.const 0))
+            (global $c2 (mut f32) (f32.const 0)) (global $c3 (mut f32) (f32.const 0))
+            (global $file (mut f32) (f32.const 0))
+            (func (export "procraft_control") (param $i i32) (param $v f32)
+                (if (i32.eq (local.get $i) (i32.const 0)) (then (global.set $c0 (local.get $v))))
+                (if (i32.eq (local.get $i) (i32.const 1)) (then (global.set $c1 (local.get $v))))
+                (if (i32.eq (local.get $i) (i32.const 2)) (then (global.set $c2 (local.get $v))))
+                (if (i32.eq (local.get $i) (i32.const 3)) (then (global.set $c3 (local.get $v)))))
+            (func (export "procraft_file_buffer") (param i32 i32) (result i32) (i32.const 0))
+            (func (export "procraft_file") (param $i i32) (param $len i32)
+                (global.set $file (f32.convert_i32_s (local.get $len))))
+            (func (export "procraft_position") (param $x f32) (param $y f32) (result i64)
+                (local $nx f32) (local $ny f32)
+                (drop (memory.grow (i32.const {grow})))
+                (local.set $nx (local.get $x)) (local.set $ny (local.get $y))
+                (if (f32.ge (global.get $c0) (f32.const 0.5)) (then
+                    (local.set $nx (f32.add (local.get $x)
+                        (f32.add (global.get $c1) (f32.mul (global.get $c2) (f32.const 100)))))
+                    (local.set $ny (f32.add (local.get $y) (global.get $file)))))
+                (i64.or (i64.extend_i32_u (i32.reinterpret_f32 (local.get $nx)))
+                    (i64.shl (i64.extend_i32_u (i32.reinterpret_f32 (local.get $ny))) (i64.const 32))))
+            (func (export "procraft_stroke_sound")
+                (param i32 i32 f32 f32 f32 i32 f32 f32 f32) (result i32) (i32.const 0))
+            (func (export "procraft_pressure") (param i32 i32 f32 f32 f32 f32) (result f32)
+                (if (result f32) (f32.ge (global.get $c2) (f32.const 0.5))
+                    (then (f32.add
+                        (select (f32.const 0.5) (global.get $c3) (f32.gt (global.get $file) (f32.const 0)))
+                        (f32.mul (global.get $c0) (f32.const 0.25))) {press})
+                    (else (f32.const -1))))
+            (func (export "procraft_pressure_taper") (param i32 i32) (result f32) (f32.const 0)))"#
+        );
+        wat::parse_str(text).unwrap()
+    }
+
+    /// Its manifest: Offset answering `offset_hooks`, Press the pressure hook with a file under it.
+    fn featured_manifest(module: &[u8], offset_hooks: Value) -> Value {
+        let mut manifest = coded(FEATURED, module);
+        manifest["compat"]["procraft"]["interface"] = json!(16);
+        let mut hooks = vec![json!("position"), json!("pressure")];
+        if offset_hooks.as_array().is_some_and(|h| h.contains(&json!("stroke_sound"))) {
+            hooks.push(json!("stroke_sound"));
+        }
+        manifest["hooks"] = json!(hooks);
+        manifest["controls"] = json!([
+            { "key": "offset", "type": "feature", "label": "Offset", "description": "Moves samples.", "hooks": offset_hooks },
+            { "key": "x", "type": "slider", "label": "X", "least": -50, "most": 50, "starts": 0, "under": "offset" },
+            { "key": "press", "type": "feature", "label": "Press", "description": "Presses.", "hooks": ["pressure"] },
+            { "key": "level", "type": "slider", "label": "Level", "least": 0, "most": 0.5, "step": 0.1, "starts": 0.2, "under": "press" },
+            { "key": "sound", "type": "file", "label": "Sound", "accepts": "sound", "under": "press" },
+        ]);
+        manifest
+    }
+
+    fn featured_plugins(dir: &str, module: &[u8], offset_hooks: Value) -> Arc<Plugins> {
+        let plugins = Plugins::with_store(dir.to_owned());
+        assert_eq!(plugins.install(file(&featured_manifest(module, offset_hooks), module)), None);
+        plugins
+    }
+
+    fn pressed(hooks: &Hooks) -> Option<f32> {
+        let asked =
+            crate::plugin_run::PressureAsked { pointer: 0, first: true, x: 1.0, y: 1.0, ms: 0.0, pressure: 0.6 };
+        hooks.pressure(asked)
+    }
+
+    /// The features of `id` with a copy of its code on the hooks, by their switches' places.
+    fn copies(hooks: &Hooks, id: &str) -> Vec<Option<usize>> {
+        hooks.working().on.iter().filter(|p| p.id == id).map(|p| p.feature).collect()
+    }
+
+    #[test]
+    fn each_feature_on_runs_in_a_copy_of_its_own_on_its_own_hooks_as_the_plugin_it_was() {
+        let dir = store("features");
+        let module = featured_module("", 0);
+        let plugins = featured_plugins(&dir, &module, json!(["position"]));
+        let hooks = plugins.hooks();
+        // on, with no feature on: on no hook at all
+        assert!(plugins.set_on(FEATURED.to_owned(), true));
+        assert_eq!((hooks.position(10.0, 10.0), pressed(&hooks)), ((10.0, 10.0), None));
+        assert_eq!(hooks.hooked.load(Ordering::Relaxed), 0);
+        assert!(copies(&hooks, FEATURED).is_empty());
+        // Offset on: on the position hook alone
+        assert!(plugins.set_switch(format!("{FEATURED}.offset"), true));
+        assert_eq!(plugins.set_slider(format!("{FEATURED}.x"), 5.0), Some(5.0));
+        assert_eq!((hooks.position(10.0, 10.0), pressed(&hooks)), ((15.0, 10.0), None));
+        assert_eq!(hooks.hooked.load(Ordering::Relaxed), Hook::Position.bit());
+        // Press on too: a copy of its own; each told the other's switch as off, so neither answers
+        // for the other (Offset not 100 further, Press not a quarter higher)
+        assert!(plugins.set_switch(format!("{FEATURED}.press"), true));
+        assert_eq!(copies(&hooks, FEATURED), [Some(0), Some(2)]);
+        assert_eq!(hooks.position(10.0, 10.0), (15.0, 10.0));
+        assert!((pressed(&hooks).unwrap() - 0.2).abs() < 1e-6);
+        assert_eq!(plugins.set_slider(format!("{FEATURED}.level"), 0.4), Some(0.4));
+        assert!((pressed(&hooks).unwrap() - 0.4).abs() < 1e-6);
+        // the card: each feature a heading, what comes under it while it is on
+        let shown = card(&plugins);
+        let features: Vec<(&str, &str, usize)> = shown
+            .features
+            .iter()
+            .map(|f| (f.control.label.as_str(), f.description.as_str(), f.controls.len()))
+            .collect();
+        assert_eq!(features, [("Offset", "Moves samples.", 1), ("Press", "Presses.", 2)]);
+        // Offset off: its copy goes, Press's stays
+        assert!(plugins.set_switch(format!("{FEATURED}.offset"), false));
+        assert_eq!(copies(&hooks, FEATURED), [Some(2)]);
+        assert_eq!(hooks.position(10.0, 10.0), (10.0, 10.0));
+        assert!(pressed(&hooks).is_some());
+        assert_eq!(card(&plugins).features.first().map(|f| f.controls.len()), Some(0));
+        // through a restart, as kept
+        let next = restarted(&dir, &plugins);
+        let next_hooks = next.hooks();
+        assert_eq!(copies(&next_hooks, FEATURED), [Some(2)]);
+        assert!((pressed(&next_hooks).unwrap() - 0.4).abs() < 1e-6);
+        // the plugin off: every copy goes
+        assert!(plugins.set_on(FEATURED.to_owned(), false));
+        assert!(copies(&hooks, FEATURED).is_empty());
+        assert_eq!(hooks.hooked.load(Ordering::Relaxed), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_picked_under_a_feature_goes_to_its_copy_alone() {
+        let dir = store("features-files");
+        let module = featured_module("", 0);
+        let plugins = featured_plugins(&dir, &module, json!(["position"]));
+        let hooks = plugins.hooks();
+        assert!(plugins.set_on(FEATURED.to_owned(), true));
+        assert!(plugins.set_switch(format!("{FEATURED}.offset"), true));
+        assert!(plugins.set_switch(format!("{FEATURED}.press"), true));
+        let wav = crate::sound_file::write_wav(&[0.25; 800], 8000);
+        assert!(plugins.set_sound_file(format!("{FEATURED}.sound"), "Tick".to_owned(), wav));
+        // Press was handed it (0.5 from then on), Offset not (its y as it was)
+        assert!((pressed(&hooks).unwrap() - 0.5).abs() < 1e-6);
+        assert_eq!(hooks.position(10.0, 10.0), (10.0, 10.0));
+        // and as Press comes on again, or on a start
+        assert!(plugins.set_switch(format!("{FEATURED}.press"), false));
+        assert!(plugins.set_switch(format!("{FEATURED}.press"), true));
+        assert!((pressed(&hooks).unwrap() - 0.5).abs() < 1e-6);
+        let next = restarted(&dir, &plugins);
+        assert!((pressed(&next.hooks()).unwrap() - 0.5).abs() < 1e-6);
+        assert_eq!(next.hooks().position(10.0, 10.0), (10.0, 10.0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_feature_s_copy_has_the_memory_its_own_hooks_give() {
+        // each sample asks for 1 MiB more: the position hook's 16 MiB is spent by the sixteenth,
+        // while the sound hook's 128 MB takes forty
+        for (hooks_of_offset, lasts) in [(json!(["position"]), false), (json!(["position", "stroke_sound"]), true)] {
+            let dir = store("features-memory");
+            let module = featured_module("", 16);
+            let plugins = featured_plugins(&dir, &module, hooks_of_offset.clone());
+            let hooks = plugins.hooks();
+            assert!(plugins.set_on(FEATURED.to_owned(), true));
+            assert!(plugins.set_switch(format!("{FEATURED}.offset"), true));
+            for _ in 0..40 {
+                hooks.position(1.0, 1.0);
+            }
+            assert_eq!(card(&plugins).on, lasts, "{hooks_of_offset}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn one_feature_s_copy_going_wrong_switches_the_whole_plugin_off() {
+        let dir = store("features-stop");
+        let module = featured_module("(unreachable)", 0);
+        let plugins = featured_plugins(&dir, &module, json!(["position"]));
+        let hooks = plugins.hooks();
+        assert!(plugins.set_on(FEATURED.to_owned(), true));
+        assert!(plugins.set_switch(format!("{FEATURED}.offset"), true));
+        assert!(plugins.set_switch(format!("{FEATURED}.press"), true));
+        assert_eq!(copies(&hooks, FEATURED).len(), 2);
+        assert_eq!(pressed(&hooks), None);
+        assert!(copies(&hooks, FEATURED).is_empty(), "Offset's copy went too");
+        assert_eq!(hooks.position(10.0, 10.0), (10.0, 10.0));
+        let card = card(&plugins);
+        assert!(!card.on && card.problem.as_deref() == Some("Switched off: it crashed."), "{card:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What Brush extras' per-sample hooks cost a sample, Finger pressure's and Touch position
+    /// offset's on, alone and with Brush sounds making its sound on a thread of its own meanwhile:
+    /// printed, each the best of three runs. With `PROCRAFT_OLD_PLUGINS` naming a folder holding the
+    /// files of the plugins they were made of (`finger-pressure`, `touch-offset` and `brush-sounds`,
+    /// `.procraft-plugin` each), those are timed the same way in the same run, and the merged one may
+    /// cost a sample a tenth more at most (and a microsecond, for noise). Run alone:
+    /// `cargo test -p procraft-core sample_hooks_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn sample_hooks_cost() {
+        const SAMPLES: u32 = 50_000;
+        // a sample through the pressure hook then the position hook, as a stroke's goes
+        let cost = |hooks: &Hooks| {
+            let best = (0..3).map(|_| {
+                let t = Instant::now();
+                let mut sum = 0.0;
+                for i in 0..SAMPLES {
+                    let ms = i as f32 * 4.0;
+                    let x = std::hint::black_box(ms * 1.5 % 2000.0);
+                    let asked = crate::plugin_run::PressureAsked {
+                        pointer: 0,
+                        first: i % 500 == 0,
+                        x,
+                        y: 300.0,
+                        ms,
+                        pressure: 0.5,
+                    };
+                    sum += hooks.pressure(asked).unwrap_or(0.0);
+                    sum += hooks.position(x, 300.0).0;
+                }
+                std::hint::black_box(sum);
+                t.elapsed().as_secs_f64() * 1e6 / f64::from(SAMPLES)
+            });
+            best.fold(f64::MAX, f64::min)
+        };
+        // the same while a thread asks for the stroke's sound as fast as it can
+        let sounding = |hooks: &Arc<Hooks>| {
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let thread = {
+                let (hooks, stop) = (Arc::clone(hooks), Arc::clone(&stop));
+                std::thread::spawn(move || {
+                    let motion = crate::stroke_sound::SoundMotion {
+                        speed: 1.0,
+                        pressure: 1.0,
+                        since_ms: 0.0,
+                        state: 1,
+                        hover: (0.0, 0.0),
+                        height: 1000.0,
+                    };
+                    let brush = crate::stroke_sound::SoundBrush {
+                        name: "Pencil".to_owned(),
+                        set: "Sketching".to_owned(),
+                        controls: vec![0.0],
+                        key: 1,
+                    };
+                    let mut made = 0_u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        made += hooks.stroke_sound(256, 48_000, &motion, &brush).map_or(0, |s| s.len() as u64);
+                    }
+                    made
+                })
+            };
+            let each = cost(hooks);
+            stop.store(true, Ordering::Relaxed);
+            let made = thread.join().unwrap();
+            assert!(made > 0, "the sound was made meanwhile");
+            each
+        };
+        let dir = store("sample-cost");
+        let plugins = Plugins::with_bundled(dir.clone());
+        let hooks = plugins.hooks();
+        let none = cost(&hooks);
+        const EXTRAS: &str = "io.github.artcraftandroid.brush-extras";
+        assert!(plugins.set_on(EXTRAS.to_owned(), true));
+        for feature in ["finger_pressure", "touch_offset"] {
+            assert!(plugins.set_switch(format!("{EXTRAS}.{feature}"), true));
+        }
+        assert!(plugins.set_slider(format!("{EXTRAS}.x"), 3.0).is_some());
+        let merged = cost(&hooks);
+        assert!(plugins.set_switch(format!("{EXTRAS}.brush_sounds"), true));
+        let merged_sounding = sounding(&hooks);
+        println!("a sample through the pressure and position hooks: {none:.3} µs with none on");
+        println!("Brush extras: {merged:.3} µs; {merged_sounding:.3} µs while Brush sounds makes its sound");
+        let _ = std::fs::remove_dir_all(&dir);
+        // the plugins it was made of, the same way, in the same run
+        let Ok(folder) = std::env::var("PROCRAFT_OLD_PLUGINS") else { return };
+        let dir = store("sample-cost-old");
+        let plugins = Plugins::with_store(dir.clone());
+        let hooks = plugins.hooks();
+        let old =
+            |name: &str| std::fs::read(std::path::Path::new(&folder).join(format!("{name}.procraft-plugin"))).unwrap();
+        for name in ["finger-pressure", "touch-offset", "brush-sounds"] {
+            assert_eq!(plugins.install(old(name)), None, "{name}");
+        }
+        for name in ["finger-pressure", "touch-offset"] {
+            assert!(plugins.set_on(format!("io.github.artcraftandroid.{name}"), true));
+        }
+        assert!(plugins.set_slider("io.github.artcraftandroid.touch-offset.x".to_owned(), 3.0).is_some());
+        let parts = cost(&hooks);
+        assert!(plugins.set_on("io.github.artcraftandroid.brush-sounds".to_owned(), true));
+        let parts_sounding = sounding(&hooks);
+        println!(
+            "the plugins it was made of: {parts:.3} µs; {parts_sounding:.3} µs while Brush sounds makes its sound"
+        );
+        assert!(merged <= parts * 1.1 + 1.0, "{merged} against {parts}");
+        assert!(merged_sounding <= parts_sounding * 1.1 + 1.0, "{merged_sounding} against {parts_sounding}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

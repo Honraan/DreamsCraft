@@ -3712,11 +3712,12 @@ mod tests {
     /// interface separately: `scales` in the parts' order (floating panels, menus, the side bar, the
     /// top bar, the panels).
     fn parts_sized(name: &str, scales: [f32; 5]) -> (Arc<procraft_core::Plugins>, PathBuf) {
-        const INTERFACE: &str = "io.github.artcraftandroid.interface";
+        const INTERFACE: &str = "io.github.artcraftandroid.interface-look";
         let dir = std::env::temp_dir().join(format!("procraft-parts-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let plugins = procraft_core::Plugins::with_bundled(dir.to_string_lossy().into_owned());
         assert!(plugins.set_on(INTERFACE.to_owned(), true));
+        assert!(plugins.set_switch(format!("{INTERFACE}.interface"), true));
         assert!(plugins.set_switch(format!("{INTERFACE}.size_on"), true));
         assert!(plugins.set_switch(format!("{INTERFACE}.parts"), true));
         for (key, scale) in ["floating", "menus", "side_bar", "top_bar", "panels"].into_iter().zip(scales) {

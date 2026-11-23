@@ -107,7 +107,35 @@ private struct PluginCard: View {
             PluginSliderRow(slider: one) { PluginsModel.shared.setSlider($0, $1) }
         case let .file(one):
             PluginFileRow(file: one) { model.showNotice($0, warning: true) }
+        case let .texture(one):
+            PluginTextureRow(texture: one)
         }
+    }
+
+    /// One of its features (interface 16): its name and words, and the switch that turns it on.
+    private func featureHead(_ feature: PluginFeature) -> some View {
+        let one = feature.control
+        return HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(verbatim: one.label)
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(Pc.panelTitle)
+                    .lineLimit(1)
+                if !feature.description.isEmpty {
+                    Text(verbatim: feature.description)
+                        .font(.system(size: 14))
+                        .foregroundStyle(Pc.actionsRow)
+                }
+            }
+            Spacer(minLength: 0)
+            PcSwitch(on: one.on)
+        }
+        .padding(.leading, 16)
+        .padding(.trailing, 8)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .onTapGesture { PluginsModel.shared.setSwitch(one.key, !one.on) }
     }
 
     var body: some View {
@@ -116,7 +144,20 @@ private struct PluginCard: View {
         VStack(spacing: 0) {
             about
             // a filter's own controls are on its panel; what the card shows comes with the list
-            if plugin.on, plugin.problem == nil {
+            if plugin.on, plugin.problem == nil, !plugin.features.isEmpty {
+                // made of features: each a heading with its switch, what comes under it while it is on
+                ForEach(plugin.features.indices, id: \.self) { f in
+                    let feature = plugin.features[f]
+                    line
+                    featureHead(feature)
+                    if feature.control.on {
+                        ForEach(feature.controls.indices, id: \.self) { i in
+                            line
+                            control(feature.controls[i])
+                        }
+                    }
+                }
+            } else if plugin.on, plugin.problem == nil {
                 ForEach(plugin.controls.indices, id: \.self) { i in
                     line
                     control(plugin.controls[i])
@@ -135,6 +176,29 @@ private struct PluginCard: View {
         }
         .background(shape.fill(Pc.actionsGroup))
         .clipShape(shape)
+    }
+}
+
+/// A texture control on a card (interface 15): its label and what is chosen, a grain by its number
+/// in the Source Library or a picture of the plugin's own. It is chosen on the other apps for now.
+private struct PluginTextureRow: View {
+    let texture: PluginTexture
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Text(verbatim: texture.label)
+                .font(.system(size: 17))
+                .foregroundStyle(Pc.actionsRow)
+                .lineLimit(1)
+            Spacer(minLength: 0)
+            Text(verbatim: texture.value > 0 ? "Grain \(texture.value)" : (texture.value < 0 ? "Picture" : "None"))
+                .font(.system(size: 17))
+                .foregroundStyle(Pc.accent)
+                .lineLimit(1)
+        }
+        .padding(.leading, 16)
+        .padding(.trailing, 16)
+        .frame(height: 44)
     }
 }
 

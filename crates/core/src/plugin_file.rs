@@ -24,7 +24,18 @@ const MANIFEST: &str = "craft-extension.json";
 /// The manifest format read here: a newer one may mean anything, so it is refused.
 const SCHEMA: u64 = 1;
 /// What a plugin's code is written to, see [`crate::plugin_run`]: a newer one is refused too.
-const INTERFACE: u32 = 15;
+const INTERFACE: u32 = 16;
+/// The first interface with features (several plugins' worth in one, each a switch of its own).
+const FEATURES_FROM: u32 = 16;
+/// A plugin of features: so many features, controls under each (besides its own switch) and
+/// actions under each; and in all so many controls (files among them), hooks and actions.
+const MOST_FEATURES: usize = 16;
+const MOST_FEATURE_CONTROLS: usize = 16;
+const MOST_FEATURED_CONTROLS: usize = 64;
+const MOST_FEATURED_HOOKS: usize = 32;
+const MOST_FEATURED_ACTIONS: usize = 32;
+/// The most values a picker's picture is given (its controls' all).
+const MOST_PICTURE_VALUES: usize = 16;
 /// What ids of our own start with: no file may claim one.
 const OWN_PREFIX: &str = "procraft.";
 /// The file, its entries, one entry, all of them unpacked, and the manifest, in bytes.
@@ -182,14 +193,31 @@ pub(crate) struct Shape {
     pub filters: Vec<ListedFilter>,
     pub replaces: Vec<Replaced>,
     pub menu: Option<Menu>,
+    /// The switch each of its rows in the brush studio comes under: shown only while it is on.
+    pub brush_under: Vec<Option<usize>>,
+    /// Its features (interface 16), in their order: none for a plugin written without.
+    pub features: Vec<Feature>,
+}
+
+/// One of the features of a plugin made of several (interface 16): a switch at the top of its list,
+/// heading everything that comes under it, with words of its own under its name. While it is on,
+/// it runs in a copy of the plugin's code of its own, on the hooks it lists, with the memory they
+/// give; off, it is on none.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Feature {
+    /// Its switch's place among the controls.
+    pub at: usize,
+    pub description: String,
+    pub hooks: Vec<Hook>,
 }
 
 /// A menu a plugin with code has somewhere in the interface, from a button of the app's: where,
-/// and its choices.
+/// its choices, and the switch it comes under (its button shows only while that is on).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Menu {
     pub place: plugins::PluginMenuPlace,
     pub choices: Vec<MenuChoice>,
+    pub under: Option<usize>,
 }
 
 /// One of a menu's choices: what picks it (`<id>.<key>`), its words, its icon (path data on the
@@ -215,22 +243,29 @@ pub(crate) struct ListedFilter {
     pub under: Option<usize>,
 }
 
-/// A plugin another takes the place of, by its id: the switch its being on turns on, and each of
-/// its controls by the key its value was kept under, with the place of the control taking it.
+/// A plugin another takes the place of, by its id: the switch its being on turns on, each of its
+/// controls by the key its value was kept under, with the place of the control taking it (a file
+/// control's file comes too), and whether the marks it kept with layers are this one's now
+/// (interface 16).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Replaced {
     pub id: String,
     pub switch: Option<usize>,
     pub controls: Vec<(String, usize)>,
+    pub marks: bool,
 }
+
+/// How many switches may stand above a control: a switch at the top, one under it and one under
+/// that, the top a feature (interface 16); without features, one fewer.
+const MOST_ABOVE: usize = 3;
 
 impl Shape {
     /// Whether whatever comes under `under` shows, in a plugin whose controls are `controls`: that
     /// switch is on, and any it comes under.
     pub(crate) fn shows(&self, under: Option<usize>, controls: &[PluginControl]) -> bool {
         let mut next = under;
-        // (a switch comes under another at most, as read)
-        for _ in 0..3 {
+        // (as read, at most so many stand above anything)
+        for _ in 0..=MOST_ABOVE {
             let Some(at) = next else { return true };
             if !matches!(controls.get(at), Some(PluginControl::Switch { control }) if control.on) {
                 return false;
@@ -238,6 +273,45 @@ impl Shape {
             next = self.under.get(at).copied().flatten();
         }
         false
+    }
+
+    /// The switch at the top of what stands above `under` (itself, if it comes under nothing).
+    fn top_of(&self, under: Option<usize>) -> Option<usize> {
+        let mut at = under?;
+        for _ in 0..MOST_ABOVE {
+            match self.under.get(at).copied().flatten() {
+                Some(up) => at = up,
+                None => break,
+            }
+        }
+        Some(at)
+    }
+
+    /// The feature (its place in [`Shape::features`]) that whatever comes under `under` belongs to.
+    pub(crate) fn feature_under(&self, under: Option<usize>) -> Option<usize> {
+        let top = self.top_of(under)?;
+        self.features.iter().position(|f| f.at == top)
+    }
+
+    /// The feature control `at` belongs to: the one it heads, or the one it comes under.
+    pub(crate) fn feature_of(&self, at: usize) -> Option<usize> {
+        self.feature_under(Some(at))
+    }
+
+    /// The switch of the feature control `at` belongs to.
+    pub(crate) fn feature_switch_of(&self, at: usize) -> Option<usize> {
+        self.feature_of(at).and_then(|f| self.features.get(f)).map(|f| f.at)
+    }
+
+    /// Whether the menu shows, in a plugin whose controls are `controls`.
+    pub(crate) fn menu_shows(&self, controls: &[PluginControl]) -> bool {
+        self.menu.as_ref().is_some_and(|menu| self.shows(menu.under, controls))
+    }
+
+    /// The id the marks it keeps with layers go by: that of a plugin it takes the place of whose
+    /// marks it keeps, or `id`, its own.
+    pub(crate) fn marks_id<'a>(&'a self, id: &'a str) -> &'a str {
+        self.replaces.iter().find(|r| r.marks).map_or(id, |r| r.id.as_str())
     }
 }
 
@@ -315,11 +389,13 @@ struct RawManifest {
 }
 
 /// A menu of a plugin's own, from a button the app puts at `place`: its choices, each an icon and
-/// words, setting some of the plugin's controls.
+/// words, setting some of the plugin's controls; and the key of the switch it comes under.
 #[derive(Deserialize)]
 struct RawMenu {
     place: String,
     choices: Vec<RawChoice>,
+    #[serde(default)]
+    under: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -345,6 +421,7 @@ fn menu_of(
     keys: &[String],
     controls: &[PluginControl],
     code: bool,
+    under: Option<usize>,
 ) -> Result<Option<Menu>, Refusal> {
     let Some(raw) = raw else { return Ok(None) };
     if !code || raw.choices.is_empty() || raw.choices.len() > MOST_MENU_CHOICES {
@@ -383,7 +460,7 @@ fn menu_of(
             sets,
         });
     }
-    Ok(Some(Menu { place, choices }))
+    Ok(Some(Menu { place, choices, under }))
 }
 
 /// A filter of several in one plugin (interface 5): its key, its name under Adjustments, the keys
@@ -398,8 +475,9 @@ struct RawFilter {
     under: Option<String>,
 }
 
-/// A plugin this one takes the place of: its id, the key of the switch its being on turns on, and
-/// its controls' keys, each with the key of the control here that takes its value.
+/// A plugin this one takes the place of: its id, the key of the switch its being on turns on, its
+/// controls' keys, each with the key of the control here that takes its value, and whether the
+/// marks it kept with layers are this one's now (interface 16).
 #[derive(Deserialize)]
 struct RawReplaced {
     id: String,
@@ -407,6 +485,8 @@ struct RawReplaced {
     switch: Option<String>,
     #[serde(default)]
     controls: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    marks: bool,
 }
 
 /// A brush engine a plugin has: its key, what it is called, and the endings of the names of the
@@ -526,12 +606,18 @@ struct RawAction {
 /// The most actions a plugin may list.
 const MOST_ACTIONS: usize = 8;
 
-/// A row a plugin adds to the brush studio: a choice of a few, kept with each brush.
+/// A row a plugin adds to the brush studio: a choice of a few, kept with each brush; the key of
+/// the switch it comes under; and the id of a plugin it takes the place of whose row it is, whose
+/// key brushes keep its choice under (interface 16).
 #[derive(Deserialize)]
 struct RawBrushControl {
     key: String,
     label: String,
     choices: Vec<String>,
+    #[serde(default)]
+    under: Option<String>,
+    #[serde(default)]
+    from: Option<String>,
 }
 
 /// The most rows a plugin may add to the brush studio, and choices a row may have.
@@ -539,14 +625,25 @@ const MOST_BRUSH_CONTROLS: usize = 8;
 const MOST_CHOICES: usize = 16;
 
 /// `raw` as a row of plugin `id`'s in the brush studio, if it holds up: its key kept with each
-/// brush is `plugin:<id>:<key>`.
-fn checked_brush_control(id: &str, raw: RawBrushControl) -> Result<PluginBrushControl, Refusal> {
+/// brush is `plugin:<id>:<key>`, or, for a row of a plugin it takes the place of (`replaced`
+/// names them), `plugin:<that id>:<key>`, so what brushes kept for that one still says.
+fn checked_brush_control(
+    id: &str,
+    raw: RawBrushControl,
+    replaced: &[RawReplaced],
+    interface: Option<u32>,
+) -> Result<PluginBrushControl, Refusal> {
     let plain = |text: &String, most| !text.trim().is_empty() && shows_plainly(text, most);
     let choices = (2..=MOST_CHOICES).contains(&raw.choices.len()) && raw.choices.iter().all(|c| plain(c, 24));
     if !valid_key(&raw.key) || !plain(&raw.label, 40) || !choices {
         return Err(Refusal::Described);
     }
-    Ok(PluginBrushControl { key: format!("plugin:{id}:{}", raw.key), label: raw.label, choices: raw.choices })
+    let kept_by = match raw.from.as_deref() {
+        None => id,
+        Some(from) if interface.is_some_and(|i| i >= FEATURES_FROM) && replaced.iter().any(|r| r.id == from) => from,
+        Some(_) => return Err(Refusal::Described),
+    };
+    Ok(PluginBrushControl { key: format!("plugin:{kept_by}:{}", raw.key), label: raw.label, choices: raw.choices })
 }
 
 #[derive(Deserialize)]
@@ -617,6 +714,11 @@ struct RawControl {
     /// Kept with each artwork rather than with the plugin.
     #[serde(default)]
     artwork: Option<bool>,
+    /// A feature's words under its name, and the hooks it answers (interface 16).
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    hooks: Option<Vec<String>>,
     /// The keys of the file controls of pictures a texture offers too.
     #[serde(default)]
     own: Option<Vec<String>>,
@@ -741,7 +843,23 @@ fn checked_control(id: &str, raw: RawControl) -> Result<PluginControl, Refusal> 
         Some(_) => return Err(Refusal::Described),
         None => format!("{id}.{}", raw.key),
     };
+    // only a feature has words under its name and hooks of its own
+    let feature = raw.kind == "feature";
+    if !feature && (raw.description.is_some() || raw.hooks.is_some()) {
+        return Err(Refusal::Described);
+    }
     match raw.kind.as_str() {
+        // a feature (interface 16): a switch heading what comes under it, off until someone turns
+        // it on; it keeps no setting the app used to have
+        "feature" => {
+            let words = raw.description.as_deref().unwrap_or_default();
+            let starts_off = raw.starts.as_ref().is_none_or(|s| *s == Value::Bool(false));
+            if raw.keeps.is_some() || !starts_off || !shows_plainly(words, 200) {
+                return Err(Refusal::Described);
+            }
+            let control = PluginSwitch { key, label: raw.label, on: false, starts: false };
+            Ok(PluginControl::Switch { control })
+        }
         "switch" => {
             let starts = match raw.starts {
                 None => false,
@@ -871,7 +989,19 @@ fn read_manifest(text: &[u8]) -> Result<Manifest, Refusal> {
     if compat.min_app.as_deref().is_some_and(|v| version_parts(v).is_none()) || compat.interface == Some(0) {
         return Err(Refusal::Described);
     }
-    let mut shape = shape_of(&raw.id, &raw.controls, &raw.actions, &raw.filters, &raw.replaces)?;
+    let menu_under = raw.menu.as_ref().and_then(|m| m.under.as_deref());
+    let (mut shape, menu_under) = shape_of(
+        &raw.id,
+        &raw.controls,
+        &raw.actions,
+        &raw.filters,
+        &raw.replaces,
+        &raw.brush_controls,
+        menu_under,
+        compat.interface,
+    )?;
+    // made of features (interface 16): each holds what a plugin held
+    let featured = !shape.features.is_empty();
     let mut files = Vec::with_capacity(raw.files.len().min(MOST_ENTRIES));
     let mut seen = HashSet::new();
     for file in raw.files {
@@ -885,10 +1015,13 @@ fn read_manifest(text: &[u8]) -> Result<Manifest, Refusal> {
     let picked = raw.controls.iter().filter(|c| c.kind == "file").count();
     let more = compat.interface.is_some_and(|interface| interface >= 6) && !holds.contains(&PluginPart::Filter);
     let most = if more { MOST_CONTROLS_6 } else { MOST_CONTROLS };
-    if raw.controls.len() - picked > most || picked > MOST_FILES {
+    // (a plugin of features counted already, its files among its controls; each filter it lists
+    // reads its own few)
+    if (!featured && raw.controls.len() - picked > most) || picked > MOST_FILES {
         return Err(Refusal::Described);
     }
-    if picked > 0 && (!holds.contains(&PluginPart::Hooks) || holds.contains(&PluginPart::Filter)) {
+    let filter_reads_all = holds.contains(&PluginPart::Filter) && !featured;
+    if picked > 0 && (!holds.contains(&PluginPart::Hooks) || filter_reads_all) {
         return Err(Refusal::Described);
     }
     let mut keys = HashSet::new();
@@ -899,7 +1032,7 @@ fn read_manifest(text: &[u8]) -> Result<Manifest, Refusal> {
     let keys: Vec<String> = raw.controls.iter().map(|c| c.key.clone()).collect();
     let controls = raw.controls.into_iter().map(|c| checked_control(&id, c)).collect::<Result<Vec<_>, _>>()?;
     // a menu of its own, setting its controls
-    shape.menu = menu_of(&id, raw.menu, &keys, &controls, holds.contains(&PluginPart::Hooks))?;
+    shape.menu = menu_of(&id, raw.menu, &keys, &controls, holds.contains(&PluginPart::Hooks), menu_under)?;
     if id.starts_with(OWN_PREFIX) {
         return Err(Refusal::Described);
     }
@@ -931,8 +1064,12 @@ fn read_manifest(text: &[u8]) -> Result<Manifest, Refusal> {
     }
     let mut hooks = Vec::new();
     if has(PluginPart::Hooks) {
+        let most_hooks = if featured { MOST_FEATURED_HOOKS } else { MOST_HOOKS };
+        if featured && raw.hooks.len() > most_hooks {
+            return Err(Refusal::Described);
+        }
         // a hook this app doesn't have is a plugin for a newer one
-        for name in raw.hooks.iter().take(MOST_HOOKS + 1) {
+        for name in raw.hooks.iter().take(most_hooks + 1) {
             let hook = Hook::named(name).ok_or(Refusal::Newer)?;
             if hooks.contains(&hook) {
                 return Err(Refusal::Described);
@@ -952,16 +1089,36 @@ fn read_manifest(text: &[u8]) -> Result<Manifest, Refusal> {
     } else if !raw.hooks.is_empty() {
         return Err(Refusal::Described);
     }
+    // a plugin of features: code, each feature's hooks the plugin's and each of those some
+    // feature's; its filters listed, each with its own few controls; no kinds of its own, which no
+    // feature could hold; and a picker's picture has room for all its controls
+    if featured {
+        let theirs = shape.features.iter().all(|f| f.hooks.iter().all(|h| hooks.contains(h)));
+        let held = hooks.iter().all(|h| shape.features.iter().any(|f| f.hooks.contains(h)));
+        let kinds = !raw.kinds.is_empty() || !raw.layer_kinds.is_empty() || !raw.brush_engines.is_empty();
+        let one_filter = has(PluginPart::Filter) && !listed;
+        let picture = hooks.contains(&Hook::Picker) && controls.len() > MOST_PICTURE_VALUES;
+        if !has(PluginPart::Hooks) || !theirs || !held || kinds || one_filter || picture {
+            return Err(Refusal::Described);
+        }
+    }
     // a picker brings its picture, and only a picker has one
     if fits(PICTURE_CODE, MOST_SHADER) != hooks.contains(&Hook::Picker).then_some(true) {
         return Err(Refusal::Described);
     }
-    // a filter's controls are its own, so none of them can be a moved setting
-    if has(PluginPart::Filter) && controls.iter().any(|c| !c.key().starts_with(&format!("{id}."))) {
+    // a filter's controls are its own, so none of them can be a moved setting (of a plugin of
+    // features, those its filters read)
+    let read_by_filters: Vec<&PluginControl> = if featured {
+        shape.filters.iter().flat_map(|f| f.controls.iter().filter_map(|&at| controls.get(at))).collect()
+    } else {
+        controls.iter().collect()
+    };
+    if has(PluginPart::Filter) && read_by_filters.iter().any(|c| !c.key().starts_with(&format!("{id}."))) {
         return Err(Refusal::Described);
     }
     // rows in the brush studio, for code to read (a filter has no way to)
-    let fits_brush = raw.brush_controls.is_empty() || (has(PluginPart::Hooks) && !has(PluginPart::Filter));
+    let fits_brush =
+        raw.brush_controls.is_empty() || (has(PluginPart::Hooks) && (!has(PluginPart::Filter) || featured));
     let mut brush_keys = HashSet::new();
     if !fits_brush
         || raw.brush_controls.len() > MOST_BRUSH_CONTROLS
@@ -970,12 +1127,14 @@ fn read_manifest(text: &[u8]) -> Result<Manifest, Refusal> {
         return Err(Refusal::Described);
     }
     let brush_controls =
-        raw.brush_controls.into_iter().map(|c| checked_brush_control(&id, c)).collect::<Result<Vec<_>, _>>()?;
+        raw.brush_controls.into_iter().map(|c| checked_brush_control(&id, c, &raw.replaces, compat.interface));
+    let brush_controls = brush_controls.collect::<Result<Vec<_>, _>>()?;
     // actions and what they reach, for code written to interface 2 or later
     let code = has(PluginPart::Hooks) && compat.interface.is_some_and(|interface| interface >= 2);
     let mut action_keys = HashSet::new();
     let plain = |text: &String| !text.trim().is_empty() && shows_plainly(text, 40);
-    let actions_fit = raw.actions.len() <= MOST_ACTIONS
+    let most_actions = if featured { MOST_FEATURED_ACTIONS } else { MOST_ACTIONS };
+    let actions_fit = raw.actions.len() <= most_actions
         && raw.actions.iter().all(|a| valid_key(&a.key) && plain(&a.label) && action_keys.insert(a.key.clone()));
     let mut kind_keys = HashSet::new();
     let kinds_fit = raw.kinds.len() <= MOST_KINDS
@@ -1098,31 +1257,90 @@ fn read_manifest(text: &[u8]) -> Result<Manifest, Refusal> {
     })
 }
 
-/// What the manifest of plugin `id` says beyond its card's list (its controls, actions, filters and
-/// what it replaces, as written), if it holds up: a control or an action comes under a
-/// switch of the list's top level, or under one that comes under such a switch; a listed filter has a plain key and name and reads controls
-/// that aren't files, each once; a plugin it takes the place of has an id beside its own (the same
-/// but for the last part), and what took its values is here.
+/// What the manifest of plugin `id` says beyond its card's list (its controls, actions, filters,
+/// rows in the brush studio, menu and what it replaces, as written), if it holds up: a control or
+/// anything else comes under a switch of the list's top level, or under one that comes under such a
+/// switch; a listed filter has a plain key and name and reads controls that aren't files, each once;
+/// a plugin it takes the place of has an id beside its own (the same but for the last part), and
+/// what took its values is here. And the switch its menu comes under.
+///
+/// A plugin of features (interface 16) has a feature at the top of its list for each of the plugins
+/// it is made of, and everything else comes under one: one switch deeper than without, so a feature
+/// can hold what a plugin of switches held.
+#[allow(clippy::too_many_arguments)]
 fn shape_of(
     id: &str,
     controls: &[RawControl],
     actions: &[RawAction],
     listed: &[RawFilter],
     replacing: &[RawReplaced],
-) -> Result<Shape, Refusal> {
-    // a switch of the top level, or one that comes under one
-    let top = |key: &str| controls.iter().any(|c| c.key == key && c.kind == "switch" && c.under.is_none());
+    brush_rows: &[RawBrushControl],
+    menu_under: Option<&str>,
+    interface: Option<u32>,
+) -> Result<(Shape, Option<usize>), Refusal> {
+    let featured = controls.iter().any(|c| c.kind == "feature");
+    if featured && interface.is_none_or(|i| i < FEATURES_FROM) {
+        return Err(Refusal::Described);
+    }
+    let position = |key: &str| controls.iter().position(|c| c.key == key);
+    // the switches above the control at `at`, nearest first, if they hold up: each a switch (or a
+    // feature), a few at most (so a loop never does)
+    let above = |at: usize| -> Option<Vec<usize>> {
+        let mut chain = Vec::new();
+        let mut next = controls.get(at)?.under.as_deref();
+        while let Some(key) = next {
+            let up = position(key)?;
+            let c = controls.get(up)?;
+            if !matches!(c.kind.as_str(), "switch" | "feature") || chain.len() >= MOST_ABOVE {
+                return None;
+            }
+            chain.push(up);
+            next = c.under.as_deref();
+        }
+        Some(chain)
+    };
+    // what something may come under: a switch of the top level or one that comes under one; with
+    // features, a feature, or a switch with one or two above it, a feature at the top
     let switch_at = |key: &str| {
-        let at = controls.iter().position(|c| c.key == key && c.kind == "switch");
-        let fits = at.and_then(|at| controls.get(at)).is_some_and(|c| c.under.as_deref().is_none_or(top));
+        let at =
+            position(key).filter(|&at| controls.get(at).is_some_and(|c| c.kind == "switch" || c.kind == "feature"));
+        let fits = at.is_some_and(|at| {
+            let Some(chain) = above(at) else { return false };
+            let kind = controls.get(at).map(|c| c.kind.as_str());
+            let top_is_feature = chain.last().and_then(|&top| controls.get(top)).is_some_and(|c| c.kind == "feature");
+            if featured {
+                (kind == Some("feature") && chain.is_empty())
+                    || (kind == Some("switch") && (1..MOST_ABOVE).contains(&chain.len()) && top_is_feature)
+            } else {
+                kind == Some("switch") && chain.len() < MOST_ABOVE - 1
+            }
+        });
         at.filter(|_| fits).ok_or(Refusal::Described)
+    };
+    // with features, everything comes under one; a feature under nothing
+    let under_of = |under: Option<&str>| match under {
+        Some(key) => switch_at(key).map(Some),
+        None if featured => Err(Refusal::Described),
+        None => Ok(None),
     };
     let control_at =
         |key: &str| controls.iter().position(|c| c.key == key && c.kind != "file").ok_or(Refusal::Described);
-    let under = controls.iter().map(|c| c.under.as_deref().map(switch_at).transpose());
-    let under = under.collect::<Result<Vec<_>, _>>()?;
-    let action_under = actions.iter().map(|a| a.under.as_deref().map(switch_at).transpose());
+    let mut under = Vec::new();
+    for c in controls {
+        under.push(if c.kind == "feature" {
+            if c.under.is_some() {
+                return Err(Refusal::Described);
+            }
+            None
+        } else {
+            under_of(c.under.as_deref())?
+        });
+    }
+    let action_under = actions.iter().map(|a| under_of(a.under.as_deref()));
     let action_under = action_under.collect::<Result<Vec<_>, _>>()?;
+    let brush_under = brush_rows.iter().map(|r| under_of(r.under.as_deref()));
+    let brush_under = brush_under.collect::<Result<Vec<_>, _>>()?;
+    let menu_under = menu_under.map(switch_at).transpose()?;
     // where else a control shows: a switch or a slider, on the card or in a place this app has
     let mut places = Vec::new();
     for c in controls {
@@ -1131,7 +1349,8 @@ fn shape_of(
             Some(name) => plugins::PluginPlace::named(name).ok_or(Refusal::Newer)?,
         };
         let fits = matches!(place, plugins::PluginPlace::Card | plugins::PluginPlace::Canvas);
-        if !fits || (place != plugins::PluginPlace::Card && (c.kind == "file" || c.kind == "texture")) {
+        let elsewhere = place != plugins::PluginPlace::Card;
+        if !fits || (elsewhere && matches!(c.kind.as_str(), "file" | "texture" | "feature")) {
             return Err(Refusal::Described);
         }
         places.push(place);
@@ -1154,7 +1373,8 @@ fn shape_of(
     let action_presses = action_presses.collect::<Result<Vec<_>, _>>()?;
     // kept with each artwork: a switch or a slider that keeps no setting the app used to have
     let artwork: Vec<bool> = controls.iter().map(|c| c.artwork == Some(true)).collect();
-    if controls.iter().zip(&artwork).any(|(c, &kept)| kept && (c.kind == "file" || c.keeps.is_some())) {
+    let unkeepable = |c: &RawControl| c.kind == "file" || c.kind == "feature" || c.keeps.is_some();
+    if controls.iter().zip(&artwork).any(|(c, &kept)| kept && unkeepable(c)) {
         return Err(Refusal::Described);
     }
     if listed.len() > MOST_FILTERS || replacing.len() > MOST_REPLACES {
@@ -1168,7 +1388,9 @@ fn shape_of(
             return Err(Refusal::Described);
         }
         let controls = f.controls.iter().map(|key| control_at(key)).collect::<Result<Vec<_>, _>>()?;
-        if controls.iter().collect::<HashSet<_>>().len() != controls.len() {
+        // (a filter has room for so many values)
+        let room = !featured || controls.len() <= MOST_CONTROLS;
+        if controls.iter().collect::<HashSet<_>>().len() != controls.len() || !room {
             return Err(Refusal::Described);
         }
         filters.push(ListedFilter {
@@ -1176,12 +1398,14 @@ fn shape_of(
             label: f.label.clone(),
             code: format!("{FILTERS_FOLDER}/{}.wgsl", f.key),
             controls,
-            under: f.under.as_deref().map(switch_at).transpose()?,
+            under: under_of(f.under.as_deref())?,
         });
     }
     let space = |id: &str| id.rsplit_once('.').map(|(space, _)| space.to_owned());
     let mut ids = HashSet::new();
     let mut replaces = Vec::new();
+    // a control a plugin it takes the place of had, its file too: any control here
+    let any_at = |key: &str| position(key).ok_or(Refusal::Described);
     for r in replacing {
         let beside = space(&r.id).is_some() && space(&r.id) == space(id);
         if !valid_id(&r.id) || r.id == id || !beside || !ids.insert(r.id.as_str()) {
@@ -1192,11 +1416,67 @@ fn shape_of(
             if !valid_key(old) {
                 return Err(Refusal::Described);
             }
-            controls.push((format!("{}.{old}", r.id), control_at(new)?));
+            let at = if featured { any_at(new)? } else { control_at(new)? };
+            controls.push((format!("{}.{old}", r.id), at));
         }
-        replaces.push(Replaced { id: r.id.clone(), switch: r.switch.as_deref().map(switch_at).transpose()?, controls });
+        let switch = r.switch.as_deref().map(switch_at).transpose()?;
+        replaces.push(Replaced { id: r.id.clone(), switch, controls, marks: r.marks });
     }
-    Ok(Shape { under, action_under, places, presses, action_presses, artwork, filters, replaces, menu: None })
+    // the marks of one at most, from interface 16
+    let marking = replaces.iter().filter(|r| r.marks).count();
+    if marking > 1 || (marking == 1 && interface.is_none_or(|i| i < FEATURES_FROM)) {
+        return Err(Refusal::Described);
+    }
+    let mut shape = Shape {
+        under,
+        action_under,
+        places,
+        presses,
+        action_presses,
+        artwork,
+        filters,
+        replaces,
+        menu: None,
+        brush_under,
+        features: Vec::new(),
+    };
+    shape.features = features_of(controls, &shape, actions.len())?;
+    Ok((shape, menu_under))
+}
+
+/// The features `controls` head (interface 16), each with its words and hooks, in `shape`, which
+/// lists `actions` actions; if they hold up: a few, each with a few controls and actions under it
+/// and its hooks each once, and the plugin's controls and actions a few in all.
+fn features_of(controls: &[RawControl], shape: &Shape, actions: usize) -> Result<Vec<Feature>, Refusal> {
+    let mut features = Vec::new();
+    for (at, c) in controls.iter().enumerate().filter(|(_, c)| c.kind == "feature") {
+        let mut hooks = Vec::new();
+        for name in c.hooks.iter().flatten() {
+            let hook = Hook::named(name).ok_or(Refusal::Newer)?;
+            if hooks.contains(&hook) {
+                return Err(Refusal::Described);
+            }
+            hooks.push(hook);
+        }
+        features.push(Feature { at, description: c.description.clone().unwrap_or_default(), hooks });
+    }
+    if features.is_empty() {
+        return Ok(features);
+    }
+    let in_all = controls.len() <= MOST_FEATURED_CONTROLS && actions <= MOST_FEATURED_ACTIONS;
+    if features.len() > MOST_FEATURES || !in_all {
+        return Err(Refusal::Described);
+    }
+    let lookup = Shape { features: features.clone(), ..shape.clone() };
+    for (f, feature) in features.iter().enumerate() {
+        let mine = |under: &Option<usize>| lookup.feature_under(*under) == Some(f);
+        let under = (0..controls.len()).filter(|&at| at != feature.at && lookup.feature_of(at) == Some(f)).count();
+        let acts = shape.action_under.iter().filter(|u| mine(u)).count();
+        if under > MOST_FEATURE_CONTROLS || acts > MOST_ACTIONS {
+            return Err(Refusal::Described);
+        }
+    }
+    Ok(features)
 }
 
 /// The press a manifest writes for a switch or an action, if it is one a keyboard sends (not one
@@ -2534,7 +2814,7 @@ pub(crate) mod tests {
         };
         // a hook or an interface this app doesn't have is for a newer one
         assert_eq!(of("/hooks", json!(["position", "layers"])), Refusal::Newer);
-        assert_eq!(of("/compat/procraft/interface", json!(16)), Refusal::Newer);
+        assert_eq!(of("/compat/procraft/interface", json!(17)), Refusal::Newer);
         assert_eq!(of("/hooks", json!([])), Refusal::Described);
         assert_eq!(of("/hooks", json!(["position", "position"])), Refusal::Described);
         assert_eq!(of("/compat/procraft", json!({ "min_app": "0.0.1" })), Refusal::Described);
@@ -2547,7 +2827,7 @@ pub(crate) mod tests {
     #[test]
     fn plugins_written_to_every_interface_so_far_still_load_and_a_new_hook_needs_its_function() {
         let module = a_module();
-        for interface in 1..=15 {
+        for interface in 1..=16 {
             let manifest = with(coded("org.example.plugin", &module), "/compat/procraft/interface", json!(interface));
             assert!(read_package(&a_coded_file(&manifest, &module)).is_ok(), "interface {interface}");
         }
@@ -3182,8 +3462,9 @@ pub(crate) mod tests {
             id: "org.example.old".to_owned(),
             switch: Some(0),
             controls: vec![("org.example.old.spacing".to_owned(), 1)],
+            marks: false,
         };
-        let other = Replaced { id: "org.example.other".to_owned(), switch: None, controls: Vec::new() };
+        let other = Replaced { id: "org.example.other".to_owned(), switch: None, controls: Vec::new(), marks: false };
         assert_eq!(shape.replaces, [old, other]);
         let of = |path: &str, value: Value| {
             let mut manifest = acting();
@@ -3351,5 +3632,181 @@ pub(crate) mod tests {
             assert_eq!(read_plugin_file(&pipe), None);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- plugins made of features (interface 16)
+
+    /// A module on the position and pressure hooks, told its controls.
+    fn two_hook_module() -> Vec<u8> {
+        wat::parse_str(
+            r#"(module
+            (func (export "procraft_control") (param i32 f32))
+            (func (export "procraft_position") (param f32 f32) (result i64) (i64.const 0))
+            (func (export "procraft_pressure") (param i32 i32 f32 f32 f32 f32) (result f32) (f32.const -1))
+            (func (export "procraft_pressure_taper") (param i32 i32) (result f32) (f32.const 0)))"#,
+        )
+        .unwrap()
+    }
+
+    /// Two features, Offset on the position hook and Press on the pressure hook, each with a switch
+    /// and a slider under it, the slider of Press under a switch of its own.
+    fn featured() -> Value {
+        let mut manifest = coded("org.example.both", &two_hook_module());
+        manifest["compat"]["procraft"]["interface"] = json!(16);
+        manifest["hooks"] = json!(["position", "pressure"]);
+        manifest["controls"] = json!([
+            { "key": "offset", "type": "feature", "label": "Offset", "description": "Moves samples.", "hooks": ["position"] },
+            { "key": "x", "type": "slider", "label": "X", "least": -9, "most": 9, "under": "offset" },
+            { "key": "press", "type": "feature", "label": "Press", "description": "Presses.", "hooks": ["pressure"] },
+            { "key": "lighter", "type": "switch", "label": "Lighter", "under": "press" },
+            { "key": "softer", "type": "switch", "label": "Softer", "under": "lighter" },
+            { "key": "level", "type": "slider", "label": "Level", "least": 0, "most": 1, "step": 0.1, "under": "softer" },
+        ]);
+        manifest
+    }
+
+    #[test]
+    fn a_plugin_of_features_heads_each_with_its_switch_its_words_and_its_hooks() {
+        let package = read_package(&a_coded_file(&featured(), &two_hook_module())).unwrap();
+        let shape = &package.manifest.shape;
+        let features: Vec<(usize, &str, &[Hook])> =
+            shape.features.iter().map(|f| (f.at, f.description.as_str(), f.hooks.as_slice())).collect();
+        assert_eq!(features, [(0, "Moves samples.", &[Hook::Position][..]), (2, "Presses.", &[Hook::Pressure][..])]);
+        // a feature is a switch that starts off; what comes under it, three deep
+        assert!(
+            matches!(&package.manifest.controls[0], PluginControl::Switch { control } if !control.on && !control.starts)
+        );
+        assert_eq!(shape.under, [None, Some(0), None, Some(2), Some(3), Some(4)]);
+        let belongs: Vec<Option<usize>> = (0..6).map(|at| shape.feature_of(at)).collect();
+        assert_eq!(belongs, [Some(0), Some(0), Some(1), Some(1), Some(1), Some(1)]);
+        assert_eq!(shape.feature_switch_of(5), Some(2));
+    }
+
+    #[test]
+    fn a_plugin_of_features_is_refused_unless_everything_comes_under_one_within_its_limits() {
+        let module = two_hook_module();
+        let of = |manifest: Value| read_package(&a_coded_file(&manifest, &module)).err();
+        let set = |at: usize, field: &str, value: Value| {
+            let mut manifest = featured();
+            manifest["controls"][at][field] = value;
+            manifest
+        };
+        assert_eq!(of(featured()), None);
+        // before interface 16, a feature is a control the plugin's interface doesn't have
+        assert_eq!(of(with(featured(), "/compat/procraft/interface", json!(15))), Some(Refusal::Described));
+        // under nothing, or a feature under something
+        assert_eq!(of(set(1, "under", Value::Null)), Some(Refusal::Described));
+        assert_eq!(of(set(2, "under", json!("offset"))), Some(Refusal::Described));
+        // three deep under a feature, not four
+        let mut deep = featured();
+        let switch = json!({ "key": "deeper", "type": "switch", "label": "Deeper", "under": "softer" });
+        deep["controls"].as_array_mut().unwrap().push(switch);
+        assert_eq!(of(deep.clone()), None, "three deep");
+        let slider =
+            json!({ "key": "deepest", "type": "slider", "label": "D", "least": 0, "most": 1, "under": "deeper" });
+        deep["controls"].as_array_mut().unwrap().push(slider);
+        assert_eq!(of(deep), Some(Refusal::Described), "four deep");
+        // a feature's hooks are the plugin's, and each of those some feature's
+        assert_eq!(of(set(0, "hooks", json!(["pressure", "position"]))), None);
+        assert_eq!(of(set(0, "hooks", json!(["position", "pick_layer"]))), Some(Refusal::Described));
+        assert_eq!(of(set(2, "hooks", json!([]))), Some(Refusal::Described));
+        assert_eq!(of(set(2, "hooks", json!(["teleport"]))), Some(Refusal::Newer));
+        assert_eq!(of(set(2, "hooks", json!(["pressure", "pressure"]))), Some(Refusal::Described));
+        // a feature starts off, and is reached on its card alone
+        for (field, value) in [
+            ("starts", json!(true)),
+            ("place", json!("canvas")),
+            ("press", json!("alt+q")),
+            ("artwork", json!(true)),
+            ("keeps", json!("fill_gap")),
+        ] {
+            assert_eq!(of(set(0, field, value)), Some(Refusal::Described), "{field}");
+        }
+        assert_eq!(of(set(0, "starts", json!(false))), None);
+        // words and hooks are a feature's alone
+        assert_eq!(of(set(1, "description", json!("A slider."))), Some(Refusal::Described));
+        // sixteen under a feature, and 64 in all
+        let mut many = featured();
+        let controls = many["controls"].as_array_mut().unwrap();
+        controls.extend(
+            (0..14).map(|i| json!({ "key": format!("s{i}"), "type": "switch", "label": "S", "under": "press" })),
+        );
+        assert_eq!(of(many.clone()), Some(Refusal::Described), "seventeen under Press");
+        many["controls"].as_array_mut().unwrap().pop();
+        assert_eq!(of(many), None, "sixteen");
+    }
+
+    #[test]
+    fn what_a_plugin_of_features_takes_over_holds_up() {
+        let module = two_hook_module();
+        let of = |manifest: Value| read_package(&a_coded_file(&manifest, &module));
+        let mut manifest = featured();
+        manifest["replaces"] = json!([
+            { "id": "org.example.old", "switch": "lighter", "controls": { "spacing": "x" }, "marks": true },
+            { "id": "org.example.other", "switch": "offset" },
+        ]);
+        manifest["brush_controls"] = json!([{ "key": "kind", "label": "Kind", "choices": ["A", "B"], "under": "press", "from": "org.example.old" }]);
+        let package = of(manifest.clone()).unwrap();
+        let shape = &package.manifest.shape;
+        assert_eq!(shape.marks_id("org.example.both"), "org.example.old");
+        assert_eq!(shape.brush_under, [Some(2)]);
+        // a row taken over is kept under the old one's key, so brushes say what they said
+        assert_eq!(package.manifest.brush_controls[0].key, "plugin:org.example.old:kind");
+        // the marks of one at most; a row from one it takes the place of; with features, a row under one
+        let mut two = manifest.clone();
+        two["replaces"][1]["marks"] = json!(true);
+        assert_eq!(of(two).err(), Some(Refusal::Described));
+        let mut stranger = manifest.clone();
+        stranger["brush_controls"][0]["from"] = json!("org.example.stranger");
+        assert_eq!(of(stranger).err(), Some(Refusal::Described));
+        let mut loose = manifest.clone();
+        loose["brush_controls"][0].as_object_mut().unwrap().remove("under");
+        assert_eq!(of(loose).err(), Some(Refusal::Described));
+        // nor before interface 16 (written without features)
+        let mut older = coded("org.example.older", &module);
+        older["compat"]["procraft"]["interface"] = json!(15);
+        older["replaces"] = json!([{ "id": "org.example.old", "marks": true }]);
+        assert_eq!(of(older.clone()).err(), Some(Refusal::Described));
+        older["replaces"] = json!([{ "id": "org.example.old" }]);
+        older["brush_controls"] =
+            json!([{ "key": "kind", "label": "Kind", "choices": ["A", "B"], "from": "org.example.old" }]);
+        assert_eq!(of(older.clone()).err(), Some(Refusal::Described));
+        older["brush_controls"][0].as_object_mut().unwrap().remove("from");
+        assert_eq!(of(older).unwrap().manifest.brush_controls[0].key, "plugin:org.example.older:kind");
+    }
+
+    #[test]
+    fn a_plugin_written_before_features_reads_as_it_did() {
+        // a switch under a switch under a switch: two deep at most, as ever
+        let module = two_hook_module();
+        let mut manifest = coded("org.example.older", &module);
+        manifest["compat"]["procraft"]["interface"] = json!(15);
+        manifest["controls"] = json!([
+            { "key": "a", "type": "switch", "label": "A" },
+            { "key": "b", "type": "switch", "label": "B", "under": "a" },
+            { "key": "c", "type": "slider", "label": "C", "least": 0, "most": 1, "under": "b" },
+        ]);
+        let package = read_package(&a_coded_file(&manifest, &module)).unwrap();
+        assert!(package.manifest.shape.features.is_empty());
+        assert_eq!(package.manifest.shape.under, [None, Some(0), Some(1)]);
+        manifest["controls"][2]["type"] = json!("switch");
+        manifest["controls"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "key": "d", "type": "switch", "label": "D", "under": "c" }));
+        assert_eq!(read_package(&a_coded_file(&manifest, &module)).err(), Some(Refusal::Described));
+        // seventeen controls are still too many for it, and a menu or a row under a switch reads
+        let mut many = coded("org.example.many", &module);
+        many["compat"]["procraft"]["interface"] = json!(15);
+        many["controls"] = json!(
+            (0..17).map(|i| json!({ "key": format!("s{i}"), "type": "switch", "label": "S" })).collect::<Vec<_>>()
+        );
+        assert_eq!(read_package(&a_coded_file(&many, &module)).err(), Some(Refusal::Described));
+        let mut rows = coded("org.example.rows", &module);
+        rows["compat"]["procraft"]["interface"] = json!(15);
+        rows["controls"] = json!([{ "key": "a", "type": "switch", "label": "A" }]);
+        rows["brush_controls"] = json!([{ "key": "kind", "label": "Kind", "choices": ["A", "B"], "under": "a" }]);
+        let package = read_package(&a_coded_file(&rows, &module)).unwrap();
+        assert_eq!(package.manifest.shape.brush_under, [Some(0)]);
     }
 }

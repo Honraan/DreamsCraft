@@ -2409,7 +2409,7 @@ mod tests {
 
     #[test]
     fn the_sample_strokes_show_in_the_colour_a_plugin_gives_by_the_colour_painted_with() {
-        const ID: &str = "io.github.artcraftandroid.coloured-previews";
+        const ID: &str = "io.github.artcraftandroid.interface-look";
         let dir = std::env::temp_dir().join(format!("procraft-library-tints-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let plugins = procraft_core::Plugins::with_bundled(dir.to_string_lossy().into_owned());
@@ -2423,6 +2423,7 @@ mod tests {
         assert_eq!(f.library.tint(true), Color32::WHITE);
         // on: each brush's in the colour painted with, the one in use's white on the accent
         assert!(plugins.set_on(ID.to_owned(), true));
+        assert!(plugins.set_switch(format!("{ID}.coloured_previews"), true));
         f.frame(Vec::new());
         assert_eq!((f.library.tint(false), f.library.tint(true)), (red, Color32::WHITE));
         // the colour changed, the next frame shows it, the strokes themselves not drawn again

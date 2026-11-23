@@ -83,6 +83,9 @@ pub(crate) struct Host {
     pub(crate) set_controls: Vec<(usize, f32)>,
     /// The plugin's id, for what only its own may reach (its brushes' data).
     pub(crate) owner: String,
+    /// The id the marks it keeps with layers go by: its own, or that of a plugin it took the place
+    /// of whose marks it keeps (interface 16).
+    pub(crate) marks: String,
     /// What the last utility made, until the plugin reads it.
     pub(crate) answer: Vec<u8>,
     /// While it makes brushes of a file: set when that is no longer wanted (a long call stops at
@@ -102,6 +105,7 @@ impl Host {
             close_panel: false,
             set_controls: Vec::new(),
             owner: String::new(),
+            marks: String::new(),
             answer: Vec::new(),
             cancel: None,
             file_span: None,
@@ -398,7 +402,7 @@ pub(crate) fn link(linker: &mut Linker<Host>, granted: &[PluginPermission]) -> R
         })?;
         // the number the plugin keeps with a layer, 0 for none (interface 10)
         linker.func_wrap(FROM, "layer_mark", |caller: Caller<'_, Host>, layer: i64| -> i64 {
-            session(&caller).map_or(0, |s| s.layer_mark(&caller.data().owner, layer as u64))
+            session(&caller).map_or(0, |s| s.layer_mark(&caller.data().marks, layer as u64))
         })?;
         linker.func_wrap(FROM, "current_layer", |caller: Caller<'_, Host>| -> i64 {
             let found = session(&caller).and_then(|s| s.layers().iter().find(|l| l.current).map(|l| l.id));
@@ -445,7 +449,7 @@ pub(crate) fn link(linker: &mut Linker<Host>, granted: &[PluginPermission]) -> R
         })?;
         // a number kept with a layer for the plugin, saved with the artwork, 0 taking it off
         linker.func_wrap(FROM, "set_layer_mark", |caller: Caller<'_, Host>, layer: i64, mark: i64| -> i32 {
-            session(&caller).map_or(0, |s| i32::from(s.set_layer_mark(&caller.data().owner, layer as u64, mark)))
+            session(&caller).map_or(0, |s| i32::from(s.set_layer_mark(&caller.data().marks, layer as u64, mark)))
         })?;
     }
     if granted.contains(&PluginPermission::Brush) {

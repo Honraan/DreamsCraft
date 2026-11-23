@@ -1438,6 +1438,33 @@ fn controls_show(plugin: &PluginInfo) -> bool {
     plugin.on && plugin.problem.is_none()
 }
 
+/// A feature's head on a card (interface 16): its padding above and below, its name's height, and
+/// the room its words leave for its switch.
+const FEATURE_PAD: f32 = 10.0;
+const FEATURE_NAME: f32 = 21.0;
+const FEATURE_ROOM: f32 = 16.0 + 8.0 + 63.0 + 12.0;
+
+/// How tall `feature`'s head is on a card `width` wide.
+fn feature_head_height(painter: &Painter, feature: &procraft_core::PluginFeature, width: f32) -> f32 {
+    let said = if feature.description.is_empty() {
+        0.0
+    } else {
+        4.0 + wrapped(painter, &feature.description, 14.0, Weight::Regular, Color32::WHITE, width - FEATURE_ROOM)
+            .size()
+            .y
+    };
+    2.0 * FEATURE_PAD + FEATURE_NAME + said
+}
+
+/// How tall `control` is as a card's row, its line above it with it.
+fn control_height(control: &PluginControl) -> f32 {
+    match control {
+        PluginControl::Switch { .. } | PluginControl::File { .. } | PluginControl::Texture { .. } => 1.0 + ROW_HEIGHT,
+        PluginControl::Slider { control } if !plugin_slider_choices(control.clone()).is_empty() => 1.0 + ROW_HEIGHT,
+        PluginControl::Slider { .. } => 1.0 + SLIDE_HEIGHT,
+    }
+}
+
 /// A row under a card's controls.
 #[derive(Clone, Copy)]
 enum CardRow {
@@ -1451,7 +1478,9 @@ enum CardRow {
 /// What can be done with `plugin`: what it does when tapped, once it's on; it is on or off; and
 /// what was imported can go.
 fn card_rows(plugin: &PluginInfo) -> Vec<CardRow> {
-    let actions = (0..plugin.actions.len()).filter(|_| controls_show(plugin)).map(CardRow::Action);
+    // (a plugin of features has its actions under them)
+    let flat = controls_show(plugin) && plugin.features.is_empty();
+    let actions = (0..plugin.actions.len()).filter(|_| flat).map(CardRow::Action);
     let mut rows: Vec<CardRow> = actions.collect();
     rows.push(if plugin.on { CardRow::TurnOff } else { CardRow::TurnOn });
     if plugin.source == PluginSource::File {
@@ -1465,18 +1494,17 @@ fn plugin_height(painter: &Painter, plugin: &PluginInfo, width: f32) -> f32 {
     let inside = width - 2.0 * PLUGIN_INSET;
     let said = wrapped(painter, &plugin.description, 14.0, Weight::Regular, Color32::WHITE, inside);
     let problem = if plugin.problem.is_some() { PLUGIN_PROBLEM } else { 0.0 };
-    let controls: f32 = plugin
-        .controls
-        .iter()
-        .filter(|_| controls_show(plugin))
-        .map(|c| match c {
-            PluginControl::Switch { .. } | PluginControl::File { .. } | PluginControl::Texture { .. } => {
-                1.0 + ROW_HEIGHT
-            }
-            PluginControl::Slider { control } if !plugin_slider_choices(control.clone()).is_empty() => 1.0 + ROW_HEIGHT,
-            PluginControl::Slider { .. } => 1.0 + SLIDE_HEIGHT,
-        })
-        .sum();
+    let controls: f32 = if !controls_show(plugin) {
+        0.0
+    } else if plugin.features.is_empty() {
+        plugin.controls.iter().map(control_height).sum()
+    } else {
+        let under = |f: &procraft_core::PluginFeature| {
+            let rows: f32 = f.controls.iter().map(control_height).sum();
+            if f.control.on { rows + f.actions.len() as f32 * (1.0 + ROW_HEIGHT) } else { 0.0 }
+        };
+        plugin.features.iter().map(|f| 1.0 + feature_head_height(painter, f, width) + under(f)).sum()
+    };
     let rows = card_rows(plugin).len() as f32 * (1.0 + ROW_HEIGHT);
     PLUGIN_HEAD + said.size().y + problem + PLUGIN_FOOT + controls + rows
 }
@@ -1521,110 +1549,58 @@ fn plugin_card(
     let head = ui.interact(head_rect, ui.scope_id().with(("plugin head", g)), Sense::click());
     let line = |y: f32| Rect::from_min_size(pos2(area.left(), y), vec2(width, 1.0));
     let mut changed = false;
-    for (i, control) in plugin.controls.iter().enumerate().filter(|_| controls_show(plugin)) {
-        painter.rect_filled(line(y), 0, argb(ACTIONS_SEPARATOR));
-        y += 1.0;
-        match control {
-            PluginControl::Switch { control } => {
-                let cell = Rect::from_min_size(pos2(area.left(), y), vec2(width, ROW_HEIGHT));
+    if controls_show(plugin) && !plugin.features.is_empty() {
+        // made of features: each a heading with its switch, what comes under it while it is on
+        for (f, feature) in plugin.features.iter().enumerate() {
+            painter.rect_filled(line(y), 0, argb(ACTIONS_SEPARATOR));
+            y += 1.0;
+            let tall = feature_head_height(&painter, feature, width);
+            let cell = Rect::from_min_size(pos2(area.left(), y), vec2(width, tall));
+            let switch = &feature.control;
+            let name_at = pos2(cell.left() + 16.0, cell.top() + FEATURE_PAD);
+            text(&painter, name_at, Align2::LEFT_TOP, &switch.label, 17.0, Weight::SemiBold, argb(PANEL_TITLE));
+            if !feature.description.is_empty() {
+                let said = wrapped(
+                    &painter,
+                    &feature.description,
+                    14.0,
+                    Weight::Regular,
+                    argb(ACTIONS_ROW),
+                    width - FEATURE_ROOM,
+                );
+                painter.galley(pos2(cell.left() + 16.0, name_at.y + FEATURE_NAME + 4.0), said, argb(ACTIONS_ROW));
+            }
+            let switch_at = pos2(cell.right() - 8.0 - 63.0, cell.center().y - 14.0);
+            crate::transform::switch(ui, switch_at, switch.on, &switch.key);
+            if ui.interact(cell, ui.scope_id().with(("plugin feature", g, f)), Sense::click()).clicked() {
+                changed |= plugins.set_switch(switch.key.clone(), !switch.on);
+            }
+            y += tall;
+            if !switch.on {
+                continue;
+            }
+            for (i, control) in feature.controls.iter().enumerate() {
+                painter.rect_filled(line(y), 0, argb(ACTIONS_SEPARATOR));
+                y += 1.0;
+                let at = (g, (f + 1) * 100 + i);
+                changed |= card_control(ui, &painter, area, &mut y, at, control, plugins, moved, choice, textures);
+            }
+            for (a, act) in feature.actions.iter().enumerate() {
+                painter.rect_filled(line(y), 0, argb(ACTIONS_SEPARATOR));
+                let cell = Rect::from_min_size(pos2(area.left(), y + 1.0), vec2(width, ROW_HEIGHT));
                 let at = pos2(cell.left() + 16.0, cell.center().y);
-                text(&painter, at, Align2::LEFT_CENTER, &control.label, 17.0, Weight::Regular, argb(ACTIONS_ROW));
-                let switch_at = pos2(cell.right() - 8.0 - 63.0, cell.center().y - 14.0);
-                crate::transform::switch(ui, switch_at, control.on, &control.key);
-                if ui.interact(cell, ui.scope_id().with(("plugin switch", g, i)), Sense::click()).clicked() {
-                    changed |= plugins.set_switch(control.key.clone(), !control.on);
+                text(&painter, at, Align2::LEFT_CENTER, &act.label, 17.0, Weight::Regular, argb(pc::ACCENT));
+                if ui.interact(cell, ui.scope_id().with(("plugin feature action", g, f, a)), Sense::click()).clicked() {
+                    *action = Some(act.key.clone());
                 }
-                y += ROW_HEIGHT;
+                y += 1.0 + ROW_HEIGHT;
             }
-            PluginControl::Slider { control } if !plugin_slider_choices(control.clone()).is_empty() => {
-                // its label, the one chosen in blue; a click opens a menu of them
-                let cell = Rect::from_min_size(pos2(area.left(), y), vec2(width, ROW_HEIGHT));
-                let at = pos2(cell.left() + 16.0, cell.center().y);
-                text(&painter, at, Align2::LEFT_CENTER, &control.label, 17.0, Weight::Regular, argb(ACTIONS_ROW));
-                let right = pos2(cell.right() - 16.0, cell.center().y);
-                let shown = plugin_slider_shown(control.clone(), control.value);
-                text(&painter, right, Align2::RIGHT_CENTER, &shown, 17.0, Weight::Regular, argb(pc::ACCENT));
-                let clicked = ui.interact(cell, ui.scope_id().with(("plugin choice", g, i)), Sense::click()).clicked();
-                if clicked || choice.as_ref().is_some_and(|c| c.slider.key == control.key) {
-                    let clicked = clicked || choice.as_ref().is_some_and(|c| c.clicked);
-                    *choice = Some(PluginChoice { slider: control.clone(), row: cell, clicked });
-                }
-                y += ROW_HEIGHT;
-            }
-            PluginControl::Slider { control } => {
-                let cell = Rect::from_min_size(pos2(area.left(), y), vec2(width, SLIDE_HEIGHT));
-                let held = moved.as_ref().filter(|(key, _)| *key == control.key).map(|(_, value)| *value);
-                let value = held.unwrap_or(control.value);
-                let shown = plugin_slider_shown(control.clone(), value);
-                let along = plugin_slider_along(control.clone(), value);
-                if let Some(at) = slide_row(ui, cell, &control.label, &shown, along, (g, i)) {
-                    let to = plugin_slider_at(control.clone(), at);
-                    if control.live {
-                        changed |= plugins.set_slider(control.key.clone(), to).is_some();
-                    } else {
-                        *moved = Some((control.key.clone(), to));
-                    }
-                }
-                y += SLIDE_HEIGHT;
-            }
-            PluginControl::Texture { control } => {
-                // its label, the texture chosen in blue; a click opens the Textures sheet
-                let cell = Rect::from_min_size(pos2(area.left(), y), vec2(width, ROW_HEIGHT));
-                let at = pos2(cell.left() + 16.0, cell.center().y);
-                text(&painter, at, Align2::LEFT_CENTER, &control.label, 17.0, Weight::Regular, argb(ACTIONS_ROW));
-                let right = pos2(cell.right() - 16.0, cell.center().y);
-                let shown = crate::textures::chosen_name(plugins, control);
-                text(&painter, right, Align2::RIGHT_CENTER, &shown, 17.0, Weight::Regular, argb(pc::ACCENT));
-                if ui.interact(cell, ui.scope_id().with(("plugin texture", g, i)), Sense::click()).clicked() {
-                    *textures = Some(control.key.clone());
-                }
-                y += ROW_HEIGHT;
-            }
-            PluginControl::File { control } => {
-                // its label; the name of what was picked and Clear, or Import; a click picks another
-                let cell = Rect::from_min_size(pos2(area.left(), y), vec2(width, ROW_HEIGHT));
-                let at = pos2(cell.left() + 16.0, cell.center().y);
-                text(&painter, at, Align2::LEFT_CENTER, &control.label, 17.0, Weight::Regular, argb(ACTIONS_ROW));
-                let right = pos2(cell.right() - 16.0, cell.center().y);
-                let clear = control.chosen.as_ref().map(|chosen| {
-                    let clear =
-                        text(&painter, right, Align2::RIGHT_CENTER, "Clear", 17.0, Weight::Regular, argb(pc::ACCENT));
-                    let shown: String = if chosen.chars().count() > 28 {
-                        chosen.chars().take(27).chain(['\u{2026}']).collect()
-                    } else {
-                        chosen.clone()
-                    };
-                    let name_at = pos2(clear.left() - 12.0, cell.center().y);
-                    text(&painter, name_at, Align2::RIGHT_CENTER, &shown, 15.0, Weight::Regular, argb(SLIDE_VALUE));
-                    clear
-                });
-                if clear.is_none() {
-                    text(&painter, right, Align2::RIGHT_CENTER, "Import", 17.0, Weight::Regular, argb(pc::ACCENT));
-                }
-                let response = ui.interact(cell, ui.scope_id().with(("plugin file", g, i)), Sense::click());
-                if response.clicked() {
-                    let on_clear =
-                        clear.zip(response.interact_pointer_pos()).is_some_and(|(c, at)| c.expand(8.0).contains(at));
-                    if on_clear {
-                        changed |= plugins.clear_file(control.key.clone());
-                    } else if control.accepts == procraft_core::PluginFileKind::Picture {
-                        if let Some((bytes, name)) = crate::files::pick_control_picture(&control.label) {
-                            if plugins.set_picture_file(control.key.clone(), name, bytes) {
-                                changed = true;
-                            } else {
-                                crate::files::say("This picture couldn't be used. Pick a PNG or a JPEG.");
-                            }
-                        }
-                    } else if let Some((bytes, name)) = crate::files::pick_sound(&control.label) {
-                        if plugins.set_sound_file(control.key.clone(), name, bytes) {
-                            changed = true;
-                        } else {
-                            crate::files::say("This sound couldn't be used. On the computer, pick a WAV file.");
-                        }
-                    }
-                }
-                y += ROW_HEIGHT;
-            }
+        }
+    } else {
+        for (i, control) in plugin.controls.iter().enumerate().filter(|_| controls_show(plugin)) {
+            painter.rect_filled(line(y), 0, argb(ACTIONS_SEPARATOR));
+            y += 1.0;
+            changed |= card_control(ui, &painter, area, &mut y, (g, i), control, plugins, moved, choice, textures);
         }
     }
     for (r, row) in card_rows(plugin).into_iter().enumerate() {
@@ -1650,6 +1626,128 @@ fn plugin_card(
         y += 1.0 + ROW_HEIGHT;
     }
     (changed, head, area)
+}
+
+/// One of a plugin card's controls, whatever it is, drawn at `y` (moved past it), `at` its card's
+/// place and its own for what it is told, as [`plugin_card`] has it: whether a value changed.
+#[allow(clippy::too_many_arguments)]
+fn card_control(
+    ui: &mut Ui,
+    painter: &Painter,
+    area: Rect,
+    y: &mut f32,
+    (g, i): (usize, usize),
+    control: &PluginControl,
+    plugins: &Plugins,
+    moved: &mut Option<(String, f32)>,
+    choice: &mut Option<PluginChoice>,
+    textures: &mut Option<String>,
+) -> bool {
+    let width = area.width();
+    let mut changed = false;
+    match control {
+        PluginControl::Switch { control } => {
+            let cell = Rect::from_min_size(pos2(area.left(), *y), vec2(width, ROW_HEIGHT));
+            let at = pos2(cell.left() + 16.0, cell.center().y);
+            text(painter, at, Align2::LEFT_CENTER, &control.label, 17.0, Weight::Regular, argb(ACTIONS_ROW));
+            let switch_at = pos2(cell.right() - 8.0 - 63.0, cell.center().y - 14.0);
+            crate::transform::switch(ui, switch_at, control.on, &control.key);
+            if ui.interact(cell, ui.scope_id().with(("plugin switch", g, i)), Sense::click()).clicked() {
+                changed |= plugins.set_switch(control.key.clone(), !control.on);
+            }
+            *y += ROW_HEIGHT;
+        }
+        PluginControl::Slider { control } if !plugin_slider_choices(control.clone()).is_empty() => {
+            // its label, the one chosen in blue; a click opens a menu of them
+            let cell = Rect::from_min_size(pos2(area.left(), *y), vec2(width, ROW_HEIGHT));
+            let at = pos2(cell.left() + 16.0, cell.center().y);
+            text(painter, at, Align2::LEFT_CENTER, &control.label, 17.0, Weight::Regular, argb(ACTIONS_ROW));
+            let right = pos2(cell.right() - 16.0, cell.center().y);
+            let shown = plugin_slider_shown(control.clone(), control.value);
+            text(painter, right, Align2::RIGHT_CENTER, &shown, 17.0, Weight::Regular, argb(pc::ACCENT));
+            let clicked = ui.interact(cell, ui.scope_id().with(("plugin choice", g, i)), Sense::click()).clicked();
+            if clicked || choice.as_ref().is_some_and(|c| c.slider.key == control.key) {
+                let clicked = clicked || choice.as_ref().is_some_and(|c| c.clicked);
+                *choice = Some(PluginChoice { slider: control.clone(), row: cell, clicked });
+            }
+            *y += ROW_HEIGHT;
+        }
+        PluginControl::Slider { control } => {
+            let cell = Rect::from_min_size(pos2(area.left(), *y), vec2(width, SLIDE_HEIGHT));
+            let held = moved.as_ref().filter(|(key, _)| *key == control.key).map(|(_, value)| *value);
+            let value = held.unwrap_or(control.value);
+            let shown = plugin_slider_shown(control.clone(), value);
+            let along = plugin_slider_along(control.clone(), value);
+            if let Some(at) = slide_row(ui, cell, &control.label, &shown, along, (g, i)) {
+                let to = plugin_slider_at(control.clone(), at);
+                if control.live {
+                    changed |= plugins.set_slider(control.key.clone(), to).is_some();
+                } else {
+                    *moved = Some((control.key.clone(), to));
+                }
+            }
+            *y += SLIDE_HEIGHT;
+        }
+        PluginControl::Texture { control } => {
+            // its label, the texture chosen in blue; a click opens the Textures sheet
+            let cell = Rect::from_min_size(pos2(area.left(), *y), vec2(width, ROW_HEIGHT));
+            let at = pos2(cell.left() + 16.0, cell.center().y);
+            text(painter, at, Align2::LEFT_CENTER, &control.label, 17.0, Weight::Regular, argb(ACTIONS_ROW));
+            let right = pos2(cell.right() - 16.0, cell.center().y);
+            let shown = crate::textures::chosen_name(plugins, control);
+            text(painter, right, Align2::RIGHT_CENTER, &shown, 17.0, Weight::Regular, argb(pc::ACCENT));
+            if ui.interact(cell, ui.scope_id().with(("plugin texture", g, i)), Sense::click()).clicked() {
+                *textures = Some(control.key.clone());
+            }
+            *y += ROW_HEIGHT;
+        }
+        PluginControl::File { control } => {
+            // its label; the name of what was picked and Clear, or Import; a click picks another
+            let cell = Rect::from_min_size(pos2(area.left(), *y), vec2(width, ROW_HEIGHT));
+            let at = pos2(cell.left() + 16.0, cell.center().y);
+            text(painter, at, Align2::LEFT_CENTER, &control.label, 17.0, Weight::Regular, argb(ACTIONS_ROW));
+            let right = pos2(cell.right() - 16.0, cell.center().y);
+            let clear = control.chosen.as_ref().map(|chosen| {
+                let clear =
+                    text(painter, right, Align2::RIGHT_CENTER, "Clear", 17.0, Weight::Regular, argb(pc::ACCENT));
+                let shown: String = if chosen.chars().count() > 28 {
+                    chosen.chars().take(27).chain(['\u{2026}']).collect()
+                } else {
+                    chosen.clone()
+                };
+                let name_at = pos2(clear.left() - 12.0, cell.center().y);
+                text(painter, name_at, Align2::RIGHT_CENTER, &shown, 15.0, Weight::Regular, argb(SLIDE_VALUE));
+                clear
+            });
+            if clear.is_none() {
+                text(painter, right, Align2::RIGHT_CENTER, "Import", 17.0, Weight::Regular, argb(pc::ACCENT));
+            }
+            let response = ui.interact(cell, ui.scope_id().with(("plugin file", g, i)), Sense::click());
+            if response.clicked() {
+                let on_clear =
+                    clear.zip(response.interact_pointer_pos()).is_some_and(|(c, at)| c.expand(8.0).contains(at));
+                if on_clear {
+                    changed |= plugins.clear_file(control.key.clone());
+                } else if control.accepts == procraft_core::PluginFileKind::Picture {
+                    if let Some((bytes, name)) = crate::files::pick_control_picture(&control.label) {
+                        if plugins.set_picture_file(control.key.clone(), name, bytes) {
+                            changed = true;
+                        } else {
+                            crate::files::say("This picture couldn't be used. Pick a PNG or a JPEG.");
+                        }
+                    }
+                } else if let Some((bytes, name)) = crate::files::pick_sound(&control.label) {
+                    if plugins.set_sound_file(control.key.clone(), name, bytes) {
+                        changed = true;
+                    } else {
+                        crate::files::say("This sound couldn't be used. On the computer, pick a WAV file.");
+                    }
+                }
+            }
+            *y += ROW_HEIGHT;
+        }
+    }
+    changed
 }
 
 /// What a plugin's panel was asked.
@@ -2944,16 +3042,22 @@ mod tests {
 
     #[test]
     fn finger_pressure_s_card_shows_its_sliders_once_it_is_on() {
-        const ID: &str = "io.github.artcraftandroid.finger-pressure";
+        const ID: &str = "io.github.artcraftandroid.brush-extras";
         let dir = std::env::temp_dir().join(format!("procraft-actions-finger-pressure-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut page = Page::new();
         page.prefs.plugins = Plugins::with_bundled(dir.to_string_lossy().into_owned());
         assert!(page.list().iter().any(|p| p.id == ID && !p.on), "it comes with the app, off");
         let shapes = page.run(Vec::new()).1;
-        assert!(drawn(&shapes, "Finger pressure").is_some());
-        assert!(drawn(&shapes, "Speed influence").is_none(), "off, its sliders don't show");
+        assert!(drawn(&shapes, "Brush extras").is_some());
+        assert!(drawn(&shapes, "Finger pressure").is_none(), "off, its features don't show");
         assert!(page.prefs.plugins.set_on(ID.to_owned(), true));
+        page.frame(Vec::new());
+        // on: a heading for each feature, Finger pressure's sliders once it is on
+        let shapes = page.run(Vec::new()).1;
+        assert!(drawn(&shapes, "Finger pressure").is_some() && drawn(&shapes, "Touch position offset").is_some());
+        assert!(drawn(&shapes, "Speed influence").is_none(), "its feature off, its sliders don't show");
+        assert!(page.prefs.plugins.set_switch(format!("{ID}.finger_pressure"), true));
         page.frame(Vec::new());
         let shapes = page.run(Vec::new()).1;
         let rows = [
@@ -2986,7 +3090,7 @@ mod tests {
     #[ignore]
     fn dump_finger_pressure_card() {
         use procraft_gpu::wgpu;
-        const ID: &str = "io.github.artcraftandroid.finger-pressure";
+        const ID: &str = "io.github.artcraftandroid.brush-extras";
         let Ok(out) = std::env::var("PROCRAFT_DUMP") else { return };
         let Ok(gpu) = procraft_gpu::Gpu::headless() else { return eprintln!("skipped: no GPU") };
         let dir = std::env::temp_dir().join(format!("procraft-actions-finger-dump-{}", std::process::id()));
@@ -2998,6 +3102,7 @@ mod tests {
             assert!(page.prefs.plugins.remove(other.id).is_some());
         }
         assert!(page.prefs.plugins.set_on(ID.to_owned(), true));
+        assert!(page.prefs.plugins.set_switch(format!("{ID}.finger_pressure"), true));
         page.frame(Vec::new());
         page.frame(Vec::new());
         let (_, bottom) = page.cards()[0];
@@ -3198,6 +3303,7 @@ mod tests {
     #[test]
     fn a_plugin_nothing_answers_to_draws_and_does_nothing() {
         let stranger = PluginInfo {
+            features: Vec::new(),
             brush_controls: Vec::new(),
             actions: Vec::new(),
             kinds: Vec::new(),

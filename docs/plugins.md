@@ -21,23 +21,32 @@ A plugin holds one or both of these:
 - **A [filter](#filters)**, or [several](#several-in-one-plugin), each a new adjustment. A filter is
   a function the GPU runs over a layer.
 
-The samples are in [`plugins/`](../plugins). `touch-offset` is the smallest with code and `vector-layers`
-the largest. `effects` lists three filters, each under a switch of its own. `layer-fills` has an
-action beside a filter, `colour-triangle` is a picker, `vector-layers` adds layers of its own, and
-`keyboard-shortcuts` rebinds keys from a panel of its own and keeps what it binds. `interface`,
-`layer-tools` and `colordrop-tools` each answer several hooks, one for each of their switches,
-`colour-triangle`'s picture draws its hue ring as its switch says and its [menu](#a-menu-of-its-own)
-switches its shape, and `floating-panels` lets panels float in windows of their own. `rotation-reset`
-has an action and two switches in the Canvas tab, `value-check` a switch there with a key of its own, `trace-view` a choice there, a row in the Layers panel and keys for its actions,
-`paper` controls kept with each artwork, `reference-windows` a single slider, and `finger-pressure`
-gives a finger a pressure on the `pressure` hook, and `coloured-previews` tints the brush library's
-strokes on the `brush_preview_colour` hook. `colour-labels` keeps a mark with each layer from an
-action in its options, shows it with the `layer_label` hook, and asks for it with a row of colours.
-`pop-up-palette` has an action a pen's button runs, which shows a ring of the recent colours and
-brushes where the pen is. `canvas-surround` colours the area round the canvas on the
-`interface_colour` hook's surround, or shows a picture picked for its `file` control there on the
-`surround_picture` hook. `slider-look` makes the side bar's sliders see-through frosted glass on the
-`slider_look` hook.
+The samples are in [`plugins/`](../plugins). `radial-segments` is the smallest with code and
+`vector-layers` the largest. Five are made of [features](#features), each what a plugin of its own
+once was: `colour-tools`, `interface-look`, `view-tools`, `brush-extras` and `layer-toolbox`.
+
+- `colour-tools`: its Colour triangle is a picker whose picture draws its hue ring as its switch says
+  and whose [menu](#a-menu-of-its-own) switches its shape; Colour labels keeps a mark with each layer
+  from an action in its options, shows it with the `layer_label` hook and asks for it with a row of
+  colours; Colour extras answers the `colour_panel` hook, and ColorDrop tools the fill hooks.
+- `interface-look`: Interface answers several hooks, one for each of its switches, a switch under a
+  switch among them; Slider look makes the side bar's sliders see-through frosted glass on the
+  `slider_look` hook; Canvas surround colours the area round the canvas on the `interface_colour`
+  hook's surround, or shows a picture picked for its `file` control there on the `surround_picture`
+  hook; Floating panels lets panels float in windows of their own; and Coloured brush previews tints
+  the brush library's strokes on the `brush_preview_colour` hook.
+- `view-tools`: Rotation reset has an action and two switches in the Canvas tab, Value check a switch
+  there with a key of its own, Trace view a choice there, a row in the Layers panel and keys for its
+  actions, and Reference windows a single slider.
+- `brush-extras`: Finger pressure gives a finger a pressure on the `pressure` hook, Touch position
+  offset moves samples on the `position` hook, Brush sounds plays sounds with files picked for it and
+  a row in the brush studio, and Randomise and QuickShape curves answer a hook each.
+- `layer-toolbox`: Layer tools answers three hooks, one for each of its switches; Layer fills has an
+  action beside a filter; and Effects lists three filters, each under a switch of its own.
+
+`keyboard-shortcuts` rebinds keys from a panel of its own and keeps what it binds, `paper` has
+controls kept with each artwork, `pop-up-palette` has an action a pen's button runs, which shows a ring
+of the recent colours and brushes where the pen is, and `lasso-fill` comes with brushes.
 
 ## What you write
 
@@ -87,8 +96,9 @@ panels' rows of colours 10, the recent colours and brushes, actions at the pen, 
 brushes and rings, the `interface_colour` hook's surround, the `surround_picture` and `slider_look`
 hooks and `file` controls of pictures 11, the `stroke_fill` hook, the `paper` hook's tooth and
 picture, actions in the Layers panel, `set_control` and the `colour_panel` hook 12, the
-`view_dim_others` hook 13, a set of brushes 14, and `texture` controls, panels' rows of a control and
-the `paper` hook's grain 15.
+`view_dim_others` hook 13, a set of brushes 14, `texture` controls, panels' rows of a control and
+the `paper` hook's grain 15, and [features](#features), a row in the brush studio kept as a plugin it
+takes the place of kept it, and the marks of one it takes the place of 16.
 
 ### Brushes it comes with
 
@@ -119,7 +129,8 @@ starts off, until someone taps Turn on. One the app adds by itself starts off, w
 ## Controls
 
 A plugin can have up to eight, each a `slider` or a `switch`, or sixteen if it holds code written to
-interface 6 and no filter; a plugin with code can have up to eight `file` controls besides.
+interface 6 and no filter; a plugin with code can have up to eight `file` controls besides. One made
+of [features](#features) has more.
 
 | Field | Means |
 |---|---|
@@ -132,7 +143,7 @@ interface 6 and no filter; a plugin with code can have up to eight `file` contro
 | `names` | A name for each of a slider's steps from its lowest, shown in place of the number |
 | `live` | The value goes in as the slider moves, rather than as it lets go |
 | `accepts` | What a `file` control takes: `"sound"`, a recording (the app reads it, keeps a minute of it at most with the plugin, and drops it with the plugin); or `"picture"` (interface 11), a PNG or a JPEG of 32 MiB at most, kept as it came |
-| `under` | The `key` of a switch it comes under: on the card it shows after that switch, while the switch is on (its value stays as it was while it's hidden). That switch is at the top of the list, or comes under one there (interface 6): two deep at most |
+| `under` | The `key` of a switch it comes under: on the card it shows after that switch, while the switch is on (its value stays as it was while it's hidden). That switch is at the top of the list, or comes under one there (interface 6): two deep at most (three under a [feature](#features)) |
 | `place` | Where else a switch or a slider shows besides the card: `"canvas"`, see [below](#in-the-canvas-tab-on-a-key-and-with-each-artwork) |
 | `press` | A key that flips a switch, see [below](#in-the-canvas-tab-on-a-key-and-with-each-artwork) |
 | `artwork` | `true`: a switch or a slider kept with each artwork rather than with the plugin, see [below](#in-the-canvas-tab-on-a-key-and-with-each-artwork) |
@@ -140,7 +151,55 @@ interface 6 and no filter; a plugin with code can have up to eight `file` contro
 A plugin that does several things can have a switch for each, at the top of the list, with that
 thing's sliders `under` it. Turning the plugin on switches none of them on: each is the user's to
 turn on, and the code answers for each only while its switch says so (it is told the switch as any
-control). An action, and a filter of several, can come `under` a switch too.
+control). An action, a filter of several, a [menu](#a-menu-of-its-own) and a
+[row in the brush studio](#rows-in-the-brush-studio) can come `under` a switch too. A plugin made of
+several plugins' worth has a [feature](#features) for each instead.
+
+### Features
+
+A plugin written to interface 16 can be made of features: several plugins' worth in one, each with a
+switch of its own at the top of its card, its own words under its name, and everything it holds under
+it. A feature is a control of the type `feature`:
+
+```json
+"hooks": ["position", "pressure"],
+"controls": [
+  { "key": "offset", "type": "feature", "label": "Touch position offset",
+    "description": "Moves where your strokes land.", "hooks": ["position"] },
+  { "key": "x", "type": "slider", "label": "X", "least": -100, "most": 100, "starts": 0, "under": "offset" },
+  { "key": "pressure", "type": "feature", "label": "Finger pressure",
+    "description": "Gives your finger a pressure.", "hooks": ["pressure"] },
+  { "key": "speed", "type": "slider", "label": "Speed influence", "least": 0, "most": 1, "step": 0.01,
+    "starts": 0.7, "under": "pressure" }
+]
+```
+
+- A feature is a switch, off as the plugin comes and when it's turned on, so each is the user's to
+  turn on; the code is told it as any switch. It is at the top of the list (no `under`), and has no
+  `place`, `press`, `artwork` or `keeps`. Its `description` is up to 200 characters, as a plugin's.
+- With features, everything else comes `under` one: every other control, action, filter, the menu and
+  each row in the brush studio, under the feature or under a switch that comes under it, two deep
+  below it at most. So a feature holds all a plugin of switches could.
+- `hooks` names the hooks it answers, each one of the plugin's `hooks`, and each of those is some
+  feature's. A hook several features answer is named by each.
+- Up to sixteen features, sixteen controls under each and eight actions under each; and in all up to
+  64 controls (files among them, eight at most), 32 hooks and 32 actions. A filter it lists reads at
+  most eight controls, and it lists its filters (no `filter.wgsl`); a picker's picture is given all
+  its controls, so a plugin with a picker has sixteen at most. It has no kinds of artwork, layer or
+  brush engine.
+
+How the app runs it: each feature that is on runs in a copy of the plugin's code of its own, started
+as the feature is turned on (or the plugin is, or the app starts) and let go as it is turned off, on
+the hooks the feature names alone and with the memory those give (so a feature on `stroke_sound` has
+its 128 MB, and one on `pressure` its 16 MiB). A feature that's off, or names no hooks, runs nowhere.
+Each copy is told every control as it is, but the other features' switches as off, so it answers as
+the plugin it was would; the files picked for `file` controls under a feature are handed to that
+feature's copy alone. One copy's long call (a fill, a sound) holds up no other feature's hooks.
+Copies of one plugin go on a hook in the order of their features. An action runs in a copy of its own
+as always, told every control as it is. A copy that stops switches the whole plugin off.
+
+The card shows each feature as a heading with its switch and words, and under it, while it is on, its
+controls and actions. An older ProCraft says the plugin needs a newer one.
 
 A `file` control shows Import, or the name of the file picked and Clear. The plugin is told 1 while a
 file is picked, 0 while none is, and is handed the file itself if it takes files (see below); what
@@ -204,6 +263,8 @@ and kept the same way.
 - `place` is where: `"classic"`, a button of three dots in the lower left corner of the colour
   panel's Classic picker (in the panel hanging from its button, while it works in HSB). A place this
   app doesn't have makes the file one for a newer ProCraft.
+- `under` (optional) is the key of a switch it comes under: the button shows only while that switch is
+  on (and any it comes under).
 - Up to eight choices, each with a `key` of its own and a `label` of at most 24 characters (what the
   choice is called where its icon can't say, as to a screen reader or under a pointer).
 - `icon` is SVG path data on the interface icons' grid, 24 units each way: moves, lines (`L`, `H`,
@@ -230,9 +291,14 @@ to 16 (each 24 characters at most), kept with each brush:
 ]
 ```
 
-A brush starts at the first choice. The row shows under its `label` while the plugin is on; a brush
-keeps its choice under `plugin:<id>:<key>`, so it stays with the brush when the plugin is off, and
-in its file when it's shared (`Plugins/Rows.txt` in the brush's folder, which other apps pass over).
+A brush starts at the first choice. The row shows under its `label` while the plugin is on (and, with
+`under`, the key of a switch, while that switch is on); a brush keeps its choice under
+`plugin:<id>:<key>`, so it stays with the brush when the plugin is off, and in its file when it's
+shared (`Plugins/Rows.txt` in the brush's folder, which other apps pass over).
+
+A row a plugin takes over from one it [takes the place of](#taking-the-place-of-other-plugins) can
+say so with `"from"`, that plugin's id (interface 16): brushes then keep its choice under
+`plugin:<from>:<key>`, as they did for that plugin, so every brush set before says the same.
 
 ### What the code is told
 
@@ -522,7 +588,7 @@ fingers closing fast as they lift leave the canvas as they left it, rather than 
 window as a quick pinch in does. Answer 0 for a part you don't know: more may come. With several
 plugins on this hook, one that locks a part locks it.
 
-The Rotation reset plugin the app comes with has a switch for each part: Lock rotation while
+View tools' Rotation reset, which the app comes with, has a switch for each part: Lock rotation while
 pinching, and No fit on a quick pinch.
 
 ### `view_look`
@@ -543,7 +609,7 @@ stops the plugin. The app asks as the plugins change, not as it draws. With seve
 hook, each plugin's matrix comes after the last's, in order of id, and the app's own grey view after
 them all.
 
-The Value check plugin the app comes with answers each colour as the grey of its luminance (each row
+View tools' Value check, which the app comes with, answers each colour as the grey of its luminance (each row
 `0.2126, 0.7152, 0.0722, 0`), its greys spread from a middle grey as far as its Contrast says.
 
 ### `view_dim_others`
@@ -566,7 +632,7 @@ plugins' layers aren't drawn sharp meanwhile. An answer that isn't a number, or 
 stops the plugin. The app asks as the plugins change, not as it draws. With several plugins on this
 hook, the most any says.
 
-The Trace view plugin the app comes with has a Layer view of Normal (none dimmed), Solo (all the way)
+View tools' Trace view, which the app comes with, has a Layer view of Normal (none dimmed), Solo (all the way)
 and Trace (as far as its slider says, 70% as it starts), chosen in the Canvas tab or from its row in
 the Layers panel, whose panel holds both; Alt+S and Alt+T toggle Solo and Trace.
 
@@ -682,9 +748,9 @@ pressure the last one gave; each taper is the longest any gives. A stroke on a p
 what was given (field 27), so it is laid again the same.
 
 The kit has no macro for this hook: a plugin exports both functions itself, as
-`plugins/finger-pressure` does with the kit's `Controls` beside them.
+`plugins/brush-extras` does with the kit's `Controls` beside them.
 
-The Finger pressure plugin the app comes with gives a finger a pressure by its speed (window points a
+Brush extras' Finger pressure, which the app comes with, gives a finger a pressure by its speed (window points a
 second, followed over about 40 ms): the most when it goes slowly, falling towards the least as it
 speeds up, by a share of `s² / (1 + s²)` (`s` the speed over 1,000) times its Speed influence; and
 tapers each finger's stroke in and out over its Start taper and End taper. Pens and mice it leaves
@@ -707,7 +773,7 @@ library's strokes, the cards of the other libraries' too, but not the brush stud
 0xFFFFFF, or below -1, stops the plugin. With several plugins on this hook, the first by id that
 answers is used.
 
-The Coloured brush previews plugin the app comes with shows them in the colour being painted with,
+Interface look's Coloured brush previews, which the app comes with, shows them in the colour being painted with,
 or in one of its own from its Hue, Saturation and Brightness, and the brush in use so too while
 its switch says.
 
@@ -725,7 +791,7 @@ which shows down the row's left edge, or -1 for none. An answer past 0xFFFFFF, o
 the plugin. With several plugins on this hook, the first by id that answers for a layer's marks is
 used. With the plugin off, its marks stay and show nothing.
 
-The Colour labels plugin the app comes with gives a layer one of eight colours from Colour label in
+Colour tools' Colour labels, which the app comes with, gives a layer one of eight colours from Colour label in
 its options, a panel of the eight and No label, and keeps the colour's place as the layer's mark.
 
 ### `stroke_fill`
@@ -815,7 +881,7 @@ pictures with one picked shows none; an answer below -1 or past 255 stops the pl
 the plugins change, and the picture is read again only when the file changes. With several plugins on
 this hook, the first by id that answers is used.
 
-The Canvas surround plugin the app comes with gives the surround a colour from its Hue, Saturation
+Interface look's Canvas surround, which the app comes with, gives the surround a colour from its Hue, Saturation
 and Brightness (black at none), or, with A picture of your own on, the picture picked for it.
 
 ### `slider_look`
@@ -835,7 +901,7 @@ Answer below 0 to leave a part as the app has it, as for one you don't know: mor
 past 1, or that isn't a number, stops the plugin. It's asked as the plugins change. With several
 plugins on this hook, the first by id that answers each part is used.
 
-The Slider look plugin the app comes with makes the tracks frosted and as opaque as its Opacity says.
+Interface look's Slider look, which the app comes with, makes the tracks frosted and as opaque as its Opacity says.
 
 ### `colour_panel`
 
@@ -853,7 +919,7 @@ procraft_colour_panel(part: i32) -> i32
 Answer 0 for a part you don't know: more may come. It's asked as the plugins change. With several
 plugins on this hook, a part is done if any says so.
 
-The Colour extras plugin the app comes with does each by a switch of its own.
+Colour tools' Colour extras, which the app comes with, does each by a switch of its own.
 
 ### `pin_panels`
 
@@ -964,7 +1030,7 @@ fn picture(at: vec2<f32>) -> vec4<f32> {
 It's checked as a filter's function is (see [What is refused](#what-is-refused)): it reaches
 nothing, and its loops pay from a budget. A picture that runs out of budget, or takes too long,
 switches the plugin off. `tools/pack_plugin.py` packs `picture.wgsl` for a plugin on this hook. The
-kit's `picker!` writes the two functions, and `plugins/colour-triangle` is one to start from.
+kit's `picker!` writes the two functions, and `plugins/colour-tools` is one to start from (its Colour triangle).
 
 Written to interface 6, the picture is given the plugin's controls too, as a filter is: each as
 `v.<key>`, a switch 1 or 0. The app draws it again when they change.
@@ -1099,7 +1165,7 @@ procraft_curve_nodes() -> i32
 circle, triangle, equilateral triangle, quadrilateral, rectangle and square, or -1 when a curve is
 asked for by name. `run` answers how many nodes the curve has, 0 for none: an anchor, then two
 controls and an anchor for each span (4, 7, 10 ...). `nodes` answers where they are, as the points
-came. The QuickShape curves plugin the app comes with offers one for a polyline: an anchor at each
+came. Brush extras' QuickShape curves, which the app comes with, offers one for a polyline: an anchor at each
 corner, each anchor's controls leaning the way the stroke came and went.
 
 ### `stroke_sound`
@@ -1121,7 +1187,7 @@ tall), 4 the tool erases. Before the first sound at a rate, `procraft_sound_prep
 readies whatever it makes once, as a long call. A sound may spend fuel by the frame; there's 128 MB
 of memory. It's told the brush and its rows as above, so a sound can go by the brush.
 
-The Brush sounds plugin the app comes with behaves as Krita's Brush SFX plugin by davi133 does
+Brush extras' Brush sounds, which the app comes with, behaves as Krita's Brush SFX plugin by davi133 does
 (github.com/davi133/brush_sfx): six sounds (an eraser, a pencil, a pen, a paintbrush, an airbrush and
 a spray can), each brush the one its kind takes (by its name, else its set's), louder the faster and
 harder the stroke goes, the pen's and the paintbrush's ring rising with speed, the airbrush hissing
@@ -1245,7 +1311,7 @@ An action runs in a copy of the code of its own, told the controls as they are, 
 meanwhile. It may take 4,000,000,000 steps, for at most 20 seconds. Calls to the app's functions
 answer only while an action runs. At a hook they do nothing.
 
-`plugins/layer-fills` is one to start from.
+`plugins/layer-toolbox` is one to start from (its Layer fills).
 
 ### Panels
 
@@ -1945,10 +2011,10 @@ other, with the same card, Turn on and Remove.
 - A later version of the app adds any it never added before, and puts a newer file in place of an
   older one that's there, keeping what was set, as an import of it would.
 - One imported before the app came with it is left as it is, but for a newer file.
-- A setting the app used to have and a plugin now `keeps` (ColorDrop tools' gap, Interface's size,
-  Layer tools' eyedropper and paste switches) starts the plugin the app added on with it, if someone
-  had changed it, and the switch it comes under. Once the plugin is turned on or off, that is what's
-  kept.
+- A setting the app used to have and a plugin now `keeps` (Colour tools' ColorDrop gap, Interface
+  look's size, Layer tools' eyedropper and paste switches) starts the plugin the app added on with it,
+  if someone had changed it, and the switches it comes under. Once the plugin is turned on or off,
+  that is what's kept.
 
 ### Taking the place of other plugins
 
@@ -1970,6 +2036,14 @@ A plugin can take the place of others, such as several small ones made into one,
   of each that was, and their controls' values. The import screen names those it takes the place of.
 - What was kept for the old ones, on a start, goes the same way until it has values of its own, which
   then say instead, read before or after. Removed, it takes what was kept for them with it.
+- An old one being on turns on its `switch` and the switches that comes under (a
+  [feature](#features)), unless their own values say otherwise.
+- `controls` can map a `file` control of the old one's to one of its own (interface 16): the file
+  picked for it is written beside the new one's before the old one goes (unless one is picked there
+  already), and the old one stays until it can be, so nothing picked is lost. The page shows it where
+  the old one was.
+- With `"marks": true` (interface 16, one of them at most), the marks the old one kept with layers
+  are its own: it reads and keeps them by that one's id, so every artwork's labels still show.
 - An old one can't be imported while it is here.
 
 The packed files are committed, so building the app needs no WebAssembly target. Whenever anything
@@ -2005,11 +2079,13 @@ actions at the pen, panels' rows of brushes and rings, the `interface_colour` ho
 `surround_picture` and `slider_look` hooks and `file` controls of pictures, interface 12 the `stroke_fill` hook,
 the `paper` hook's tooth and picture, actions in the Layers panel, `set_control` and the
 `colour_panel` hook, interface 13 the `view_dim_others` hook, interface 14 sets of brushes a
-plugin comes with, and interface 15 `texture` controls, panels' rows of a control and the `paper`
-hook's grain. What comes under a switch at the top of the list, taking the place of other plugins, a menu of
-its own, and controls in the Canvas tab, on a key or kept with each artwork need no newer
-interface: an older app shows every control, leaves the others where they are, shows no menu and
-keeps every control with the plugin. What a
+plugin comes with, interface 15 `texture` controls, panels' rows of a control and the `paper`
+hook's grain, and interface 16 features (each running in a copy of the code of its own), a row in
+the brush studio kept as a plugin it takes the place of kept it (`from`), and the marks and picked
+files of a plugin it takes the place of. What comes under a switch at the top of the list (a menu and
+a row in the brush studio too), taking the place of other plugins, a menu of its own, and controls in
+the Canvas tab, on a key or kept with each artwork need no newer interface: an older app shows every
+control, leaves the others where they are, shows no menu and keeps every control with the plugin. What a
 hook calls stays as it's written here, and the app keeps every interface's template, so a plugin
 goes on working as it was written.
 

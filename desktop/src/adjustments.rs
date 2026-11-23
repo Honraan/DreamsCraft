@@ -616,6 +616,7 @@ mod tests {
             kinds: Vec::new(),
             layer_kinds: Vec::new(),
             permissions: Vec::new(),
+            features: Vec::new(),
         }
     }
 

@@ -800,7 +800,22 @@ private fun PluginHead(plugin: PluginInfo, modifier: Modifier = Modifier, lifted
 private fun PluginCard(plugin: PluginInfo, vm: CanvasViewModel, modifier: Modifier, head: Modifier, onRemove: () -> Unit) {
     Column(modifier.fillMaxWidth().clip(RoundedCornerShape(22.dp)).background(Pc.ActionsGroup)) {
         PluginHead(plugin, modifier = head)
-        if (plugin.on && plugin.problem == null) {
+        if (plugin.on && plugin.problem == null && plugin.features.isNotEmpty()) {
+            // made of features: each a heading with its switch, what comes under it while it is on
+            for (feature in plugin.features) {
+                Box(Modifier.fillMaxWidth().height(1.dp).background(Pc.ActionsSeparator))
+                PluginFeatureHead(feature, vm)
+                if (!feature.control.on) continue
+                for (control in feature.controls) {
+                    Box(Modifier.fillMaxWidth().height(1.dp).background(Pc.ActionsSeparator))
+                    PluginControlRow(control, vm)
+                }
+                for (action in feature.actions) {
+                    Box(Modifier.fillMaxWidth().height(1.dp).background(Pc.ActionsSeparator))
+                    PluginActionRow(action.label) { vm.runPluginAction(action.key) }
+                }
+            }
+        } else if (plugin.on && plugin.problem == null) {
             for (control in plugin.controls) {
                 Box(Modifier.fillMaxWidth().height(1.dp).background(Pc.ActionsSeparator))
                 PluginControlRow(control, vm)
@@ -816,6 +831,22 @@ private fun PluginCard(plugin: PluginInfo, vm: CanvasViewModel, modifier: Modifi
             Box(Modifier.fillMaxWidth().height(1.dp).background(Pc.ActionsSeparator))
             ActionRowView(Act("Remove", onClick = onRemove))
         }
+    }
+}
+
+/** One of a plugin's features as its card shows it: its name and words, and the switch that turns it on. */
+@Composable
+private fun PluginFeatureHead(feature: io.github.artcraftandroid.procraft.core.PluginFeature, vm: CanvasViewModel) {
+    val switch = feature.control
+    Row(
+        Modifier.fillMaxWidth().clickable { vm.setPluginSwitch(switch.key, !switch.on) }.padding(start = 16.dp, end = 8.dp, top = 10.dp, bottom = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f).padding(end = 8.dp)) {
+            Text(switch.label, color = Pc.PanelTitle, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+            if (feature.description.isNotEmpty()) Text(feature.description, color = Pc.ActionsRow, fontSize = 14.sp, modifier = Modifier.padding(top = 4.dp))
+        }
+        Switch(switch.on, true)
     }
 }
 

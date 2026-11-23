@@ -1459,7 +1459,14 @@ impl Running {
 
     /// It is the plugin `id`'s code: what only that plugin's own may reach goes by it.
     pub(crate) fn own(&mut self, id: &str) {
-        self.store.data_mut().owner = id.to_owned();
+        let host = self.store.data_mut();
+        host.owner = id.to_owned();
+        host.marks = id.to_owned();
+    }
+
+    /// The marks it keeps with layers go by `id`: a plugin's it took the place of (interface 16).
+    pub(crate) fn own_marks(&mut self, id: &str) {
+        self.store.data_mut().marks = id.to_owned();
     }
 
     /// `text` written where its key buffer says, for a call that follows: its length.

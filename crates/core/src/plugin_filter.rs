@@ -586,10 +586,41 @@ mod tests {
                 .map(|(path, code)| json!({ "path": path, "sha256": sha256(code), "size": code.len() }))
                 .collect();
             manifest["files"] = json!(files);
-            // the code beside a filter is looked at by its own crate: here it holds the filters alone
+            // the code beside a filter is looked at by its own crate: here it holds the filters alone,
+            // and of a plugin of features, the controls they read, under nothing
+            let featured = manifest["controls"].as_array().is_some_and(|c| c.iter().any(|c| c["type"] == "feature"));
+            if featured {
+                let read: Vec<String> = listed
+                    .iter()
+                    .flat_map(|f| f["controls"].as_array().cloned().unwrap_or_default())
+                    .filter_map(|key| key.as_str().map(str::to_owned))
+                    .collect();
+                let controls: Vec<Value> = manifest["controls"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|c| c["key"].as_str().is_some_and(|key| read.iter().any(|r| r == key)))
+                    .map(|mut c| {
+                        c.as_object_mut().map(|c| c.remove("under"));
+                        c
+                    })
+                    .collect();
+                manifest["controls"] = json!(controls);
+                let filters: Vec<Value> = listed
+                    .iter()
+                    .cloned()
+                    .map(|mut f| {
+                        f.as_object_mut().map(|f| f.remove("under"));
+                        f
+                    })
+                    .collect();
+                manifest["filters"] = json!(filters);
+                manifest["compat"]["procraft"]["interface"] = json!(5);
+            }
             if let Some(object) = manifest.as_object_mut() {
                 object.insert("holds".to_owned(), json!(["filter"]));
-                for field in ["hooks", "actions", "brush_controls", "kinds", "layer_kinds"] {
+                for field in ["hooks", "actions", "brush_controls", "kinds", "layer_kinds", "replaces", "menu"] {
                     object.remove(field);
                 }
                 object.insert("permissions".to_owned(), json!([]));
@@ -600,8 +631,8 @@ mod tests {
             let packed: Vec<(&str, &[u8])> =
                 paths.iter().map(String::as_str).zip(codes.iter().map(Vec::as_slice)).collect();
             assert_eq!(plugins.install(pack(&manifest, &packed)), None, "{}", folder.display());
-            // each listed under its switch, on
-            for filter in &listed {
+            // each listed under its switch, on (of a plugin of features, under none here)
+            for filter in listed.iter().filter(|_| !featured) {
                 if let Some(under) = filter["under"].as_str() {
                     assert!(plugins.set_switch(format!("{plugin}.{under}"), true), "{plugin}.{under}");
                 }
