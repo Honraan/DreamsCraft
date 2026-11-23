@@ -5686,6 +5686,72 @@ fn a_paper_takes_paint_in_its_hollows_shows_in_the_background_and_changes_nothin
 }
 
 #[test]
+fn wet_paint_takes_the_paper_as_dry_paint_does_and_a_smudge_moves_paint_as_it_did() {
+    let Some(gpu) = gpu() else { return };
+    let _check = NoErrors(&gpu);
+    // a tile whose left half is a hollow and right half a peak, a canvas pixel a tile pixel: its
+    // columns 0 to 127 hollow and 128 to 255 peak
+    let n = TEXTURE_SIZE;
+    let tile: Vec<u8> = (0..n * n).map(|i| if i % n < n / 2 { 0 } else { 255 }).collect();
+    let paper = |strength: f32, tooth: f32| procraft_gpu::CanvasPaper {
+        tile: tile.clone(),
+        strength,
+        scale: 1.0,
+        depth: 0.0,
+        tooth,
+        colour: None,
+    };
+    // a wet stamp over the hollow (60, 32) and one over the peak (190, 32), as wet as `wetness`:
+    // what each laid there
+    let laid = |paper: Option<&procraft_gpu::CanvasPaper>, wetness: f32| {
+        let mut doc = Document::new(256, 64);
+        let mut canvas = Canvas::new(&gpu, &doc).unwrap();
+        canvas.set_paper(&gpu, paper);
+        let style =
+            StrokeStyle { wet_pull: Some(0.5), wetness, ..StrokeStyle::new(StrokeTool::Paint, [0.0, 0.0, 0.0], 1.0) };
+        canvas.begin_stroke(doc.current(), style);
+        canvas.add_stamps(&[
+            Stamp::round(Vec2::new(60.0, 32.0), 20.0, 1.0),
+            Stamp::round(Vec2::new(190.0, 32.0), 20.0, 1.0),
+        ]);
+        canvas.end_stroke();
+        canvas.render(&gpu, &mut doc, None);
+        let layer = canvas.read_layer(&gpu, doc.current()).unwrap();
+        (pixel(&layer, 256, 60, 32)[3], pixel(&layer, 256, 190, 32)[3])
+    };
+    let (hollow, peak) = laid(None, 1.0);
+    assert!(hollow > 250 && peak > 250, "{hollow} {peak}");
+    // a paper that takes nothing changes not a pixel
+    assert_eq!(laid(Some(&paper(0.0, 0.0)), 1.0), (hollow, peak));
+    // a strong one: the hollow takes three quarters of the paint, the peak none, as a dry stroke's
+    let (taken, kept) = laid(Some(&paper(0.75, 0.0)), 1.0);
+    assert!(taken.abs_diff(64) <= 4 && kept == peak, "{taken} {kept}");
+    // half as wet: a quarter of its half
+    let (half, _) = laid(None, 0.5);
+    let (taken, _) = laid(Some(&paper(0.75, 0.0)), 0.5);
+    assert!(half.abs_diff(128) < 6 && taken.abs_diff(32) <= 4, "{half} {taken}");
+    // with all its tooth, only where the paper stands above its strength: none in the hollow
+    let (taken, kept) = laid(Some(&paper(0.5, 1.0)), 1.0);
+    assert!(taken <= 2 && kept == peak, "{taken} {kept}");
+    // a smudge moves what is there as it did, paper or not
+    let smudged = |paper: Option<&procraft_gpu::CanvasPaper>| {
+        let mut doc = Document::new(256, 64);
+        let mut canvas = Canvas::new(&gpu, &doc).unwrap();
+        canvas.begin_stroke(doc.current(), style(StrokeTool::Paint, 1.0));
+        canvas.add_stamps(&[dot(Vec2::new(60.0, 32.0), 16.0)]);
+        canvas.end_stroke();
+        canvas.render(&gpu, &mut doc, None);
+        canvas.set_paper(&gpu, paper);
+        canvas.begin_stroke(doc.current(), style(StrokeTool::Smudge, 1.0));
+        canvas.add_stamps(&(0..12).map(|k| dot(Vec2::new(60.0 + k as f32 * 4.0, 32.0), 12.0)).collect::<Vec<_>>());
+        canvas.end_stroke();
+        canvas.render(&gpu, &mut doc, None);
+        canvas.read_layer(&gpu, doc.current()).unwrap()
+    };
+    assert!(smudged(None) == smudged(Some(&paper(0.75, 0.0))), "the smudge tool takes no paper");
+}
+
+#[test]
 fn a_paper_s_tooth_takes_paint_only_above_its_strength_and_none_leaves_it_as_it_was() {
     let Some(gpu) = gpu() else { return };
     let _check = NoErrors(&gpu);

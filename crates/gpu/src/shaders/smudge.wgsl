@@ -153,6 +153,11 @@ struct SmudgeStamp {
     grain_mirrored: u32,
     // what the stamp rounds its paint to 8 bits by (see `deposit`)
     dither: u32,
+    room: vec2<u32>,
+    // the paper wet paint takes, as a stroke's is (composite.wgsl's `lu.paper`): how strongly its
+    // hollows take the paint away (0: none), how many canvas pixels a pixel of its tile covers, (its
+    // depth under the art, not read here) and its tooth
+    paper: vec4<f32>,
 }
 
 // a pass of wet paint's stamps: middle, radius and turn; roundness, pull, mixture and final
@@ -231,6 +236,8 @@ fn kept_paint(c: vec4<f32>, fallback: vec4<f32>) -> vec4<f32> {
 @group(0) @binding(8) var pass_tex: texture_2d<f32>;
 // the image as last shown, the canvas's size (a stroke picking up from every layer)
 @group(0) @binding(9) var image_tex: texture_2d<f32>;
+// the paper's tile, which wet paint takes (read through the grains' sampler)
+@group(0) @binding(11) var paper_tex: texture_2d<f32>;
 @group(1) @binding(0) var shapes: texture_2d_array<f32>;
 @group(1) @binding(1) var grains: texture_2d_array<f32>;
 @group(1) @binding(2) var shape_smp: sampler;
@@ -677,6 +684,26 @@ fn grain_plain(d: Dab, p: vec2<f32>) -> f32 {
     return clamp((g - 0.5) * (1.0 + st.grain_contrast) + 0.5 + st.grain_brightness, 0.0, 1.0);
 }
 
+// how far below the paper's strength its tooth begins to take paint, and is half way (as a
+// stroke's, composite.wgsl's TOOTH_EDGE)
+const PAPER_TOOTH_EDGE: f32 = 0.04;
+
+// how much of what a stamp lays the paper lets through at canvas point `at`, as a dry stroke's
+// paint takes it as it is laid on its layer: where the paper stands at h (0 a hollow, 1 a peak), its
+// strength's share of the paint goes from a hollow (1 - strength * (1 - h)), or with a tooth only
+// below the strength, as sharply as that says; all of it with no paper
+fn paper_lets(at: vec2<f32>) -> f32 {
+    if (st.paper.x <= 0.0) {
+        return 1.0;
+    }
+    let side = f32(textureDimensions(paper_tex).x);
+    let level = max(log2(1.0 / st.paper.y), 0.0);
+    let h = textureSampleLevel(paper_tex, grain_smp, at / (st.paper.y * side), level).r;
+    let soft = 1.0 - st.paper.x * (1.0 - h);
+    let sharp = smoothstep(st.paper.x - 2.0 * PAPER_TOOTH_EDGE, st.paper.x, h);
+    return mix(soft, sharp, st.paper.w);
+}
+
 // how much wet stamp `d` lays at canvas point `p` (stamp frame point `t`): its shape and its grain
 // combined by the grain's blend mode (unless the grain is laid over the stroke once), then the
 // bleed as a contrast on that (none of the faint parts, all of the strong ones, more of both the
@@ -790,7 +817,8 @@ fn deposit(d: Dab, p: vec2<i32>, found: Found) -> Deposit {
         if (st.count > 0u) {
             laid = plot_at(PASS_PLOTS, d.index * st.plot * st.plot, st.plot, t);
         }
-        var weight = wet_weight(d, vec2<f32>(p) + 0.5, t);
+        // (as far as the paper lets it through there, as dry paint is)
+        var weight = wet_weight(d, vec2<f32>(p) + 0.5, t) * paper_lets(vec2<f32>(p) + 0.5);
         if (st.rule == 1u) {
             // the paint shows as far as the strongest stamp over the pixel
             dep.amount = max(found.amount, weight);

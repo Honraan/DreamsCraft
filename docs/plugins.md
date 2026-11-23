@@ -706,8 +706,9 @@ names a grain, `procraft_paper` isn't asked: the grain is the tile as it is (it 
 A number past the grains stops the plugin.
 
 Every stroke laid by the app's brush engine from then on takes the paper on top of its brush's own
-grain, the eraser too, whatever the layer; a stroke laid with paint mixed on the layer in place (wet
-mixing, the smudge tool) takes none yet. With strength 0 and depth 0 every pixel is as it would be
+grain, the eraser too, whatever the layer. Wet paint, and paint laid on the layer in place, takes it
+as each stamp lays it, as far as the paper lets that through there; the smudge tool, which moves
+paint already laid, takes none. With strength 0 and depth 0 every pixel is as it would be
 with no paper. What a stroke took from it is pixels, kept with the plugin off; the background shows
 it only while the plugin gives it, and files of flattened pictures have the background as shown (a
 layered file has the artwork's own background colour). The app asks as the plugins change, so answers the same each time unless a

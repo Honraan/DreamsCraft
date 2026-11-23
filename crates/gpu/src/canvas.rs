@@ -513,7 +513,8 @@ impl StrokeStyle {
 /// A paper a plugin gives the canvas ([`Canvas::set_paper`]): a tile, `TEXTURE_SIZE` square, each
 /// byte how high the paper stands there (rows from the top), repeated over the canvas, each of its
 /// pixels `scale` canvas pixels across (0.25 to 16). Every stroke's paint is taken away where the
-/// paper is low, as far as `strength` says (0 to 1: a hollow takes `strength` of it), and with a
+/// paper is low (a wet stroke's each stamp, as it lays it; the smudge tool's, which moves paint
+/// already laid, none), as far as `strength` says (0 to 1: a hollow takes `strength` of it), and with a
 /// `tooth` (0 to 1) only where it stands higher than `strength`, as sharply as that says; the
 /// background shows `colour` (none: the artwork's own), its hollows darker as far as `depth` says
 /// (0 to 1).
@@ -1976,6 +1977,8 @@ fn smudge_uniform(s: &StampInstance, style: &StrokeStyle, bbox: IRect, (width, h
         grain_mirrored: u32::from(moving && s.look[1] < 0.0),
         dither: 0,
         room: [0; 2],
+        // (the canvas's, as it is laid)
+        paper: [0.0, 1.0, 0.0, 0.0],
     }
 }
 
@@ -2116,6 +2119,9 @@ struct SmudgeUniform {
     grain_mirrored: u32,
     dither: u32,
     room: [u32; 2],
+    /// The paper wet paint takes, as a stroke's uniform has it ([`LayerUniform::paper`]): set as
+    /// the stamp is laid (see `Canvas::paper_look`).
+    paper: [f32; 4],
 }
 
 const _: () = assert!(size_of::<SmudgeUniform>().is_multiple_of(16));
@@ -13000,6 +13006,17 @@ impl Pipelines {
                     compute_texture(8),
                     // the image as last shown (a smudge picking up from every layer)
                     compute_texture(9),
+                    // the paper's tile, which wet paint takes (filtered, as a stroke's paper is)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 11,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
                 ],
             });
             let smudge_module = module(

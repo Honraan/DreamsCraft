@@ -240,6 +240,8 @@ impl FragmentPipelines {
                 loaded(8, FLOAT),
                 loaded(9, FLOAT),
                 loaded(10, UINT),
+                // the paper's tile, which wet paint takes (filtered, as a stroke's paper is)
+                loaded(11, wgpu::TextureSampleType::Float { filterable: true }),
             ],
         });
         let smudge_carry_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -880,6 +882,8 @@ impl Canvas {
         (brush, second): (&wgpu::BindGroup, Option<&wgpu::TextureView>),
     ) -> bool {
         let device = &gpu.device;
+        // the paper as it is now, which each wet stamp takes as it lays
+        let paper = self.paper_look();
         let reach = if reach.is_empty() { IRect::new(0, 0, 1, 1) } else { reach }.intersect(self.full());
         if reach.is_empty() || !self.fits_window(reach) {
             log::error!("smudging: {} by {} pixels is past what a window holds", reach.width(), reach.height());
@@ -940,6 +944,8 @@ impl Canvas {
                 // the image as last shown, for a stroke that picks up from it (else anything)
                 view(9, if from_image { &self.composite_view } else { before_view }),
                 view(10, &first(&window.shown).unwrap_or_else(|| spare_word.clone())),
+                // the paper's tile, which wet paint takes
+                view(11, &self.paper_view),
             ],
         });
         let carry_bind = |carry: &wgpu::TextureView, plots: &wgpu::TextureView| {
@@ -980,7 +986,7 @@ impl Canvas {
                 .uniforms
                 .iter()
                 .map(|u| {
-                    let u = SmudgeUniform { origin, stride, rows: reach.height(), ..*u };
+                    let u = SmudgeUniform { origin, stride, rows: reach.height(), paper, ..*u };
                     (params.push(&u), u)
                 })
                 .collect();

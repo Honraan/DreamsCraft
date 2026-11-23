@@ -617,9 +617,13 @@ impl Canvas {
                         &window.before_view
                     }),
                 },
+                // the paper's tile, which wet paint takes
+                wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(&self.paper_view) },
             ],
         });
         let stride = row_bytes(reach.width()) / 4;
+        // the paper as it is now, which each wet stamp takes as it lays
+        let paper = self.paper_look();
         let begin = |encoder: &mut wgpu::CommandEncoder| {
             let mut pass = encoder
                 .begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("smudge"), timestamp_writes: None })
@@ -638,7 +642,13 @@ impl Canvas {
                 .uniforms
                 .iter()
                 .map(|u| {
-                    params.push(&SmudgeUniform { origin: [reach.x0, reach.y0], stride, rows: reach.height(), ..*u })
+                    params.push(&SmudgeUniform {
+                        origin: [reach.x0, reach.y0],
+                        stride,
+                        rows: reach.height(),
+                        paper,
+                        ..*u
+                    })
                 })
                 .collect();
             for &(pipe, which, [x, y]) in &piece.dispatches {
