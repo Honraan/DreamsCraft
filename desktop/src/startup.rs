@@ -71,6 +71,14 @@ const START_WATCH_MOST: Duration = Duration::from_secs(10 * 60);
 /// When the app was started.
 static LAUNCHED: OnceLock<Instant> = OnceLock::new();
 
+/// The log of the run before this one (the one a crash ended, after one), else this run's: what to
+/// send on when asked for it.
+pub fn last_run_log() -> std::path::PathBuf {
+    let dir = files::app_dir();
+    let before = dir.join(PREVIOUS_LOG);
+    if before.is_file() { before } else { dir.join(LOG) }
+}
+
 /// The log to the terminal and to the app folder's log file, and a crash's message into it. A
 /// start the app made itself on another graphics backend goes on in the same log, so it holds
 /// every backend's try (the run before them all stays the previous log).

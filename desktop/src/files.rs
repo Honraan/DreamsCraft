@@ -432,8 +432,10 @@ pub fn keep_text(name: &str, text: &str) {
 /// renamed over it, so a write cut short leaves the last one.
 pub fn write_whole(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let next = path.with_extension("next");
-    std::fs::write(&next, bytes)?;
-    std::fs::rename(&next, path)
+    // (one cut short, the disk full, goes: it would only take room)
+    std::fs::write(&next, bytes).and_then(|()| std::fs::rename(&next, path)).inspect_err(|_| {
+        let _ = std::fs::remove_file(&next);
+    })
 }
 
 /// A new artwork as `preset` says: its size, DPI, background and colour profile.
@@ -806,20 +808,58 @@ pub fn open_anyway(dir: &str) -> bool {
     if cfg!(target_os = "linux") && !has_program("zenity") {
         return true;
     }
-    let action = "Open Anyway".to_owned();
+    // how that run ended isn't known here: the log is asked for, and Share Log shows it to send on
+    let (action, share) = ("Open Anyway".to_owned(), "Share Log".to_owned());
+    loop {
+        let answer = message()
+            .set_level(MessageLevel::Warning)
+            .set_title(procraft_core::opening_ended_app_title())
+            .set_description(procraft_core::opening_ended_app_said(false))
+            .set_buttons(MessageButtons::YesNoCancelCustom(action.clone(), share.clone(), "Cancel".to_owned()))
+            .show();
+        // (Windows without its newer dialogs shows Yes, No and Cancel)
+        match answer {
+            MessageDialogResult::Yes => return true,
+            MessageDialogResult::Custom(chosen) if chosen == action => return true,
+            MessageDialogResult::No => reveal(&crate::startup::last_run_log()),
+            MessageDialogResult::Custom(chosen) if chosen == share => reveal(&crate::startup::last_run_log()),
+            _ => return false,
+        }
+    }
+}
+
+/// Asks, with `title` and what it says (`said`), whether to leave an artwork that couldn't be saved without
+/// saving it: Stay, the default (and what closing the question, or a system with no way of asking,
+/// comes to), or Leave Without Saving.
+pub fn leave_without_saving(title: &str, said: &str) -> bool {
+    log::warn!("{title}: {said}");
+    if cfg!(target_os = "linux") && !has_program("zenity") {
+        tell(title, said);
+        return false;
+    }
+    let (stay, leave) = ("Stay".to_owned(), "Leave Without Saving".to_owned());
     let answer = message()
         .set_level(MessageLevel::Warning)
-        .set_title("This artwork closed the app")
-        .set_description(
-            "ProCraft closed while this artwork was opening last time, perhaps for want of memory. Closing other programs first may help.",
-        )
-        .set_buttons(MessageButtons::OkCancelCustom(action.clone(), "Cancel".to_owned()))
+        .set_title(title)
+        .set_description(said)
+        .set_buttons(MessageButtons::OkCancelCustom(stay, leave.clone()))
         .show();
-    // (Windows without its newer dialogs shows OK and Cancel)
-    match answer {
-        MessageDialogResult::Ok | MessageDialogResult::Yes => true,
-        MessageDialogResult::Custom(chosen) => chosen == action,
-        _ => false,
+    // (Windows without its newer dialogs shows OK and Cancel: both stay)
+    matches!(answer, MessageDialogResult::Custom(chosen) if chosen == leave)
+}
+
+/// Shows the file at `path` in the system's file manager (its folder, on Linux), for the person to
+/// send it on.
+fn reveal(path: &Path) {
+    let shown = if cfg!(windows) {
+        std::process::Command::new("explorer").arg("/select,").arg(path).spawn()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg("-R").arg(path).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(path.parent().unwrap_or(path)).spawn()
+    };
+    if let Err(e) = shown {
+        log::warn!("showing the log: {e}");
     }
 }
 

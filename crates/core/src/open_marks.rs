@@ -28,6 +28,43 @@ pub fn opening_ended_app(dir: String) -> bool {
     file().is_some_and(|file| ended_in(&file, Path::new(&dir), std::process::id()))
 }
 
+/// The run (process) whose opening of the artwork in folder `dir` closed the app, if one did: for
+/// the app to find how that run ended (Android keeps why each of the app's last runs ended).
+#[uniffi::export]
+pub fn opening_ended_run(dir: String) -> Option<u32> {
+    let name = name_of(Path::new(&dir));
+    let this_run = std::process::id();
+    read(&file()?).into_iter().find(|(run, n)| *n == name && *run != this_run).map(|(run, _)| run)
+}
+
+/// The title of what is asked before an artwork whose opening closed the app opens again.
+#[uniffi::export]
+pub fn opening_ended_app_title() -> String {
+    "ProCraft closed while opening this artwork".to_owned()
+}
+
+/// What is asked, by how that run ended: the device short of memory (`low_memory`), when closing
+/// other apps may help; else a crash, or not known, when it may close again and its log is wanted.
+#[uniffi::export]
+pub fn opening_ended_app_said(low_memory: bool) -> String {
+    if low_memory {
+        "Your device ran low on memory. Closing other apps first may help.".to_owned()
+    } else {
+        "It may close again if you open it now. Share the log so the problem can be found.".to_owned()
+    }
+}
+
+/// Android's reason for a run that the system ended short of memory
+/// (`ApplicationExitInfo.REASON_LOW_MEMORY`).
+const ANDROID_LOW_MEMORY: i32 = 3;
+
+/// Whether a run Android says ended for `reason` (its `ApplicationExitInfo` reason) was ended for
+/// want of memory; a crash, one not responding, a signal or anything else isn't.
+#[uniffi::export]
+pub fn android_run_ended_short_of_memory(reason: i32) -> bool {
+    reason == ANDROID_LOW_MEMORY
+}
+
 /// Whether the marks in `file` say artwork `dir`'s opening began in a run other than `run`.
 fn ended_in(file: &Path, dir: &Path, run: u32) -> bool {
     let name = name_of(dir);
@@ -115,7 +152,7 @@ fn read(file: &Path) -> Vec<(u32, String)> {
 fn write(file: &Path, marks: &[(u32, String)]) {
     let text: String = marks.iter().map(|(run, name)| format!("{run} {name}\n")).collect();
     let written = crate::project::write_atomically(file, |p| {
-        std::fs::write(p, &text).map_err(|e| crate::project::file_error("noting the artwork being opened", e))
+        crate::storage::write(p, &text).map_err(|e| crate::project::file_error("noting the artwork being opened", e))
     });
     if let Err(e) = written {
         log::warn!("{e}");
@@ -150,5 +187,37 @@ mod tests {
         std::fs::write(&file, "x ArtworkB\n2\n3 ArtworkB\n").unwrap();
         assert_eq!(read(&file), [(3, "ArtworkB".to_owned())]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// What is asked about an artwork whose opening closed the app says how that run ended: short
+    /// of memory, closing other apps may help; a crash, a run not responding, a signal or a reason
+    /// not known, the log is asked for. The run is found by the artwork's mark, none for one that
+    /// showed or for this run's own.
+    #[test]
+    fn what_is_asked_after_an_opening_closed_the_app_follows_how_it_ended() {
+        let root = std::env::temp_dir().join(format!("procraft-open-ended-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("opening.txt");
+        use_file_on_this_thread(Some(file.clone()));
+        let (a, b) = (root.join("ArtworkA"), root.join("ArtworkB"));
+        let path = |p: &Path| p.to_string_lossy().into_owned();
+        std::fs::write(&file, format!("4242 ArtworkA\n{} ArtworkB\n", std::process::id())).unwrap();
+        assert_eq!(opening_ended_run(path(&a)), Some(4242));
+        assert_eq!(opening_ended_run(path(&b)), None, "this run's own opening");
+        assert_eq!(opening_ended_run(path(&root.join("ArtworkC"))), None);
+        use_file_on_this_thread(None);
+        let _ = std::fs::remove_dir_all(&root);
+        // Android's reasons: 3 low memory; 0 unknown, 1 exit itself, 2 signaled, 4 crash, 5 native
+        // crash, 6 not responding, 9 excessive resource use, 10 user requested, 13 other
+        let said = |reason: i32| opening_ended_app_said(android_run_ended_short_of_memory(reason));
+        let memory = "Your device ran low on memory. Closing other apps first may help.";
+        let crashed = "It may close again if you open it now. Share the log so the problem can be found.";
+        assert_eq!(said(3), memory);
+        for reason in [0, 1, 2, 4, 5, 6, 9, 10, 13] {
+            assert_eq!(said(reason), crashed, "reason {reason}");
+        }
+        // nothing known of how it ended (before Android 11, the desktop, the iPad): the log is asked for
+        assert_eq!(opening_ended_app_said(false), crashed);
+        assert_eq!(opening_ended_app_title(), "ProCraft closed while opening this artwork");
     }
 }

@@ -262,7 +262,7 @@ impl Palettes {
                 let _ = std::fs::create_dir_all(dir);
             }
             let tmp = file.with_extension("json.tmp");
-            let written = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, file));
+            let written = crate::storage::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, file));
             let mut failure = self.failure.lock().unwrap_or_else(|e| e.into_inner());
             match written {
                 Ok(()) => failure.1 = false,

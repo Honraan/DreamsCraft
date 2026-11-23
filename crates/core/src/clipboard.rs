@@ -116,7 +116,7 @@ pub fn picture_png(straight: &ThumbnailImage, icc: &[u8]) -> Option<Vec<u8>> {
 pub fn write_copy_png(image: ThumbnailImage, icc: Vec<u8>, path: String) -> bool {
     let Some(png) = picture_png(&copy_straight(&image), &icc) else { return false };
     let written = crate::project::write_atomically(std::path::Path::new(&path), |p| {
-        std::fs::write(p, &png).map_err(|e| crate::project::file_error("copying", e))
+        crate::storage::write(p, &png).map_err(|e| crate::project::file_error("copying", e))
     });
     written.is_ok()
 }

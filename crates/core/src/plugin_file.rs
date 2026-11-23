@@ -1986,7 +1986,7 @@ pub(crate) fn write_look(dir: &Path, id: &str, key: &str, data: u64, look: &[u8]
     let folder = home.join(LOOKS);
     let beside = spare(&folder, LOOKS);
     let written = std::fs::create_dir_all(&folder)
-        .and_then(|()| std::fs::write(&beside, look))
+        .and_then(|()| crate::storage::write(&beside, look))
         .and_then(|()| std::fs::rename(&beside, look_path(dir, id, key, data)));
     if let Err(e) = written {
         let _ = std::fs::remove_file(&beside);
@@ -2185,7 +2185,7 @@ fn stopped_note(dir: &Path, id: &str) -> PathBuf {
 
 /// Writes down why plugin `id` stopped, so it stays off through a restart.
 pub(crate) fn note_stopped(dir: &Path, id: &str, why: &str) {
-    if let Err(e) = std::fs::write(stopped_note(dir, id), why) {
+    if let Err(e) = crate::storage::write(stopped_note(dir, id), why) {
         log::warn!("couldn't note a plugin stopped: {e}");
     }
 }
@@ -2212,7 +2212,7 @@ pub(crate) fn read_told(dir: &Path) -> Vec<String> {
 
 /// Writes down that someone has been told of `told`, so it is said once.
 pub(crate) fn note_told(dir: &Path, told: &[String]) {
-    let written = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(told_note(dir), told.join("\n")));
+    let written = std::fs::create_dir_all(dir).and_then(|()| crate::storage::write(told_note(dir), told.join("\n")));
     if let Err(e) = written {
         log::warn!("couldn't note what has been told: {e}");
     }

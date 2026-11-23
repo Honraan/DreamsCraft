@@ -159,7 +159,7 @@ impl ColourHistory {
         }
         let text = write_kept(colours);
         let written = crate::project::write_atomically(file, |tmp| {
-            std::fs::write(tmp, &text).map_err(|e| crate::project::file_error("saving", e))
+            crate::storage::write(tmp, &text).map_err(|e| crate::project::file_error("saving", e))
         });
         match written {
             Ok(()) => self.failing.store(false, Ordering::Relaxed),

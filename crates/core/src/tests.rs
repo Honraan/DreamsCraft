@@ -4591,7 +4591,7 @@ fn a_failing_autosave_is_told_once_until_a_save_works() {
     let _ = std::fs::remove_file(&blocked);
     let _ = std::fs::remove_dir_all(&good);
     assert!(again.is_some(), "told again after a save worked");
-    assert!(crate::save_failure_said("No space left on device (os error 28)".into()).contains("no room"));
+    assert_eq!(crate::save_failure_said("No space left on device (os error 28)".into()), crate::NO_ROOM);
 }
 
 /// An export says how far it has come while it runs (read without waiting on it): all the way

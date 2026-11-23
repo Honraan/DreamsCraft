@@ -800,7 +800,7 @@ fn move_chosen(store: &std::path::Path, to: &PluginInfo, replaced: &Replaced, fr
         let copied = |old: &std::path::Path, new: &std::path::Path| {
             let bytes = std::fs::read(old).map_err(|e| crate::project::file_error("reading", e))?;
             let written = |tmp: &std::path::Path| {
-                std::fs::write(tmp, &bytes).map_err(|e| crate::project::file_error("saving", e))
+                crate::storage::write(tmp, &bytes).map_err(|e| crate::project::file_error("saving", e))
             };
             crate::project::write_atomically(new, written)
         };
@@ -2065,11 +2065,12 @@ impl Plugins {
         let Some(PluginControl::File { control }) = plugin.controls.get_mut(at) else { return false };
         let (file, named) = plugin_file::chosen_paths(store, &id, &key);
         let kept_wav = crate::sound_file::write_wav(&samples, rate);
-        let written =
-            |tmp: &std::path::Path| std::fs::write(tmp, &kept_wav).map_err(|e| crate::project::file_error("saving", e));
+        let written = |tmp: &std::path::Path| {
+            crate::storage::write(tmp, &kept_wav).map_err(|e| crate::project::file_error("saving", e))
+        };
         let kept = file.parent().is_some_and(|folder| std::fs::create_dir_all(folder).is_ok())
             && crate::project::write_atomically(&file, written).is_ok()
-            && std::fs::write(&named, &name).is_ok();
+            && crate::storage::write(&named, &name).is_ok();
         if !kept {
             log::warn!("a sound for {key} couldn't be kept");
             return false;
@@ -2100,11 +2101,12 @@ impl Plugins {
             return false;
         }
         let (file, named) = plugin_file::chosen_paths(store, &id, &key);
-        let written =
-            |tmp: &std::path::Path| std::fs::write(tmp, &bytes).map_err(|e| crate::project::file_error("saving", e));
+        let written = |tmp: &std::path::Path| {
+            crate::storage::write(tmp, &bytes).map_err(|e| crate::project::file_error("saving", e))
+        };
         let kept = file.parent().is_some_and(|folder| std::fs::create_dir_all(folder).is_ok())
             && crate::project::write_atomically(&file, written).is_ok()
-            && std::fs::write(&named, &name).is_ok();
+            && crate::storage::write(&named, &name).is_ok();
         if !kept {
             log::warn!("a picture for {key} couldn't be kept");
             return false;

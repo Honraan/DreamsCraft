@@ -345,7 +345,7 @@ impl Importing {
     pub(crate) fn begin(dir: &Path) -> Importing {
         let mark = dir.join(IMPORTING);
         let _ = fs::create_dir_all(dir);
-        if let Err(e) = fs::write(&mark, std::process::id().to_string()) {
+        if let Err(e) = crate::storage::write(&mark, std::process::id().to_string()) {
             log::warn!("noting an import: {e}");
         }
         Importing(mark)
@@ -419,7 +419,12 @@ fn copy_dir(from: &Path, to: &Path, last: Option<&str>) -> std::io::Result<()> {
         }
     }
     if let Some(last) = last.map(|l| from.join(l)).filter(|l| l.is_file()) {
-        fs::copy(&last, to.join(name_of(&last)))?;
+        // whole or not at all: one cut short (the storage full) would be an artwork that can't be read
+        let to = to.join(name_of(&last));
+        let beside = to.with_extension("copying");
+        fs::copy(&last, &beside).and_then(|_| fs::rename(&beside, &to)).inspect_err(|_| {
+            let _ = fs::remove_file(&beside);
+        })?;
     }
     Ok(())
 }
@@ -427,7 +432,11 @@ fn copy_dir(from: &Path, to: &Path, last: Option<&str>) -> std::io::Result<()> {
 /// The artwork in `from` copied to `to`, its own file last (a copy half made isn't an artwork in
 /// the gallery yet) and as recent as the original's (not worked on yet).
 fn copy_artwork(from: &Path, to: &Path) -> std::io::Result<()> {
-    copy_dir(from, to, Some(ARTWORK_FILE))?;
+    // a copy that couldn't be finished (the storage full) goes whole: it would only take room
+    copy_dir(from, to, Some(ARTWORK_FILE)).inspect_err(|e| {
+        log::warn!("copying an artwork: {e}");
+        let _ = fs::remove_dir_all(to);
+    })?;
     let when = fs::metadata(from.join(ARTWORK_FILE)).and_then(|m| m.modified());
     if let (Ok(when), Ok(file)) = (when, fs::File::options().write(true).open(to.join(ARTWORK_FILE))) {
         let _ = file.set_modified(when);
@@ -492,7 +501,7 @@ fn write_order(at: &Path, order: &[String]) {
     let file = at.join(ORDER_FILE);
     let next = at.join(format!("{ORDER_FILE}.new"));
     let text: String = order.iter().map(|n| format!("{n}\n")).collect();
-    if fs::write(&next, text).is_ok() && fs::rename(&next, &file).is_err() {
+    if crate::storage::write(&next, text).is_ok() && fs::rename(&next, &file).is_err() {
         let _ = fs::remove_file(&file);
         let _ = fs::rename(&next, &file);
     }
@@ -502,7 +511,7 @@ fn write_stack_name(dir: &Path, name: &str) {
     let name = if name.trim().is_empty() { STACK } else { name.trim() };
     let text = serde_json::json!({ "name": name }).to_string();
     let _ = crate::project::write_atomically(&dir.join(STACK_FILE), |p| {
-        fs::write(p, &text).map_err(|e| crate::project::file_error("naming the stack", e))
+        crate::storage::write(p, &text).map_err(|e| crate::project::file_error("naming the stack", e))
     });
 }
 
@@ -667,7 +676,8 @@ impl ArtworkStore {
     }
 
     /// A copy of the artwork in `dir`, under the same name, right after it; a stack's copy holds
-    /// a copy of each of its artworks, in its order. Returns its folder.
+    /// a copy of each of its artworks, in its order. Returns its folder (none there if no copy could
+    /// be made, the storage full: nothing half made is left).
     pub fn duplicate(&self, dir: String) -> String {
         let dir = PathBuf::from(dir);
         let at = self.parent_of(&dir);
@@ -688,8 +698,13 @@ impl ArtworkStore {
                 .collect();
             write_order(&copy, &inside);
             let _ = fs::copy(dir.join(STACK_FILE), copy.join(STACK_FILE));
-        } else {
-            let _ = copy_artwork(&dir, &copy);
+            // none of them copied (the storage full): no empty stack left
+            if inside.is_empty() && !self.order(&dir).is_empty() {
+                let _ = fs::remove_dir_all(&copy);
+                return copy.to_string_lossy().into_owned();
+            }
+        } else if copy_artwork(&dir, &copy).is_err() {
+            return copy.to_string_lossy().into_owned();
         }
         let place = before.iter().position(|n| *n == name_of(&dir)).map_or(0, |i| i + 1);
         let mut order = before;
@@ -739,7 +754,7 @@ impl ArtworkStore {
             // written whole or not at all: cut short, the artwork couldn't be opened
             let text = json.to_string();
             let _ = crate::project::write_atomically(&file, |p| {
-                fs::write(p, &text).map_err(|e| crate::project::file_error("renaming the artwork", e))
+                crate::storage::write(p, &text).map_err(|e| crate::project::file_error("renaming the artwork", e))
             });
         }
     }

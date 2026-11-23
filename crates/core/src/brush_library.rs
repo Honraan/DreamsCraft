@@ -591,7 +591,11 @@ pub fn adopt_kept_brushes(dir: String, seen: Option<String>, choices: Option<Str
     [(SEEN_FILE, seen), (CHOICES_FILE, choices)].into_iter().all(|(name, text)| {
         let path = dir.join(name);
         match text {
-            Some(text) if !path.exists() => std::fs::write(&path, text).is_ok(),
+            // whole or not at all: a list cut short (the storage full) would bring back brushes seen
+            Some(text) if !path.exists() => crate::project::write_atomically(&path, |p| {
+                crate::storage::write(p, &text).map_err(|e| crate::project::file_error("keeping the brushes", e))
+            })
+            .is_ok(),
             _ => true,
         }
     })
@@ -1583,7 +1587,7 @@ impl CanvasSession {
             let _ = std::fs::create_dir_all(&dir);
             // whole or not at all: cut short, the next start would add shipped brushes again
             let kept = crate::project::write_atomically(&seen_file, |p| {
-                std::fs::write(p, &text).map_err(|e| crate::project::file_error("keeping the brushes seen", e))
+                crate::storage::write(p, &text).map_err(|e| crate::project::file_error("keeping the brushes seen", e))
             });
             if let Err(e) = kept {
                 log::error!("{e}");
@@ -1648,7 +1652,8 @@ impl CanvasSession {
         }
         let text = given.join("\n");
         let kept = crate::project::write_atomically(&file, |p| {
-            std::fs::write(p, &text).map_err(|e| crate::project::file_error("keeping the plugins' brushes given", e))
+            crate::storage::write(p, &text)
+                .map_err(|e| crate::project::file_error("keeping the plugins' brushes given", e))
         });
         if let Err(e) = kept {
             log::error!("{e}");
@@ -1747,7 +1752,8 @@ impl CanvasSession {
             let _ = std::fs::create_dir_all(dir);
         }
         let written = crate::project::write_atomically(path, |p| {
-            std::fs::write(p, choices.as_bytes()).map_err(|e| crate::project::file_error("keeping the brushes", e))
+            crate::storage::write(p, choices.as_bytes())
+                .map_err(|e| crate::project::file_error("keeping the brushes", e))
         });
         if let Err(e) = &written {
             log::error!("{e}");
@@ -1765,7 +1771,7 @@ fn keep_library_text(path: &std::path::Path, json: &str, pictures: &[(String, cr
         return false;
     }
     let written = crate::project::write_atomically(path, |p| {
-        std::fs::write(p, json.as_bytes()).map_err(|e| crate::project::file_error("keeping the brushes", e))
+        crate::storage::write(p, json.as_bytes()).map_err(|e| crate::project::file_error("keeping the brushes", e))
     });
     if let Err(e) = &written {
         log::error!("{e}");

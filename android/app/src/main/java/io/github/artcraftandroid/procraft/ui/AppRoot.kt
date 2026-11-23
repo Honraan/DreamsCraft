@@ -372,6 +372,7 @@ private fun Screens(vm: CanvasViewModel, keptClear: Clearance) {
             ImportTroubleAlert(vm)
             SharedLayerAlert(vm)
             PluginOfferAlert(vm)
+            LeaveUnsavedAlert(vm)
             // a fill a plugin is finishing, or a dropped colour's being made: nothing is touched until
             // it is done (the screen goes on drawing)
             if (vm.fillFinishing || vm.dropFilling) {
@@ -529,6 +530,23 @@ private fun hiddenMessage(name: String, by: io.github.artcraftandroid.procraft.c
         io.github.artcraftandroid.procraft.core.HiddenBy.SOLO -> "another layer is shown alone."
         io.github.artcraftandroid.procraft.core.HiddenBy.ITSELF, null -> "it is hidden."
     }
+
+/**
+ * The artwork open couldn't be saved to leave it (the storage full, say): Stay, the default (Cancel's
+ * place, as a tap beside it or back), or Leave Without Saving, which says what it loses.
+ */
+@Composable
+internal fun LeaveUnsavedAlert(vm: CanvasViewModel) {
+    Alert(
+        vm.leaveUnsaved,
+        title = { it.title },
+        message = { it.message },
+        action = "Leave Without Saving",
+        cancel = "Stay",
+        onCancel = { vm.stayUnsaved() },
+        onAction = { vm.leaveWithoutSaving() },
+    )
+}
 
 /** A layer a texture set's meshes share is about to go from all of them. */
 @Composable

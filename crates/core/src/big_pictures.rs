@@ -543,7 +543,8 @@ fn write(folder: &Path, id: u64, pixels: &[u8]) {
         .map_err(|e| crate::project::file_error("keeping a brush's big picture", e))
         .and_then(|()| {
             crate::project::write_atomically(&file(folder, id), |p| {
-                std::fs::write(p, &packed).map_err(|e| crate::project::file_error("keeping a brush's big picture", e))
+                crate::storage::write(p, &packed)
+                    .map_err(|e| crate::project::file_error("keeping a brush's big picture", e))
             })
         });
     if let Err(e) = written {

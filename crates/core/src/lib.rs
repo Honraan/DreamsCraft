@@ -65,6 +65,8 @@ mod layers;
 mod liquify;
 mod liquify_steps;
 mod list_slider;
+#[cfg(test)]
+mod low_storage_tests;
 mod modes;
 mod open_marks;
 mod pacing;
@@ -107,6 +109,7 @@ mod sound_file;
 mod stand_ins;
 mod stock_brushes;
 mod stock_library;
+mod storage;
 mod stroke_sound;
 mod studio;
 mod surround;
@@ -213,7 +216,10 @@ pub use layers::{
 pub use liquify::liquify_reach;
 pub use list_slider::{ListSliderTouch, list_slider_touch};
 pub use modes::{ModeButton, ModeSwitch, Modes, mode_switch, mode_switch_deselects};
-pub use open_marks::{opening_ended_app, set_open_marks_file};
+pub use open_marks::{
+    android_run_ended_short_of_memory, opening_ended_app, opening_ended_app_said, opening_ended_app_title,
+    opening_ended_run, set_open_marks_file,
+};
 pub use palettes::{PaletteInfo, Palettes, colour_name};
 pub use pick::Pick;
 pub use pickers::{
@@ -236,7 +242,7 @@ pub use presets::{
     presets_json, profile_chip, standard_presets,
 };
 pub use project::{
-    ArtworkInfo, PdfBook, export_file_name, read_signature, save_failure_said, write_photo, write_signature,
+    ArtworkInfo, Leaving, PdfBook, export_file_name, read_signature, save_failure_said, write_photo, write_signature,
 };
 pub use project::{PackageTimeLapse, artwork_plays, artwork_preview_png, package_time_lapse, preview_side};
 pub use project::{PagesOutcome, PsdOutcome, import_pages, import_psd};
@@ -267,6 +273,7 @@ pub use side_bar::{
 pub use side_slider::{
     ShadowStep, SideSliderTap, side_slider_drag_share, side_slider_shown_percent, side_slider_tap, side_thumb_shadow,
 };
+pub use storage::{NO_ROOM, save_failure_to_tell, storage_full_writes, storage_was_full};
 pub use studio::{
     SliderExtrasInfo, SourceImage, SourceKind, StudioAbout, curve_samples, repeatable_source, slider_extras,
     small_source, source_from_copy, source_from_picture, source_library, source_size,
@@ -1656,6 +1663,9 @@ pub(crate) struct Shared {
     /// Why the autosave failed, not yet asked for, and whether it is failing (told once until a
     /// save works again); a lock of its own, never held through a save.
     pub(crate) save_failure: Mutex<(Option<String>, bool)>,
+    /// A save of the artwork, or its time-lapse, found the storage full since its saves last worked:
+    /// the next that works says there is room again (see `storage.rs`).
+    pub(crate) found_full: std::sync::atomic::AtomicBool,
     /// The canvas's touches (they call into the session, so they keep their own lock).
     pub(crate) touches: touch::TouchState,
     /// The brush studio's pad being drawn again off the caller's thread (see
@@ -2311,6 +2321,7 @@ impl CanvasSession {
                 edits_saved: std::sync::atomic::AtomicU64::new(project::NOT_SAVED),
                 export_progress: std::sync::atomic::AtomicU32::new(0),
                 save_failure: Mutex::new((None, false)),
+                found_full: std::sync::atomic::AtomicBool::new(false),
                 touches: Mutex::new(touch::Touches::default()),
                 pad_sync: Mutex::new(studio::PadSync::default()),
                 studio_previews: std::sync::atomic::AtomicU64::new(0),

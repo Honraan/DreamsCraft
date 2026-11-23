@@ -157,6 +157,7 @@ object VideoWriter {
             return false
         }
         var track = -1
+        var stopped = false
         val done = MediaCodec.BufferInfo()
         val pixels = IntArray(width * height)
         var step = "configured"
@@ -238,6 +239,12 @@ object VideoWriter {
             patience.progressed()
             drain(true)
             if (track < 0) AppLog.w("ProCraft", "$what: the encoder gave nothing back ($step)")
+            // its file ended here: one whose end couldn't be written (the storage full) is no video
+            if (track >= 0) {
+                step = "its file ended"
+                muxer.stop()
+                stopped = true
+            }
             return track >= 0
         } catch (e: Exception) {
             AppLog.w("ProCraft", "$what failed, $step", e)
@@ -245,8 +252,10 @@ object VideoWriter {
         } finally {
             runCatching { codec.stop() }
             codec.release()
-            runCatching { if (track >= 0) muxer.stop() }
-            muxer.release()
+            // a stop that failed leaves Android 8 and 9's muxer started, and its release then stops
+            // it again and throws
+            runCatching { if (track >= 0 && !stopped) muxer.stop() }
+            runCatching { muxer.release() }
         }
     }
 
@@ -260,6 +269,7 @@ object VideoWriter {
         parts.singleOrNull()?.let { part -> return runCatching { part.copyTo(out, overwrite = true) }.isSuccess }
         val muxer = runCatching { MediaMuxer(out.path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4) }.getOrNull() ?: return false
         var track = -1
+        var stopped = false
         var first: MediaFormat? = null
         var offset = 0L
         var buffer = ByteBuffer.allocate(0)
@@ -303,13 +313,18 @@ object VideoWriter {
                     extractor.release()
                 }
             }
+            // its file ended here: one whose end couldn't be written (the storage full) is no video
+            if (track >= 0) {
+                muxer.stop()
+                stopped = true
+            }
             return track >= 0
         } catch (e: Exception) {
             AppLog.e("ProCraft", "joining videos", e)
             return false
         } finally {
-            runCatching { if (track >= 0) muxer.stop() }
-            muxer.release()
+            runCatching { if (track >= 0 && !stopped) muxer.stop() }
+            runCatching { muxer.release() }
         }
     }
 

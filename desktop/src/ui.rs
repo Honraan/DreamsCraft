@@ -565,9 +565,10 @@ impl Interface {
         self.canvas_pressed = std::mem::take(&mut input.canvas_pressed);
         // looked at again soon while an insert is read, or brushes made
         let brushes_coming = self.brushes_added(session);
-        // the autosave told of when it fails (once until a save works again), the palettes too
-        if let Some(why) = session.take_save_failure() {
-            self.overlays.notice(procraft_core::save_failure_said(why), true);
+        // the autosave told of when it fails (once until a save works again; the storage full once
+        // until there is room, whichever meets it first), the palettes too
+        if let Some(said) = session.take_save_failure().and_then(procraft_core::save_failure_to_tell) {
+            self.overlays.notice(said, true);
         }
         // a crop or a smudge the GPU had no memory for
         if let Some(why) = session.take_failure() {

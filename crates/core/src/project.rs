@@ -24,6 +24,18 @@ use crate::{CanvasSession, MobileError};
 pub const THUMBNAIL_SIDE: u32 = 512;
 /// [`CanvasSession::edits_saved`] before any save.
 pub(crate) const NOT_SAVED: u64 = u64::MAX;
+/// How many saves leaving an artwork makes at most while it is painted on as it saves.
+const LEAVE_SAVES: usize = 3;
+
+/// What leaving an artwork came to (see [`CanvasSession::save_to_leave`]).
+#[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
+pub enum Leaving {
+    /// Saved whole: the canvas may go.
+    Left,
+    /// It couldn't be saved: it stays open, with what to ask (a title and what it says): stay (the
+    /// default), or leave without saving, which loses what wasn't saved.
+    Stays { title: String, message: String },
+}
 /// How long after a change an open artwork kept saved looks for what to save (it waits for a
 /// change first: nothing changing, it never looks).
 const AUTOSAVE_EVERY: std::time::Duration = std::time::Duration::from_millis(if cfg!(test) { 50 } else { 3000 });
@@ -654,19 +666,49 @@ fn write_or_keep_changed(
     {
         canvas.mark_changed(changed);
     }
+    session.note_room(&result);
     result
+}
+
+impl CanvasSession {
+    /// What a save of the artwork came to, for the storage (see `storage.rs`): failed for want of
+    /// room, the storage is full; worked after a save or its time-lapse found it full, there is room
+    /// again, and the next time it fills is told again.
+    pub(crate) fn note_room(&self, result: &Result<(), MobileError>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        match result {
+            Err(e) if crate::storage::says_full(&e.to_string()) => {
+                crate::storage::found_full();
+                self.shared.found_full.store(true, Relaxed);
+            }
+            Ok(()) if self.shared.found_full.swap(false, Relaxed) => crate::storage::room_again(),
+            _ => {}
+        }
+    }
 }
 
 impl CanvasSession {
     /// [`CanvasSession::start_autosave`], looking `every` so long, and `again` after that when
     /// something was under way.
     pub(crate) fn keep_saved(self: Arc<Self>, dir: String, every: std::time::Duration, again: std::time::Duration) {
+        let kept = self.edits();
+        self.keep_saved_since(dir, every, again, kept);
+    }
+
+    /// [`CanvasSession::keep_saved`], with what is in `dir` as of the artwork's edits `kept`: an
+    /// artwork whose last save failed is saved at its next look even before it changes again.
+    pub(crate) fn keep_saved_since(
+        self: Arc<Self>,
+        dir: String,
+        every: std::time::Duration,
+        again: std::time::Duration,
+        mut kept: u64,
+    ) {
         let mine = {
             let mut saved = self.shared.saving.lock().unwrap_or_else(|e| e.into_inner());
             saved.autosave = saved.autosave.wrapping_add(1);
             saved.autosave
         };
-        let mut kept = self.edits();
         let session = Arc::downgrade(&self);
         // (its own handle on the changes: waiting on them keeps nothing else of the session alive)
         let nudge = Arc::clone(&self.shared.nudge);
@@ -747,8 +789,11 @@ impl CanvasSession {
                         if !failure.1 {
                             *failure = (Some(e.to_string()), true);
                         }
-                        // tried again with the next change, or before long
+                        // tried again with the next change, or before long; a failing save (the
+                        // storage full) reads and encodes as much as one that works, so it is
+                        // spaced as one is
                         unsaved = Some(AUTOSAVE_LONGEST);
+                        wait = autosave_wait(every, started.elapsed());
                     }
                 }
             }
@@ -969,7 +1014,7 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
         for (id, bytes) in &files {
             let to = layer_path(dir, *id);
             stage(
-                write_beside(&to, |p| fs::write(p, bytes).map_err(|e| file_error("writing a layer", e))),
+                write_beside(&to, |p| crate::storage::write(p, bytes).map_err(|e| file_error("writing a layer", e))),
                 to,
                 &mut staged,
             )?;
@@ -1000,7 +1045,7 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
             && (saved.reference_picture != Some(pixels_hash(png)) || !picture_path.exists())
         {
             let written = write_beside(&picture_path, |p| {
-                fs::write(p, png).map_err(|e| file_error("writing the reference picture", e))
+                crate::storage::write(p, png).map_err(|e| file_error("writing the reference picture", e))
             });
             stage(written, picture_path, &mut staged)?;
         }
@@ -1011,8 +1056,9 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
             if saved.more_pictures.get(i).copied().flatten() == Some(pixels_hash(png)) && path.exists() {
                 continue;
             }
-            let written =
-                write_beside(&path, |p| fs::write(p, png).map_err(|e| file_error("writing a reference picture", e)));
+            let written = write_beside(&path, |p| {
+                crate::storage::write(p, png).map_err(|e| file_error("writing a reference picture", e))
+            });
             stage(written, path, &mut staged)?;
         }
         // plugins' layers' data, each whole, unless its file there has it already
@@ -1022,7 +1068,7 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
                 continue;
             }
             let written = write_beside(&path, |p| {
-                fs::write(p, data.as_slice()).map_err(|e| file_error("writing a layer's plugin data", e))
+                crate::storage::write(p, data.as_slice()).map_err(|e| file_error("writing a layer's plugin data", e))
             });
             stage(written, path, &mut staged)?;
         }
@@ -1038,29 +1084,34 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
                 .collect::<Result<Vec<_>, _>>()?;
             let bytes = crate::layer_store::encode(kind, (w, h), layer_hash, &planes)?;
             let path = crate::layer_store::store_path(dir, id);
-            let written =
-                write_beside(&path, |p| fs::write(p, &bytes).map_err(|e| file_error("writing a layer's store", e)));
+            let written = write_beside(&path, |p| {
+                crate::storage::write(p, &bytes).map_err(|e| file_error("writing a layer's store", e))
+            });
             stage(written, path, &mut staged)?;
             stored.push(id);
         }
         for (id, bytes) in &store_files {
             let path = crate::layer_store::store_path(dir, *id);
-            let written =
-                write_beside(&path, |p| fs::write(p, bytes).map_err(|e| file_error("writing a layer's store", e)));
+            let written = write_beside(&path, |p| {
+                crate::storage::write(p, bytes).map_err(|e| file_error("writing a layer's store", e))
+            });
             stage(written, path, &mut staged)?;
             stored.push(*id);
         }
         // a plugin's artwork's own data, whole, before the document that names its kind
         if let Some(data) = plugin_data.as_deref() {
             let path = dir.join(PLUGIN_DATA);
-            let written =
-                write_beside(&path, |p| fs::write(p, data).map_err(|e| file_error("writing the plugin's artwork", e)));
+            let written = write_beside(&path, |p| {
+                crate::storage::write(p, data).map_err(|e| file_error("writing the plugin's artwork", e))
+            });
             stage(written, path, &mut staged)?;
         }
         let json = serde_json::to_string(&file).map_err(|e| file_error("writing the artwork", e))?;
         let doc = dir.join("artwork.json");
         stage(
-            write_beside(&doc, |p| fs::write(p, json.as_bytes()).map_err(|e| file_error("writing the artwork", e))),
+            write_beside(&doc, |p| {
+                crate::storage::write(p, json.as_bytes()).map_err(|e| file_error("writing the artwork", e))
+            }),
             doc,
             &mut staged,
         )
@@ -1352,6 +1403,35 @@ impl CanvasSession {
         self.keep_saved(dir, AUTOSAVE_EVERY, AUTOSAVE_AGAIN);
     }
 
+    /// Saves the artwork into `dir` to leave it: [`Leaving::Left`] once all of it is saved (what is
+    /// painted while it saves saved too), and the canvas may go. An artwork is never left with work
+    /// that is only in memory: one that can't be saved (the storage full, say) [`Leaving::Stays`]
+    /// open, painting from memory and kept saved again (what wasn't saved goes at the autosave's next
+    /// look, once there is room), with what to ask: stay, or leave without saving, which loses it.
+    /// The apps all leave so; only the system ending the app can lose it.
+    pub fn save_to_leave(self: Arc<Self>, dir: String) -> Leaving {
+        self.stop_autosave();
+        let mut failed = None;
+        for _ in 0..LEAVE_SAVES {
+            match self.save(dir.clone()) {
+                Ok(()) if self.edits_saved() == Some(self.edits()) => return Leaving::Left,
+                Ok(()) => failed = None,
+                Err(e) => {
+                    failed = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        // (painted on through every round: what the last saved stands, the rest is the next save's)
+        let Some(reason) = failed else { return Leaving::Left };
+        let saved = self.shared.edits_saved.load(std::sync::atomic::Ordering::Relaxed);
+        let ever_saved = Path::new(&dir).join("artwork.json").is_file();
+        let (title, message) = crate::storage::leave_unsaved_said(&reason, ever_saved);
+        Arc::clone(&self).keep_saved_since(dir, AUTOSAVE_EVERY, AUTOSAVE_AGAIN, saved);
+        self.shared.nudge.nudge();
+        Leaving::Stays { title, message }
+    }
+
     /// Ends the autosave started last: a save it is making is finished first, and none follows.
     /// Why the autosave failed, once until a save works and another fails (for the app to tell,
     /// as [`save_failure_said`] puts it); none if it hasn't. Never waits on a save.
@@ -1419,7 +1499,7 @@ impl CanvasSession {
         drop(straight);
         let bytes = procraft_engine::jpeg::encode_tagged(&rgb, w, h, JPEG_QUALITY, &icc);
         self.exported(0.95);
-        write_atomically(Path::new(&path), |p| fs::write(p, &bytes).map_err(|e| file_error("saving", e)))?;
+        write_atomically(Path::new(&path), |p| crate::storage::write(p, &bytes).map_err(|e| file_error("saving", e)))?;
         self.exported(1.0);
         Ok(())
     }
@@ -1563,7 +1643,7 @@ impl CanvasSession {
             (icc, None) => formats::tiff(p.width, p.height, p.doc.dpi, &icc, &p.composite),
         };
         self.exported(0.95);
-        write_atomically(Path::new(&path), |f| fs::write(f, &bytes).map_err(|e| file_error("saving", e)))?;
+        write_atomically(Path::new(&path), |f| crate::storage::write(f, &bytes).map_err(|e| file_error("saving", e)))?;
         self.exported(1.0);
         Ok(())
     }
@@ -1577,7 +1657,9 @@ impl CanvasSession {
         if !layers {
             let bytes = formats::pdf(w, h, p.doc.dpi, &icc, &[p.composite.as_slice()], quality, inks.as_ref());
             self.exported(0.95);
-            write_atomically(Path::new(&path), |f| fs::write(f, &bytes).map_err(|e| file_error("saving", e)))?;
+            write_atomically(Path::new(&path), |f| {
+                crate::storage::write(f, &bytes).map_err(|e| file_error("saving", e))
+            })?;
             self.exported(1.0);
             return Ok(());
         }
@@ -1750,7 +1832,7 @@ pub fn write_signature(dir: String, strokes: Vec<Vec<f32>>) -> Result<(), Mobile
     fs::create_dir_all(&about).map_err(|e| file_error("keeping the signature", e))?;
     let json = serde_json::to_string(&strokes).map_err(|e| file_error("keeping the signature", e))?;
     write_atomically(&about.join("signature.json"), |p| {
-        fs::write(p, &json).map_err(|e| file_error("keeping the signature", e))
+        crate::storage::write(p, &json).map_err(|e| file_error("keeping the signature", e))
     })
 }
 
@@ -1760,7 +1842,9 @@ pub fn write_signature(dir: String, strokes: Vec<Vec<f32>>) -> Result<(), Mobile
 pub fn write_photo(dir: String, bytes: Vec<u8>) -> Result<(), MobileError> {
     let about = Path::new(&dir).join("about");
     fs::create_dir_all(&about).map_err(|e| file_error("keeping the photo", e))?;
-    write_atomically(&about.join("photo.jpg"), |p| fs::write(p, &bytes).map_err(|e| file_error("keeping the photo", e)))
+    write_atomically(&about.join("photo.jpg"), |p| {
+        crate::storage::write(p, &bytes).map_err(|e| file_error("keeping the photo", e))
+    })
 }
 
 /// The table showing a CMYK canvas's colours as its press prints them (in Display P3, as its
@@ -2009,10 +2093,10 @@ impl From<MobileError> for std::io::Error {
 /// does: a file that couldn't be written whole is never left there.
 fn write_file_atomically(
     path: &Path,
-    write: impl FnOnce(&mut std::io::BufWriter<fs::File>) -> std::io::Result<()>,
+    write: impl FnOnce(&mut std::io::BufWriter<crate::storage::File>) -> std::io::Result<()>,
 ) -> Result<(), MobileError> {
     write_atomically(path, |tmp| {
-        let file = fs::File::create(tmp).map_err(|e| file_error("saving", e))?;
+        let file = crate::storage::create(tmp).map_err(|e| file_error("saving", e))?;
         let mut out = std::io::BufWriter::new(file);
         write(&mut out).map_err(|e| file_error("saving", e))?;
         out.into_inner().map(drop).map_err(|e| file_error("saving", e.into_error()))
@@ -2037,8 +2121,8 @@ fn old_layer_data_path(dir: &Path, id: LayerId) -> PathBuf {
 /// What the apps say when saving an artwork failed for `reason` (a save's error).
 #[uniffi::export]
 pub fn save_failure_said(reason: String) -> String {
-    if reason.to_lowercase().contains("space") {
-        "There's no room left to save this artwork.".to_owned()
+    if crate::storage::says_full(&reason) {
+        crate::storage::NO_ROOM.to_owned()
     } else {
         "This artwork couldn't be saved.".to_owned()
     }
@@ -2078,7 +2162,7 @@ fn beside(path: &Path) -> PathBuf {
 /// A PNG of RGBA8 pixels, carrying the colour profile `icc` (none if empty).
 pub(crate) fn write_png(path: &Path, width: u32, height: u32, rgba: &[u8], icc: &[u8]) -> Result<(), MobileError> {
     let bytes = png_bytes(width, height, rgba, icc)?;
-    fs::write(path, bytes).map_err(|e| file_error("saving", e))
+    crate::storage::write(path, bytes).map_err(|e| file_error("saving", e))
 }
 
 /// A PNG of premultiplied RGBA8 pixels (as the GPU gives them), none on failure but empty.
@@ -2561,7 +2645,7 @@ pub fn package_time_lapse(path: String, dir: String) -> Result<Option<PackageTim
     let mut segments = Vec::with_capacity(t.segments.len());
     for (i, data) in t.segments.iter().enumerate() {
         let file = dir.join(format!("segment-{}.mp4", i + 1));
-        fs::write(&file, data).map_err(|e| file_error("saving the time-lapse", e))?;
+        crate::storage::write(&file, data).map_err(|e| file_error("saving the time-lapse", e))?;
         segments.push(file.to_string_lossy().into_owned());
     }
     Ok(Some(PackageTimeLapse {
@@ -2587,7 +2671,7 @@ pub fn keep_package_thumbnail(path: String, dir: String) -> bool {
         return false;
     };
     let kept = write_atomically(&Path::new(&dir).join("thumbnail.png"), |p| {
-        fs::write(p, &png).map_err(|e| file_error("keeping the package's preview", e))
+        crate::storage::write(p, &png).map_err(|e| file_error("keeping the package's preview", e))
     });
     if let Err(e) = &kept {
         log::error!("{e}");

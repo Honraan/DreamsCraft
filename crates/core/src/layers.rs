@@ -1233,9 +1233,16 @@ impl CanvasSession {
     /// once (true). Nothing waits for the frames or lays their work at once,
     /// and a stroke right after another doesn't leave the first one's frame out. With no frames
     /// drawn (the app away, an artwork never shown) it is taken now and kept before this returns:
-    /// whether it was. False before the canvas exists, or while it doesn't record.
+    /// whether it was. False before the canvas exists, while it doesn't record, or while it waits for
+    /// room on a full storage.
     pub fn record_time_lapse(&self, lapse: std::sync::Arc<crate::timelapse::TimeLapse>) -> bool {
         if !lapse.recording() {
+            return false;
+        }
+        // the storage full: nothing read back or encoded only to be refused, until a save of the
+        // artwork works again (which then says there is room)
+        if lapse.waits_for_room() {
+            self.shared.found_full.store(true, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
         let keeper = {

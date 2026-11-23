@@ -2277,7 +2277,7 @@ impl CanvasSession {
         let reason = |why: &str| crate::MobileError::File { reason: why.to_owned() };
         let bytes = self.plugin_export_bytes(&key).ok_or_else(|| reason("the plugin couldn't make it"))?;
         crate::project::write_atomically(std::path::Path::new(&path), |p| {
-            std::fs::write(p, &bytes).map_err(|e| reason(&format!("writing the file: {e}")))
+            crate::storage::write(p, &bytes).map_err(|e| reason(&format!("writing the file: {e}")))
         })
     }
 

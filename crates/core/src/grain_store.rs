@@ -140,7 +140,7 @@ fn write(folder: &Path, id: u64, pixels: &[u8]) -> bool {
     let written = fs::create_dir_all(folder).map_err(|e| crate::project::file_error("keeping a brush's grain", e));
     let written = written.and_then(|()| {
         crate::project::write_atomically(&path, |p| {
-            fs::write(p, pixels).map_err(|e| crate::project::file_error("keeping a brush's grain", e))
+            crate::storage::write(p, pixels).map_err(|e| crate::project::file_error("keeping a brush's grain", e))
         })
     });
     if let Err(e) = &written {

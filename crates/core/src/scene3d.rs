@@ -397,7 +397,7 @@ pub fn unpack_model_artwork(path: String, dir: String) -> bool {
         let bytes = zip.read(name).ok_or(())?;
         let to = root.join(name);
         to.parent().map_or(Ok(()), fs::create_dir_all).map_err(|_| ())?;
-        fs::write(to, bytes).map_err(|_| ())
+        crate::storage::write(to, bytes).map_err(|_| ())
     });
     if wrote.is_err() {
         let _ = fs::remove_dir_all(root);
@@ -1864,7 +1864,9 @@ impl CanvasSession {
             zip.add(file, png);
         }
         let bytes = zip.finish();
-        write_atomically(Path::new(&path), |p| fs::write(p, &bytes).map_err(|e| file_error("exporting the model", e)))
+        write_atomically(Path::new(&path), |p| {
+            crate::storage::write(p, &bytes).map_err(|e| file_error("exporting the model", e))
+        })
     }
 
     /// The artwork, saved to `dir` first, as one file at `path` that comes back whole in another
@@ -1876,7 +1878,7 @@ impl CanvasSession {
         let mut zip = procraft_engine::zip::ZipWriter::new();
         zip_folder(&mut zip, root, root).map_err(|e| file_error("saving", e))?;
         let bytes = zip.finish();
-        write_atomically(Path::new(&path), |p| fs::write(p, &bytes).map_err(|e| file_error("saving", e)))
+        write_atomically(Path::new(&path), |p| crate::storage::write(p, &bytes).map_err(|e| file_error("saving", e)))
     }
 
     /// Writes the model as a glTF binary at `path`, for a viewer that shows it in the room: as
@@ -1910,7 +1912,9 @@ impl CanvasSession {
             })
             .collect();
         let bytes = procraft_engine::gltf::write_glb(&mesh, &parts);
-        write_atomically(Path::new(&path), |p| fs::write(p, &bytes).map_err(|e| file_error("exporting the model", e)))
+        write_atomically(Path::new(&path), |p| {
+            crate::storage::write(p, &bytes).map_err(|e| file_error("exporting the model", e))
+        })
     }
 
     /// Writes the model as a USDZ package at `path`: the mesh with a preview-surface material
@@ -1918,7 +1922,9 @@ impl CanvasSession {
     pub fn export_model_usdz(&self, path: String) -> Result<(), MobileError> {
         let files = self.model_files()?;
         let bytes = procraft_engine::usd::write_usdz(&files.mesh, &files.images);
-        write_atomically(Path::new(&path), |p| fs::write(p, &bytes).map_err(|e| file_error("exporting the model", e)))
+        write_atomically(Path::new(&path), |p| {
+            crate::storage::write(p, &bytes).map_err(|e| file_error("exporting the model", e))
+        })
     }
 }
 
@@ -1940,7 +1946,9 @@ impl CanvasSession {
                 .chain(images.occlusion.iter().map(|(_, png)| ("AmbientOcclusion", png)));
             for (channel, png) in named {
                 let path = dir.join(format!("{name}-{channel}.png"));
-                write_atomically(&path, |p| fs::write(p, png).map_err(|e| file_error("exporting the textures", e)))?;
+                write_atomically(&path, |p| {
+                    crate::storage::write(p, png).map_err(|e| file_error("exporting the textures", e))
+                })?;
                 out.push(path.to_string_lossy().into_owned());
             }
         }
@@ -1952,7 +1960,9 @@ impl CanvasSession {
     pub fn export_model_render(&self, path: String, transparent: bool) -> Result<(), MobileError> {
         let (w, h, rgba) = self.model_picture(transparent)?;
         let png = crate::project::rgba_png(w, h, &rgba);
-        write_atomically(Path::new(&path), |p| fs::write(p, &png).map_err(|e| file_error("rendering the model", e)))
+        write_atomically(Path::new(&path), |p| {
+            crate::storage::write(p, &png).map_err(|e| file_error("rendering the model", e))
+        })
     }
 
     /// The model as the window shows it, on the canvas's surround, as a JPEG at `path`.
@@ -1960,14 +1970,18 @@ impl CanvasSession {
         let (w, h, rgba) = self.model_picture(false)?;
         let rgb = crate::project::onto_white(&crate::project::straight_alpha(&rgba))?;
         let bytes = procraft_engine::jpeg::encode(&rgb, w, h, crate::project::JPEG_QUALITY);
-        write_atomically(Path::new(&path), |p| fs::write(p, &bytes).map_err(|e| file_error("rendering the model", e)))
+        write_atomically(Path::new(&path), |p| {
+            crate::storage::write(p, &bytes).map_err(|e| file_error("rendering the model", e))
+        })
     }
 
     /// The model as the window shows it, on the canvas's surround, as a TIFF at `path`.
     pub fn export_model_tiff(&self, path: String) -> Result<(), MobileError> {
         let (w, h, rgba) = self.model_picture(false)?;
         let bytes = procraft_engine::formats::tiff(w, h, 72.0, &[], &rgba);
-        write_atomically(Path::new(&path), |p| fs::write(p, &bytes).map_err(|e| file_error("rendering the model", e)))
+        write_atomically(Path::new(&path), |p| {
+            crate::storage::write(p, &bytes).map_err(|e| file_error("rendering the model", e))
+        })
     }
 }
 
@@ -2092,7 +2106,7 @@ impl CanvasSession {
             self.exported(0.95 * (i + 1) as f32 / count as f32);
         }
         let bytes = gif.ok_or_else(|| file_error("saving", "there are no frames"))?.finish();
-        write_atomically(Path::new(&path), |f| fs::write(f, &bytes).map_err(|e| file_error("saving", e)))?;
+        write_atomically(Path::new(&path), |f| crate::storage::write(f, &bytes).map_err(|e| file_error("saving", e)))?;
         self.exported(1.0);
         Ok(())
     }
@@ -2533,13 +2547,15 @@ impl State {
 pub(crate) fn write_model(saved: &mut SavedSets, dir: &Path, model: &ModelSnapshot) -> Result<(), MobileError> {
     let file = dir.join(format!("model.{}", model.source.extension));
     if !file.exists() {
-        write_atomically(&file, |p| fs::write(p, &model.source.bytes).map_err(|e| file_error("saving the model", e)))?;
+        write_atomically(&file, |p| {
+            crate::storage::write(p, &model.source.bytes).map_err(|e| file_error("saving the model", e))
+        })?;
     }
     let mtl = dir.join("model.mtl");
     if let Some(text) = model.source.mtl.as_ref()
         && !mtl.exists()
     {
-        write_atomically(&mtl, |p| fs::write(p, text).map_err(|e| file_error("saving the model", e)))?;
+        write_atomically(&mtl, |p| crate::storage::write(p, text).map_err(|e| file_error("saving the model", e)))?;
     }
     let side = model.saved.texture_size;
     // the maps, written once: they don't change

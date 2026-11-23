@@ -160,7 +160,7 @@ pub fn write_log_to_share(dir: String, to: String) -> bool {
     if let Some(folder) = to.parent() {
         let _ = fs::create_dir_all(folder);
     }
-    fs::write(to, text).map_err(|e| log::warn!("the log to share: {e}")).is_ok()
+    crate::storage::write(to, text).map_err(|e| log::warn!("the log to share: {e}")).is_ok()
 }
 
 /// The line a log begins with: the run (process) it is of.
@@ -191,7 +191,7 @@ fn keep_ended_in(dir: &Path, ended: &[u32]) {
         && process_of(&before).is_some_and(|run| ended.contains(&run))
     {
         let written = crate::project::write_atomically(&crashed, |p| {
-            fs::write(p, &before).map_err(|e| crate::project::file_error("keeping the log", e))
+            crate::storage::write(p, &before).map_err(|e| crate::project::file_error("keeping the log", e))
         });
         if let Err(e) = written {
             log::warn!("{e}");

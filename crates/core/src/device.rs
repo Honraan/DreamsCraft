@@ -276,7 +276,7 @@ fn write_record(path: &Path, first: &str, build: &str, rest: &str) {
         first.to_owned()
     };
     let written = crate::project::write_atomically(path, |tmp| {
-        std::fs::write(tmp, &text).map_err(|e| crate::project::file_error("the GPU record", e))
+        crate::storage::write(tmp, &text).map_err(|e| crate::project::file_error("the GPU record", e))
     });
     if let Err(e) = written {
         log::warn!("{e}");

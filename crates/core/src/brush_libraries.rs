@@ -290,7 +290,7 @@ fn write(path: &Path, text: &str) -> bool {
         let _ = std::fs::create_dir_all(dir);
     }
     let written = crate::project::write_atomically(path, |p| {
-        std::fs::write(p, text.as_bytes()).map_err(|e| crate::project::file_error("keeping the brushes", e))
+        crate::storage::write(p, text.as_bytes()).map_err(|e| crate::project::file_error("keeping the brushes", e))
     });
     if let Err(e) = &written {
         log::error!("{e}");

@@ -606,15 +606,17 @@ struct GalleryView: View {
             }
         )
         // an artwork whose opening closed the app last time: opened again only when asked to (it can
-        // be shared, duplicated or deleted from the gallery meanwhile)
+        // be shared, duplicated or deleted from the gallery meanwhile); how that run ended isn't
+        // known here, so the log is asked for, with Share Log beside
         AlertView(
             content: model.endedOpening != nil ? AlertContent(
-                title: "This artwork closed the app",
-                message: "ProCraft closed while this artwork was opening last time, perhaps for want of memory. Closing other apps first may help.",
-                action: "Open Anyway", destructive: false
+                title: openingEndedAppTitle(),
+                message: openingEndedAppSaid(lowMemory: false),
+                action: "Open Anyway", destructive: false, extra: "Share Log"
             ) : nil,
             onCancel: model.keepClosed,
-            onAction: model.openAnyway
+            onAction: model.openAnyway,
+            onExtra: shareLog
         )
         AlertView(
             content: pdfFor != nil ? AlertContent(
@@ -626,6 +628,19 @@ struct GalleryView: View {
             onExtra: { sharePdf(PdfQuality.better) },
             onFirst: { sharePdf(PdfQuality.good) }
         )
+    }
+
+    /// The log as a text file, to the share sheet (made off the main thread): what the question about
+    /// an artwork that closed the app asks for.
+    private func shareLog() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let log = AppLog.toShare()
+            DispatchQueue.main.async {
+                if let log {
+                    Sharing.share([log])
+                }
+            }
+        }
     }
 
     private func sharePdf(_ quality: UInt8) {

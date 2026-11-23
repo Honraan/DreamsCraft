@@ -61,6 +61,13 @@ final class CanvasModel {
     let dir: String
     /// Back to the gallery, the artwork kept.
     @ObservationIgnored var onClose: () -> Void = {}
+    /// What follows leaving the artwork (a file brought in), once it is left: dropped if it stays.
+    @ObservationIgnored var afterLeaving: (() -> Void)?
+    /// The artwork couldn't be saved to leave it (the storage full, say): what is asked, Stay or
+    /// Leave Without Saving, while it stays open.
+    var leaveUnsaved: (title: String, message: String)?
+    /// Leaves the artwork that couldn't be saved without saving it (the canvas's screen does).
+    @ObservationIgnored var leaveWithoutSaving: () -> Void = {}
 
     private(set) var tool: ToolKind = .paint
     private(set) var size: Float = 0
@@ -2625,11 +2632,14 @@ final class CanvasModel {
         }
     }
 
-    /// A save failed, for `reason`: said the first time since one last succeeded.
+    /// A save failed, for `reason`: said the first time since one last succeeded (the storage full
+    /// once, by whichever meets it first, a save or the time-lapse).
     func saveFailed(_ reason: String) {
         if !saveFailing {
             saveFailing = true
-            showNotice(saveFailureSaid(reason: reason), warning: true)
+            if let said = saveFailureToTell(reason: reason) {
+                showNotice(said, warning: true)
+            }
         }
     }
 

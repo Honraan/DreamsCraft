@@ -1471,22 +1471,48 @@ impl App {
         waits
     }
 
-    /// The artwork open is put away and kept; false if it couldn't be.
+    /// The artwork open is put away and kept; false while it stays open. One that can't be saved (the
+    /// storage full, say) stays, kept saved again, unless the person chooses to leave it without
+    /// saving (the core's rule, as the tablet's).
     fn leave_artwork(&mut self) -> bool {
         if let Some(session) = self.session.clone() {
             // its time counted up to now, saved with it
             session.set_tracking(false);
             self.ui.closing(&session);
-            // no save of its own after this one
-            session.stop_autosave();
         }
-        let kept = self.keep_artwork();
-        // still open: kept saved again
-        if !kept && let (Some(session), Some(dir)) = (&self.session, &self.artwork) {
+        let left = self.keep_artwork_to_leave();
+        // still open: its time counts again
+        if !left && let Some(session) = &self.session {
             session.set_tracking(true);
-            Arc::clone(session).start_autosave(dir.clone());
         }
-        kept
+        left
+    }
+
+    /// Saves the artwork open to leave it (and the brushes as it left them): true once it is kept,
+    /// or once the person chose to leave it without saving when it couldn't be; false to stay.
+    fn keep_artwork_to_leave(&mut self) -> bool {
+        let (Some(session), Some(dir)) = (self.session.clone(), self.artwork.clone()) else { return true };
+        // its canvas made first (it is being made on a thread of its own), so the save has its picture
+        if let Some((_, made)) = self.opening.take() {
+            let _ = made.join();
+        }
+        files::keep_brushes(&session);
+        let (brush, mask) = self.ui.colours.brush_and_mask();
+        files::keep_colours(brush, mask);
+        let edits = session.edits();
+        match Arc::clone(&session).save_to_leave(dir) {
+            procraft_core::Leaving::Left => {
+                self.ui.saved_edits = edits;
+                true
+            }
+            procraft_core::Leaving::Stays { title, message } => {
+                let leave = files::leave_without_saving(&title, &message);
+                if leave {
+                    session.stop_autosave();
+                }
+                leave
+            }
+        }
     }
 
     /// Saves the artwork open into its folder in the gallery (and the brushes as it left them);
@@ -1507,7 +1533,11 @@ impl App {
                 true
             }
             Err(e) => {
-                files::tell("Can't keep the artwork", &e.to_string());
+                // (the storage full said plainly: it stays open until there is room)
+                let why = e.to_string();
+                let said =
+                    if procraft_core::storage_was_full(why.clone()) { procraft_core::NO_ROOM.to_owned() } else { why };
+                files::tell("Can't keep the artwork", &said);
                 false
             }
         }

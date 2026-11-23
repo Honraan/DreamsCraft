@@ -137,8 +137,9 @@ class MainActivity : ComponentActivity() {
             vm.offerPlugin(uri)
             return
         }
-        if (vm.screen == io.github.artcraftandroid.procraft.canvas.Screen.CANVAS) vm.closeArtwork()
-        vm.importFile(uri)
+        // the artwork open is left (saved) first; one that can't be saved stays, and the file comes in
+        // only if it is left without saving
+        if (vm.screen == io.github.artcraftandroid.procraft.canvas.Screen.CANVAS) vm.closeArtwork { vm.importFile(uri) } else vm.importFile(uri)
     }
 
     override fun onStart() {

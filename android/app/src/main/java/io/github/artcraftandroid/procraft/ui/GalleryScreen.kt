@@ -825,8 +825,9 @@ fun GalleryScreen(vm: CanvasViewModel) {
     // it) shared from here, with no canvas to open for Help's
     Alert(
         vm.openingEndedApp,
-        title = { "This artwork closed the app" },
-        message = { "ProCraft closed while this artwork was opening last time, perhaps for want of memory. Closing other apps first may help." },
+        title = { io.github.artcraftandroid.procraft.core.openingEndedAppTitle() },
+        // why that run ended, where Android kept it: short of memory, or else (a crash) the log asked for
+        message = { o -> io.github.artcraftandroid.procraft.core.openingEndedAppSaid(o.lowMemory) },
         action = "Open Anyway",
         destructive = false,
         extra = "Share Log",

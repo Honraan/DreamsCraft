@@ -268,6 +268,18 @@ struct CanvasScreen: View {
                     onCancel: { model.saying = nil },
                     onAction: { model.saying = nil }
                 )
+                // the artwork couldn't be saved to leave it: Stay, the default (a tap beside it too), or
+                // Leave Without Saving, which says what it loses
+                AlertView(
+                    content: model.leaveUnsaved.map {
+                        AlertContent(title: $0.title, message: $0.message, action: "Leave Without Saving", cancel: "Stay")
+                    },
+                    onCancel: {
+                        model.leaveUnsaved = nil
+                        model.afterLeaving = nil
+                    },
+                    onAction: { model.leaveWithoutSaving() }
+                )
                 // what a model newly opened may not paint well with, said once
                 AlertView(
                     content: model.scene.warnings.isEmpty ? nil : AlertContent(
@@ -574,6 +586,8 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
     private var observers: [NSObjectProtocol] = []
     /// Back to the gallery, once the artwork is kept.
     private let leave: () -> Void
+    /// The artwork is being saved to leave it.
+    private var leaving = false
 
     init(model: CanvasModel) {
         self.model = model
@@ -582,6 +596,7 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
         super.init(nibName: nil, bundle: nil)
         // the top bar's Gallery keeps the artwork first
         model.onClose = { [weak self] in self?.close() }
+        model.leaveWithoutSaving = { [weak self] in self?.leaveUnsaved() }
     }
 
     @available(*, unavailable)
@@ -890,14 +905,54 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
         }
     }
 
-    /// Back to the gallery, the artwork kept.
+    /// Back to the gallery, the artwork kept. An artwork is never left with work only in memory: one
+    /// that can't be saved (the storage full, say) stays open, kept saved again, and asks whether to
+    /// stay or leave without saving (the core's rule, as the other apps'); what was to follow
+    /// leaving (a file brought in) waits for that.
     private func close() {
+        guard !leaving else { return }
+        let model = model
         let session = model.session
         let dir = model.dir
-        let lapse = model.timeLapse.lapse
         model.noteTime()
-        model.stopWatching()
         model.keepChoicesNow()
+        leaving = true
+        // off the main thread: a large artwork takes a while
+        DispatchQueue.global(qos: .userInitiated).async {
+            let left = session.saveToLeave(dir: dir)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.leaving = false
+                switch left {
+                case .left:
+                    model.saveSucceeded()
+                    self.leaveCanvas(saved: true)
+                case let .stays(title, message):
+                    // still open: its time counts again, and the person chooses
+                    AppLog.error("save", "the artwork couldn't be saved to leave it: \(message)")
+                    model.resumeTracking()
+                    model.leaveUnsaved = (title, message)
+                }
+            }
+        }
+    }
+
+    /// Leaves without saving, as asked: what wasn't saved is lost, its last save stays as it was.
+    private func leaveUnsaved() {
+        model.leaveUnsaved = nil
+        model.noteTime()
+        leaveCanvas(saved: false)
+    }
+
+    /// Back to the gallery, the artwork saved (`saved`) or left without saving; then what was to
+    /// follow leaving. Its memory goes, and the frames it recorded into one more video (only once
+    /// saved: the storage full, they stay pictures).
+    private func leaveCanvas(saved: Bool) {
+        let session = model.session
+        let lapse = model.timeLapse.lapse
+        let then = model.afterLeaving
+        model.afterLeaving = nil
+        model.stopWatching()
         StrokeSound.shared.follow(nil, on: false)
         // the gallery zooms out of the artwork's cell, a picture of the canvas fading away over it
         GalleryZoomer.shared.close(session, dir: dir, pixels: canvas.window?.screen.scale ?? canvas.traitCollection.displayScale)
@@ -908,24 +963,19 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
         Projection.shared.artwork(nil)
         leave()
         Gallery.closingSaves += 1
-        // off the main thread: a large artwork takes a while, and the gallery shows meanwhile
         DispatchQueue.global(qos: .userInitiated).async {
-            // after the autosave under way, if one is, and no save of its own after this one
+            // (saved: its autosave ended already; left without saving: it ends now)
             session.stopAutosave()
-            var failure: String?
-            do {
-                try session.save(dir: dir)
-            } catch {
-                failure = "\(error)"
-                AppLog.error("save", "keeping the artwork: \(error)")
-            }
             // the artwork file keeps a time-lapse as video
-            _ = lapse.forPackage()
+            if saved {
+                _ = lapse.forPackage()
+            }
             lapse.close()
             // its memory free at once, not when the object goes
             session.releaseCanvas()
-            DispatchQueue.main.async { Gallery.artworkKept(failure: failure) }
+            DispatchQueue.main.async { Gallery.artworkKept(failure: nil) }
         }
+        then?()
     }
 
     /// Saves the artwork off the main thread, the system letting the app finish first (a background

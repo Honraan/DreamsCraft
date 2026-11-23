@@ -237,8 +237,14 @@ struct RootView: View {
                     offerPlugin(url)
                     return
                 }
-                open?.onClose()
-                GalleryModel.shared.importOpened(url)
+                // the artwork open is left (saved) first; one that can't be saved stays, and the file
+                // comes in only if it is left without saving
+                guard let open else {
+                    GalleryModel.shared.importOpened(url)
+                    return
+                }
+                open.afterLeaving = { GalleryModel.shared.importOpened(url) }
+                open.onClose()
             }
         #if DEBUG
         .task { ScreenCapture.start { open = $0 } }

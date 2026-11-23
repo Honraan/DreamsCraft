@@ -223,8 +223,12 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     var opening by mutableStateOf(false)
         private set
 
-    /** An artwork picked whose opening ended the app last time, and what was to follow its opening: asked about before it opens again. */
-    data class OpeningEndedApp(val artwork: Artwork, val then: (() -> Unit)?)
+    /**
+     * An artwork picked whose opening ended the app last time, and what was to follow its opening:
+     * asked about before it opens again; with whether the system ended that run short of memory
+     * ([lowMemory]), which the question then says rather than ask for the log.
+     */
+    data class OpeningEndedApp(val artwork: Artwork, val then: (() -> Unit)?, val lowMemory: Boolean = false)
 
     /** The artwork picked whose opening ended the app last time, while the gallery asks whether to open it anyway. */
     var openingEndedApp by mutableStateOf<OpeningEndedApp?>(null)
@@ -259,7 +263,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 e == null -> if (result.getOrDefault(false)) saveFailing = false
                 !saveFailing -> {
                     saveFailing = true
-                    message = io.github.artcraftandroid.procraft.core.saveFailureSaid(e.message.orEmpty())
+                    // the storage full is told once, by whichever meets it first (a save, the time-lapse)
+                    io.github.artcraftandroid.procraft.core.saveFailureToTell(e.message.orEmpty())?.let { message = it }
                 }
             }
         }
@@ -2591,16 +2596,19 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             val names = withContext(Dispatchers.IO) { uris.map(::fileName) }
             val models = uris.indices.filter { i -> names[i]?.let(::isModelName) == true }
             // each one opened is kept (closed, so saved) as the next comes in
+            // the artwork open is left (saved) first, and the files come in after; one that can't be
+            // saved stays, and they come in only if it is left without saving
+            if (session != null) return@launch closeArtwork { importFiles(uris) }
             if (models.isEmpty()) {
                 for (uri in uris) {
-                    if (session != null) closeArtwork()
+                    if (session != null) return@launch closeArtwork { importFiles(uris.drop(uris.indexOf(uri))) }
                     importWithCard(uri, open = uris.size == 1)
                 }
                 return@launch
             }
             val picked = (uris.indices - models.toSet()).mapNotNull { i -> names[i]?.let { uris[i] to it } }
             for (i in models) {
-                if (session != null) closeArtwork()
+                if (session != null) return@launch closeArtwork { importFiles(uris) }
                 newFromModel(uris[i], names[i] ?: continue, picked)
             }
         }
@@ -2624,7 +2632,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         // isn't read into memory to find out what it is
         val zipFile = if (zip) withContext(Dispatchers.IO) { cacheCopy(uri) } else null
         if (zip && zipFile == null) {
-            if (!importCancelled) message = "This file can't be opened."
+            if (!importCancelled) message = if (copyNoRoom) NO_ROOM_TO_IMPORT else "This file can't be opened."
             return
         }
         try {
@@ -2676,12 +2684,15 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             importPdf(uri, name)
         } else if (zipFile != null) {
             // an artwork file of ours, or a layered package
+            val fullBefore = io.github.artcraftandroid.procraft.core.storageFullWrites()
+            var failure: Throwable? = null
             val ok = withContext(Dispatchers.IO) {
                 val dir = importFolder()
-                val ours = runCatching { zipFile.inputStream().use { io.github.artcraftandroid.procraft.gallery.ArtworkFile.read(it, dir) } }.getOrNull() == true
-                (ours || importPackage(zipFile, dir)).also { if (!it) dir.deleteRecursively() }
+                val read = runCatching { zipFile.inputStream().use { io.github.artcraftandroid.procraft.gallery.ArtworkFile.read(it, dir) } }
+                failure = read.exceptionOrNull()
+                (read.getOrNull() == true || importPackage(zipFile, dir)).also { if (!it) dir.deleteRecursively() }
             }
-            if (ok) refreshGallery() else message = "This file can't be opened."
+            if (ok) refreshGallery() else message = if (noRoom(fullBefore, failure)) NO_ROOM_TO_IMPORT else "This file can't be opened."
         } else {
             // named after its file, as a picture opened on the computer is
             pictureArtwork(uri, name?.substringBeforeLast('.')?.trim()?.ifBlank { null } ?: "Untitled Artwork")
@@ -2695,6 +2706,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
      */
     private suspend fun importPdf(uri: android.net.Uri, name: String?) {
         val app = getApplication<Application>()
+        val fullBefore = io.github.artcraftandroid.procraft.core.storageFullWrites()
+        var failure: Throwable? = null
         val outcome = withContext(Dispatchers.IO) {
             val pages = File(app.cacheDir, "pdf-${System.nanoTime()}").apply { mkdirs() }
             val dir = importFolder()
@@ -2733,6 +2746,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 } ?: io.github.artcraftandroid.procraft.core.PagesOutcome.Unreadable
             } catch (e: Exception) {
                 AppLog.e("ProCraft", "importing a PDF", e)
+                failure = e
                 io.github.artcraftandroid.procraft.core.PagesOutcome.Unreadable
             } finally {
                 pages.deleteRecursively()
@@ -2742,13 +2756,16 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             io.github.artcraftandroid.procraft.core.PagesOutcome.Imported -> refreshGallery()
             is io.github.artcraftandroid.procraft.core.PagesOutcome.TooManyPages ->
                 message = "This PDF has more pages than a canvas its size can hold as layers (${outcome.most})."
-            io.github.artcraftandroid.procraft.core.PagesOutcome.Unreadable -> message = "This PDF can't be opened."
+            io.github.artcraftandroid.procraft.core.PagesOutcome.Unreadable ->
+                message = if (noRoom(fullBefore, failure)) NO_ROOM_TO_IMPORT else "This PDF can't be opened."
         }
     }
 
     /** A layered PSD from [uri] made into a new artwork, named after its file; a message says why if it can't be. */
     private suspend fun importPsd(uri: android.net.Uri, name: String?) {
         val app = getApplication<Application>()
+        val fullBefore = io.github.artcraftandroid.procraft.core.storageFullWrites()
+        var failure: Throwable? = null
         val outcome = withContext(Dispatchers.IO) {
             val temp = File(app.cacheDir, "import-${System.nanoTime()}.psd")
             val dir = importFolder()
@@ -2757,6 +2774,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 io.github.artcraftandroid.procraft.core.importPsd(temp.path, dir.path, name?.substringBeforeLast('.')?.trim().orEmpty())
             } catch (e: Exception) {
                 AppLog.e("ProCraft", "importing a PSD", e)
+                failure = e
                 io.github.artcraftandroid.procraft.core.PsdOutcome.Unreadable
             } finally {
                 temp.delete()
@@ -2768,13 +2786,22 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 message = "This file has more layers than a canvas its size can hold (${outcome.most})."
             io.github.artcraftandroid.procraft.core.PsdOutcome.TooLarge -> message = "This file's canvas is larger than this device can hold."
             io.github.artcraftandroid.procraft.core.PsdOutcome.Unsupported -> message = "This kind of PSD can't be opened."
-            io.github.artcraftandroid.procraft.core.PsdOutcome.Unreadable -> message = "This file can't be opened."
+            io.github.artcraftandroid.procraft.core.PsdOutcome.Unreadable ->
+                message = if (noRoom(fullBefore, failure)) NO_ROOM_TO_IMPORT else "This file can't be opened."
         }
     }
 
     /** The last [cacheCopy] failed for want of room on the device. */
     @Volatile
     private var copyNoRoom = false
+
+    /**
+     * Whether an import that failed did for want of room: a write of the core's found the storage
+     * full since it counted [fullBefore], or what failed ([failure]) says so.
+     */
+    private fun noRoom(fullBefore: ULong, failure: Throwable?): Boolean =
+        io.github.artcraftandroid.procraft.core.storageFullWrites() != fullBefore ||
+            failure?.message?.let { io.github.artcraftandroid.procraft.core.storageWasFull(it) } == true
 
     /**
      * The file at [uri] copied whole into the cache (streamed through, never held in memory), or
@@ -2957,8 +2984,9 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         val cell = thumbAt[a.dir.name]
         viewModelScope.launch {
             if (!anyway && withContext(Dispatchers.IO) { io.github.artcraftandroid.procraft.core.openingEndedApp(a.dir.path) }) {
+                val lowMemory = withContext(Dispatchers.IO) { endedShortOfMemory(a.dir) }
                 opening = false
-                openingEndedApp = OpeningEndedApp(a, then)
+                openingEndedApp = OpeningEndedApp(a, then, lowMemory)
                 return@launch
             }
             val s = withContext(Dispatchers.IO) {
@@ -2978,6 +3006,21 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 then?.invoke()
             }.onFailure { message = "This artwork can't be opened." }
         }
+    }
+
+    /**
+     * Whether the run whose opening of the artwork in [dir] ended the app was ended by the system short
+     * of memory, as Android keeps how the app's runs ended (Android 11 on); false if it crashed, or
+     * it isn't known.
+     */
+    private fun endedShortOfMemory(dir: File): Boolean {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R) return false
+        val run = io.github.artcraftandroid.procraft.core.openingEndedRun(dir.path) ?: return false
+        val app = getApplication<Application>()
+        val ended = runCatching {
+            app.getSystemService(android.app.ActivityManager::class.java)?.getHistoricalProcessExitReasons(app.packageName, run.toInt(), 1)?.firstOrNull()
+        }.getOrNull() ?: return false
+        return io.github.artcraftandroid.procraft.core.androidRunEndedShortOfMemory(ended.reason)
     }
 
     /** How many of the gallery's artworks being shared are written, as a share of them. */
@@ -3135,8 +3178,24 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Saves the open artwork and goes back to the gallery. */
-    fun closeArtwork() {
+    /** An artwork being left couldn't be saved: what is asked (stay, or leave without saving), and what was to follow leaving. */
+    data class LeaveUnsaved(val title: String, val message: String, val then: (() -> Unit)?)
+
+    /** Asked while the artwork open couldn't be saved to leave it (the storage full, say): it stays open meanwhile. */
+    var leaveUnsaved by mutableStateOf<LeaveUnsaved?>(null)
+        private set
+
+    /** The open artwork is being saved to leave it. */
+    private var leaving = false
+
+    /**
+     * Saves the open artwork and goes back to the gallery, then [then]. An artwork is never left with
+     * work only in memory: one that can't be saved (the storage full, say) stays open, kept saved
+     * again, and [leaveUnsaved] asks whether to stay or leave without saving (the core's rule, as
+     * the desktop app's).
+     */
+    fun closeArtwork(then: (() -> Unit)? = null) {
+        if (leaving) return
         endFilling()
         endLayerOpacity()
         endTransform(true)
@@ -3146,9 +3205,53 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         val s = session ?: return
         noteTime()
         keepChoices(s)
+        val dir = artworkDir ?: return leave(s, null, saved = false, then)
+        leaving = true
+        closingSaves.incrementAndGet()
+        viewModelScope.launch {
+            val outcome = try {
+                withContext(Dispatchers.IO) { s.saveToLeave(dir.path) }
+            } finally {
+                closingSaves.decrementAndGet()
+                leaving = false
+            }
+            if (session !== s) return@launch
+            when (outcome) {
+                is io.github.artcraftandroid.procraft.core.Leaving.Left -> {
+                    told(Result.success(true))
+                    leave(s, dir, saved = true, then)
+                }
+                is io.github.artcraftandroid.procraft.core.Leaving.Stays -> {
+                    // still open: its time counts again, and the person chooses
+                    resumeTracking()
+                    leaveUnsaved = LeaveUnsaved(outcome.title, outcome.message, then)
+                }
+            }
+        }
+    }
+
+    /** Stays on the artwork that couldn't be saved (the default). */
+    fun stayUnsaved() {
+        leaveUnsaved = null
+    }
+
+    /** Leaves the artwork that couldn't be saved without saving it: what wasn't saved is lost, its last save stays as it was. */
+    fun leaveWithoutSaving() {
+        val asked = leaveUnsaved ?: return
+        leaveUnsaved = null
+        val s = session ?: return
+        noteTime()
+        leave(s, artworkDir, saved = false, asked.then)
+    }
+
+    /**
+     * Goes back to the gallery from [s], open on the artwork in [dir]: saved there ([saved]) or left
+     * without saving, then [then]. Its memory is let go, and the frames it recorded made into one
+     * more video (only once saved: the storage full, they stay pictures).
+     */
+    private fun leave(s: CanvasSession, dir: File?, saved: Boolean, then: (() -> Unit)?) {
         strokeSound.follow(null, false)
         s.detachProjection()
-        val dir = artworkDir
         // the gallery zooms out of the artwork's cell, the canvas fading away over it; the cell as
         // it will show, turned as the canvas is left
         val turns = s.shownTurns().toInt()
@@ -3179,14 +3282,16 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             try {
                 withContext(Dispatchers.IO) {
-                    // after the autosave's save under way, if one is
+                    // (saved: its autosave ended already; left without saving: it ends now)
                     s.stopAutosave()
-                    dir?.let { told(runCatching { s.save(it.path) }.map { true }) }
                     // its memory free at once, not when the object is collected
                     s.releaseCanvas()
                     // the frames it recorded made into one more video, their pictures then gone, as
                     // the artwork file keeps a time-lapse
-                    lapse?.let { runCatching { it.forPackage() }; it.close() }
+                    lapse?.let {
+                        if (saved) runCatching { it.forPackage() }
+                        it.close()
+                    }
                 }
             } finally {
                 closingSaves.decrementAndGet()
@@ -3194,6 +3299,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             galleryVersion++
             refreshGallery()
         }
+        then?.invoke()
     }
 
     /** Artworks left that are still being saved. */
