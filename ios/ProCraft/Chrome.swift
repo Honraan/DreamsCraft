@@ -144,10 +144,15 @@ private struct ColorButton: View {
 }
 
 /// The side bar against the left edge (the right one, `right`-handed): brush size, the modify
-/// button, opacity, undo and redo. On the right everything is mirrored but the glyphs.
+/// button, opacity, undo and redo. On the right everything is mirrored but the glyphs. Its modify
+/// button dragged out moves it along its edge in a window `windowHeight` tall; stretched `stretch`
+/// toward the finger as it goes, it is placed that far out by its caller and its glass reaches
+/// back as far, its edge side staying against the window's edge.
 struct SideBar: View {
     let model: CanvasModel
     var right = false
+    var windowHeight: CGFloat = 0
+    var stretch: CGFloat = 0
 
     /// A control's left edge, mirrored on the right.
     private func x(_ left: CGFloat, _ width: CGFloat) -> CGFloat {
@@ -160,23 +165,28 @@ struct SideBar: View {
         let corners = right
             ? RectangleCornerRadii(topLeading: r, bottomLeading: r, bottomTrailing: 0, topTrailing: 0)
             : RectangleCornerRadii(topLeading: 0, bottomLeading: 0, bottomTrailing: r, topTrailing: r)
+        // its glass reaches back to the window's edge however far it is stretched
+        let reach = max(stretch, 0)
+        let back: CGFloat = right ? 0 : -reach
         ZStack(alignment: .topLeading) {
             // frosted, as the top bar is
             UnevenRoundedRectangle(cornerRadii: corners, style: .circular)
                 .fill(.ultraThinMaterial)
-                .frame(width: Pc.sideBarWidth, height: Pc.sideBarHeight)
+                .frame(width: Pc.sideBarWidth + reach, height: Pc.sideBarHeight)
+                .offset(x: back)
                 .allowsHitTesting(false)
             // translucent, with windows where the slider tracks are: they show what is behind
             Canvas { context, size in
                 var shape = Path()
                 shape.addRoundedRect(in: CGRect(origin: .zero, size: size), cornerRadii: corners, style: .circular)
                 for top in [sizeTrackTop, opacityTrackTop] {
-                    let track = CGRect(x: x(sliderLeft, Pc.sliderWidth), y: top, width: Pc.sliderWidth, height: Pc.sliderHeight)
+                    let track = CGRect(x: x(sliderLeft, Pc.sliderWidth) - back, y: top, width: Pc.sliderWidth, height: Pc.sliderHeight)
                     shape.addRoundedRect(in: track, cornerSize: CGSize(width: Pc.sliderCorner, height: Pc.sliderCorner), style: .circular)
                 }
                 context.fill(shape, with: .color(fill), style: FillStyle(eoFill: true))
             }
-            .frame(width: Pc.sideBarWidth, height: Pc.sideBarHeight)
+            .frame(width: Pc.sideBarWidth + reach, height: Pc.sideBarHeight)
+            .offset(x: back)
             .allowsHitTesting(false)
 
             BrushSlider(
@@ -187,7 +197,7 @@ struct SideBar: View {
             )
             .offset(x: x(sliderLeft, Pc.sliderWidth), y: sizeTrackTop)
 
-            ModifyButton(model: model)
+            ModifyButton(model: model, windowHeight: windowHeight)
                 .offset(x: x(5, 40), y: 191)
 
             BrushSlider(
@@ -222,35 +232,146 @@ struct SideBar: View {
     }
 }
 
-/// The modify button: held, it changes what a canvas touch does; tapped, it does what Tap □ is
-/// set to (at first: the next touch on the canvas picks a colour).
-private struct ModifyButton: View {
-    let model: CanvasModel
-    @State private var down = false
+/// One touch on the modify button: the core's drag, which says when it moves the side bar instead;
+/// whether the button is still pressed; and where the button stood on the window as it began.
+private final class ModifyTouch {
+    let drag: SideBarDrag
+    let button: CGRect
+    var pressing = true
 
-    var body: some View {
-        RoundedRectangle(cornerRadius: Pc.modifyCorner - Pc.modifyStroke / 2, style: .circular)
-            .stroke(model.pickNext ? Pc.accent : Pc.sideGlyph, lineWidth: Pc.modifyStroke)
-            .padding(Pc.modifyStroke / 2)
-            .frame(width: Pc.modifySize, height: Pc.modifySize)
-            .frame(width: 40, height: 41)
-            .contentShape(Rectangle())
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { _ in
-                        if !down {
-                            down = true
-                            model.modifyPressed()
-                        }
-                    }
-                    .onEnded { value in
-                        down = false
-                        let inside = CGRect(x: 0, y: 0, width: 40, height: 41).contains(value.location)
-                        model.modifyReleased(cancelled: !inside)
-                    }
-            )
+    init(drag: SideBarDrag, button: CGRect) {
+        self.drag = drag
+        self.button = button
     }
 }
+
+/// The modify button: held, it changes what a canvas touch does; tapped, it does what Tap □ is
+/// set to (at first: the next touch on the canvas picks a colour). Dragged out from the bar's edge
+/// and then up or down, it moves the side bar along its edge (in a window `windowHeight` tall)
+/// instead, the press let go untapped; slid off without moving the bar, the press is let go
+/// untapped too.
+private struct ModifyButton: View {
+    let model: CanvasModel
+    let windowHeight: CGFloat
+    @State private var touch: ModifyTouch?
+    /// A touch is down on it: gone as it lifts, or as the system takes it back (no end comes then).
+    @GestureState private var pressing = false
+
+    /// A drag's time as the core's drag takes it (ms).
+    private static func ms(_ drag: DragGesture.Value) -> Double {
+        drag.time.timeIntervalSinceReferenceDate * 1000
+    }
+
+    /// The touch at `drag` (on the window), in the bar's own points.
+    private static func at(_ location: CGPoint) -> (x: Float, y: Float) {
+        let p = Interface.shared.point(location)
+        return (Float(p.x), Float(p.y))
+    }
+
+    /// The touch moved: the bar moves if the core says so; moving it, or off the button, the press
+    /// is let go untapped.
+    private func moved(_ t: ModifyTouch, _ drag: DragGesture.Value) {
+        let p = Self.at(drag.location)
+        let shown = t.drag.moved(x: p.x, y: p.y, ms: Self.ms(drag))
+        model.sideBarDragged(shown)
+        if t.pressing, shown.state == .moving || !t.button.contains(drag.location) {
+            t.pressing = false
+            model.modifyReleased(cancelled: true)
+        }
+    }
+
+    /// The touch is over (`cancelled`: taken back, or let go off the button).
+    private func letGo(_ t: ModifyTouch, cancelled: Bool) {
+        touch = nil
+        model.sideBarLetGo(t.drag.letGo())
+        if t.pressing {
+            t.pressing = false
+            model.modifyReleased(cancelled: cancelled)
+        }
+    }
+
+    var body: some View {
+        GeometryReader { place in
+            RoundedRectangle(cornerRadius: Pc.modifyCorner - Pc.modifyStroke / 2, style: .circular)
+                .stroke(model.pickNext ? Pc.accent : Pc.sideGlyph, lineWidth: Pc.modifyStroke)
+                .padding(Pc.modifyStroke / 2)
+                .frame(width: Pc.modifySize, height: Pc.modifySize)
+                .frame(width: 40, height: 41)
+                .contentShape(Rectangle())
+                // on the window: the bar may move under the finger
+                .gesture(
+                    DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                        .updating($pressing) { _, down, _ in down = true }
+                        .onChanged { drag in
+                            if let t = touch {
+                                moved(t, drag)
+                                return
+                            }
+                            model.modifyPressed()
+                            let start = Self.at(drag.startLocation)
+                            let t = ModifyTouch(
+                                drag: model.sideBarDrag(x: start.x, y: start.y, ms: Self.ms(drag), windowHeight: windowHeight),
+                                button: place.frame(in: .global)
+                            )
+                            touch = t
+                            if drag.location != drag.startLocation {
+                                moved(t, drag)
+                            }
+                        }
+                        .onEnded { drag in
+                            guard let t = touch else { return }
+                            letGo(t, cancelled: !t.button.contains(drag.location))
+                        }
+                )
+        }
+        .frame(width: 40, height: 41)
+        // taken back by the system, no end comes: let go of it all the same (after an end that
+        // may yet come)
+        .onChange(of: pressing) { _, down in
+            guard !down, let t = touch else { return }
+            DispatchQueue.main.async {
+                if touch === t {
+                    letGo(t, cancelled: true)
+                }
+            }
+        }
+    }
+}
+
+extension CanvasModel {
+    /// A touch on the modify button at (`x`, `y`) at `ms` (the side bar's points, on the window) in
+    /// a window `windowHeight` tall: the core's drag, which says when it moves the bar.
+    func sideBarDrag(x: Float, y: Float, ms: Double, windowHeight: CGFloat) -> SideBarDrag {
+        SideBarDrag(
+            x: x, y: y, ms: ms, right: AppSettings.shared.rightHanded, height: Float(windowHeight),
+            topBar: Float(Pc.barHeight), centre: sideBarCentre
+        )
+    }
+
+    /// The modify button's drag moved: the bar follows while it moves it.
+    func sideBarDragged(_ shown: SideBarShown) {
+        if shown.state == .moving {
+            sideBarMoving = shown
+        }
+    }
+
+    /// The modify button let go: a bar it moved settles back to its width, inside its room, and
+    /// its place is kept.
+    func sideBarLetGo(_ shown: SideBarShown) {
+        guard shown.state == .moving else {
+            sideBarMoving = nil
+            return
+        }
+        UserDefaults.standard.set(shown.centre, forKey: sideBarCentreKey())
+        withAnimation(sideBarSettle) {
+            sideBarCentre = shown.centre
+            sideBarMoving = nil
+        }
+    }
+}
+
+/// The side bar settling into its width and place once its drag is let go.
+private let sideBarSettle = Motion.easeOut(0.15)
 
 private struct SideButton: View {
     let icon: PcIcon

@@ -173,30 +173,36 @@ fn gpu_line(log: &str) -> Option<&str> {
     log.lines().rev().find_map(|line| line.find("] GPU: ").and_then(|at| line.get(at + 7..)))
 }
 
-/// The core's log to Android's (through `android`) and into the file, from `info` up.
-#[cfg(target_os = "android")]
-pub(crate) fn install(android: android_logger::AndroidLogger) {
-    struct Both(android_logger::AndroidLogger);
-
-    impl log::Log for Both {
-        fn enabled(&self, metadata: &log::Metadata) -> bool {
-            metadata.level() <= log::Level::Info
-        }
-
-        fn log(&self, record: &log::Record) {
-            if !self.enabled(record.metadata()) {
-                return;
-            }
-            log::Log::log(&self.0, record);
-            write(&line(record.level(), record.target(), &record.args().to_string()));
-        }
-
-        fn flush(&self) {}
-    }
-
-    if log::set_logger(Box::leak(Box::new(Both(android)))).is_ok() {
+/// The core's log into the file, from `info` up, and to the platform's own log (`system`: Android's)
+/// where it has one the core writes to.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub(crate) fn install(system: Option<Box<dyn log::Log>>) {
+    if log::set_logger(Box::leak(Box::new(Both(system)))).is_ok() {
         log::set_max_level(log::LevelFilter::Info);
     }
+}
+
+/// The core's log into the file, and to the platform's own log if it has one.
+#[cfg(any(target_os = "android", target_os = "ios", test))]
+struct Both(Option<Box<dyn log::Log>>);
+
+#[cfg(any(target_os = "android", target_os = "ios", test))]
+impl log::Log for Both {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Info
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        if let Some(system) = &self.0 {
+            system.log(record);
+        }
+        write(&line(record.level(), record.target(), &record.args().to_string()));
+    }
+
+    fn flush(&self) {}
 }
 
 /// A line of the log: how long after it began, how serious, where from, and what.
@@ -861,6 +867,38 @@ mod tests {
             )
         );
         fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn the_core_s_log_goes_on_to_the_platform_s_from_info_up() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counted(Arc<AtomicUsize>);
+        impl log::Log for Counted {
+            fn enabled(&self, _: &log::Metadata) -> bool {
+                true
+            }
+            fn log(&self, _: &log::Record) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn flush(&self) {}
+        }
+        let heard = Arc::new(AtomicUsize::new(0));
+        let both = Both(Some(Box::new(Counted(Arc::clone(&heard)))));
+        for level in [log::Level::Error, log::Level::Warn, log::Level::Info, log::Level::Debug, log::Level::Trace] {
+            log::Log::log(
+                &both,
+                &log::Record::builder().level(level).target("procraft").args(format_args!("a line")).build(),
+            );
+        }
+        // error, warn and info reach it; debug and trace don't
+        assert_eq!(heard.load(Ordering::SeqCst), 3);
+        assert!(!log::Log::enabled(&both, &log::Metadata::builder().level(log::Level::Debug).build()));
+        // without a platform's log (the iPad's), lines go to the file alone, and nothing fails
+        log::Log::log(
+            &Both(None),
+            &log::Record::builder().level(log::Level::Warn).args(format_args!("a line")).build(),
+        );
     }
 
     #[test]

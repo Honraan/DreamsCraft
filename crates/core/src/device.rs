@@ -127,15 +127,18 @@ pub fn set_gpu_record_folder(dir: String, build: String) {
 
 /// The log, to Android's (tag "procraft") and to the app's log file once that has begun (see
 /// `app_log`), with a panic's message and place in it (the platform drops what the standard error
-/// says); once.
+/// says); once. On the iPad, to the file alone: the app's share of the system's log is its own.
 pub(crate) fn start_log() {
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
-            crate::app_log::install(android_logger::AndroidLogger::new(
+            #[cfg(target_os = "android")]
+            crate::app_log::install(Some(Box::new(android_logger::AndroidLogger::new(
                 android_logger::Config::default().with_max_level(log::LevelFilter::Info).with_tag("procraft"),
-            ));
+            ))));
+            #[cfg(target_os = "ios")]
+            crate::app_log::install(None);
             let before = std::panic::take_hook();
             std::panic::set_hook(Box::new(move |info| {
                 log::error!("{info}");

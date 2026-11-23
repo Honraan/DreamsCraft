@@ -114,6 +114,8 @@ final class CanvasModel {
     private(set) var barsHidden = false
     /// The eyedropper, while it is open.
     private(set) var picking: PickState?
+    /// Liquify's ring where its brush is on the canvas or the Pencil hovers, while it shows.
+    private(set) var liquifyRing: LiquifyRing?
     @ObservationIgnored private var pendingPick: (x: Float, y: Float)?
     @ObservationIgnored private var pickRunning = false
     @ObservationIgnored private var pickEnding = false
@@ -192,6 +194,13 @@ final class CanvasModel {
     var showSideBar = true {
         didSet { applyFitInsets() }
     }
+    /// The side bar's centre down its edge, a share of the window's height, kept from one start to
+    /// the next (the same for either edge and either way up). Moved by dragging the modify button.
+    var sideBarCentre = sideBarKeptCentre(
+        kept: (UserDefaults.standard.object(forKey: sideBarCentreKey()) as? NSNumber)?.floatValue ?? sideBarFirstCentre()
+    )
+    /// Where the side bar shows while the modify button drags it (none at its place).
+    var sideBarMoving: SideBarShown?
     /// Share's animated export, while its screen is up.
     var animatedExport: AnimatedFormat?
     /// A CMYK canvas's inks for the Value picker: the inks a canvas colour prints with, and back.
@@ -314,6 +323,8 @@ final class CanvasModel {
     @ObservationIgnored private(set) lazy var timeLapse = TimeLapseTool(model: self)
     @ObservationIgnored private(set) lazy var animationAssist = AnimationAssist(model: self)
     @ObservationIgnored private(set) lazy var text = TextTool(model: self)
+    /// The model the artwork paints on, if it is one.
+    @ObservationIgnored private(set) lazy var scene = ModelScene(model: self)
     /// The middle of the screen, window pixels.
     @ObservationIgnored var screenCentre = CGPoint.zero
     /// The layer whose opacity a drag changes, while the mode is on, and its opacity as it is dragged.
@@ -339,6 +350,8 @@ final class CanvasModel {
     /// The palette shown under the history in the other colour modes.
     private(set) var defaultPalette = 0
     var harmonyKind = HarmonyKind.complementary
+    /// Where the colour painted with stands in the colour model, kept while it is still the colour.
+    @ObservationIgnored let colourPlace = ColourPlace()
     /// The background's colour being picked, instead of the layers.
     var backgroundPick: HeldColor?
     /// A question open over everything.
@@ -386,6 +399,8 @@ final class CanvasModel {
         readSliders()
         refresh()
         pushSecondary()
+        // a model is lit, and its meshes read, as it opens
+        scene.start()
         activeSince = Date()
         watchSaves()
     }
@@ -495,6 +510,24 @@ final class CanvasModel {
         setChoice[Int(b.set)] = Int(b.index)
         readSliders()
         keepChoices()
+    }
+
+    /// The colour and the brush as a plugin's action or panel left them (it may set either).
+    func followPluginBrush() {
+        let c = session.color()
+        if c.count >= 3 {
+            let rgb = c.prefix(3).map { UInt32((min(max($0, 0), 1) * 255).rounded()) }
+            let packed = rgb[0] << 16 | rgb[1] << 8 | rgb[2]
+            if packed != colorRgb() {
+                setRgb(packed)
+            }
+        }
+        let brush = session.currentBrush()
+        if brush.set != currentBrush?.set || brush.index != currentBrush?.index {
+            currentBrush = brush
+            readSliders()
+            keepChoices()
+        }
     }
 
     /// Each set's last choice, as the library read last has it.
@@ -613,13 +646,16 @@ final class CanvasModel {
         }
     }
 
-    /// `b` dragged and let go at place `index` of set `set`: along its own set it moves there; onto
-    /// another set it is copied there, the one dragged staying where it was (the core's rule).
-    func dropBrush(_ b: BrushInfo, set: Int, index: Int) {
-        if set == Int(b.set), index == Int(b.index) {
+    /// `brushes` (of one set) dragged together and let go at place `index` of set `set`: along
+    /// their own set they move there, the first taking it and the rest after it; onto another set
+    /// they are copied there, those dragged staying where they were (the core's rule).
+    func dropBrushes(_ brushes: [BrushInfo], set: Int, index: Int) {
+        guard let first = brushes.first else { return }
+        if brushes.count == 1, set == Int(first.set), index == Int(first.index) {
             return
         }
-        if session.dropBrushes(set: b.set, indices: [b.index], toSet: UInt32(set), toIndex: UInt32(index)) {
+        let indices = brushes.filter { $0.set == first.set }.map(\.index)
+        if session.dropBrushes(set: first.set, indices: indices, toSet: UInt32(set), toIndex: UInt32(index)) {
             libraryChanged()
         }
     }
@@ -1123,6 +1159,7 @@ final class CanvasModel {
     /// Whether the side bar shows: a mode taking the screen slides it off its edge.
     var sideBarShown: Bool {
         showSideBar && !transforming && !selecting && crop.shown == nil && opacityLayer == nil && !guide.editing && text.info == nil
+            && !scene.studioOpen
             && (!adjusting || adjustShown?.pencil == true)
     }
 
@@ -1221,6 +1258,11 @@ final class CanvasModel {
 
     /// The transform button: opens transform on the current layer, or keeps it and closes.
     func toggleTransform() {
+        // a picture being placed on a model is kept
+        if scene.placing {
+            scene.endPicture(keep: true)
+            return
+        }
         if transforming {
             _ = switchModes(.transform)
             return
@@ -1364,6 +1406,7 @@ final class CanvasModel {
         adjustMenuAt = nil
         adjustModesOpen = false
         liquifyPopup = 0
+        liquifyRing = nil
         let painted = adjustShown?.pencil == true
         _ = session.adjustmentEnd(commit: commit)
         if commit {
@@ -1431,6 +1474,25 @@ final class CanvasModel {
     func changeLiquifyAmount(_ amount: Float) {
         session.adjustmentLiquifyAmount(amount: amount)
         readAdjust()
+    }
+
+    /// The finger let go of Adjust's slider: that drag is an undo step of its own.
+    func letGoLiquifyAmount() {
+        session.adjustmentLiquifyAmountEnd()
+        refreshFlags()
+    }
+
+    /// Shows Liquify's ring at `at` (points; none hides it), as big as its brush reaches at the
+    /// zoom, while Liquify is open.
+    func showLiquifyRing(_ at: CGPoint?) {
+        guard let at, adjustment == .liquify else {
+            if liquifyRing != nil {
+                liquifyRing = nil
+            }
+            return
+        }
+        let reach = CGFloat(liquifyReach(size: liquifyValue(0)) * session.info().zoom) / pixels
+        liquifyRing = LiquifyRing(at: at, radius: reach)
     }
 
     func resetLiquify() {
@@ -1558,6 +1620,8 @@ final class CanvasModel {
         if could || name != nil {
             showNotice("Undo" + (name.map { " \($0)" } ?? ""))
         }
+        // a model's tile chosen before comes back, with its channel's colour
+        scene.followStep()
         // cloning, the core put the source back where it was before the stroke
         if adjustment != nil {
             readAdjust()
@@ -1589,6 +1653,7 @@ final class CanvasModel {
         if could {
             showNotice("Redo" + (name.map { " \($0)" } ?? ""))
         }
+        scene.followStep()
         if adjustment != nil {
             readAdjust()
         }
@@ -1596,6 +1661,11 @@ final class CanvasModel {
     }
 
     /// Reads again what the core may have changed (a stroke, an undo).
+    /// The layers' rows read again (a plugin turned on or off may label them).
+    func readLayers() {
+        layers = session.layers()
+    }
+
     func refresh() {
         reference.refresh()
         timeLapse.record()
@@ -1755,8 +1825,10 @@ final class CanvasModel {
             showNotice("This picture can't be opened.", warning: true)
             return
         }
-        // a mask that takes what is pasted has no use for a copy of the picture
-        if !isPrivate, session.pastesIntoMask(), let image = GalleryModel.decode(bytes, p3: CanvasSpace.shared.p3)?.image {
+        // a mask that takes what is pasted has no use for a copy of the picture (on a model it is
+        // placed on the surface)
+        if !isPrivate, !scene.shown, session.pastesIntoMask(),
+           let image = GalleryModel.decode(bytes, p3: CanvasSpace.shared.p3)?.image {
             let session = session
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 let pasted = session.pastePictureIntoMask(image: image)
@@ -1776,6 +1848,11 @@ final class CanvasModel {
 
     /// A copy (`image`) on a new layer; a private one is left out of the gallery's thumbnail.
     private func paste(_ image: ThumbnailImage, isPrivate: Bool) {
+        // on a model it is placed on the surface, not in the texture
+        if scene.shown {
+            scene.beginPicture(image, straight: false)
+            return
+        }
         // through a plugin it takes a moment on a big canvas: the screen doesn't wait for it
         if !isPrivate, session.pastesIntoMask() {
             closePanels()
@@ -2177,6 +2254,11 @@ final class CanvasModel {
     /// Layer Select held at window point (`x`, `y`): the layer drawn there becomes current; more
     /// than one there, a list offers the rest.
     func layerSelect(x: Float, y: Float) {
+        // on a model, the mesh there is picked
+        if scene.shown {
+            scene.pickAt(x: x, y: y)
+            return
+        }
         let ids = session.layersAt(x: x, y: y)
         guard let first = ids.first else {
             showNotice("Nothing is drawn there.")
@@ -2222,6 +2304,7 @@ final class CanvasModel {
                 break
             case .meshHidden, .meshLocked:
                 session.freeMeantMeshes()
+                scene.readMeshes()
             case .alphaLocked:
                 if b.layer.alphaLock {
                     toggleAlphaLock(b.layer)
@@ -2263,8 +2346,9 @@ final class CanvasModel {
     /// thread; points that arrive meanwhile replace each other.
     func pick(x: Float, y: Float) {
         pendingPick = (x, y)
+        // its loupe on the Pencil's tip, or clear above a finger, as the touches say it was opened
         if picking == nil {
-            picking = PickState(x: x, y: y, image: nil, rgb: nil)
+            picking = PickState(x: x, y: y, image: nil, rgb: nil, lift: session.pickLoupeLift())
         }
         if !pickRunning {
             pickRunning = true
@@ -2289,7 +2373,7 @@ final class CanvasModel {
             DispatchQueue.main.async {
                 guard let self else { return }
                 if let now = self.picking {
-                    self.picking = PickState(x: x, y: y, image: image ?? now.image, rgb: seen?.rgb ?? now.rgb)
+                    self.picking = PickState(x: x, y: y, image: image ?? now.image, rgb: seen?.rgb ?? now.rgb, lift: now.lift)
                 }
                 self.readPick()
             }
@@ -2298,8 +2382,12 @@ final class CanvasModel {
 
     /// The eyedropper over the reference window's picture, the finger at `at` on the screen: what
     /// it sees there, already read.
-    func pickFromReference(_ image: UIImage?, rgb: UInt32?, at: CGPoint) {
-        picking = PickState(x: Float(at.x * pixels), y: Float(at.y * pixels), image: image, rgb: rgb, fromReference: true)
+    func pickFromReference(_ image: UIImage?, rgb: UInt32?, at: CGPoint, pen: Bool) {
+        // on the Pencil's tip, as on the canvas; clear above a finger
+        picking = PickState(
+            x: Float(at.x * pixels), y: Float(at.y * pixels), image: image, rgb: rgb, fromReference: true,
+            lift: pen ? 0 : fingerLoupeLift
+        )
     }
 
     /// The eyedropper lets go: its colour becomes the current one (a quick tap ends before the

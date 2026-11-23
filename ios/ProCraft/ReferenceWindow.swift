@@ -25,6 +25,8 @@ private let firstSize = CGSize(width: 350, height: 423)
 /// How far above the screen's foot it starts.
 private let firstBottom: CGFloat = 50
 private let bars = topBarHeight + bottomBarHeight
+/// The side a model's picture is read at for the window.
+private let modelPixels: UInt32 = 720
 /// How long between reads of the canvas for the window (each at the size the window shows it: the
 /// core's referenceCanvasSide).
 private let readEvery = 0.3
@@ -33,9 +35,9 @@ private let mostPicture = 4096
 /// The window the eyedropper shows, points across.
 private let pickWindow: CGFloat = 54
 
-/// What the window shows.
+/// What the window shows: on a model, the model itself through a camera of its own.
 enum ReferenceMode {
-    case canvas, image, face
+    case canvas, image, face, model
 }
 
 /// The reference window: where it is, what it shows, and how each picture sits in it. Each artwork
@@ -79,8 +81,8 @@ final class ReferenceTool {
         mode = switch w.shows {
         case .image: .image
         case .face: .face
-        // a model's own view is only on a model, which this app doesn't open yet
-        case .canvas, .model: .canvas
+        case .canvas: .canvas
+        case .model: .model
         }
         if w.sized {
             size = CGSize(width: CGFloat(w.width), height: CGFloat(w.height))
@@ -107,6 +109,7 @@ final class ReferenceTool {
         case .canvas: .canvas
         case .image: .image
         case .face: .face
+        case .model: .model
         }
         model.session.setReferenceWindow(state: ReferenceWindowState(
             shown: on, shows: shows, sized: size != firstSize,
@@ -144,7 +147,7 @@ final class ReferenceTool {
 
     var shown: UIImage? {
         switch mode {
-        case .canvas: canvas
+        case .canvas, .model: canvas
         case .image: image
         case .face: nil
         }
@@ -263,6 +266,12 @@ final class ReferenceTool {
     /// Fingers on the window's picture moved from `from` to `to` (their middle), `spread` times as
     /// far apart: the picture zooms and moves with them.
     func pinch(_ sizes: ReferenceSizes, from: CGPoint, to: CGPoint, spread: CGFloat) {
+        // the model turns under the finger, and doesn't move in the window
+        if mode == .model {
+            model.session.referenceModelTurn(dx: Float(to.x - from.x), dy: Float(to.y - from.y), side: sizes.windowWidth)
+            refresh()
+            return
+        }
         set(referenceViewPinched(
             view: view, sizes: sizes, fromX: Float(from.x), fromY: Float(from.y),
             toX: Float(to.x), toY: Float(to.y), spread: Float(spread)
@@ -310,7 +319,7 @@ final class ReferenceTool {
     /// The eyedropper over the picture at `place` (`referencePicturePoint`'s: its point, and how many
     /// of its pixels a point spans), the finger at `at` on the screen: the colour there and what is
     /// around it.
-    func pick(_ picture: UIImage, _ place: [Float], at: CGPoint) {
+    func pick(_ picture: UIImage, _ place: [Float], at: CGPoint, pen: Bool) {
         guard let image = picture.cgImage, place.count >= 3 else { return }
         let x = min(max(Int(place[0]), 0), image.width - 1)
         let y = min(max(Int(place[1]), 0), image.height - 1)
@@ -319,12 +328,12 @@ final class ReferenceTool {
         let left = min(max(x - n / 2, 0), image.width - n)
         let top = min(max(y - n / 2, 0), image.height - n)
         let around = image.cropping(to: CGRect(x: left, y: top, width: n, height: n)).map { UIImage(cgImage: $0) }
-        model.pickFromReference(around, rgb: Self.rgb(of: image, x: x, y: y), at: at)
+        model.pickFromReference(around, rgb: Self.rgb(of: image, x: x, y: y), at: at, pen: pen)
     }
 
     /// Reads the canvas again for the window, at most every so often while changes come.
     func refresh() {
-        guard on, mode == .canvas else { return }
+        guard on, mode == .canvas || mode == .model else { return }
         if reading {
             stale = true
             return
@@ -336,10 +345,12 @@ final class ReferenceTool {
     private func read() {
         stale = false
         let session = model.session
-        // as sharp as the window shows it, zoomed as it is (not a few hundred pixels blown up)
+        // as sharp as the window shows it, zoomed as it is (not a few hundred pixels blown up); a
+        // model through its own camera
         let side = canvasSide()
+        let ofModel = mode == .model
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let read = session.canvasThumbnail(maxSide: side)
+            let read = ofModel ? session.referenceModelPicture(side: modelPixels) : session.canvasThumbnail(maxSide: side)
             let picture = read.flatMap { CanvasModel.image($0) }
             let whole = read?.width == session.info().width
             DispatchQueue.main.async {
@@ -421,13 +432,13 @@ struct ReferenceWindow: View {
                     tool.pinch(Self.sizes(area, shown), from: from, to: to, spread: spread)
                 }
             },
-            onPick: { point, area in
+            onPick: { point, area, pen in
                 guard let shown = tool.shown else { return }
                 let place = referencePicturePoint(
                     view: tool.view, sizes: Self.sizes(area, shown), x: Float(point.x), y: Float(point.y)
                 )
                 if let place {
-                    tool.pick(shown, place, at: CGPoint(x: at.x + point.x, y: at.y + point.y))
+                    tool.pick(shown, place, at: CGPoint(x: at.x + point.x, y: at.y + point.y), pen: pen)
                 }
             },
             onPickEnd: {
@@ -440,7 +451,7 @@ struct ReferenceWindow: View {
 
     @ViewBuilder private var empty: some View {
         switch tool.mode {
-        case .canvas:
+        case .canvas, .model:
             EmptyView()
         case .image:
             if tool.image == nil {
@@ -523,7 +534,12 @@ struct ReferenceWindow: View {
         HStack(spacing: 11) {
             segment(.canvas, "Canvas")
             segment(.image, "Image")
-            segment(.face, "Face")
+            // on a model the third is the model itself
+            if model.scene.open {
+                segment(.model, "3D")
+            } else {
+                segment(.face, "Face")
+            }
         }
         .padding(2)
         .frame(width: 270, height: 35)
@@ -618,7 +634,8 @@ private struct ReferenceTouches: UIViewRepresentable {
     let onDoubleTap: () -> Void
     /// Their middle from, to, how many times as far apart, and the picture's area.
     let onMove: (CGPoint, CGPoint, CGFloat, CGSize) -> Void
-    let onPick: (CGPoint, CGSize) -> Void
+    /// Where it picks, the picture's area, and whether the Pencil (not a finger) holds it.
+    let onPick: (CGPoint, CGSize, Bool) -> Void
     let onPickEnd: () -> Void
 
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
@@ -629,6 +646,8 @@ private struct ReferenceTouches: UIViewRepresentable {
         private let pan = UIPanGestureRecognizer()
         private var last = CGPoint.zero
         private var fingers = 0
+        /// The hold for the eyedropper is the Pencil's.
+        private var pencil = false
 
         init(_ touches: ReferenceTouches) {
             self.touches = touches
@@ -643,6 +662,7 @@ private struct ReferenceTouches: UIViewRepresentable {
             held.addTarget(self, action: #selector(Coordinator.picked(_:)))
             pan.delegate = self
             pinch.delegate = self
+            held.delegate = self
             for recognizer in [two, one, pan, pinch, held] as [UIGestureRecognizer] {
                 view.addGestureRecognizer(recognizer)
             }
@@ -652,6 +672,14 @@ private struct ReferenceTouches: UIViewRepresentable {
             touches = next
             held.minimumPressDuration = max(next.hold, 0.05)
             held.isEnabled = next.canPick
+        }
+
+        /// Whether the touch the hold takes is the Pencil's, for the loupe to sit on its tip.
+        func gestureRecognizer(_ g: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+            if g === held {
+                pencil = touch.type == .pencil
+            }
+            return true
         }
 
         /// A pan and a pinch go together; nothing else does.
@@ -691,7 +719,7 @@ private struct ReferenceTouches: UIViewRepresentable {
         @objc func picked(_ recognizer: UILongPressGestureRecognizer) {
             switch recognizer.state {
             case .began, .changed:
-                touches.onPick(recognizer.location(in: view), view.bounds.size)
+                touches.onPick(recognizer.location(in: view), view.bounds.size, pencil)
             case .ended, .cancelled, .failed:
                 touches.onPickEnd()
             default:

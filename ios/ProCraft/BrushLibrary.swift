@@ -117,6 +117,8 @@ private final class LibraryUi {
     /// when the library opens.
     var searchAway = searchBlock
     var dragged: BrushInfo?
+    /// The brushes going with it (it among them, those picked in its set), in their order.
+    var draggedWith: [BrushInfo] = []
     var draggedSet: Int?
     /// Where the finger is, and where on the row it took hold.
     var dragAt = CGPoint.zero
@@ -134,6 +136,14 @@ private final class LibraryUi {
         dragged != nil || draggedSet != nil
     }
 
+    /// Whether `b` is being dragged, alone or with others.
+    func isDragged(_ b: BrushInfo) -> Bool {
+        if draggedWith.isEmpty {
+            return dragged == b
+        }
+        return draggedWith.contains { $0.set == b.set && $0.index == b.index }
+    }
+
     /// Whether the dragged brush would be copied where the finger is now (onto another set, or a
     /// brush of another set), as the green plus on it says.
     var dropCopies: Bool {
@@ -146,19 +156,23 @@ private final class LibraryUi {
         return brushDropCopies(from: b.set, to: UInt32(set))
     }
 
-    /// A brush let go of: onto another set, copied to its top; onto a brush of the shown set, to its
-    /// place (copied there from another set, moved along its own).
+    /// A brush let go of, with those going with it: onto another set, copied to its top; onto a
+    /// brush of the shown set not among them, to its place (copied there from another set, moved
+    /// along their own).
     func dropBrush(_ model: CanvasModel, shown: [BrushInfo]) {
         guard let b = dragged else { return }
+        let moving = draggedWith.isEmpty ? [b] : draggedWith
         dragged = nil
+        draggedWith = []
         if let set = setFrames.first(where: { $0.value.contains(dragAt) })?.key {
             if set != Int(b.set) {
-                model.dropBrush(b, set: set, index: 0)
+                model.dropBrushes(moving, set: set, index: 0)
             }
             return
         }
-        if let target = shown.first(where: { brushFrames[CanvasModel.brushKey($0)]?.contains(dragAt) == true }) {
-            model.dropBrush(b, set: Int(target.set), index: Int(target.index))
+        if let target = shown.first(where: { brushFrames[CanvasModel.brushKey($0)]?.contains(dragAt) == true }),
+           !moving.contains(where: { $0.set == target.set && $0.index == target.index }) {
+            model.dropBrushes(moving, set: Int(target.set), index: Int(target.index))
         }
     }
 
@@ -996,7 +1010,7 @@ private struct BrushRow: View {
             }
             .frame(maxWidth: .infinity, minHeight: brushHeight, maxHeight: brushHeight, alignment: .topLeading)
             .clipShape(shape)
-            .opacity(ui.dragged == brush ? 0.3 : 1)
+            .opacity(ui.isDragged(brush) ? 0.3 : 1)
             .background(GeometryReader { g in
                 Color.clear.preference(key: BrushFrames.self, value: [key: g.frame(in: .named(librarySpace))])
             })
@@ -1030,6 +1044,9 @@ private struct BrushRow: View {
                     withAnimation(Motion.menuClose) { ui.brushMenu = nil }
                     let frame = ui.brushFrames[key] ?? .zero
                     ui.grab = CGPoint(x: at.x - frame.minX, y: at.y - frame.minY)
+                    // the brushes picked in its set go with it, when it is one of them
+                    let set = model.brushSets.indices.contains(Int(brush.set)) ? model.brushSets[Int(brush.set)].brushes : []
+                    ui.draggedWith = draggedTogether(brush, picked: model.pickedBrushes, selected: selected, brushes: set)
                     ui.dragged = brush
                 },
                 ended: { ui.dropBrush(model, shown: listed) }
@@ -1042,6 +1059,17 @@ private struct BrushRow: View {
             }
         }
     }
+}
+
+/// The brushes dragged with `held`: those picked (`picked`, by place "set-index") in its set and
+/// it, in their order in its set (`brushes`), when it is one of them (the current brush,
+/// `selected`, counts as picked); else it alone.
+private func draggedTogether(_ held: BrushInfo, picked: [String], selected: Bool, brushes: [BrushInfo]) -> [BrushInfo] {
+    if picked.isEmpty || (!picked.contains(CanvasModel.brushKey(held)) && !selected) {
+        return [held]
+    }
+    let going = brushes.filter { $0.set == held.set && (picked.contains(CanvasModel.brushKey($0)) || $0.index == held.index) }
+    return going.isEmpty ? [held] : going
 }
 
 /// The dragged brush or set, following the finger.
@@ -1068,6 +1096,19 @@ private struct DragGhost: View {
             }
             .frame(width: ui.brushFrames[key]?.width ?? 0, height: brushHeight)
             .clipShape(shape)
+            // several going together: how many
+            .overlay(alignment: .topTrailing) {
+                if ui.draggedWith.count > 1 {
+                    Text(verbatim: "\(ui.draggedWith.count)")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Pc.rowSelected)
+                        .lineLimit(1)
+                        .frame(width: 24, height: 24)
+                        .background(Circle().fill(Color.white))
+                        .padding(.top, 8)
+                        .padding(.trailing, 8)
+                }
+            }
             // over another set it would be copied into: a green plus on its corner
             .overlay(alignment: .topTrailing) {
                 if ui.dropCopies {

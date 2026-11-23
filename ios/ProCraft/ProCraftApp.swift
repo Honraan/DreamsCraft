@@ -9,6 +9,8 @@ import UniformTypeIdentifiers
 @main
 struct ProCraftApp: App {
     init() {
+        // the log kept in a file too, for Help's Share log
+        AppLog.start()
         // the layers' textures may take a quarter of what the app may use (an iPad app is ended
         // well short of the device's memory); none said (the simulator), all of them
         let available = os_proc_available_memory()
@@ -16,6 +18,9 @@ struct ProCraftApp: App {
             setResidentBudget(bytes: UInt64(available / 4))
         }
         TextFonts.prepare()
+        // artworks being opened, noted until they show: one the app ended while opening is asked
+        // about when next picked, not opened at once into the same end
+        setOpenMarksFile(path: Gallery.openMarks.path)
         // the GPU device and the canvases' pipelines made ahead of the first artwork
         DispatchQueue.global(qos: .userInitiated).async { warmGpu() }
     }
@@ -27,15 +32,19 @@ struct ProCraftApp: App {
     }
 }
 
-/// An artwork open on the canvas, and its folder in the gallery.
+/// An artwork open on the canvas, and its folder in the gallery; opened from the gallery's Share for
+/// an animated export alone, which format.
 struct OpenArtwork {
     let session: CanvasSession
     let dir: String
+    var animated: AnimatedFormat? = nil
 }
 
 /// The gallery, or the artwork open in place of it.
 struct RootView: View {
     @State private var open: CanvasModel?
+    /// The artwork open was opened for its animated export alone: when that ends, it closes.
+    @State private var exportOnly = false
 
     @ViewBuilder private var screens: some View {
         if let open {
@@ -46,14 +55,70 @@ struct RootView: View {
         } else {
             GalleryView { artwork in
                 let model = CanvasModel(session: artwork.session, dir: artwork.dir)
-                model.onClose = { self.open = nil }
+                model.onClose = {
+                    self.open = nil
+                    self.exportOnly = false
+                }
                 self.open = model
+                if let format = artwork.animated {
+                    exportOnly = true
+                    startExport(format, on: model)
+                }
+            }
+        }
+    }
+
+    /// Opens `format`'s export over the artwork in `model` once its canvas is made (the frames are
+    /// read from it): a model's turntable, else its layers.
+    private func startExport(_ format: AnimatedFormat, on model: CanvasModel) {
+        Task { @MainActor in
+            while open === model, !model.session.canvasMade() {
+                try? await Task.sleep(for: .milliseconds(16))
+            }
+            guard open === model else { return }
+            if model.session.modelInfo() != nil {
+                model.scene.openAnimatedExport(format)
+            } else {
+                model.openAnimatedExport(format)
+            }
+        }
+    }
+
+    /// Whether `url` is a plugin file, by its name (the old ending still opens).
+    private static func isPluginFile(_ url: URL) -> Bool {
+        let name = url.lastPathComponent.lowercased()
+        return name.hasSuffix(".procraft-plugin") || name.hasSuffix(".procraftplugin")
+    }
+
+    /// Asks about the plugin file at `url`: nothing in it runs, and nothing is kept until it is
+    /// accepted. What can't be imported says why, on the canvas or the gallery. The system's copy
+    /// is moved where it is cleared away in time.
+    private func offerPlugin(_ url: URL) {
+        var file = url
+        if url.pathComponents.contains("Inbox") {
+            let moved = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString)-\(url.lastPathComponent)")
+            if (try? FileManager.default.moveItem(at: url, to: moved)) != nil {
+                file = moved
+            }
+        }
+        PluginsModel.shared.offer(file) { said in
+            if let open {
+                open.showNotice(said, warning: true)
+            } else {
+                GalleryModel.shared.message = said
             }
         }
     }
 
     var body: some View {
         screens
+            // an artwork opened from the gallery's Share for its animated export goes back once it ends
+            .onChange(of: open?.animatedExport == nil && open?.scene.animatedExport == nil) { _, ended in
+                if ended, exportOnly, let open {
+                    exportOnly = false
+                    open.onClose()
+                }
+            }
             .background {
                 GeometryReader { place in
                     Color.clear.onChange(of: place.size, initial: true) { _, size in
@@ -64,8 +129,13 @@ struct RootView: View {
             }
             .overlay { PluginAlerts() }
             // a file opened with the app is brought into the gallery, which shows: an open artwork
-            // is saved and closed first
+            // is saved and closed first. A plugin is asked about where the app stands: it needs no
+            // artwork closed
             .onOpenURL { url in
+                if Self.isPluginFile(url) {
+                    offerPlugin(url)
+                    return
+                }
                 open?.onClose()
                 GalleryModel.shared.importOpened(url)
             }

@@ -94,6 +94,10 @@ final class PluginsModel {
     private(set) var offer: PluginOffer?
     /// A plugin whose Remove was tapped, waiting on the alert that asks first.
     var removing: PluginInfo?
+    /// A texture control whose Textures sheet is open.
+    var texturing: TextureAsk?
+    /// The panel a plugin's action showed, while it is open.
+    private(set) var panel: PluginPanel?
     @ObservationIgnored private var offered: Data?
     @ObservationIgnored private var kept: [String: String]
     /// What the artwork open does about a change.
@@ -110,6 +114,13 @@ final class PluginsModel {
         }
         movedNotice = store.takeMovedNotice()
         read()
+        followLooks()
+    }
+
+    /// What the plugins change in how the interface looks: its accent, and the side bar's tracks.
+    private func followLooks() {
+        Look.shared.accentGiven = store.accentColour()
+        Look.shared.trackOpacity = store.sliderLook().trackOpacity
     }
 
     private func keep(_ key: String, _ value: String?) {
@@ -124,6 +135,7 @@ final class PluginsModel {
 
     private func changed() {
         read()
+        followLooks()
         changes += 1
         Interface.shared.ask()
         onChange()
@@ -144,6 +156,52 @@ final class PluginsModel {
     func setSwitch(_ key: String, _ on: Bool) {
         guard store.setSwitch(key: key, on: on) else { return }
         keep(key, on ? "true" : "false")
+        changed()
+    }
+
+    /// After a plugin's action or panel ran: the panel as it is now, and the controls it set kept as
+    /// the cards keep them.
+    func followRun() {
+        panel = store.panel()
+        keepControls(store.takeControlsSet())
+        read()
+    }
+
+    func closePanel() {
+        store.closePanel()
+        panel = nil
+    }
+
+    /// A choice picked from a plugin's menu by its `key`: the controls it set kept as the cards keep
+    /// them; one no plugin on offers changes nothing.
+    func choose(_ key: String) {
+        keepControls(store.choose(key: key))
+    }
+
+    /// Moves plugin `id` to place `to` on the Plugins page, the order kept for the next start; what
+    /// went wrong if it couldn't be.
+    func move(_ id: String, to: Int) -> String? {
+        let said = store.movePlugin(id: id, to: UInt32(max(to, 0)))
+        read()
+        return said
+    }
+
+    /// Plugins' controls `set` other than on their cards (a menu's choice, their own code): kept as
+    /// the cards keep them, and the artwork follows.
+    private func keepControls(_ given: [PluginControl]) {
+        guard !given.isEmpty else { return }
+        for control in given {
+            switch control {
+            case let .switch(one):
+                keep(one.key, one.on ? "true" : "false")
+            case let .slider(one):
+                keep(one.key, "\(one.value)")
+            case .file:
+                break
+            case let .texture(one):
+                keep(one.key, "\(one.value)")
+            }
+        }
         changed()
     }
 
@@ -176,6 +234,54 @@ final class PluginsModel {
     func clearFile(_ key: String) {
         if store.clearFile(key: key) {
             changed()
+        }
+    }
+
+    /// A plugin's texture control `key` set to `value` (a grain's number in the Source Library, 0
+    /// for none, below 0 one of the plugin's own pictures); whether there is such a control.
+    @discardableResult
+    func setTexture(_ key: String, _ value: Int32) -> Bool {
+        guard let landed = store.setTexture(key: key, value: value) else { return false }
+        keep(key, "\(landed)")
+        changed()
+        return true
+    }
+
+    /// A picture picked at `url` for a plugin's file control `key`: read in the background, then
+    /// kept with the plugin; `told` if it can't be used.
+    func pickPicture(_ key: String, from url: URL, told: @escaping (String) -> Void) {
+        keepPicture(key, from: url, told: told) { [weak self] in
+            self?.changed()
+        }
+    }
+
+    /// A picture picked at `url` into a plugin's file control `file`, then chosen for its texture
+    /// control `texture` as `value`; `told` if it can't be used.
+    func pickTexture(_ texture: String, file: String, value: Int32, from url: URL, told: @escaping (String) -> Void) {
+        keepPicture(file, from: url, told: told) { [weak self] in
+            guard let self else { return }
+            if !self.setTexture(texture, value) {
+                self.changed()
+            }
+        }
+    }
+
+    /// The picture at `url` kept for the file control `key` (a PNG or a JPEG, read in the
+    /// background), then `kept`; `told` if it can't be used.
+    private func keepPicture(_ key: String, from url: URL, told: @escaping (String) -> Void, kept: @escaping () -> Void) {
+        let name = url.lastPathComponent
+        let store = self.store
+        DispatchQueue.global(qos: .userInitiated).async {
+            let done = url.readPicked().map {
+                store.setPictureFile(key: key, name: name.isEmpty ? "Picture" : name, bytes: $0)
+            } ?? false
+            DispatchQueue.main.async {
+                if done {
+                    kept()
+                } else {
+                    told("This picture couldn't be used. Pick a PNG or a JPEG.")
+                }
+            }
         }
     }
 

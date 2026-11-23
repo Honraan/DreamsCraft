@@ -116,7 +116,8 @@ func loadDropped(_ session: any UIDropSession, done: @escaping ([URL], URL) -> V
 /// stacked with it, anywhere else on the grid it goes where it is let go. A stack moves within the
 /// gallery only. Near the grid's top or bottom the grid scrolls. Resting on a stack opens it and, in
 /// a stack, resting on the way back opens the gallery, the drag going on, so an artwork can be put
-/// in a stack where it is let go, or taken out of one. Files dragged in are imported, as Import's.
+/// in a stack where it is let go, or taken out of one; let go on the way back at once, it goes to the
+/// gallery's front. Files dragged in are imported, as Import's.
 final class GalleryDragger: NSObject, UIDragInteractionDelegate, UIDropInteractionDelegate {
     private let model: GalleryModel
     private let shown: GalleryDragShown
@@ -124,6 +125,8 @@ final class GalleryDragger: NSObject, UIDragInteractionDelegate, UIDropInteracti
     var canStart: () -> Bool = { false }
 
     private var at: DropAt?
+    /// It is over a stack's way back, which hasn't opened the gallery yet.
+    private var onBack = false
     private var rest: DispatchWorkItem?
     /// What it rests on: "" the way back, else a stack (by folder).
     private var restingOn: String?
@@ -307,7 +310,8 @@ final class GalleryDragger: NSObject, UIDragInteractionDelegate, UIDropInteracti
     }
 
     private func track(_ entry: GalleryEntry, at point: CGPoint, on window: UIView?) {
-        if model.openStack != nil, model.backAt.contains(point) {
+        onBack = model.openStack != nil && model.backAt.contains(point)
+        if onBack {
             at = nil
             scroll(0, on: window)
             showOnto(nil)
@@ -331,6 +335,7 @@ final class GalleryDragger: NSObject, UIDragInteractionDelegate, UIDropInteracti
 
     private func settle() {
         at = nil
+        onBack = false
         scroll(0, on: nil)
         stopResting()
         showOnto(nil)
@@ -363,6 +368,11 @@ final class GalleryDragger: NSObject, UIDragInteractionDelegate, UIDropInteracti
     func dropInteraction(_: UIDropInteraction, performDrop session: any UIDropSession) {
         guard let entry = ownEntry(session) else {
             bringIn(session)
+            return
+        }
+        // let go on the way back before it opened the gallery: out to the gallery's front
+        if onBack, model.openStack != nil {
+            model.takeOutOfStack(entry)
             return
         }
         guard let drop = at else { return }

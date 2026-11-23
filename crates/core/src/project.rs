@@ -2577,6 +2577,27 @@ pub fn package_time_lapse(path: String, dir: String) -> Result<Option<PackageTim
     }))
 }
 
+/// Keeps the preview the layered package at `path` brings (its `QuickLook/Thumbnail.png`) as the
+/// gallery's thumbnail of the artwork made of it in the folder `dir`, until that is opened and
+/// saved; false if it brings none (or it can't be kept).
+#[uniffi::export]
+pub fn keep_package_thumbnail(path: String, dir: String) -> bool {
+    let Ok(bytes) = fs::read(&path) else { return false };
+    let Some(png) = procraft_engine::zip::ZipReader::new(&bytes).and_then(|zip| zip.read(PACKAGE_PREVIEW)) else {
+        return false;
+    };
+    let kept = write_atomically(&Path::new(&dir).join("thumbnail.png"), |p| {
+        fs::write(p, &png).map_err(|e| file_error("keeping the package's preview", e))
+    });
+    if let Err(e) = &kept {
+        log::error!("{e}");
+    }
+    kept.is_ok()
+}
+
+/// Where a layered package keeps its preview.
+const PACKAGE_PREVIEW: &str = "QuickLook/Thumbnail.png";
+
 /// Makes the layered PSD (or PSB) at `path` an artwork named `name` in the folder `dir`: its
 /// layers, groups and masks, and its flattened picture as the gallery's thumbnail until opened.
 /// The file is only read, a part at a time where it is needed: each layer is read and written as
@@ -2729,6 +2750,40 @@ fn thumbnail_row(rgba: &[u8], width: u32, height: u32, tw: u32, th: u32, ty: u32
 #[cfg(test)]
 mod signature_tests {
     use super::*;
+
+    #[test]
+    fn a_package_s_preview_is_kept_as_the_thumbnail_until_opened() {
+        let root = std::env::temp_dir().join(format!("procraft-package-preview-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let preview: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        let with = root.join("with.procreate");
+        let mut zip = procraft_engine::zip::ZipWriter::new();
+        zip.add("Document.archive", b"plist");
+        zip.add(PACKAGE_PREVIEW, &preview);
+        fs::write(&with, zip.finish()).unwrap();
+        let without = root.join("without.procreate");
+        let mut zip = procraft_engine::zip::ZipWriter::new();
+        zip.add("Document.archive", b"plist");
+        fs::write(&without, zip.finish()).unwrap();
+        let dir = root.join("artwork");
+        fs::create_dir_all(&dir).unwrap();
+        let path = |p: &Path| p.to_string_lossy().into_owned();
+        // a package with a preview: its 1000 bytes, as they are
+        assert!(keep_package_thumbnail(path(&with), path(&dir)));
+        assert_eq!(fs::read(dir.join("thumbnail.png")).unwrap(), preview);
+        // one without, a file that isn't a zip, or none at all: nothing is kept, the thumbnail
+        // there before stays
+        fs::write(dir.join("thumbnail.png"), [7u8; 3]).unwrap();
+        assert!(!keep_package_thumbnail(path(&without), path(&dir)));
+        fs::write(root.join("not.zip"), b"not a zip").unwrap();
+        assert!(!keep_package_thumbnail(path(&root.join("not.zip")), path(&dir)));
+        assert!(!keep_package_thumbnail(path(&root.join("gone.procreate")), path(&dir)));
+        assert_eq!(fs::read(dir.join("thumbnail.png")).unwrap(), [7u8; 3]);
+        // no file left beside it by the writes
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn the_autosave_waits_longer_after_a_slow_save() {

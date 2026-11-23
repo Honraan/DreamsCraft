@@ -373,6 +373,12 @@ struct SelectionToolbar: View {
                 tool.openPopup(.saved)
             }
             ToolbarButton(icon: PcIcons.colorFill, label: "Color Fill", active: tool.colorFill, width: w, iconSize: 37) { tool.toggleColorFill() }
+            // on a model: a selection reaches every surface under it
+            if model.scene.open {
+                ToolbarButton(icon: PcIcons.xRay, label: "X-Ray", active: AppSettings.shared.selectionXRay, width: w, iconSize: 44) {
+                    model.scene.toggleXRay()
+                }
+            }
             ToolbarButton(icon: PcIcons.clearSelection, label: "Clear", enabled: has || drawing, width: w, iconSize: 44) { tool.clear() }
         }
     }

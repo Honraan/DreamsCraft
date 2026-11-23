@@ -31,6 +31,10 @@ targets:
       - path: ../android/app/src/main/assets/fonts
         type: folder
         buildPhase: resources
+      # the panoramas a model is lit by, the Android app's
+      - path: ../android/app/src/main/assets/environments
+        type: folder
+        buildPhase: resources
       # the licences of what the core and the app are made with
       - path: ../android/app/src/main/assets/licenses.txt
         buildPhase: resources
@@ -71,6 +75,10 @@ targets:
           - CFBundleTypeName: ProCraft artwork
             LSHandlerRank: Owner
             LSItemContentTypes: [io.github.artcraftandroid.procraft.artwork]
+          # asked about where the app stands, not brought into the gallery
+          - CFBundleTypeName: ProCraft plugin
+            LSHandlerRank: Owner
+            LSItemContentTypes: [io.github.artcraftandroid.procraft.plugin]
           - CFBundleTypeName: Artwork, brushes and palettes
             LSHandlerRank: Alternate
             LSItemContentTypes:
@@ -80,12 +88,23 @@ targets:
           - CFBundleTypeName: Pictures
             LSHandlerRank: Alternate
             LSItemContentTypes: [public.image, com.adobe.pdf, com.adobe.photoshop-image]
+          - CFBundleTypeName: 3D models
+            LSHandlerRank: Alternate
+            LSItemContentTypes:
+              - com.pixar.universal-scene-description-mobile
+              - com.pixar.universal-scene-description
+              - public.geometry-definition-format
         UTExportedTypeDeclarations:
           - UTTypeIdentifier: io.github.artcraftandroid.procraft.artwork
             UTTypeDescription: ProCraft artwork
             UTTypeConformsTo: [public.data, public.content]
             UTTypeTagSpecification:
               public.filename-extension: [procraft]
+          - UTTypeIdentifier: io.github.artcraftandroid.procraft.plugin
+            UTTypeDescription: ProCraft plugin
+            UTTypeConformsTo: [public.data, public.content]
+            UTTypeTagSpecification:
+              public.filename-extension: [procraft-plugin, procraftplugin]
         UTImportedTypeDeclarations:
           - UTTypeIdentifier: io.github.artcraftandroid.procraft.layered
             UTTypeDescription: Layered artwork
@@ -96,7 +115,7 @@ targets:
             UTTypeDescription: Brushes
             UTTypeConformsTo: [public.data, public.content]
             UTTypeTagSpecification:
-              public.filename-extension: [brush, brushset, brushlibrary, abr, gbr, gih, vbr, kpp, sut]
+              public.filename-extension: [brush, brushset, brushlibrary, abr, gbr, gih, vbr, kpp, sut, sutg]
           - UTTypeIdentifier: io.github.artcraftandroid.procraft.palette
             UTTypeDescription: Palette
             UTTypeConformsTo: [public.data, public.content]

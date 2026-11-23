@@ -14,6 +14,28 @@ extension CanvasModel {
         session.layerOptions(id: l.id)
     }
 
+    /// Closed group `group`'s layers, top first, as the panel would list them open: a group closed
+    /// inside it keeps its own layers out.
+    func shownInside(_ group: LayerInfo) -> [LayerInfo] {
+        let byId = Dictionary(layers.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        return layers.filter { l in
+            // the groups it is in, innermost first (a mask's, its layer's)
+            var at = l.kind == .mask ? byId[l.parent ?? 0]?.parent : l.parent
+            var steps = 0
+            while let id = at, steps <= layers.count {
+                if id == group.id {
+                    return true
+                }
+                if byId[id]?.collapsed == true {
+                    return false
+                }
+                at = byId[id]?.parent
+                steps += 1
+            }
+            return false
+        }
+    }
+
     /// The rows a drag of `l` takes along, it among them (the shared core decides).
     func movingWith(_ l: LayerInfo) -> Set<UInt64> {
         Set(session.movingWith(id: l.id))
@@ -42,6 +64,21 @@ extension CanvasModel {
     func setBlend(_ l: LayerInfo, _ blend: UInt32) {
         _ = session.setLayerBlend(id: l.id, blend: blend)
         refresh()
+    }
+
+    /// The blend list moving onto `blend`: it shows on `l` at once, the list's whole movement one
+    /// undo step.
+    func previewBlend(_ l: LayerInfo, _ blend: UInt32) {
+        if session.previewLayerBlend(id: l.id, blend: blend) {
+            refresh()
+        }
+    }
+
+    /// The blend list come to rest, or closed: what it showed as it moved is done.
+    func finishBlend() {
+        if session.finishLayerBlend() {
+            refresh()
+        }
     }
 
     func toggleAlphaLock(_ l: LayerInfo) {
@@ -78,6 +115,17 @@ extension CanvasModel {
             noRoomForLayers()
         }
         refresh()
+    }
+
+    /// Deletes `l`, asking first when the meshes of a model's texture set share it.
+    func deleteAsking(_ l: LayerInfo) {
+        guard scene.layersShared, !l.locked else {
+            delete(l)
+            return
+        }
+        question = Question(
+            title: "Delete shared layer?", message: "\u{201C}\(l.name)\u{201D} is on every mesh of this texture set."
+        ) { [weak self] in self?.delete(l) }
     }
 
     /// Delete on a locked layer's row is told about rather than done (as measured).
@@ -172,6 +220,14 @@ extension CanvasModel {
             noRoomForLayers()
         }
         refresh()
+    }
+
+    /// The actions the plugins on list in the Layers panel's `place`: the layer's options (after
+    /// the app's own) or rows under the background's.
+    func panelPluginActions(_ place: PluginPlace) -> [PluginAction] {
+        // asked again as the plugins change
+        _ = PluginsModel.shared.changes
+        return PluginsModel.shared.store.actionsIn(place: place)
     }
 
     /// The filter layers the plugins on offer (interface 17): the plus lists them.

@@ -123,9 +123,8 @@ struct GestureControls: View {
     private var page: some View {
         let settings = Gestures.shared
         let purpose = model.gesturePage
-        // painting models isn't here yet: its switch would do nothing; and the Pencil has no
-        // second button
-        let options = gestureOptions(purpose: purpose).filter { $0.key != "MODEL_FINGER" && !$0.secondButton }
+        // the Pencil has no button to hold down, nor a second one: it double-taps and squeezes
+        let options = gestureOptions(purpose: purpose).filter { !$0.secondButton && !$0.heldButton }
         return ScrollView {
             VStack(spacing: 0) {
                 VStack(spacing: 0) {
@@ -211,6 +210,16 @@ struct GestureControls: View {
     }
 }
 
+/// An option's name as the iPad says it: the pen's button is the Pencil's double-tap, its second
+/// the Pencil's squeeze.
+private func pencilLabel(_ option: GestureOption) -> String {
+    switch option.key {
+    case "PEN_DOUBLE_TAP": "Apple Pencil double-tap"
+    case "PEN_SQUEEZE": "Apple Pencil squeeze"
+    default: option.label
+    }
+}
+
 /// A way of touching: its name and what it does, and its switch.
 private struct OptionRow: View {
     let option: GestureOption
@@ -221,7 +230,7 @@ private struct OptionRow: View {
     var body: some View {
         HStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 0) {
-                Text(verbatim: option.label)
+                Text(verbatim: pencilLabel(option))
                     .font(.system(size: 18, weight: .medium))
                     .foregroundStyle(ink)
                     .lineLimit(1)

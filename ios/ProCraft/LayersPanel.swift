@@ -1,3 +1,4 @@
+import PhotosUI
 import SwiftUI
 import UIKit
 
@@ -9,6 +10,14 @@ private let rowGap: CGFloat = 1
 private let listCorner: CGFloat = 8
 private let groupHeight: CGFloat = 44
 private let groupIndent: CGFloat = 21
+/// A closed group's row is taller: its line (20 under the row's top and 20 over its bottom) opens
+/// into a window 4 in from them, on its layers' rows drawn small; opening or closing, over this long.
+private let groupClosedHeight: CGFloat = 82
+private let groupLineInset: CGFloat = 20
+private let groupWindowInset: CGFloat = 4
+private let groupTurn = 0.15
+/// The rows' width in the list, which a closed group's window draws its layers' rows to fit.
+private let listWidth: CGFloat = layersWidth - 24
 private let groupLine = Color(argb: 0xFF4E_4E4E)
 private let maskOwnerRow = Color(argb: 0xFF2C_5281)
 private let pickedRow = Color(argb: 0xFF2C_5281)
@@ -45,6 +54,80 @@ private let blendRowsBack = 0.12
 /// (of how far apart they were), as measured.
 private let squeezeFollow: CGFloat = 0.3
 private let pinchMerge: CGFloat = 0.65
+/// A dragged row this near an end of the list scrolls it, at most this far a second.
+private let dragEdge: CGFloat = 56
+private let dragScroll: CGFloat = 480
+/// A row's thumbnail (a group's line) held over by a dragged row long enough to take it.
+private let heldOutline = Color.white
+/// The rows standing aside for a dragged row, and coming back: a 0.3 s spring, damping 0.75.
+private let rowAside = Animation.spring(duration: 0.3, bounce: 0.25)
+
+/// Calls its tick once a frame with the seconds since the frame before, until the tick says to
+/// stop or it is stopped.
+private final class FrameLoop: NSObject {
+    private var link: CADisplayLink?
+    private var last: CFTimeInterval = 0
+    private var tick: ((CFTimeInterval) -> Bool)?
+
+    var running: Bool {
+        link != nil
+    }
+
+    func start(_ tick: @escaping (CFTimeInterval) -> Bool) {
+        stop()
+        self.tick = tick
+        last = CACurrentMediaTime()
+        let made = CADisplayLink(target: self, selector: #selector(step))
+        made.add(to: .main, forMode: .common)
+        link = made
+    }
+
+    func stop() {
+        link?.invalidate()
+        link = nil
+        tick = nil
+    }
+
+    @objc private func step() {
+        let now = CACurrentMediaTime()
+        let seconds = now - last
+        last = now
+        if tick?(seconds) != true {
+            stop()
+        }
+    }
+}
+
+/// How far row `id` stands aside while the rows of `unit` are dragged: the rows between where they
+/// were and where they land (`place`) take the room they left, so the gap shows where they will
+/// land; held onto a row, or over their own place, none moves.
+private func makingWay(_ id: UInt64, unit: Set<UInt64>, place: RowDrop?, rows: [UInt64: CGRect], gap: CGFloat) -> CGFloat {
+    guard !unit.contains(id), let row = rows[id] else { return 0 }
+    let moved = unit.compactMap { rows[$0] }
+    guard let top = moved.map(\.minY).min(), let bottom = moved.map(\.maxY).max() else { return 0 }
+    let room = bottom - top + gap
+    // the line between the rows they land between
+    let slot: CGFloat
+    switch place {
+    case let .above(target)?:
+        guard let r = rows[target] else { return 0 }
+        slot = r.minY
+    case let .below(target)?:
+        guard let r = rows[target] else { return 0 }
+        slot = r.maxY
+    case .bottom?:
+        slot = .infinity
+    default:
+        return 0
+    }
+    if row.maxY <= top, row.minY >= slot {
+        return room
+    }
+    if row.minY >= bottom, row.maxY <= slot {
+        return -room
+    }
+    return 0
+}
 
 /// Two rows being pinched: each moved a share of its finger's way, the upper on top.
 private struct Squeeze {
@@ -75,14 +158,31 @@ private final class LayersUi {
     var addKinds: [PluginKind]?
     /// The filter layers' list its Filter Layer opens (interface 17), while open.
     var filterList: [PluginLayerFilter]?
-    /// A row held and dragged, and how far; the row its middle is over and since when (held there
-    /// a moment, what is let go goes onto it).
+    /// A row held and dragged, and how far (on the window), with the rows that go with it (its
+    /// mask, a group's layers).
     var dragId: UInt64?
     var dragOffset: CGFloat = 0
-    @ObservationIgnored var over: (id: UInt64, since: CFTimeInterval)?
+    var dragUnit: Set<UInt64> = []
+    /// How far each other row stands aside to show where the dragged one lands, and the row it is
+    /// held over long enough to go onto (its thumbnail outlined).
+    var aside: [UInt64: CGFloat] = [:]
+    var heldTarget: UInt64?
     var squeeze: Squeeze?
     /// Where each row is on the screen.
     @ObservationIgnored var rows: [UInt64: CGRect] = [:]
+    /// The list on the screen, and the scroll view under it.
+    @ObservationIgnored var listBox: CGRect = .zero
+    @ObservationIgnored weak var scroller: UIScrollView?
+    /// The finger's way since the row was picked up, and how far the list has scrolled under it.
+    @ObservationIgnored private var fingerWay: CGFloat = 0
+    @ObservationIgnored private var scrolled: CGFloat = 0
+    /// The row under the dragged one's middle and since when (held there a moment, what is let go
+    /// goes onto it), and the row held over long enough.
+    @ObservationIgnored private var over: (id: UInt64, since: CFTimeInterval)?
+    @ObservationIgnored private var heldOver: UInt64?
+    /// Where it was last placed: placed again only when it moves or a hold comes due.
+    @ObservationIgnored private var placedFor: (y: CGFloat, held: UInt64?)?
+    @ObservationIgnored private let dragLoop = FrameLoop()
     @ObservationIgnored private var blendJob: DispatchWorkItem?
 
     /// The layer whose row is at `y` on the screen.
@@ -114,25 +214,154 @@ private final class LayersUi {
         DispatchQueue.main.asyncAfter(deadline: .now() + (opening ? blendOpen : blendClose + blendRowsWait), execute: job)
     }
 
-    /// `l`'s row dragged `offset` down: the row its middle is over is noted, and since when.
-    func dragged(_ l: LayerInfo, to offset: CGFloat) {
-        dragOffset = offset
-        let y = (rows[l.id]?.midY ?? 0) + offset
-        let under = rows.first { $0.key != l.id && y >= $0.value.minY && y < $0.value.maxY }?.key
-        if under != over?.id {
-            over = under.map { ($0, CACurrentMediaTime()) }
+    /// `l`'s row held long enough to drag: what goes with it is taken along, and each frame from
+    /// now on places it and scrolls the list while it is near an end.
+    func pickUp(_ model: CanvasModel, _ l: LayerInfo) {
+        dragId = l.id
+        dragOffset = 0
+        dragUnit = model.movingWith(l).union([l.id])
+        aside = [:]
+        heldTarget = nil
+        swiped = nil
+        fingerWay = 0
+        scrolled = 0
+        over = nil
+        heldOver = nil
+        placedFor = nil
+        dragLoop.start { [weak self, weak model] seconds in
+            guard let self, let model else { return false }
+            return self.dragFrame(model, l, seconds)
         }
     }
 
+    /// The dragged row's finger gone `way` down since it was picked up: the row stays under it,
+    /// however far the list has scrolled.
+    func dragged(_ way: CGFloat) {
+        fingerWay = way
+        dragOffset = fingerWay + scrolled
+    }
+
+    /// A frame of `l`'s drag: the row its middle is over (held there a moment, it goes onto it),
+    /// where it lands and the rows making way for it; held near an end of the list it scrolls,
+    /// faster the nearer, the row staying under the finger. Says whether the drag goes on.
+    private func dragFrame(_ model: CanvasModel, _ l: LayerInfo, _ seconds: CFTimeInterval) -> Bool {
+        guard dragId == l.id else { return false }
+        guard let frame = rows[l.id] else { return true }
+        let y = frame.midY + dragOffset
+        let now = CACurrentMediaTime()
+        let under = rows.first { !dragUnit.contains($0.key) && y >= $0.value.minY && y < $0.value.maxY }?.key
+        if under != over?.id {
+            over = under.map { ($0, now) }
+        }
+        heldOver = over.flatMap { now - $0.since >= Double(rowHoldSeconds()) ? $0.id : nil }
+        if placedFor?.y != y || placedFor?.held != heldOver {
+            placedFor = (y, heldOver)
+            let place = model.rowDrop(l, rows: rows, y: y, held: heldOver)
+            var way: [UInt64: CGFloat] = [:]
+            for id in rows.keys {
+                let by = makingWay(id, unit: dragUnit, place: place, rows: rows, gap: rowGap * Interface.shared.scale)
+                if by != 0 {
+                    way[id] = by
+                }
+            }
+            if way != aside {
+                withAnimation(rowAside) { aside = way }
+            }
+            var onto: UInt64?
+            if case let .onto(target) = place {
+                onto = target
+            }
+            if onto != heldTarget {
+                heldTarget = onto
+            }
+        }
+        // the list's own points are the interface's
+        let scale = Interface.shared.scale
+        let edge = dragEdge * scale
+        let towards: CGFloat = if y < listBox.minY + edge {
+            (y - listBox.minY - edge) / edge
+        } else if y > listBox.maxY - edge {
+            (y - listBox.maxY + edge) / edge
+        } else {
+            0
+        }
+        if towards != 0, let list = scroller {
+            let inset = list.adjustedContentInset
+            let least = -inset.top
+            let most = max(list.contentSize.height + inset.bottom - list.bounds.height, least)
+            let from = list.contentOffset.y
+            let to = min(max(from + min(max(towards, -1), 1) * dragScroll * CGFloat(seconds), least), most)
+            if to != from {
+                list.contentOffset.y = to
+                // the rows move up the screen as far, until the list says where they are
+                let moved = (to - from) * scale
+                scrolled += moved
+                dragOffset = fingerWay + scrolled
+                rows = rows.mapValues { $0.offsetBy(dx: 0, dy: -moved) }
+            }
+        }
+        return true
+    }
+
     /// Lets `l` go where its row's middle came to rest, as the shared core places it: just above
-    /// or below a row, into a group only among its layers, or onto a row held over a moment.
+    /// or below a row, into a group only among its layers, or onto a row held over a moment. The
+    /// rows settle into their new places.
     func drop(_ model: CanvasModel, _ l: LayerInfo) {
-        let y = (rows[l.id]?.midY ?? 0) + dragOffset
-        let held = over.flatMap { CACurrentMediaTime() - $0.since >= Double(rowHoldSeconds()) ? $0.id : nil }
+        dragLoop.stop()
+        let place = rows[l.id].map { model.rowDrop(l, rows: rows, y: $0.midY + dragOffset, held: heldOver) }
+        withAnimation(Motion.rowMove) {
+            dragId = nil
+            dragOffset = 0
+            dragUnit = []
+            aside = [:]
+            heldTarget = nil
+        }
+        over = nil
+        heldOver = nil
+        placedFor = nil
+        if let place {
+            model.dropRow(l, place)
+        }
+    }
+
+    /// The panel gone mid-drag: nothing moves.
+    func stopDrag() {
+        dragLoop.stop()
         dragId = nil
         dragOffset = 0
-        over = nil
-        model.dropRow(l, model.rowDrop(l, rows: rows, y: y, held: held))
+        dragUnit = []
+        aside = [:]
+        heldTarget = nil
+    }
+}
+
+/// Finds the scroll view of the list it is put in, for a dragged row to scroll it.
+private struct ListScroller: UIViewRepresentable {
+    let ui: LayersUi
+
+    final class Finder: UIView {
+        fileprivate weak var ui: LayersUi?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            guard window != nil else { return }
+            var under = superview
+            while let view = under, !(view is UIScrollView) {
+                under = view.superview
+            }
+            ui?.scroller = under as? UIScrollView
+        }
+    }
+
+    func makeUIView(context: Context) -> Finder {
+        let view = Finder()
+        view.isUserInteractionEnabled = false
+        view.ui = ui
+        return view
+    }
+
+    func updateUIView(_ view: Finder, context: Context) {
+        view.ui = ui
     }
 }
 
@@ -186,13 +415,20 @@ struct LayersPanel: View {
             ScrollViewReader { reader in
                 ScrollView {
                     VStack(spacing: rowGap) {
-                        ForEach(Array(shown.enumerated()), id: \.element.id) { index, l in
-                            LayerItem(model: model, ui: ui, layer: l, index: index, shown: shown)
-                                .id(l.id)
-                        }
-                        BackgroundRow(model: model)
+                        if model.scene.open {
+                            ModelRows(model: model, ui: ui, shown: shown)
+                        } else {
+                            ForEach(Array(shown.enumerated()), id: \.element.id) { index, l in
+                                LayerItem(model: model, ui: ui, layer: l, index: index, shown: shown)
+                                    .id(l.id)
+                            }
+                            VStack(spacing: 0) {
+                                BackgroundRow(model: model)
+                                LayersPluginRows(model: model)
+                            }
                             .padding(.top, 10)
                             .opacity(ui.blendAt >= 0 ? ui.belowShown : 1)
+                        }
                     }
                     .animation(Motion.rowMove, value: ids)
                     .padding(.horizontal, 12)
@@ -203,9 +439,11 @@ struct LayersPanel: View {
                                 .onAppear { listHeight = rows.size.height }
                                 .onChange(of: rows.size.height) { _, height in listHeight = height }
                         }
+                        ListScroller(ui: ui)
                     }
                 }
                 .scrollIndicators(.hidden)
+                // a dragged row scrolls it, near an end
                 .scrollDisabled(ui.dragId != nil)
                 // a layer added at the top of what shows comes in there
                 .onChange(of: ids) { before, now in
@@ -216,9 +454,19 @@ struct LayersPanel: View {
             }
             // as tall as its rows, up to what the screen leaves under the header
             .frame(height: max(0, min(listHeight, maxHeight - 64 - Pc.arrowHeight)))
+            .background {
+                GeometryReader { list in
+                    Color.clear
+                        .onAppear { ui.listBox = list.frame(in: .global) }
+                        .onChange(of: list.frame(in: .global)) { _, box in ui.listBox = box }
+                }
+            }
         }
         .background(RowFingers(model: model, ui: ui).frame(width: 0, height: 0))
+        .onDisappear { ui.stopDrag() }
         .onPreferenceChange(LayerFrames.self) { ui.rows = $0 }
+        // a model's meshes are pictured as the model is seen when the panel opens
+        .onAppear { model.scene.refreshMeshThumbnails() }
         .overlay(alignment: .topLeading) { LayersMenus(model: model, ui: ui, maxHeight: maxHeight) }
         .sheet(isPresented: Binding(get: { ui.filterList != nil }, set: { if !$0 { ui.filterList = nil } })) {
             FilterLayerList(filters: ui.filterList ?? [], onPick: { id in
@@ -258,11 +506,23 @@ private struct LayerItem: View {
     let layer: LayerInfo
     let index: Int
     let shown: [LayerInfo]
+    /// On a model: the row under its mesh, indented, its own corners rounded or not, and what it
+    /// says under its name ("Shared" by the meshes of its texture set).
+    var indent: CGFloat = 0
+    var corners: (top: Bool, bottom: Bool)?
+    var subtitle: String?
 
     private func tapped() {
         let l = layer
         ui.swiped = nil
-        if model.anyPicked {
+        let scene = model.scene
+        if scene.open, scene.tileChosen, l.kind != .group {
+            // on a model the row means the layer itself: its colour, no channel's tile
+            scene.leaveTiles()
+            if !l.current {
+                model.selectLayer(l.id)
+            }
+        } else if model.anyPicked {
             // picks give way to the layer tapped, the current one too
             model.selectLayer(l.id)
             ui.options = nil
@@ -279,10 +539,13 @@ private struct LayerItem: View {
 
     var body: some View {
         let l = layer
-        let dragging = ui.dragId == l.id
+        // dragged, or going with the row dragged (its mask, a group's layers)
+        let dragging = ui.dragId != nil && ui.dragUnit.contains(l.id)
+        // held over by a dragged row long enough to take it
+        let held = ui.heldTarget == l.id
         // the list's ends are rounded
-        let first = index == 0
-        let last = index == shown.count - 1
+        let first = corners?.top ?? (index == 0)
+        let last = corners?.bottom ?? (index == shown.count - 1)
         let shape = UnevenRoundedRectangle(
             topLeadingRadius: first ? listCorner : 0, bottomLeadingRadius: last ? listCorner : 0,
             bottomTrailingRadius: last ? listCorner : 0, topTrailingRadius: first ? listCorner : 0,
@@ -300,8 +563,13 @@ private struct LayerItem: View {
                 onPick: { model.pickLayer(l) }
             ) {
                 if l.kind == .group {
-                    GroupRow(model: model, layer: l, shape: shape, renaming: renaming, onRenamed: onRenamed, onTap: tapped)
+                    GroupRow(
+                        model: model, layer: l, shape: shape, renaming: renaming, onRenamed: onRenamed, onTap: tapped, held: held,
+                        closed: l.collapsed ? 1 : 0
+                    )
+                    .animation(.linear(duration: groupTurn), value: l.collapsed)
                 } else {
+                    let scene = model.scene
                     LayerRow(
                         model: model, layer: l, shape: shape,
                         // the current mask's layer, or the current layer's mask
@@ -312,31 +580,38 @@ private struct LayerItem: View {
                         onBlend: {
                             ui.changeBlend(ui.blendFor == l.id ? nil : l.id, shown: shown)
                             ui.options = nil
-                        }
+                        },
+                        indent: indent, subtitle: subtitle,
+                        // on a model: its channels, and the row giving its blue to the channel painted
+                        onCube: scene.open && l.kind != .mask ? { scene.toggleTray(l.id) } : nil,
+                        cubeLit: scene.open && l.current && scene.tileChosen,
+                        selected: l.current && !(scene.open && scene.tileChosen),
+                        held: held
                     )
                 }
+            }
+            // held by the row itself: a hold on its channels or blend modes is theirs
+            .modifier(RowDrag(
+                enabled: l.kind != .mask,
+                began: { ui.pickUp(model, l) },
+                moved: { ui.dragged($0) },
+                ended: { ui.drop(model, l) }
+            ))
+            if model.scene.open, model.scene.trayFor == l.id {
+                ChannelTray(model: model, layer: l)
             }
             if ui.blendFor == l.id {
                 BlendEditor(model: model, layer: l)
                     .transition(.opacity)
             }
         }
-        .offset(y: dragging ? ui.dragOffset : ui.squeeze?.offset(l.id) ?? 0)
+        // (the drag, the rows aside and the squeeze go by the window; the rows by the interface)
+        .offset(y: (dragging ? ui.dragOffset : (ui.squeeze?.offset(l.id) ?? 0) + (ui.aside[l.id] ?? 0)) / Interface.shared.scale)
         .opacity(ui.blendAt >= 0 && ui.blendAt < index ? ui.belowShown : 1)
         .background(GeometryReader { g in
             Color.clear.preference(key: LayerFrames.self, value: [l.id: g.frame(in: .global)])
         })
         .zIndex(dragging || ui.squeeze?.upper == l.id ? 1 : 0)
-        .modifier(RowDrag(
-            enabled: l.kind != .mask,
-            began: {
-                ui.dragId = l.id
-                ui.dragOffset = 0
-                ui.swiped = nil
-            },
-            moved: { ui.dragged(l, to: $0) },
-            ended: { ui.drop(model, l) }
-        ))
     }
 }
 
@@ -432,7 +707,7 @@ private struct LayerSwipe<Content: View>: View {
                         if alone {
                             model.clear(l)
                         } else {
-                            model.delete(l)
+                            model.deleteAsking(l)
                         }
                     }
                 }
@@ -781,8 +1056,10 @@ private struct LayerOptionsMenu: View {
 
     var body: some View {
         let rows = model.layerOptions(layer)
+        // a plugin's actions for the layer, after the app's own
+        let actions = model.panelPluginActions(.layer)
         let shape = RoundedRectangle(cornerRadius: 24, style: .circular)
-        let tall = max(CGFloat(rows.count) * 38 + 14, 64)
+        let tall = max(CGFloat(rows.count + actions.count) * 38 + 14, 64)
         // the panel hangs from the bar: its own top is the bar's height down the screen
         let top = optionsTop - Pc.barHeight
         let y = min(max(rowY - Pc.barHeight - tall / 2, top), max(maxHeight - tall, top))
@@ -810,6 +1087,21 @@ private struct LayerOptionsMenu: View {
                     }
                 }
             }
+            ForEach(actions, id: \.key) { action in
+                Text(verbatim: action.label)
+                    .font(.system(size: 17))
+                    .foregroundStyle(Pc.menuInk)
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.leading, 19)
+                    .padding(.trailing, 16)
+                    .frame(height: 38)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        onDone()
+                        model.runPluginAction(action.key)
+                    }
+            }
         }
         .padding(.vertical, 7)
         .frame(width: 194)
@@ -818,7 +1110,7 @@ private struct LayerOptionsMenu: View {
             // empty (a locked group's or mask's), as measured, the frost alone, untinted
             ZStack {
                 shape.fill(.ultraThinMaterial)
-                if !rows.isEmpty {
+                if !rows.isEmpty || !actions.isEmpty {
                     shape.fill(Pc.glassMenu)
                 }
             }
@@ -830,17 +1122,232 @@ private struct LayerOptionsMenu: View {
     }
 }
 
-/// A layer's opacity and blend mode, under its row. The modes are a picker: the rows snap to the
-/// list's middle and the row there is the layer's mode (set once a scroll settles), the ends padded
-/// so every row can reach the middle, the layer's mode there when it opens.
+/// How the blend list is moving.
+private enum BlendMotion {
+    /// At rest on a row.
+    case resting
+    /// Held: pressed with the list where a pull of `start` (unstretched) takes it, the finger then
+    /// at `from` down the list; `caught` when it was moving as it was pressed (let go without
+    /// dragging, it only stops).
+    case held(start: CGFloat, caught: Bool, from: CGFloat)
+    /// Let go at `since`, moving on as `coast` says.
+    case coasting(BlendCoast, since: CFTimeInterval)
+    /// A tapped mode on its way to the band since `since`: the list takes no touches and the
+    /// modes it passes don't show on the layer.
+    case tapped(from: Float, to: Float, since: CFTimeInterval)
+}
+
+/// The blend list's modes turning under a band fixed in its middle: how far it is scrolled (0
+/// with the first mode in the band, a row further for each mode after; past an end while
+/// stretched) and what moves it, as the shared core works it out. Each mode reaching the band as
+/// it moves shows on the layer, the whole movement one undo step.
+@Observable
+private final class BlendWheel {
+    var position: CGFloat = 0
+    @ObservationIgnored private weak var model: CanvasModel?
+    @ObservationIgnored private var layer: LayerInfo?
+    @ObservationIgnored private var modes: [BlendModeInfo] = []
+    /// The mode last shown on the layer.
+    @ObservationIgnored private var shownMode: UInt32 = 0
+    @ObservationIgnored private var motion = BlendMotion.resting
+    @ObservationIgnored private let loop = FrameLoop()
+    /// The finger's last places down the list and when, for how fast it was going as it let go.
+    @ObservationIgnored private var trail: [(at: CFTimeInterval, y: CGFloat)] = []
+
+    private var rows: UInt32 {
+        UInt32(modes.count)
+    }
+
+    /// Under a finger or moving on after it.
+    private var moving: Bool {
+        switch motion {
+        case .held, .coasting: true
+        default: false
+        }
+    }
+
+    /// Opened under `l`: its mode in the band.
+    func open(_ model: CanvasModel, _ l: LayerInfo) {
+        self.model = model
+        modes = model.blendModeList
+        follow(l)
+        shownMode = l.blend
+        position = place(of: l.blend)
+    }
+
+    /// The layer read again: undo or redo may have changed its mode, which comes to the band.
+    func follow(_ l: LayerInfo) {
+        layer = l
+        guard case .resting = motion, l.blend != shownMode else { return }
+        shownMode = l.blend
+        position = place(of: l.blend)
+    }
+
+    private func place(of blend: UInt32) -> CGFloat {
+        CGFloat(modes.firstIndex { $0.id == blend } ?? 0) * blendRowHeight
+    }
+
+    /// Pressed with the finger `y` down the list: it follows the finger from where it is, caught
+    /// if it was moving.
+    func pressed(at y: CGFloat) {
+        if case .tapped = motion {
+            return
+        }
+        let caught = moving
+        loop.stop()
+        let start = blendPullFor(position: Float(position), row: Float(blendRowHeight), rows: rows, height: Float(blendListHeight))
+        motion = .held(start: CGFloat(start), caught: caught, from: y)
+        trail = [(CACurrentMediaTime(), y)]
+    }
+
+    /// The finger at `y`: the list there between its ends, stretched past them.
+    func dragged(to y: CGFloat) {
+        guard case let .held(start, _, from) = motion else { return }
+        let now = CACurrentMediaTime()
+        trail.append((now, y))
+        trail.removeAll { now - $0.at > 0.1 }
+        position = CGFloat(blendPulled(pull: Float(start + from - y), row: Float(blendRowHeight), rows: rows, height: Float(blendListHeight)))
+        showCentred()
+    }
+
+    /// Let go `y` down the list: a tap (`tap`) on a row away from the band makes it the mode at
+    /// once and scrolls it there; else the list moves on as it was going, slowing onto a row (a
+    /// tap on a moving list only stops it).
+    func letGo(at y: CGFloat, tap: Bool) {
+        guard case let .held(_, caught, _) = motion else { return }
+        let now = CACurrentMediaTime()
+        let band = (blendListHeight - blendRowHeight) / 2
+        let row = ((y - band + position) / blendRowHeight).rounded(.down)
+        if tap, !caught, row >= 0, row < CGFloat(rows),
+           let to = blendTap(tapped: UInt32(row), position: Float(position), row: Float(blendRowHeight), rows: rows)
+        {
+            model?.finishBlend()
+            let mode = modes[Int(row)].id
+            shownMode = mode
+            if let layer {
+                model?.setBlend(layer, mode)
+            }
+            motion = .tapped(from: Float(position), to: to, since: now)
+        } else {
+            trail.append((now, y))
+            trail.removeAll { now - $0.at > 0.1 }
+            var speed: CGFloat = 0
+            if !tap, let first = trail.first, let last = trail.last, last.at - first.at > 0.005 {
+                // down the list: the finger going up
+                speed = -(last.y - first.y) / CGFloat(last.at - first.at)
+            }
+            motion = .coasting(blendCoast(from: Float(position), speed: Float(speed), row: Float(blendRowHeight), rows: rows), since: now)
+        }
+        trail = []
+        loop.start { [weak self] _ in self?.advance() ?? false }
+    }
+
+    /// A frame of the list moving by itself; at rest, what it showed is done. Says whether it
+    /// moves on.
+    private func advance() -> Bool {
+        let now = CACurrentMediaTime()
+        let step: BlendStep
+        switch motion {
+        case let .coasting(coast, since):
+            step = blendCoastAt(coast: coast, seconds: Float(now - since))
+            position = CGFloat(step.position)
+            showCentred()
+        case let .tapped(from, to, since):
+            step = blendTapAt(from: from, to: to, seconds: Float(now - since))
+            position = CGFloat(step.position)
+        default:
+            return false
+        }
+        guard step.done else { return true }
+        let coasted = moving
+        motion = .resting
+        if coasted {
+            model?.finishBlend()
+        }
+        return false
+    }
+
+    /// The mode in the band shows on the layer.
+    private func showCentred() {
+        let i = Int(blendCentred(position: Float(position), row: Float(blendRowHeight), rows: rows))
+        guard modes.indices.contains(i), modes[i].id != shownMode, let layer else { return }
+        shownMode = modes[i].id
+        model?.previewBlend(layer, shownMode)
+    }
+
+    /// Closed: it stops where it is, what it showed done.
+    func close() {
+        loop.stop()
+        motion = .resting
+        model?.finishBlend()
+    }
+}
+
+/// The blend list's touches: pressed, moved and let go. They are taken as the finger goes down,
+/// so the panel's list doesn't scroll with them.
+private struct BlendTouches: UIViewRepresentable {
+    let wheel: BlendWheel
+
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        fileprivate var wheel: BlendWheel?
+        private var start: CGPoint = .zero
+        private var far: CGFloat = 0
+
+        @objc func touched(_ g: UILongPressGestureRecognizer) {
+            guard let wheel, let view = g.view else { return }
+            let p = g.location(in: view)
+            switch g.state {
+            case .began:
+                start = p
+                far = 0
+                wheel.pressed(at: p.y)
+            case .changed:
+                far = max(far, hypot(p.x - start.x, p.y - start.y))
+                wheel.dragged(to: p.y)
+            case .ended:
+                wheel.letGo(at: p.y, tap: far < 10)
+            default:
+                wheel.letGo(at: p.y, tap: false)
+            }
+        }
+
+        /// A scroll view round it waits for these touches to be someone else's.
+        func gestureRecognizer(_ g: UIGestureRecognizer, shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool {
+            other.view is UIScrollView
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        view.backgroundColor = .clear
+        let press = UILongPressGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.touched(_:)))
+        press.minimumPressDuration = 0
+        press.allowableMovement = .greatestFiniteMagnitude
+        press.delegate = context.coordinator
+        view.addGestureRecognizer(press)
+        context.coordinator.wheel = wheel
+        return view
+    }
+
+    func updateUIView(_ view: UIView, context: Context) {
+        context.coordinator.wheel = wheel
+    }
+}
+
+/// A layer's opacity and blend mode, under its row. The modes are a picker: the rows turn under a
+/// band fixed in the list's middle, the row there the layer's mode as it moves (one undo step a
+/// movement); let go, the list slows straight onto a row; a tap on another row makes it the mode
+/// at once and scrolls it to the band. The layer's mode is in the band when it opens.
 private struct BlendEditor: View {
     let model: CanvasModel
     let layer: LayerInfo
 
     @State private var opacity: Float = 1
-    /// The mode in the list's middle.
-    @State private var centred: UInt32?
-    @State private var settling: DispatchWorkItem?
+    @State private var wheel = BlendWheel()
 
     private func slider(_ width: CGFloat) -> some View {
         let part = CGFloat(min(max(opacity, 0), 1))
@@ -881,57 +1388,70 @@ private struct BlendEditor: View {
             .frame(height: 16)
             .padding(.horizontal, 13)
             .padding(.vertical, 2)
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(modes, id: \.id) { m in
-                        let chosen = m.id == layer.blend
-                        HStack(spacing: 0) {
-                            Text(verbatim: m.name)
-                                .font(.system(size: 17))
-                                .foregroundStyle(chosen ? Color.white : Pc.panelTitle)
-                                .lineLimit(1)
-                            Spacer(minLength: 0)
-                            // its 26 frame centred 31.5 in from the right; grey unless chosen
-                            if let glyph = PcIcons.blendGlyphs.first(where: { $0.0 == m.name })?.1 {
-                                PcIconView(glyph, size: 26, color: chosen ? .white : blendGlyphInk)
-                            }
-                        }
-                        .padding(.leading, 12)
-                        .padding(.trailing, 18.5)
-                        .frame(height: blendRowHeight)
-                        .background(chosen ? Pc.rowSelected : Color.clear)
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            withAnimation(Motion.rowMove) { centred = m.id }
+            let band = (blendListHeight - blendRowHeight) / 2
+            ZStack(alignment: .top) {
+                Rectangle()
+                    .fill(Pc.rowSelected)
+                    .frame(height: blendRowHeight)
+                    .padding(.top, band)
+                // grey outside the band and white inside it: a name half under it is half and half
+                names(modes, ink: Pc.panelTitle, glyphInk: blendGlyphInk)
+                    .mask(alignment: .top) {
+                        VStack(spacing: 0) {
+                            Rectangle().frame(height: band)
+                            Color.clear.frame(height: blendRowHeight)
+                            Rectangle()
                         }
                     }
-                }
-                .scrollTargetLayout()
+                names(modes, ink: .white, glyphInk: .white)
+                    .mask(alignment: .top) {
+                        Rectangle()
+                            .frame(height: blendRowHeight)
+                            .padding(.top, band)
+                    }
             }
-            .contentMargins(.vertical, (blendListHeight - blendRowHeight) / 2, for: .scrollContent)
-            .scrollTargetBehavior(.viewAligned)
-            .scrollPosition(id: $centred, anchor: .center)
-            .scrollIndicators(.hidden)
-            .frame(height: blendListHeight)
-            .background(RoundedRectangle(cornerRadius: 12, style: .circular).fill(Pc.layerRow))
+            .frame(maxWidth: .infinity)
+            .frame(height: blendListHeight, alignment: .top)
+            .background(Pc.layerRow)
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .circular))
+            .overlay(BlendTouches(wheel: wheel))
             .padding(.top, 11)
         }
         .padding(.top, 22)
         .padding(.bottom, 15)
         .onAppear {
             opacity = layer.opacity
-            centred = layer.blend
+            wheel.open(model, layer)
         }
-        .onChange(of: centred) { _, id in
-            // once the scroll settles
-            settling?.cancel()
-            guard let id, id != layer.blend else { return }
-            let l = layer
-            let job = DispatchWorkItem { model.setBlend(l, id) }
-            settling = job
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: job)
+        .onChange(of: layer.blend) { wheel.follow(layer) }
+        .onDisappear { wheel.close() }
+    }
+
+    /// The modes' names and glyphs (each glyph's 26 frame centred 31.5 in from the right), turned
+    /// as far as the list is, over the list's height.
+    private func names(_ modes: [BlendModeInfo], ink: Color, glyphInk: Color) -> some View {
+        VStack(spacing: 0) {
+            ForEach(modes, id: \.id) { m in
+                HStack(spacing: 0) {
+                    Text(verbatim: m.name)
+                        .font(.system(size: 17))
+                        .foregroundStyle(ink)
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                    if let glyph = PcIcons.blendGlyphs.first(where: { $0.0 == m.name })?.1 {
+                        PcIconView(glyph, size: 26, color: glyphInk)
+                    }
+                }
+                .padding(.leading, 12)
+                .padding(.trailing, 18.5)
+                .frame(height: blendRowHeight)
+            }
         }
+        .fixedSize(horizontal: false, vertical: true)
+        .offset(y: (blendListHeight - blendRowHeight) / 2 - wheel.position)
+        .frame(maxWidth: .infinity)
+        .frame(height: blendListHeight, alignment: .top)
+        .allowsHitTesting(false)
     }
 }
 
@@ -946,12 +1466,21 @@ private struct LayerRow: View {
     let onRenamed: (String) -> Void
     let onTap: () -> Void
     let onBlend: () -> Void
+    /// On a model: how far in it sits under its mesh, what it says under its name, the button that
+    /// shows its channels (blue while one of them is painted), and whether it shows chosen.
+    var indent: CGFloat = 0
+    var subtitle: String?
+    var onCube: (() -> Void)?
+    var cubeLit = false
+    var selected: Bool?
+    /// Held over by a dragged row long enough to take it: its thumbnail outlined.
+    var held = false
 
     var body: some View {
         let l = layer
         let mask = l.kind == .mask
         let masked = model.hasMask(l)
-        let selected = l.current
+        let selected = self.selected ?? l.current
         let ink = selected || l.picked ? Color.white : Pc.panelTitle
         let fill = selected ? Pc.rowSelected : l.picked ? pickedRow : owner ? maskOwnerRow : Pc.layerRow
         HStack(spacing: 0) {
@@ -959,7 +1488,7 @@ private struct LayerRow: View {
                 PcIconView(PcIcons.clip, size: 16, color: ink)
             }
             // a mask's thumbnail and its layer's join into one, rounded only at the outer corners
-            Thumb(model: model, layer: l, top: !masked, bottom: !mask)
+            Thumb(model: model, layer: l, top: !masked, bottom: !mask, held: held)
                 .padding(.leading, 4)
                 .offset(y: mask ? 2 : masked ? -2 : 0)
             ZStack(alignment: .leading) {
@@ -974,11 +1503,21 @@ private struct LayerRow: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            // a model's layer: laid out narrower than it is touched (36 from the blend letter), so
+            // the name keeps its room up to the icon
+            if let onCube {
+                Spacer().frame(width: 10)
+                PcIconView(PcIcons.tab3D, size: 48, color: cubeLit ? Pc.accent : ink)
+                    .frame(width: 44, height: 47)
+                    .contentShape(Rectangle())
+                    .onTapGesture(perform: onCube)
+                    .frame(width: 12, height: 47)
+            }
             // the blend and visibility buttons overlap by 8, as measured; a mask has no blend
             if mask {
                 Spacer().frame(width: 36)
             } else {
-                Text(verbatim: blendCode(l.blend))
+                Text(verbatim: blendLetters(model, l.blend))
                     .font(.system(size: 14, weight: .semibold))
                     // a locked layer's mode is greyed
                     .foregroundStyle(l.locked && !l.current && !l.picked ? lockedLetter : ink)
@@ -990,22 +1529,25 @@ private struct LayerRow: View {
             VisibilityBox(model: model, layer: l, fill: selected || l.picked ? Color.white : Pc.checkFill, height: 47)
             Spacer().frame(width: 8)
         }
-        .padding(.leading, (l.clipped ? 18 : 0) + groupIndent * CGFloat(l.depth))
+        .padding(.leading, indent + (l.clipped ? 18 : 0) + groupIndent * CGFloat(l.depth))
         .frame(maxWidth: .infinity)
         .frame(height: mask || masked ? maskedRowHeight : rowHeight)
-        .background(shape.fill(fill))
+        .background(RowFill(shape: shape, fill: fill, layer: l))
         .contentShape(Rectangle())
         .onTapGesture(perform: onTap)
     }
 
     /// What the layer is, under its name: the reference layer, one drawing assist is on for, a
-    /// private one.
+    /// private one, a model's layer shared by its texture set's meshes.
     private func tag(_ l: LayerInfo) -> String? {
         if l.reference && l.assisted {
             return "Assisted Reference"
         }
         if l.reference {
-            return "Reference"
+            return subtitle.map { "\($0) Reference" } ?? "Reference"
+        }
+        if let subtitle {
+            return subtitle
         }
         if l.assisted {
             return "Assisted"
@@ -1015,20 +1557,20 @@ private struct LayerRow: View {
         }
         return nil
     }
+}
 
-    /// The letters on a layer's row for its mode: a two-word name's initials (the second small), a
-    /// one-word name's first letter, or its first two where one letter is already taken.
-    private func blendCode(_ blend: UInt32) -> String {
-        guard let name = model.blendModeList.first(where: { $0.id == blend })?.name else { return "N" }
-        if twoLetterBlends.contains(name) {
-            return String(name.prefix(2))
-        }
-        let words = name.split(separator: " ")
-        if words.count == 1 {
-            return String(name.prefix(1))
-        }
-        return String(words[0].prefix(1)) + words[1].prefix(1).lowercased()
+/// The letters on a layer's row for its mode: a two-word name's initials (the second small), a
+/// one-word name's first letter, or its first two where one letter is already taken.
+private func blendLetters(_ model: CanvasModel, _ blend: UInt32) -> String {
+    guard let name = model.blendModeList.first(where: { $0.id == blend })?.name else { return "N" }
+    if twoLetterBlends.contains(name) {
+        return String(name.prefix(2))
     }
+    let words = name.split(separator: " ")
+    if words.count == 1 {
+        return String(name.prefix(1))
+    }
+    return String(words[0].prefix(1)) + words[1].prefix(1).lowercased()
 }
 
 /// A layer's visibility box: tapped, shown or hidden (or, with a layer shown alone, every layer
@@ -1048,23 +1590,47 @@ private struct VisibilityBox: View {
     }
 }
 
-/// A group's row: a line where a thumbnail would be, its name, its open or closed arrow and its
-/// box.
-private struct GroupRow: View {
+/// A group's row: where a thumbnail would be, a line while it is open or, closed (the row taller),
+/// a window on its layers' rows drawn small; its name, its open or closed arrow and its box. Held
+/// over by a dragged row long enough to take it (`held`), the line or window is outlined.
+private struct GroupRow: View, Animatable {
     let model: CanvasModel
     let layer: LayerInfo
     let shape: UnevenRoundedRectangle
     let renaming: Bool
     let onRenamed: (String) -> Void
     let onTap: () -> Void
+    let held: Bool
+    /// 0 open, 1 closed, between as it opens or closes.
+    var closed: CGFloat
+
+    var animatableData: CGFloat {
+        get { closed }
+        set { closed = newValue }
+    }
 
     var body: some View {
         let l = layer
         let ink = l.current || l.picked ? Color.white : Pc.panelTitle
+        let height = groupHeight + (groupClosedHeight - groupHeight) * closed
+        // the line's 20 above and below become 4, the line the window between
+        let inset = groupLineInset + (groupWindowInset - groupLineInset) * closed
+        let window = RoundedRectangle(cornerRadius: 2 + 2 * closed, style: .circular)
         HStack(spacing: 0) {
-            RoundedRectangle(cornerRadius: 2, style: .circular)
+            window
                 .fill(groupLine)
-                .frame(width: 93, height: 4)
+                .frame(width: 93, height: max(height - inset * 2, 0))
+                .overlay(alignment: .topLeading) {
+                    if closed > 0 {
+                        GroupContents(model: model, group: l)
+                    }
+                }
+                .clipShape(window)
+                .overlay {
+                    if held {
+                        window.strokeBorder(heldOutline, lineWidth: 2)
+                    }
+                }
                 .padding(.leading, 4)
             LockedName(layer: l, ink: ink, renaming: renaming, onRenamed: onRenamed)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -1078,10 +1644,87 @@ private struct GroupRow: View {
         }
         .padding(.leading, groupIndent * CGFloat(l.depth))
         .frame(maxWidth: .infinity)
-        .frame(height: groupHeight)
-        .background(shape.fill(l.current ? Pc.rowSelected : l.picked ? pickedRow : Pc.layerRow))
+        .frame(height: height)
+        .background(RowFill(shape: shape, fill: l.current ? Pc.rowSelected : l.picked ? pickedRow : Pc.layerRow, layer: l))
         .contentShape(Rectangle())
         .onTapGesture(perform: onTap)
+    }
+}
+
+/// A closed group's layers' rows as the panel would list them open, drawn small to fit its
+/// window's width less 1 on each side, from its top: their fills, thumbnails, names, blend letters
+/// and boxes.
+private struct GroupContents: View {
+    let model: CanvasModel
+    let group: LayerInfo
+
+    var body: some View {
+        VStack(spacing: rowGap) {
+            ForEach(model.shownInside(group), id: \.id) { l in
+                MiniRow(model: model, layer: l, depth: max(Int(l.depth) - Int(group.depth) - 1, 0))
+            }
+        }
+        .frame(width: listWidth)
+        .fixedSize(horizontal: false, vertical: true)
+        .scaleEffect((93 - 2) / listWidth, anchor: .topLeading)
+        .offset(x: 1, y: 1)
+        .allowsHitTesting(false)
+    }
+}
+
+/// A row of a closed group's window, as its row in the list looks, without its controls.
+private struct MiniRow: View {
+    let model: CanvasModel
+    let layer: LayerInfo
+    /// How many groups in from the closed one it is.
+    let depth: Int
+
+    var body: some View {
+        let l = layer
+        let mask = l.kind == .mask
+        let masked = model.hasMask(l)
+        let group = l.kind == .group
+        let chosen = l.current || l.picked
+        let ink = chosen ? Color.white : Pc.panelTitle
+        HStack(spacing: 0) {
+            if group {
+                RoundedRectangle(cornerRadius: 2, style: .circular)
+                    .fill(groupLine)
+                    .frame(width: 93, height: 4)
+                    .padding(.leading, 4)
+            } else {
+                Thumb(model: model, layer: l, top: !masked, bottom: !mask)
+                    .padding(.leading, 4)
+                    .offset(y: mask ? 2 : masked ? -2 : 0)
+            }
+            Text(verbatim: l.name)
+                .font(.system(size: 17))
+                .foregroundStyle(ink)
+                .lineLimit(1)
+                .padding(.leading, 29)
+                .padding(.trailing, 6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if group {
+                PcIconView(l.collapsed ? PcIcons.chevronRight : PcIcons.chevronDown, size: 16, color: ink)
+                    .frame(width: 44, height: groupHeight)
+                    .offset(x: 8)
+            } else if mask {
+                Spacer().frame(width: 36)
+            } else {
+                Text(verbatim: blendLetters(model, l.blend))
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(l.locked && !chosen ? lockedLetter : ink)
+                    .frame(width: 44, height: 47)
+                    .offset(x: 8)
+            }
+            CheckBox(checked: l.visible && !l.soloedOut, fill: chosen ? Color.white : Pc.checkFill)
+                .frame(width: 44, height: 47)
+            Spacer().frame(width: 8)
+        }
+        .padding(.leading, groupIndent * CGFloat(depth))
+        .frame(maxWidth: .infinity)
+        .frame(height: group ? groupHeight : mask || masked ? maskedRowHeight : rowHeight)
+        .background(RowFill(shape: Rectangle(), fill: l.current ? Pc.rowSelected : l.picked ? pickedRow : Pc.layerRow, layer: l))
     }
 }
 
@@ -1123,6 +1766,8 @@ private struct Thumb: View {
     let layer: LayerInfo
     let top: Bool
     let bottom: Bool
+    /// Outlined: held over by a dragged row long enough to take it.
+    var held = false
 
     var body: some View {
         let corner: CGFloat = 4
@@ -1156,6 +1801,12 @@ private struct Thumb: View {
                 }
                 .frame(width: 18, height: 14)
                 .padding(3)
+            }
+        }
+        .overlay {
+            // 2 inside its edge, the rest clipped
+            if held {
+                shape.stroke(heldOutline, lineWidth: 4)
             }
         }
         .clipShape(shape)
@@ -1239,5 +1890,283 @@ private struct BackgroundRow: View {
     }
 }
 
+/// The actions the plugins on put in the Layers panel, under the background's row: a row each, by
+/// its label, drawn as the background's is. A tap runs it, as one anywhere else does.
+private struct LayersPluginRows: View {
+    let model: CanvasModel
+
+    var body: some View {
+        ForEach(model.panelPluginActions(.layers), id: \.key) { action in
+            Text(verbatim: action.label)
+                .font(.system(size: 17))
+                .foregroundStyle(Pc.panelTitle)
+                .lineLimit(1)
+                .padding(.horizontal, 18)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(height: 50)
+                .background(RoundedRectangle(cornerRadius: 17, style: .circular).fill(Pc.backgroundRow))
+                .contentShape(Rectangle())
+                .onTapGesture { model.runPluginAction(action.key) }
+                .padding(.top, 10)
+        }
+    }
+}
+
+/// How wide the colour a plugin labels a layer with shows, down the left edge of its row.
+private let labelWidth: CGFloat = 5
+
+/// A row's fill in its shape, and the colour a plugin labels its layer with, if one does, down its
+/// left edge (under what is on the row).
+private struct RowFill<S: Shape>: View {
+    let shape: S
+    let fill: Color
+    let layer: LayerInfo
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            shape.fill(fill)
+            if let label = layer.label {
+                Color(argb: 0xFF00_0000 | label)
+                    .frame(width: labelWidth)
+            }
+        }
+        .clipShape(shape)
+    }
+}
+
 /// The layers panel's width.
 let layersPanelWidth = layersWidth
+
+/// A model's mesh opened in the layers panel: its row darkened blue.
+private let submeshOpen = Color(argb: 0xFF25_344A)
+private let submeshTile = Color(argb: 0xFF43_4246)
+private let trayFill = Color(argb: 0xFF30_3032)
+private let trayTile = Color(argb: 0xFF3B_3B3D)
+
+/// On a model: each texture set headed by its name, its meshes under it; the open mesh's texture
+/// set's layers under that, shared by every mesh in the set.
+private struct ModelRows: View {
+    let model: CanvasModel
+    let ui: LayersUi
+    let shown: [LayerInfo]
+
+    var body: some View {
+        let scene = model.scene
+        ForEach(Array(scene.textureSets.enumerated()), id: \.offset) { setIndex, name in
+            let meshes = Array(scene.submeshes.enumerated().filter { Int($0.element.textureSet) == setIndex })
+            if !meshes.isEmpty {
+                SetHeader(name: name, first: setIndex == 0)
+                ForEach(Array(meshes.enumerated()), id: \.offset) { k, mesh in
+                    let lastMesh = k == meshes.count - 1
+                    let open = scene.openSubmesh == mesh.offset && setIndex == scene.textureSet && !shown.isEmpty
+                    SubmeshRow(
+                        model: model, index: mesh.offset, name: mesh.element.name, open: open,
+                        roundTop: k == 0, roundBottom: lastMesh && !open
+                    )
+                    if open {
+                        ForEach(Array(shown.enumerated()), id: \.element.id) { index, l in
+                            LayerItem(
+                                model: model, ui: ui, layer: l, index: index, shown: shown, indent: groupIndent,
+                                corners: (false, lastMesh && index == shown.count - 1),
+                                subtitle: meshes.count > 1 ? "Shared" : nil
+                            )
+                            .id(l.id)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A model's texture set's name, heading its meshes: 41 tall, 16 under the set before it.
+private struct SetHeader: View {
+    let name: String
+    let first: Bool
+
+    var body: some View {
+        Text(verbatim: name)
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(Pc.panelTitle)
+            .lineLimit(1)
+            .padding(.leading, 16)
+            .padding(.top, 12)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+            .frame(height: 41, alignment: .top)
+            .padding(.top, first ? 0 : 16)
+    }
+}
+
+/// One of a model's meshes: its picture, its name, the arrow that opens it (its texture set's
+/// layers under it) and its box (shown or hidden). A tap anywhere but the box opens or closes it;
+/// slid left it shows Lock (or Unlock); a little right, it joins the meshes picked.
+private struct SubmeshRow: View {
+    let model: CanvasModel
+    let index: Int
+    let name: String
+    let open: Bool
+    let roundTop: Bool
+    let roundBottom: Bool
+
+    @State private var offset: CGFloat = 0
+    @State private var opened = false
+    /// The touch is going along the row, not down the list.
+    @State private var sliding = false
+
+    var body: some View {
+        let scene = model.scene
+        let hidden = scene.hiddenMeshes.indices.contains(index) && scene.hiddenMeshes[index]
+        let locked = scene.lockedMeshes.indices.contains(index) && scene.lockedMeshes[index]
+        let picked = scene.activeMeshes.contains(index)
+        let reach = swipeButton + 6
+        let shape = UnevenRoundedRectangle(
+            topLeadingRadius: roundTop ? listCorner : 0, bottomLeadingRadius: roundBottom ? listCorner : 0,
+            bottomTrailingRadius: roundBottom ? listCorner : 0, topTrailingRadius: roundTop ? listCorner : 0,
+            style: .circular
+        )
+        ZStack(alignment: .trailing) {
+            if offset < 0 {
+                Text(verbatim: locked ? "Unlock" : "Lock")
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(swipeInk)
+                    .lineLimit(1)
+                    .frame(width: swipeButton)
+                    .frame(maxHeight: .infinity)
+                    .background(RoundedRectangle(cornerRadius: 8, style: .circular).fill(swipeFill))
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        scene.toggleLocked(index)
+                        opened = false
+                        withAnimation(Motion.swipeSettle) { offset = 0 }
+                    }
+            }
+            HStack(spacing: 0) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 4, style: .circular).fill(submeshTile)
+                    if let picture = scene.meshThumbnails[index] {
+                        Image(uiImage: picture)
+                            .resizable()
+                            .scaledToFit()
+                            .padding(4)
+                    }
+                }
+                .frame(width: 93, height: 61)
+                .clipShape(RoundedRectangle(cornerRadius: 4, style: .circular))
+                .padding(.leading, 4)
+                Text(verbatim: name)
+                    .font(.system(size: 17))
+                    .foregroundStyle(Pc.panelTitle)
+                    .lineLimit(1)
+                    .padding(.leading, 29)
+                    .padding(.trailing, 6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if locked {
+                    PcIconView(PcIcons.pageLocked, size: 16, color: Pc.panelTitle)
+                }
+                PcIconView(open ? PcIcons.chevronDown : PcIcons.chevronRight, size: 16, color: Pc.panelTitle)
+                    .frame(width: 44, height: 51)
+                    .contentShape(Rectangle())
+                    .onTapGesture { scene.openMesh(index) }
+                    .offset(x: 8)
+                CheckBox(checked: !hidden, fill: Pc.checkFill)
+                    .frame(width: 44, height: 47)
+                    .contentShape(Rectangle())
+                    .onTapGesture { scene.toggleHidden(index) }
+                Spacer().frame(width: 8)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: rowHeight)
+            .background(shape.fill(open || picked ? submeshOpen : Pc.layerRow))
+            .contentShape(Rectangle())
+            .onTapGesture { scene.openMesh(index) }
+            .offset(x: offset)
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 14)
+                    .onChanged { drag in
+                        if !sliding, abs(drag.translation.width) > abs(drag.translation.height) {
+                            sliding = true
+                        }
+                        if sliding {
+                            offset = min(max((opened ? -reach : 0) + drag.translation.width, -reach), opened ? 0 : pickReach)
+                        }
+                    }
+                    .onEnded { _ in
+                        guard sliding else { return }
+                        sliding = false
+                        if offset > pickReach / 2 {
+                            scene.pickMore(index)
+                            opened = false
+                        } else {
+                            opened = offset < -reach / 2
+                        }
+                        withAnimation(Motion.swipeSettle) { offset = opened ? -reach : 0 }
+                    }
+            )
+        }
+        .clipped()
+    }
+}
+
+/// A model's layer's channels under its row: Color, Roughness and Metallic, each its picture of
+/// the layer; the one painted on (of the current layer) blue. A tap paints on it; held, a picture
+/// replaces what the channel holds.
+private struct ChannelTray: View {
+    let model: CanvasModel
+    let layer: LayerInfo
+
+    @State private var asking = false
+    @State private var channelAsked = 0
+    @State private var photo: PhotosPickerItem?
+
+    var body: some View {
+        let scene = model.scene
+        HStack(spacing: 6) {
+            ForEach(Array(["Color", "Roughness", "Metallic"].enumerated()), id: \.offset) { c, label in
+                let chosen = layer.current && scene.tileChosen && scene.channel == c
+                VStack(alignment: .leading, spacing: 0) {
+                    ZStack {
+                        Rectangle().fill(Pc.thumbBackground)
+                        if let picture = scene.channelThumbnail(c, layer.id) {
+                            Image(uiImage: picture)
+                                .resizable()
+                                .scaledToFit()
+                        }
+                    }
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 102)
+                    .clipShape(RoundedRectangle(cornerRadius: 3, style: .circular))
+                    Text(verbatim: label)
+                        .font(.system(size: 15))
+                        .foregroundStyle(chosen ? Color.white : Pc.panelTitle)
+                        .lineLimit(1)
+                        .padding(.leading, 2)
+                        .padding(.top, 9)
+                }
+                .padding(6)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .background(RoundedRectangle(cornerRadius: 6, style: .circular).fill(chosen ? Pc.accent : trayTile))
+                .contentShape(Rectangle())
+                .onTapGesture { scene.chooseTile(c, of: layer) }
+                .onLongPressGesture(minimumDuration: 0.5) {
+                    channelAsked = c
+                    asking = true
+                }
+            }
+        }
+        .padding(4)
+        .frame(maxWidth: .infinity)
+        .frame(height: 159)
+        .background(trayFill)
+        .photosPicker(isPresented: $asking, selection: $photo, matching: .images)
+        .onChange(of: photo) { _, item in
+            guard let item else { return }
+            photo = nil
+            let channel = channelAsked
+            let l = layer
+            Task { @MainActor in
+                let data = try? await item.loadTransferable(type: Data.self)
+                scene.replaceMap(l, channel: channel, with: data)
+            }
+        }
+    }
+}

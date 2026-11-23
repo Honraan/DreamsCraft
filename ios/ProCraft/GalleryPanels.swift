@@ -221,17 +221,17 @@ private struct SwipeRow: View {
     }
 }
 
-/// Share's formats: beside a swiped artwork's Share, or under Select's. A tap on one shares in it.
+/// Share's formats: beside a swiped artwork's Share, or under Select's (at `centre`, More's when
+/// Share is in its list). A tap on one shares in it.
 struct ImageFormats: View {
     let share: GalleryShare
     let screen: CGSize
+    let centre: CGFloat
     let onPick: (String) -> Void
 
     /// Where they go: their top left, the arrow's side and place.
     private var place: (left: CGFloat, top: CGFloat, side: ArrowSide, arrowAt: CGFloat) {
         guard let from = share.from else {
-            // Select's Share button's centre: left of Delete and More
-            let centre = screen.width - 20 - 44 - 13 - 61 - 70 - 65 / 2
             let left = min(max(centre - formatsWidth / 2, 4), max(screen.width - 4 - formatsWidth, 4))
             return (left, 69, .none, 0)
         }
@@ -375,33 +375,38 @@ struct AboutApp: View {
     }
 }
 
-/// More options for the picked artworks: Preview, Stack (two or more) and Duplicate, under More.
+/// A row of More's list: its name, whether it can act now, what it does.
+struct MoreRow {
+    let label: String
+    let enabled: Bool
+    let action: () -> Void
+}
+
+/// More options, under More: what the title row has no room for (selecting, Preview, Stack and
+/// Duplicate; in a narrow window, more of them), each greyed while it can't act.
 struct MoreOptions: View {
     let screen: CGSize
-    let count: Int
-    let canStack: Bool
-    let onStack: () -> Void
-    let onPreview: () -> Void
-    let onDuplicate: () -> Void
+    /// The middle of More in the title row, for the list to hang from.
+    let centre: CGFloat
+    let rows: [MoreRow]
 
-    private func row(_ label: String, enabled: Bool, action: @escaping () -> Void) -> some View {
-        Text(verbatim: label)
+    private func row(_ row: MoreRow) -> some View {
+        Text(verbatim: row.label)
             .font(.system(size: 17))
-            .foregroundStyle(enabled ? Pc.panelTitle : Pc.actionsDisabled)
+            .foregroundStyle(row.enabled ? Pc.panelTitle : Pc.actionsDisabled)
             .padding(.leading, 16)
             .frame(maxWidth: .infinity, minHeight: 44, maxHeight: 44, alignment: .leading)
             .contentShape(Rectangle())
             .onTapGesture {
-                if enabled {
-                    action()
+                if row.enabled {
+                    row.action()
                 }
             }
     }
 
     var body: some View {
-        // under More, kept 4 from the screen's edge
-        let centre = screen.width - 20 - 44 - 13 - 61 / 2
-        let left = min(centre - 125, screen.width - 4 - 250)
+        // under More, kept 4 from the screen's edges
+        let left = max(min(centre - 125, screen.width - 4 - 250), 4)
         let shape = RoundedRectangle(cornerRadius: 18, style: .circular)
         Popover(width: 250, arrowX: centre - left, fill: Pc.galleryPopover) {
             VStack(alignment: .leading, spacing: 0) {
@@ -411,11 +416,12 @@ struct MoreOptions: View {
                     .padding(.leading, 24)
                     .padding(.vertical, 14)
                 VStack(spacing: 0) {
-                    row("Preview", enabled: count > 0, action: onPreview)
-                    Rectangle().fill(Pc.actionsSeparator).frame(height: 1)
-                    row("Stack", enabled: canStack && count >= 2, action: onStack)
-                    Rectangle().fill(Pc.actionsSeparator).frame(height: 1)
-                    row("Duplicate", enabled: count > 0, action: onDuplicate)
+                    ForEach(rows.indices, id: \.self) { i in
+                        if i > 0 {
+                            Rectangle().fill(Pc.actionsSeparator).frame(height: 1)
+                        }
+                        row(rows[i])
+                    }
                 }
                 .background(shape.fill(Pc.actionsGroup))
                 .clipShape(shape)

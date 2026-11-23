@@ -29,6 +29,7 @@ enum SystemSettings {
     static var singleTouchCompanion: Bool { flag("singleTouchCompanion", false) }
     static var colorNames: Bool { flag("colorNames", false) }
     static var feedbackSounds: Bool { flag("feedbackSounds", false) }
+    static var tapAssistance: Bool { flag("tapAssistance", false) }
 
     static var speedDistance: Float {
         (UserDefaults.standard.object(forKey: "speedDistance") as? NSNumber)?.floatValue ?? 1
@@ -93,7 +94,7 @@ extension CanvasModel {
     }
 
     /// A hardware keyboard's key as the shared shortcuts name it.
-    private static func name(of key: UIKey) -> String? {
+    static func name(of key: UIKey) -> String? {
         switch key.keyCode {
         case .keyboardSpacebar: return "space"
         case .keyboardDeleteOrBackspace: return "backspace"
@@ -106,6 +107,12 @@ extension CanvasModel {
         }
         let typed = key.charactersIgnoringModifiers.lowercased()
         return typed.count == 1 && "abcdefghijklmnopqrstuvwxyz0123456789[];".contains(typed) ? typed : nil
+    }
+
+    /// A press written out with its modifiers ("command+shift+z"), to tell one press from another.
+    static func pressText(_ name: String, _ flags: UIKeyModifierFlags) -> String {
+        let held: [(UIKeyModifierFlags, String)] = [(.command, "command+"), (.control, "control+"), (.shift, "shift+"), (.alternate, "alt+")]
+        return held.filter { flags.contains($0.0) }.map(\.1).joined() + name
     }
 
     /// A key went down; whether it did anything.
@@ -169,28 +176,97 @@ extension CanvasModel {
     }
 
     /// Files dropped on the canvas: pictures on layers of their own, a picture alone ready to
-    /// transform; other files' brushes join the library. The copies in `folder` go after them.
+    /// transform, a video's frames on the timeline; other files' brushes join the library. The
+    /// copies in `folder` go after them.
     func dropOnCanvas(_ urls: [URL], from folder: URL) {
-        let pictures = urls.filter { UTType(filenameExtension: $0.pathExtension)?.conforms(to: .image) == true }
-        let others = urls.filter { !pictures.contains($0) }
+        let inserted = urls.filter { $0.isMovie || UTType(filenameExtension: $0.pathExtension)?.conforms(to: .image) == true }
+        let others = urls.filter { !inserted.contains($0) }
         guard !urls.isEmpty else { return }
         let gone = DispatchGroup()
         for file in others {
             gone.enter()
             importBrushes(from: file) { gone.leave() }
         }
-        if !pictures.isEmpty {
+        if !inserted.isEmpty {
             if transforming {
                 endTransform(commit: true)
             }
             closePanels()
-            for file in pictures {
-                insertPicture(try? Data(contentsOf: file), name: file.lastPathComponent, isPrivate: false, transform: pictures.count == 1)
-            }
+            gone.enter()
+            insertDropped(inserted[...], transform: inserted.count == 1) { gone.leave() }
         }
         gone.notify(queue: .global(qos: .utility)) {
             try? FileManager.default.removeItem(at: folder)
         }
+    }
+
+    /// Dropped pictures and videos in, one after another (a video's frames read before the next),
+    /// until one can't come in; then `done`.
+    private func insertDropped(_ files: ArraySlice<URL>, transform: Bool, done: @escaping () -> Void) {
+        guard let file = files.first else {
+            done()
+            return
+        }
+        let rest = files.dropFirst()
+        guard file.isMovie else {
+            if insertPicture(try? Data(contentsOf: file), name: file.lastPathComponent, isPrivate: false, transform: transform) {
+                insertDropped(rest, transform: transform, done: done)
+            } else {
+                done()
+            }
+            return
+        }
+        insertVideo(file, isPrivate: false) { [weak self] came in
+            if came, let self {
+                self.insertDropped(rest, transform: transform, done: done)
+            } else {
+                done()
+            }
+        }
+    }
+}
+
+/// The canvas's keyboard shortcuts as the system lists them while ⌘ is held: the shared shortcuts
+/// with an Apple keyboard's keys, each press a command that sends `action` (the key's name in its
+/// property list), under the name of what it does (a brush size's with its group's). The modify
+/// button's key (⌥ held by itself) and ⌦ aren't listed: they come as presses, as before.
+func shortcutKeyCommands(action: Selector) -> [UIKeyCommand] {
+    keyShortcutList(desktop: false, mac: true).flatMap { group in
+        group.rows.flatMap { row in
+            row.combos.compactMap { combo -> UIKeyCommand? in
+                guard let input = keyCommandInput(combo.key) else { return nil }
+                var flags: UIKeyModifierFlags = []
+                if combo.command {
+                    flags.insert(.command)
+                }
+                if combo.shift {
+                    flags.insert(.shift)
+                }
+                if combo.alt {
+                    flags.insert(.alternate)
+                }
+                let title = group.heading == "Brush size" ? "Brush size: \(row.does)" : row.does
+                let command = UIKeyCommand(
+                    title: title, action: action, input: input, modifierFlags: flags, propertyList: combo.key, discoverabilityTitle: title
+                )
+                // the canvas's own keys before what the system would do with them
+                command.wantsPriorityOverSystemBehavior = true
+                return command
+            }
+        }
+    }
+}
+
+/// The input a key command takes for a key the shared shortcuts name; none for one it can't.
+private func keyCommandInput(_ name: String) -> String? {
+    switch name {
+    case "space": return " "
+    case "backspace": return "\u{8}"
+    case "left": return UIKeyCommand.inputLeftArrow
+    case "right": return UIKeyCommand.inputRightArrow
+    case "up": return UIKeyCommand.inputUpArrow
+    case "down": return UIKeyCommand.inputDownArrow
+    default: return name.count == 1 ? name : nil
     }
 }
 

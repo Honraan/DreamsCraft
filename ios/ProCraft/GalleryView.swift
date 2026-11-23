@@ -22,6 +22,9 @@ private let renameBlur: CGFloat = 20
 private let recoverySearchSteps = 44
 private let recoveryStep = Duration.milliseconds(16)
 private let recoveryDone = Duration.milliseconds(900)
+/// How long an artwork can take to open before the gallery says it is opening, and what dims it.
+private let slowOpeningAfter = Duration.milliseconds(500)
+private let openingVeil = Color(argb: 0x6600_0000)
 
 /// A gallery cell's sizes: its pitch both ways (the screen's width over the columns, three upright
 /// and four on its side), the content's width (40 less) and the thumbnail box's height (82 less).
@@ -42,6 +45,30 @@ private struct CellSize {
     }
 }
 
+/// The title's font at its own size, for how wide and tall it is.
+private let titleFont = UIFont.systemFont(ofSize: 36, weight: .bold)
+
+/// How many columns the gallery has in a window `screen` big (the shared core's rule): three
+/// upright and four on its side; in a narrow window (beside another app) by its width.
+private func galleryColumnCount(_ screen: CGSize) -> Int {
+    max(Int(galleryColumns(width: Float(screen.width), landscape: screen.width > screen.height)), 1)
+}
+
+/// A title row button's name, as More's list shows it.
+private func galleryActionLabel(_ action: GalleryAction) -> String {
+    switch action {
+    case .select: "Select"
+    case .`import`: "Import"
+    case .photo: "Photo"
+    case .stack: "Stack"
+    case .preview: "Preview"
+    case .share: "Share"
+    case .duplicate: "Duplicate"
+    case .delete: "Delete"
+    case .more: "More"
+    }
+}
+
 /// An artwork's or stack's name being changed.
 struct Renaming: Identifiable {
     let id: String
@@ -50,34 +77,40 @@ struct Renaming: Identifiable {
     let stack: Bool
 }
 
-/// Artworks to share, and the swiped Share button's place on the screen; none from Select.
+/// Artworks to share, and the swiped Share button's place on the screen (none from Select); several
+/// as one PDF are named `group`.
 struct GalleryShare {
     let artworks: [GalleryArtwork]
     let from: CGRect?
+    var group = GalleryModel.groupName
 }
 
 /// The gallery: its title and buttons, then the artworks kept on the iPad (the core's store, in the
 /// app's own Application Support). A tap opens an artwork (on its name, renames it), a swipe left
-/// shows Share, Duplicate and Delete, two fingers spread on it open it in Preview, and held it can
-/// be dragged (`GalleryDragger`); Select picks several; + makes a new canvas.
+/// shows Share, Duplicate and Delete (a stack's act on every artwork in it), two fingers spread on
+/// it open it in Preview, and held it can be dragged (`GalleryDragger`); Select picks several
+/// artworks and stacks; + makes a new canvas.
 struct GalleryView: View {
     let onOpen: (OpenArtwork) -> Void
 
     @Environment(\.displayScale) private var displayScale
     @State private var model = GalleryModel.shared
     @State private var failure: String?
-    /// The artwork (by folder) whose actions a swipe left is showing.
+    /// The artwork or stack (by folder) whose actions a swipe left is showing.
     @State private var swiped: String?
     @State private var selecting = false
+    /// The artworks and stacks picked, by folder.
     @State private var selected: Set<String> = []
     @State private var moreOpen = false
     @State private var newCanvasOpen = false
     @State private var sharing: GalleryShare?
-    /// Artworks waiting for their PDF's quality.
-    @State private var pdfFor: [GalleryArtwork]?
+    /// Artworks waiting for their PDF's quality (several go into one, named as the share says).
+    @State private var pdfFor: GalleryShare?
     @State private var renaming: Renaming?
     @State private var deleting: GalleryArtwork?
-    @State private var deletingSelected = false
+    /// What Select's Delete is asking about, and a stack swiped to.
+    @State private var deletingSelected: GalleryPick?
+    @State private var deletingStack: GalleryPick?
     @State private var importAsked = false
     @State private var photoAsked = false
     @State private var photo: PhotosPickerItem?
@@ -95,13 +128,33 @@ struct GalleryView: View {
     @State private var about = false
     /// Gallery Recovery's card, while it shows.
     @State private var recovery: ProgressShown?
+    /// The artwork being opened has taken long enough to say so.
+    @State private var slowOpening = false
 
     init(onOpen: @escaping (OpenArtwork) -> Void) {
         self.onOpen = onOpen
     }
 
-    private func picked() -> [GalleryArtwork] {
-        model.artworks.filter { selected.contains($0.dir) }
+    /// What Select's actions act on now (the shared core's rules): a stack picked whole.
+    private func picked() -> GalleryPick {
+        model.pick(selected)
+    }
+
+    /// Several shared as one PDF are named after the one stack picked alone, else the stack open.
+    private func shareName(_ pick: GalleryPick) -> String {
+        if pick.dirs.count == 1, case let .stack(_, name, _)? = model.entries.first(where: { $0.dir == pick.dirs.first }) {
+            return name
+        }
+        return model.openStack?.name ?? GalleryModel.groupName
+    }
+
+    /// Selecting, a tap picks the artwork or stack in `dir`, or lets it go.
+    private func toggle(_ dir: String) {
+        if selected.contains(dir) {
+            selected.remove(dir)
+        } else {
+            selected.insert(dir)
+        }
     }
 
     private func endSelecting() {
@@ -113,7 +166,7 @@ struct GalleryView: View {
     /// A stack's artworks flying back into its cell, over the gallery growing back.
     @ViewBuilder private func flyingBack(_ screen: CGSize) -> some View {
         if let back = model.flyingBack {
-            let columns = screen.width > screen.height ? 4 : 3
+            let columns = galleryColumnCount(screen)
             let cell = CellSize(screenWidth: screen.width, columns: columns)
             GeometryReader { place in
                 let origin = Interface.shared.rect(place.frame(in: .global)).origin
@@ -137,7 +190,7 @@ struct GalleryView: View {
     /// Nothing is open over the gallery, so a touch on a cell can be taken for a drag or a spread.
     private func quiet() -> Bool {
         guard !selecting, !newCanvasOpen, !model.customOpen, sharing == nil, renaming == nil, deleting == nil,
-              pdfFor == nil, previewing == nil, opening == nil, !about
+              deletingStack == nil, model.endedOpening == nil, pdfFor == nil, previewing == nil, opening == nil, !about
         else { return false }
         return true
     }
@@ -157,11 +210,7 @@ struct GalleryView: View {
         if swiped != nil {
             withAnimation(Motion.swipeSettle) { swiped = nil }
         } else if selecting {
-            if selected.contains(a.dir) {
-                selected.remove(a.dir)
-            } else {
-                selected.insert(a.dir)
-            }
+            toggle(a.dir)
         } else if y > cell.nameTop {
             renaming = Renaming(id: a.dir, name: a.name, shown: a, stack: false)
         } else {
@@ -171,10 +220,21 @@ struct GalleryView: View {
 
     /// How far a swiped cell's actions shift to stay on the screen: they are wider than a narrow
     /// cell, so the first and last columns' would run off it.
-    private func pillShift(_ a: GalleryArtwork, cell: CellSize, columns: Int) -> CGFloat {
+    private func pillShift(_ dir: String, cell: CellSize, columns: Int) -> CGFloat {
         let over = max((swipePillWidth * 3 + 6 - cell.pitch) / 2, 0)
-        let column = (model.entries.firstIndex { $0.dir == a.dir } ?? 0) % columns
+        let column = (model.entries.firstIndex { $0.dir == dir } ?? 0) % columns
         return column == 0 ? over : column == columns - 1 ? -over : 0
+    }
+
+    /// Moved left across the cell of `dir`, its actions show; moved right, they go.
+    private func swipe(_ dir: String) -> some Gesture {
+        DragGesture(minimumDistance: 14).onChanged { drag in
+            guard !selecting, opening == nil, self.drag.dragging == nil, abs(drag.translation.width) > abs(drag.translation.height) else { return }
+            let next = drag.translation.width < 0 ? dir : nil
+            if next != swiped {
+                withAnimation(Motion.swipeSettle) { swiped = next }
+            }
+        }
     }
 
     private func artworkCell(_ a: GalleryArtwork, cell: CellSize, columns: Int) -> some View {
@@ -207,41 +267,64 @@ struct GalleryView: View {
                 )
                 // centred on the thumbnail's frame
                 .padding(.top, 39 + cell.thumb / 2 - swipePillHeight / 2)
-                .offset(x: pillShift(a, cell: cell, columns: columns))
+                .offset(x: pillShift(a.dir, cell: cell, columns: columns))
                 .transition(.scale(scale: 0.2, anchor: .trailing).combined(with: .opacity))
             }
         }
         .zIndex(open ? 1 : 0)
         .contentShape(Rectangle())
         .onTapGesture { location in tapped(a, at: location.y, cell: cell) }
-        .simultaneousGesture(
-            DragGesture(minimumDistance: 14).onChanged { drag in
-                guard !selecting, opening == nil, self.drag.dragging == nil, abs(drag.translation.width) > abs(drag.translation.height) else { return }
-                let next = drag.translation.width < 0 ? a.dir : nil
-                if next != swiped {
-                    withAnimation(Motion.swipeSettle) { swiped = next }
-                }
-            }
-        )
+        .simultaneousGesture(swipe(a.dir))
     }
 
-    private func stackCell(dir: String, name: String, artworks: [GalleryArtwork], cell: CellSize) -> some View {
-        StackCell(name: name, artworks: artworks, cell: cell, version: model.version, dim: selecting, wash: drag.onto == dir)
-            .modifier(CellPlace(model: model, dir: dir))
-            .opacity(drag.dragging == dir ? draggedAlpha : 1)
-            .contentShape(Rectangle())
-            .onTapGesture { location in
-                guard !selecting else { return }
-                if location.y > cell.nameTop, let top = artworks.first {
-                    renaming = Renaming(id: dir, name: name, shown: top, stack: true)
-                } else {
-                    model.showStack(dir, name: name)
-                }
+    private func stackCell(dir: String, name: String, artworks: [GalleryArtwork], cell: CellSize, columns: Int) -> some View {
+        let open = swiped == dir
+        return StackCell(
+            name: name, artworks: artworks, cell: cell, version: model.version,
+            chosen: selecting ? selected.contains(dir) : nil, wash: drag.onto == dir
+        )
+        .modifier(CellPlace(model: model, dir: dir))
+        .opacity(drag.dragging == dir ? draggedAlpha : 1)
+        // swiped open, it fades back and its actions grow in over it, as an artwork's
+        .opacity(open ? 1 - swipedFade : 1)
+        .overlay(alignment: .top) {
+            if open {
+                // a stack's act on every artwork in it
+                SwipeActions(
+                    onShare: { at in sharing = GalleryShare(artworks: artworks, from: at, group: name) },
+                    onDuplicate: {
+                        swiped = nil
+                        model.duplicate(dirs: [dir])
+                    },
+                    onDelete: {
+                        swiped = nil
+                        deletingStack = model.pick([dir])
+                    }
+                )
+                .padding(.top, 39 + cell.thumb / 2 - swipePillHeight / 2)
+                .offset(x: pillShift(dir, cell: cell, columns: columns))
+                .transition(.scale(scale: 0.2, anchor: .trailing).combined(with: .opacity))
             }
+        }
+        .zIndex(open ? 1 : 0)
+        .contentShape(Rectangle())
+        .onTapGesture { location in
+            // a tap puts away the actions showing; selecting, it picks the stack (or lets it go)
+            if swiped != nil {
+                withAnimation(Motion.swipeSettle) { swiped = nil }
+            } else if selecting {
+                toggle(dir)
+            } else if location.y > cell.nameTop, let top = artworks.first {
+                renaming = Renaming(id: dir, name: name, shown: top, stack: true)
+            } else {
+                model.showStack(dir, name: name)
+            }
+        }
+        .simultaneousGesture(swipe(dir))
     }
 
     private func grid(_ screen: CGSize) -> some View {
-        let columns = screen.width > screen.height ? 4 : 3
+        let columns = galleryColumnCount(screen)
         let cell = CellSize(screenWidth: screen.width, columns: columns)
         return ScrollView {
             LazyVGrid(columns: Array(repeating: GridItem(.fixed(cell.pitch), spacing: 0), count: columns), spacing: 0) {
@@ -250,7 +333,7 @@ struct GalleryView: View {
                     case let .artwork(artwork):
                         artworkCell(artwork, cell: cell, columns: columns)
                     case let .stack(dir, name, artworks):
-                        stackCell(dir: dir, name: name, artworks: artworks, cell: cell)
+                        stackCell(dir: dir, name: name, artworks: artworks, cell: cell, columns: columns)
                     }
                 }
             }
@@ -270,40 +353,89 @@ struct GalleryView: View {
         }
     }
 
+    /// The title row laid out for the window (the shared core's rules): the buttons that fit, the
+    /// rest under More, and the title on one line, shrunk to fit beside them.
+    private func headerFit(_ screen: CGSize) -> GalleryHeaderFit {
+        let title = model.openStack?.name ?? "ProCraft"
+        let width = (title as NSString).size(withAttributes: [.font: titleFont]).width
+        // in a stack the name follows the way back; selecting, it stands alone
+        let titleX: Float = model.openStack != nil && !selecting ? 60 : 32
+        return galleryHeaderFit(
+            width: Float(screen.width), titleX: titleX, titleWidth: Float(width.rounded(.up)),
+            selecting: selecting, landscape: screen.width > screen.height, inStack: model.openStack != nil
+        )
+    }
+
+    /// The middle of `action`'s button in the title row, if it shows there.
+    private func buttonCentre(_ action: GalleryAction, in fit: GalleryHeaderFit) -> CGFloat? {
+        var x = CGFloat(fit.capsuleLeft)
+        for button in fit.buttons {
+            if button.action == action {
+                return x + CGFloat(button.width) / 2
+            }
+            x += CGFloat(button.width)
+        }
+        return nil
+    }
+
+    /// Whether `action` can act now: Stack on two or more picked, the rest of Select's on any; the
+    /// others always.
+    private func canAct(_ action: GalleryAction, _ pick: GalleryPick?) -> Bool {
+        switch action {
+        case .stack: pick?.canStack == true
+        case .preview, .share, .duplicate, .delete: pick?.dirs.isEmpty == false
+        default: true
+        }
+    }
+
+    /// What a button in the title row, or a row of More's list, does.
+    private func act(_ action: GalleryAction) {
+        switch action {
+        case .select:
+            swiped = nil
+            selecting = true
+        case .`import`:
+            importAsked = true
+        case .photo:
+            photoAsked = true
+        case .stack:
+            model.stackPicked(picked().dirs)
+            endSelecting()
+        case .preview:
+            showPicked()
+        case .share:
+            let pick = picked()
+            sharing = GalleryShare(artworks: pick.artworks, from: nil, group: shareName(pick))
+        case .duplicate:
+            model.duplicate(dirs: picked().dirs)
+            endSelecting()
+        case .delete:
+            deletingSelected = picked()
+        case .more:
+            moreOpen.toggle()
+        }
+    }
+
     @ViewBuilder private func header(_ screen: CGSize) -> some View {
+        let fit = headerFit(screen)
         if selecting {
+            let pick = picked()
             SelectHeader(
                 title: model.openStack?.name ?? "ProCraft",
-                count: selected.count,
-                wide: screen.width > screen.height,
-                canStack: model.openStack == nil,
-                onStack: {
-                    model.stack(picked())
-                    endSelecting()
-                },
-                onPreview: showPicked,
-                onShare: { sharing = GalleryShare(artworks: picked(), from: nil) },
-                onDuplicate: {
-                    picked().forEach(model.duplicate)
-                    endSelecting()
-                },
-                onDelete: { deletingSelected = true },
-                onMore: { moreOpen.toggle() },
+                fit: fit,
+                canAct: { canAct($0, pick) },
+                onAction: act,
                 onDone: endSelecting
             )
         } else {
             GalleryHeader(
                 stack: model.openStack?.name,
+                fit: fit,
                 backLit: drag.backLit,
                 onBackPlaced: { model.backAt = $0 },
                 onBack: { model.showStack(nil) },
                 onAbout: { withAnimation(Motion.easeInOut(0.3)) { about = true } },
-                onSelect: {
-                    swiped = nil
-                    selecting = true
-                },
-                onImport: { importAsked = true },
-                onPhoto: { photoAsked = true },
+                onAction: act,
                 onNew: { withAnimation(Motion.menuOpen) { newCanvasOpen.toggle() } }
             )
         }
@@ -328,7 +460,7 @@ struct GalleryView: View {
 
     private func showPicked() {
         previewFrom = 0
-        previewing = picked()
+        previewing = picked().artworks
     }
 
     /// An artwork spreading open, and Preview, over the whole screen.
@@ -366,25 +498,20 @@ struct GalleryView: View {
             )
             .menuTransition(.topTrailing)
         }
-        if moreOpen {
+        let fit = headerFit(screen)
+        if moreOpen, !fit.more.isEmpty {
             Color.clear
                 .contentShape(Rectangle())
                 .onTapGesture { moreOpen = false }
+            // what the title row has no room for, greyed until it can act on what is picked
+            let pick = selecting ? picked() : nil
             MoreOptions(
-                screen: screen, count: selected.count, canStack: model.openStack == nil,
-                onStack: {
-                    moreOpen = false
-                    model.stack(picked())
-                    endSelecting()
-                },
-                onPreview: {
-                    moreOpen = false
-                    showPicked()
-                },
-                onDuplicate: {
-                    moreOpen = false
-                    picked().forEach(model.duplicate)
-                    endSelecting()
+                screen: screen, centre: buttonCentre(.more, in: fit) ?? screen.width / 2,
+                rows: fit.more.map { action in
+                    MoreRow(label: galleryActionLabel(action), enabled: canAct(action, pick)) {
+                        moreOpen = false
+                        act(action)
+                    }
                 }
             )
         }
@@ -392,11 +519,18 @@ struct GalleryView: View {
             Color.clear
                 .contentShape(Rectangle())
                 .onTapGesture { sharing = nil }
-            ImageFormats(share: share, screen: screen) { format in
+            // under Select's Share, or under More when Share is in its list
+            let centre = buttonCentre(.share, in: fit) ?? buttonCentre(.more, in: fit) ?? screen.width / 2
+            ImageFormats(share: share, screen: screen, centre: centre) { format in
                 sharing = nil
                 swiped = nil
-                if format == "PDF" {
-                    pdfFor = share.artworks
+                if let animated = GalleryModel.animatedFormats.first(where: { $0.title == format }) {
+                    // the first artwork opens into its animated export
+                    if let first = share.artworks.first {
+                        model.open(first, animated: animated)
+                    }
+                } else if format == "PDF" {
+                    pdfFor = share
                 } else {
                     model.share(share.artworks, format: format, from: share.from)
                 }
@@ -421,17 +555,42 @@ struct GalleryView: View {
                 deleting = nil
             }
         )
+        // what Select picked (a stack with its artworks), or a stack swiped to: the core's words
         AlertView(
-            content: deletingSelected ? AlertContent(
-                title: selected.count == 1 ? "Delete 1 artwork?" : "Delete \(selected.count) artworks?",
-                message: "This can't be undone.", action: "Delete", icon: PcIcons.trash
-            ) : nil,
-            onCancel: { deletingSelected = false },
+            content: deletingSelected.map {
+                AlertContent(title: $0.deleteTitle, message: $0.deleteMessage, action: "Delete", icon: PcIcons.trash)
+            },
+            onCancel: { deletingSelected = nil },
             onAction: {
-                picked().forEach(model.delete)
-                deletingSelected = false
+                if let pick = deletingSelected {
+                    model.delete(dirs: pick.dirs)
+                }
+                deletingSelected = nil
                 endSelecting()
             }
+        )
+        AlertView(
+            content: deletingStack.map {
+                AlertContent(title: $0.deleteTitle, message: $0.deleteMessage, action: "Delete", icon: PcIcons.trash)
+            },
+            onCancel: { deletingStack = nil },
+            onAction: {
+                if let pick = deletingStack {
+                    model.delete(dirs: pick.dirs)
+                }
+                deletingStack = nil
+            }
+        )
+        // an artwork whose opening closed the app last time: opened again only when asked to (it can
+        // be shared, duplicated or deleted from the gallery meanwhile)
+        AlertView(
+            content: model.endedOpening != nil ? AlertContent(
+                title: "This artwork closed the app",
+                message: "ProCraft closed while this artwork was opening last time, perhaps for want of memory. Closing other apps first may help.",
+                action: "Open Anyway", destructive: false
+            ) : nil,
+            onCancel: model.keepClosed,
+            onAction: model.openAnyway
         )
         AlertView(
             content: pdfFor != nil ? AlertContent(
@@ -446,9 +605,9 @@ struct GalleryView: View {
     }
 
     private func sharePdf(_ quality: UInt8) {
-        let list = pdfFor ?? []
+        guard let share = pdfFor else { return }
         pdfFor = nil
-        model.share(list, format: "PDF", quality: quality, from: nil)
+        model.share(share.artworks, format: "PDF", quality: quality, group: share.group, from: nil)
     }
 
     var body: some View {
@@ -519,6 +678,27 @@ struct GalleryView: View {
             .overlay {
                 ZStack {
                     previews
+                }
+            }
+            .overlay {
+                // only a slow artwork (a big one) says it is being opened; a quick one just opens
+                if model.loadingArtwork, slowOpening {
+                    ZStack {
+                        openingVeil
+                        Text(verbatim: "Opening…")
+                            .font(.system(size: 17))
+                            .foregroundStyle(Pc.text)
+                    }
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+                }
+            }
+            .task(id: model.loadingArtwork) {
+                slowOpening = false
+                guard model.loadingArtwork else { return }
+                try? await Task.sleep(for: slowOpeningAfter)
+                if !Task.isCancelled {
+                    slowOpening = true
                 }
             }
             .overlay { alerts }
@@ -653,28 +833,79 @@ struct GalleryView: View {
     #endif
 }
 
-/// The title row: the app's name (in a stack, the way back and its name), the Select, Import and
-/// Photo capsule and the round + that makes a new canvas.
+/// The title's name on one line at its size shrunk as `fit` says, cut short if even then too long.
+private struct GalleryTitle: View {
+    let text: String
+    let ink: Color
+    let fit: GalleryHeaderFit
+
+    var body: some View {
+        Text(verbatim: text)
+            .font(.system(size: 36 * CGFloat(fit.titleScale), weight: .bold))
+            .foregroundStyle(ink)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .frame(maxWidth: CGFloat(fit.titleRoom), alignment: .leading)
+    }
+}
+
+/// A capsule button's face: its name, or, More alone in the capsule, its glyph.
+private struct CapsuleLabel: View {
+    let button: GalleryButton
+    let alone: Bool
+    let ink: Color
+
+    var body: some View {
+        if button.action == .more, alone {
+            PcIconView(PcIcons.more, size: 24, color: ink)
+        } else {
+            Text(verbatim: button.label)
+                .font(.system(size: 16))
+                .foregroundStyle(ink)
+        }
+    }
+}
+
+/// The capsule of the title row's buttons as `fit` lays them out, each dimmed while it can't act.
+private struct HeaderCapsule: View {
+    let fit: GalleryHeaderFit
+    let ink: Color
+    var canAct: (GalleryAction) -> Bool = { _ in true }
+    let onAction: (GalleryAction) -> Void
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ForEach(fit.buttons.indices, id: \.self) { i in
+                let button = fit.buttons[i]
+                let enabled = canAct(button.action)
+                CapsuleLabel(button: button, alone: fit.buttons.count == 1, ink: enabled ? ink : Pc.gallerySize)
+                    .frame(width: CGFloat(button.width), height: 45)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        if enabled {
+                            onAction(button.action)
+                        }
+                    }
+            }
+        }
+        .background(Capsule().fill(Pc.capsule))
+        .overlay(Capsule().strokeBorder(Pc.capsuleEdge, lineWidth: 1))
+    }
+}
+
+/// The title row: the app's name (in a stack, the way back and its name), the capsule of Select,
+/// Import and Photo and the round + that makes a new canvas, laid out by `fit`: in a narrow window
+/// some or all of the buttons go under More and the title shrinks to fit, never wrapping.
 private struct GalleryHeader: View {
     let stack: String?
+    let fit: GalleryHeaderFit
     /// An artwork dragged rests on the way back, to go back.
     let backLit: Bool
     let onBackPlaced: (CGRect) -> Void
     let onBack: () -> Void
     let onAbout: () -> Void
-    let onSelect: () -> Void
-    let onImport: () -> Void
-    let onPhoto: () -> Void
+    let onAction: (GalleryAction) -> Void
     let onNew: () -> Void
-
-    private func word(_ label: String, _ width: CGFloat, _ action: @escaping () -> Void) -> some View {
-        Text(verbatim: label)
-            .font(.system(size: 16))
-            .foregroundStyle(Pc.galleryText)
-            .frame(width: width, height: 45)
-            .contentShape(Rectangle())
-            .onTapGesture(perform: action)
-    }
 
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -684,10 +915,7 @@ private struct GalleryHeader: View {
                 HStack(spacing: 0) {
                     PcIconView(PcIcons.chevronLeft, size: 28, color: ink)
                         .frame(width: 40)
-                    Text(verbatim: stack)
-                        .font(.system(size: 36, weight: .bold))
-                        .foregroundStyle(ink)
-                        .lineLimit(1)
+                    GalleryTitle(text: stack, ink: ink, fit: fit)
                 }
                 .frame(height: 41)
                 .contentShape(Rectangle())
@@ -702,23 +930,17 @@ private struct GalleryHeader: View {
                 .padding(.leading, 20)
                 .padding(.top, 12)
             } else {
-                Text(verbatim: "ProCraft")
-                    .font(.system(size: 36, weight: .bold))
-                    .foregroundStyle(Pc.galleryTitle)
+                // as wide as there is room beside the capsule, centred on the line it has at its size
+                GalleryTitle(text: "ProCraft", ink: Pc.galleryTitle, fit: fit)
                     .contentShape(Rectangle())
                     .onTapGesture(perform: onAbout)
+                    .frame(height: titleFont.lineHeight)
                     .padding(.leading, 32)
                     .padding(.top, 11)
             }
             HStack(spacing: 0) {
                 Spacer()
-                HStack(spacing: 0) {
-                    word("Select", 69, onSelect)
-                    word("Import", 71, onImport)
-                    word("Photo", 66, onPhoto)
-                }
-                .background(Capsule().fill(Pc.capsule))
-                .overlay(Capsule().strokeBorder(Pc.capsuleEdge, lineWidth: 1))
+                HeaderCapsule(fit: fit, ink: Pc.galleryText, onAction: onAction)
                 ZStack {
                     Circle().fill(Pc.capsule).frame(width: 42, height: 42)
                     Circle().strokeBorder(Pc.capsuleEdge, lineWidth: 1).frame(width: 42, height: 42)
@@ -736,60 +958,26 @@ private struct GalleryHeader: View {
     }
 }
 
-/// The title row while artworks are picked: on a wide screen everything that can be done with
-/// them, else Share, Delete and More; and the blue tick that ends it.
+/// The title row while artworks and stacks are picked: on a wide screen on its side Stack (none in
+/// a stack), Preview, Share, Duplicate and Delete, else Share, Delete and More, in a narrow window
+/// More alone, as `fit` lays it out; each dimmed until it can act on what is picked (More always
+/// opens). Then the blue tick that ends it.
 private struct SelectHeader: View {
     let title: String
-    let count: Int
-    let wide: Bool
-    let canStack: Bool
-    let onStack: () -> Void
-    let onPreview: () -> Void
-    let onShare: () -> Void
-    let onDuplicate: () -> Void
-    let onDelete: () -> Void
-    let onMore: () -> Void
+    let fit: GalleryHeaderFit
+    let canAct: (GalleryAction) -> Bool
+    let onAction: (GalleryAction) -> Void
     let onDone: () -> Void
 
-    private func word(_ label: String, _ width: CGFloat, enabled: Bool, _ action: @escaping () -> Void) -> some View {
-        Text(verbatim: label)
-            .font(.system(size: 16))
-            .foregroundStyle(enabled ? Pc.galleryTitle : Pc.gallerySize)
-            .frame(width: width, height: 45)
-            .contentShape(Rectangle())
-            .onTapGesture {
-                if enabled {
-                    action()
-                }
-            }
-    }
-
     var body: some View {
-        let any = count > 0
         ZStack(alignment: .topLeading) {
-            Text(verbatim: title)
-                .font(.system(size: 36, weight: .bold))
-                .foregroundStyle(Pc.galleryTitle)
-                .lineLimit(1)
+            GalleryTitle(text: title, ink: Pc.galleryTitle, fit: fit)
+                .frame(height: titleFont.lineHeight)
                 .padding(.leading, 32)
                 .padding(.top, 11)
             HStack(spacing: 0) {
                 Spacer()
-                HStack(spacing: 0) {
-                    if wide {
-                        word("Stack", 65, enabled: canStack && count >= 2, onStack)
-                        word("Preview", 80, enabled: any, onPreview)
-                        word("Share", 65, enabled: any, onShare)
-                        word("Duplicate", 91, enabled: any, onDuplicate)
-                        word("Delete", 70, enabled: any, onDelete)
-                    } else {
-                        word("Share", 65, enabled: any, onShare)
-                        word("Delete", 70, enabled: any, onDelete)
-                        word("More", 61, enabled: true, onMore)
-                    }
-                }
-                .background(Capsule().fill(Pc.capsule))
-                .overlay(Capsule().strokeBorder(Pc.capsuleEdge, lineWidth: 1))
+                HeaderCapsule(fit: fit, ink: Pc.galleryTitle, canAct: canAct, onAction: onAction)
                 PcIconView(PcIcons.doneTick, size: 40, color: .white)
                     .frame(width: 44, height: 45)
                     .background(Capsule().fill(doneBlue))
@@ -984,13 +1172,14 @@ private struct ArtworkCell: View {
     }
 }
 
-/// A stack: its newest artwork on two more cards, the name, and how many it holds.
+/// A stack: its newest artwork on two more cards, the name, and how many it holds; selecting, the
+/// top card shows whether it is picked.
 private struct StackCell: View {
     let name: String
     let artworks: [GalleryArtwork]
     let cell: CellSize
     let version: Int
-    let dim: Bool
+    let chosen: Bool?
     let wash: Bool
 
     var body: some View {
@@ -1004,14 +1193,14 @@ private struct StackCell: View {
                                 .rotationEffect(.degrees(turn))
                         }
                     }
-                    Thumbnail(artwork: top, cell: cell, version: version, wash: wash)
+                    Thumbnail(artwork: top, cell: cell, version: version, chosen: chosen, wash: wash)
                 }
                 .frame(width: cell.width, height: cell.thumb, alignment: .bottom)
                 .padding(.top, 39)
             }
             Text(verbatim: name)
                 .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(dim ? Pc.gallerySize : Pc.galleryText)
+                .foregroundStyle(chosen == true ? Color.white : Pc.galleryText)
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .padding(.top, 12)
@@ -1041,6 +1230,13 @@ enum Gallery {
     }
 
     static let store: ArtworkStore = ArtworkStore.open(root: support.appendingPathComponent("gallery").path)
+
+    /// Where the artworks being opened are noted until each shows, outside the gallery: one whose
+    /// opening ended the app is asked about when next picked.
+    static var openMarks: URL {
+        try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        return support.appendingPathComponent("opening.txt")
+    }
 
     /// Brush files brought in with no artwork open, for the next one to add to the library.
     static var pendingBrushes: URL {

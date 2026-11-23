@@ -1147,6 +1147,8 @@ struct BlendListAsk {
     let current: Int
     /// Where the row's middle is on the screen.
     let centreY: CGFloat
+    /// Where the list's left edge goes; none puts it 10 from the screen's right.
+    var left: CGFloat?
     let onPick: (Int) -> Void
 }
 
@@ -1192,8 +1194,9 @@ private struct BlendPicker: View {
     }
 }
 
-/// The blend modes in the layer panel's order, as a light list 10 from the screen's right with the
-/// current one over the row it opened from; a tap picks one, a tap outside it closes it.
+/// The blend modes in the layer panel's order, as a light list 10 from the screen's right (or where
+/// the ask puts it) with the current one over the row it opened from; a tap picks one, a tap
+/// outside it closes it.
 struct BlendModeList: View {
     let ask: BlendListAsk
     let height: CGFloat
@@ -1215,7 +1218,7 @@ struct BlendModeList: View {
         let top = ask.centreY - (CGFloat(chosen - first) + 0.5) * (rowHeight + 1)
         let y = min(max(top, 10), max(height - 10 - tall, 10))
         let shape = RoundedRectangle(cornerRadius: 13, style: .circular)
-        ZStack(alignment: .topTrailing) {
+        ZStack(alignment: ask.left == nil ? .topTrailing : .topLeading) {
             Color.clear
                 .contentShape(Rectangle())
                 .onTapGesture { onDone(nil) }
@@ -1255,8 +1258,8 @@ struct BlendModeList: View {
             .background(shape.fill(Color(argb: 0xFFE1_E1E1)))
             .clipShape(shape)
             .shadow(color: .black.opacity(0.35), radius: 12)
-            .padding(.trailing, 10)
-            .offset(y: y)
+            .padding(.trailing, ask.left == nil ? 10 : 0)
+            .offset(x: ask.left ?? 0, y: y)
         }
     }
 }

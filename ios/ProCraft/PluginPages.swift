@@ -1,9 +1,9 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
-/// The tag on a card.
-private var pluginTag: Color { Look.shared.light ? Color(argb: 0x1400_0000) : Color(argb: 0x1FFF_FFFF) }
-
-/// The plugins, a page of the panel: a card each, drawn from what the list says of them.
+/// The plugins, a page of the panel: a card each, drawn from what the list says of them, in the
+/// order they were put in. A card held by its name lifts and follows the finger or Pencil; let go
+/// over another card, it takes that one's place.
 struct PluginsPage: View {
     let model: CanvasModel
     let onBack: () -> Void
@@ -36,8 +36,15 @@ struct PluginsPage: View {
                             .padding(16)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    ForEach(shown, id: \.id) { plugin in
+                    ForEach(Array(shown.enumerated()), id: \.element.id) { i, plugin in
                         PluginCard(model: model, plugin: plugin)
+                            .dropDestination(for: String.self) { ids, _ in
+                                guard let id = ids.first, id != plugin.id, shown.contains(where: { $0.id == id }) else { return false }
+                                if let said = plugins.move(id, to: i) {
+                                    model.showNotice(said, warning: true)
+                                }
+                                return true
+                            }
                     }
                 }
                 .padding(.horizontal, 12)
@@ -68,21 +75,10 @@ private struct PluginCard: View {
 
     private var about: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 8) {
-                Text(verbatim: plugin.name)
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(Pc.panelTitle)
-                    .lineLimit(1)
-                if plugin.experimental {
-                    Text(verbatim: "experimental")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(Pc.actionsRow)
-                        .lineLimit(1)
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 2)
-                        .background(RoundedRectangle(cornerRadius: 9, style: .circular).fill(pluginTag))
-                }
-            }
+            Text(verbatim: plugin.name)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(Pc.panelTitle)
+                .lineLimit(1)
             Text(verbatim: plugin.description)
                 .font(.system(size: 14))
                 .foregroundStyle(Pc.actionsRow)
@@ -97,19 +93,18 @@ private struct PluginCard: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        // held, the card is lifted by its name to another place
+        .draggable(plugin.id)
     }
 
-    @ViewBuilder private func control(_ control: PluginControl) -> some View {
-        switch control {
-        case let .switch(one):
-            RowView(row: .toggle(one.label, on: one.on, change: { PluginsModel.shared.setSwitch(one.key, $0) }))
-        case let .slider(one):
-            PluginSliderRow(slider: one) { PluginsModel.shared.setSlider($0, $1) }
-        case let .file(one):
-            PluginFileRow(file: one) { model.showNotice($0, warning: true) }
-        case let .texture(one):
-            PluginTextureRow(texture: one)
-        }
+    private func control(_ control: PluginControl) -> some View {
+        PluginControlView(model: model, control: control)
+    }
+
+    /// What it does when tapped, under its controls.
+    private func action(_ action: PluginAction) -> some View {
+        PluginActionRow(label: action.label) { model.runPluginAction(action.key) }
     }
 
     /// One of its features (interface 16): its name and words, and the switch that turns it on.
@@ -155,12 +150,20 @@ private struct PluginCard: View {
                             line
                             control(feature.controls[i])
                         }
+                        ForEach(feature.actions.indices, id: \.self) { i in
+                            line
+                            action(feature.actions[i])
+                        }
                     }
                 }
             } else if plugin.on, plugin.problem == nil {
                 ForEach(plugin.controls.indices, id: \.self) { i in
                     line
                     control(plugin.controls[i])
+                }
+                ForEach(plugin.actions.indices, id: \.self) { i in
+                    line
+                    action(plugin.actions[i])
                 }
             }
             line
@@ -176,36 +179,17 @@ private struct PluginCard: View {
     }
 }
 
-/// A texture control on a card (interface 15): its label and what is chosen, a grain by its number
-/// in the Source Library or a picture of the plugin's own. It is chosen on the other apps for now.
-private struct PluginTextureRow: View {
-    let texture: PluginTexture
-
-    var body: some View {
-        HStack(spacing: 0) {
-            Text(verbatim: texture.label)
-                .font(.system(size: 17))
-                .foregroundStyle(Pc.actionsRow)
-                .lineLimit(1)
-            Spacer(minLength: 0)
-            Text(verbatim: texture.value > 0 ? "Grain \(texture.value)" : (texture.value < 0 ? "Picture" : "None"))
-                .font(.system(size: 17))
-                .foregroundStyle(Pc.accent)
-                .lineLimit(1)
-        }
-        .padding(.leading, 16)
-        .padding(.trailing, 16)
-        .frame(height: 44)
-    }
-}
-
-/// A file control on a card (a sound): its label, then the name of what was picked and Clear, or
-/// Import; a tap on the row picks another.
-private struct PluginFileRow: View {
+/// A file control on a card (a sound or a picture): its label, then the name of what was picked
+/// and Clear, or Import; a tap on the row picks another.
+struct PluginFileRow: View {
     let file: PluginFile
     let told: (String) -> Void
 
     @State private var picking = false
+
+    private var picture: Bool {
+        file.accepts == .picture
+    }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -239,8 +223,11 @@ private struct PluginFileRow: View {
         .frame(height: 44)
         .contentShape(Rectangle())
         .onTapGesture { picking = true }
-        .fileImporter(isPresented: $picking, allowedContentTypes: [.audio]) { result in
-            if case let .success(url) = result {
+        .fileImporter(isPresented: $picking, allowedContentTypes: [picture ? UTType.image : UTType.audio]) { result in
+            guard case let .success(url) = result else { return }
+            if picture {
+                PluginsModel.shared.pickPicture(file.key, from: url, told: told)
+            } else {
                 PluginsModel.shared.pickSound(file.key, from: url, told: told)
             }
         }
@@ -249,7 +236,7 @@ private struct PluginFileRow: View {
 
 /// A slider on a card: the row follows the finger, and the value goes in as it lets go, as what it
 /// sets may move the row itself, unless it is live.
-private struct PluginSliderRow: View {
+struct PluginSliderRow: View {
     let slider: PluginSlider
     let onSet: (PluginSlider, Float) -> Void
 
@@ -280,7 +267,8 @@ private struct PluginSliderRow: View {
 }
 
 /// The one screen that asks whether to import a plugin file: what it is, and what it can do. Also
-/// where a setting that has moved to a plugin is said, once.
+/// where a setting that has moved to a plugin is said, once, and where a texture control's sheet
+/// opens over the whole window.
 struct PluginAlerts: View {
     @State private var plugins = PluginsModel.shared
     /// What went wrong keeping a file.
@@ -290,6 +278,14 @@ struct PluginAlerts: View {
 
     var body: some View {
         ZStack {
+            if let ask = plugins.texturing {
+                // laid out at the interface's size, from the window's corner
+                GeometryReader { place in
+                    TextureLibrary(ask: ask)
+                        .sized(Interface.shared.screen(place.size))
+                }
+                .ignoresSafeArea()
+            }
             AlertView(
                 content: plugins.movedNotice.map {
                     AlertContent(title: "Now a plugin", message: $0, action: "OK", destructive: false, alone: true)
@@ -347,30 +343,77 @@ extension CanvasModel {
         session.setInterfaceSize(size: Float(Interface.shared.scale))
         // what they show changes with them: the layers' rows (a label a plugin gives), and the
         // library, once a plugin turned on gave it the brushes it comes with
-        layers = session.layers()
+        readLayers()
         if session.takeBrushesChanged() {
             libraryChanged()
         }
+        followStrokeSound()
     }
 
-    /// A Pencil gesture set to a plugin's action: it runs where the Pencil is (window pixels), off
-    /// the main thread, and what it changed is read again after.
+    /// Plays the artwork's strokes while a plugin makes their sound (and the app is in front).
+    func followStrokeSound() {
+        StrokeSound.shared.follow(session, on: PluginsModel.shared.store.makesStrokeSound())
+    }
+
+    /// A plugin's action run on the artwork (a row tapped), off the main thread (it may take
+    /// seconds): the panel closes so what it does shows, and what it says, or its stopping, is told.
+    func runPluginAction(_ key: String) {
+        runPlugin(key, at: nil)
+    }
+
+    /// A Pencil gesture set to a plugin's action: it runs where the Pencil is (window pixels), where
+    /// a ring it shows opens.
     func runPluginAction(_ key: String, x: Float, y: Float) {
+        runPlugin(key, at: CGPoint(x: CGFloat(x), y: CGFloat(y)))
+    }
+
+    private func runPlugin(_ key: String, at: CGPoint?) {
+        closePanels()
+        let plugins = PluginsModel.shared
+        let store = plugins.store
+        let session = session
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            if let at {
+                _ = store.runActionAt(key: key, session: session, x: Float(at.x), y: Float(at.y))
+            } else {
+                _ = store.runAction(key: key, session: session)
+            }
+            DispatchQueue.main.async {
+                self?.afterPlugin(session)
+                // an action may turn the view, settling into place
+                self?.followView()
+            }
+        }
+    }
+
+    /// Row `row` of the plugin's panel touched with `value`: told to the plugin off the main
+    /// thread, and the panel shown as it answers (or closed).
+    func touchPluginPanel(_ row: Int, _ value: Float) {
         let store = PluginsModel.shared.store
         let session = session
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            _ = store.runActionAt(key: key, session: session, x: x, y: y)
-            DispatchQueue.main.async {
-                guard let self else { return }
-                if let failure = session.takeFailure() {
-                    self.showNotice(failure, warning: true)
-                }
-                if session.takeBrushesChanged() {
-                    self.libraryChanged()
-                }
-                self.refresh()
-            }
+            _ = store.panelTouched(row: UInt32(max(row, 0)), value: value, session: session)
+            DispatchQueue.main.async { self?.afterPlugin(session) }
         }
+    }
+
+    func closePluginPanel() {
+        PluginsModel.shared.closePanel()
+    }
+
+    /// What a plugin's action or panel changed, read again: its panel, the controls it set, the
+    /// colour and brush, what it said, and the library if it changed a brush.
+    private func afterPlugin(_ session: CanvasSession) {
+        guard session === self.session else { return }
+        PluginsModel.shared.followRun()
+        followPluginBrush()
+        if let failure = session.takeFailure() {
+            showNotice(failure, warning: true)
+        }
+        if session.takeBrushesChanged() {
+            libraryChanged()
+        }
+        refresh()
     }
 
     func setPluginFilterSlider(_ key: String, _ value: Float) {

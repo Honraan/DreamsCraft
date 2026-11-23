@@ -417,9 +417,11 @@ struct LiquifyPanel: View {
             let centre: CGFloat = wide ? (screen.width - 1093) / 2 + 86 + 94 * 8 + 37.5 : screen.width / 2
             let amount = model.adjustShown?.liquifyAmount ?? 1
             popover("Adjust", centre: centre, buttonsTop: buttonsTop) {
-                PanelSlider(label: "Amount", value: amount, shown: "\(wholeNumber(amount * 100))%") {
-                    model.changeLiquifyAmount($0)
-                }
+                // let go, that drag is an undo step of its own
+                PanelSlider(
+                    label: "Amount", value: amount, shown: "\(wholeNumber(amount * 100))%",
+                    onChange: { model.changeLiquifyAmount($0) }, onLetGo: { model.letGoLiquifyAmount() }
+                )
                 .padding(.vertical, 8)
                 .background(RoundedRectangle(cornerRadius: 13, style: .circular).fill(menuGroup))
                 .padding(.top, 4)
@@ -439,5 +441,36 @@ struct LiquifyPanel: View {
             .frame(width: screen.width, height: screen.height - 25, alignment: .bottom)
             popups
         }
+    }
+}
+
+/// Where Liquify's ring is (points) and its radius there: as far as its brush reaches.
+struct LiquifyRing {
+    let at: CGPoint
+    let radius: CGFloat
+}
+
+/// Liquify's ring: its reach as a thin dark circle with a light edge (1 black over 3 white), a
+/// fine cross in its middle.
+struct LiquifyRingView: View {
+    let ring: LiquifyRing
+
+    var body: some View {
+        Canvas { context, _ in
+            let c = ring.at
+            let r = ring.radius
+            let arm: CGFloat = 5
+            let strokes: [(width: CGFloat, colour: Color)] = [(3, .white), (1, .black)]
+            for stroke in strokes {
+                context.stroke(Path(ellipseIn: CGRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2)), with: .color(stroke.colour), lineWidth: stroke.width)
+                var cross = Path()
+                cross.move(to: CGPoint(x: c.x - arm, y: c.y))
+                cross.addLine(to: CGPoint(x: c.x + arm, y: c.y))
+                cross.move(to: CGPoint(x: c.x, y: c.y - arm))
+                cross.addLine(to: CGPoint(x: c.x, y: c.y + arm))
+                context.stroke(cross, with: .color(stroke.colour), lineWidth: stroke.width)
+            }
+        }
+        .allowsHitTesting(false)
     }
 }

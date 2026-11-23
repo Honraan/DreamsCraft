@@ -6,6 +6,10 @@ import SwiftUI
 final class Look {
     static let shared = Look()
     var light = false
+    /// The accent a plugin gives the interface (0xRRGGBB), if one does: drawn in place of its blue.
+    var accentGiven: UInt32?
+    /// How opaque a plugin makes the side bar's slider tracks, if one does.
+    var trackOpacity: Float?
 }
 
 extension Color {
@@ -31,7 +35,8 @@ enum Pc {
     static var panel: Color { pick(0xF726_2626, 0xF7E6_E6E6) }
     static var row: Color { pick(0xFF30_3030, 0xFFD8_D8D8) }
     static let rowSelected = Color(argb: 0xFF00_76FD)
-    static let accent = Color(argb: 0xFF00_76FD)
+    /// The interface's blue, or the accent a plugin gives in its place.
+    static var accent: Color { Color(argb: Look.shared.accentGiven.map { 0xFF00_0000 | $0 } ?? 0xFF00_76FD) }
     static var text: Color { pick(0xFFFF_FFFF, 0xFF22_2222) }
     static var textDim: Color { pick(0x99FF_FFFF, 0x9900_0000) }
     static var disabled: Color { pick(0x4DFF_FFFF, 0x4D00_0000) }
@@ -152,7 +157,10 @@ enum Pc {
     // the side bar: the bar and the tracks translucent, each straight over what is behind; the
     // thumbs opaque
     static var sideBar: Color { pick(0xE717_1717, 0xCFE5_E5E5) }
-    static var sliderTrack: Color { pick(0xC93E_3E3E, 0xBFF0_F0F0) }
+    static var sliderTrack: Color {
+        let own = pick(0xC93E_3E3E, 0xBFF0_F0F0)
+        return Look.shared.trackOpacity.map { own.opacity(Double(min(max($0, 0), 1))) } ?? own
+    }
     // a lighter rim round each track, more of what is behind showing through it
     static var sliderRim: Color { pick(0xB96E_6E6E, 0xFFE9_E9E9) }
     static let sliderRimWidth: CGFloat = 0.8
@@ -162,8 +170,6 @@ enum Pc {
     static let sideBarWidth: CGFloat = 51
     static let sideBarHeight: CGFloat = 519
     static let sideBarCorner: CGFloat = 20
-    /// Where the side bar's centre sits, as a fraction of the screen height.
-    static let sideBarCentre: CGFloat = 0.5234
     static let sliderWidth: CGFloat = 40
     static let sliderHeight: CGFloat = 170
     static let sliderCorner: CGFloat = 13

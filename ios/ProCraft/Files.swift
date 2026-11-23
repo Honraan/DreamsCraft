@@ -1,4 +1,5 @@
 import Foundation
+import QuickLook
 import UIKit
 
 /// Handing files to other apps through the system's share sheet.
@@ -31,6 +32,20 @@ enum Sharing {
         top.present(sheet, animated: true)
     }
 
+    /// The model in `usdz` shown by the system's viewer, which puts it in the room around the iPad.
+    static func viewInRoom(_ usdz: URL) {
+        guard let top = topController() else { return }
+        let viewer = QLPreviewController()
+        let shown = OneFile(usdz)
+        // the viewer holds its data source weakly: it is kept here while it shows
+        viewing = shown
+        viewer.dataSource = shown
+        top.present(viewer, animated: true)
+    }
+
+    /// The file the system's viewer is showing.
+    private static var viewing: OneFile?
+
     /// What is shown on top now, for something to be presented over it.
     private static func topController() -> UIViewController? {
         let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
@@ -39,6 +54,23 @@ enum Sharing {
             top = shown
         }
         return top
+    }
+}
+
+/// One file for the system's viewer.
+private final class OneFile: NSObject, QLPreviewControllerDataSource {
+    let url: URL
+
+    init(_ url: URL) {
+        self.url = url
+    }
+
+    func numberOfPreviewItems(in controller: QLPreviewController) -> Int {
+        1
+    }
+
+    func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem {
+        url as NSURL
     }
 }
 

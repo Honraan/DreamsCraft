@@ -184,6 +184,31 @@ final class AnimationAssist {
         }
     }
 
+    /// A plugin's in-between: a frame drawn between this one and the next, made off the main thread.
+    func addInbetween() {
+        frameOptionsOpen = false
+        guard let layer = currentLayer else { return }
+        let session = model.session
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let made = session.addInbetween(id: layer.id)
+            DispatchQueue.main.async {
+                guard let self, self.model.session === session else { return }
+                if made == nil {
+                    self.model.showNotice("An in-between goes between two frames of one layer each, with something drawn.", warning: true)
+                }
+                self.model.refresh()
+            }
+        }
+    }
+
+    /// A plugin's action `key` from the frame options, run with that frame's layer current.
+    func runFrameAction(_ key: String) {
+        frameOptionsOpen = false
+        guard let layer = currentLayer else { return }
+        _ = model.session.selectLayer(id: layer.id)
+        model.runPluginAction(key)
+    }
+
     /// The frame deleted; on a held place it is held one frame less.
     func deleteFrame() {
         frameOptionsOpen = false
@@ -787,10 +812,23 @@ private struct FrameOptionsPage: View {
                     }
                     .padding(.bottom, 10)
                 }
+                let plugins = PluginsModel.shared
+                // asked again as the plugins change
+                let _ = plugins.changes
                 group {
                     ActLine(label: "Duplicate") { tool.duplicateFrame() }
                     RowLine()
                     ActLine(label: "Delete") { tool.deleteFrame() }
+                    // a plugin's in-betweens: a frame drawn between this one and the next
+                    if plugins.store.tweens(), !settings.pages, tool.heldPlace == 0, index < tool.frames.count - 1 {
+                        RowLine()
+                        ActLine(label: "In-between") { tool.addInbetween() }
+                    }
+                    // a plugin's actions for the frame, after the app's own
+                    ForEach(plugins.store.actionsIn(place: .frame), id: \.key) { action in
+                        RowLine()
+                        ActLine(label: action.label) { tool.runFrameAction(action.key) }
+                    }
                 }
                 if foreground || background {
                     group {

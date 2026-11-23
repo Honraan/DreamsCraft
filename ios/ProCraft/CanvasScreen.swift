@@ -27,6 +27,11 @@ struct CanvasScreen: View {
             let screen = Interface.shared.screen(place.size)
             let right = AppSettings.shared.rightHanded
             let hidden = model.barsHidden
+            // the side bar at its kept place down its edge; its modify button dragged, it follows
+            // the finger up or down stretching a little toward it, and let go settles back
+            let sideFit = sideBarFit(height: Float(screen.size.height), topBar: Float(Pc.barHeight), centre: model.sideBarCentre)
+            let sideMoving = model.sideBarMoving
+            let sideStretch = CGFloat(sideMoving?.stretch ?? 0)
             ZStack(alignment: .topLeading) {
                 CanvasHost(model: model)
                 if model.panel != .none {
@@ -60,13 +65,14 @@ struct CanvasScreen: View {
                     .offset(y: hidden ? -Pc.barHeight : 0)
                     .opacity(hidden ? 0 : 1)
                 NoticeBand(model: model)
-                SideBar(model: model, right: right)
+                SideBar(model: model, right: right, windowHeight: screen.size.height, stretch: sideStretch)
                     .frame(maxWidth: .infinity, alignment: right ? .trailing : .leading)
-                    .offset(x: sideBarShift(right), y: screen.size.height * Pc.sideBarCentre - Pc.sideBarHeight / 2)
+                    // stretched, what is on it moves out with its far side
+                    .offset(x: sideBarShift(right) + (right ? -sideStretch : sideStretch), y: CGFloat(sideMoving?.top ?? sideFit.top))
                     .opacity(hidden ? 0 : 1)
                 // over the canvas, under the panels; not over a page that takes the screen
                 if !hidden, !model.canvasInfoOpen, !model.gestureControlsOpen, model.crop.shown == nil, !model.timeLapse.replaying,
-                   model.animatedExport == nil {
+                   model.animatedExport == nil, model.scene.animatedExport == nil, !model.scene.studioOpen {
                     AnimationBar(model: model, screen: screen.size)
                         .frame(width: screen.size.width, height: screen.size.height, alignment: .bottom)
                 }
@@ -101,6 +107,10 @@ struct CanvasScreen: View {
                     AdjustmentBar(model: model)
                         .offset(y: Pc.barHeight)
                     AdjustModes(model: model)
+                }
+                // its brush's reach where it is on the canvas, under its panel
+                if model.adjustment == .liquify, let ring = model.liquifyRing {
+                    LiquifyRingView(ring: ring)
                 }
                 if model.adjustment == .liquify, !hidden {
                     LiquifyPanel(model: model, screen: screen.size)
@@ -149,6 +159,10 @@ struct CanvasScreen: View {
                 if model.selecting, !hidden {
                     SelectionPopover(model: model, screen: screen.size)
                 }
+                // a picture being placed on a model: its box, and the bar that keeps it
+                if model.scene.placing {
+                    ModelPictureOverlay(model: model)
+                }
                 if model.adjustment == .gradientMap, let pick = model.gradientMap.stopColour, !hidden {
                     // over the stop, its arrow at the stop's top, kept inside the window
                     let left = min(max(pick.at.x - compactColorsWidth / 2, 0), max(screen.size.width - compactColorsWidth, 0))
@@ -171,6 +185,13 @@ struct CanvasScreen: View {
                 if let format = model.animatedExport {
                     AnimatedExport(model: model, format: format)
                         .transition(.move(edge: .bottom))
+                }
+                if let format = model.scene.animatedExport {
+                    ModelAnimatedExport(model: model, format: format)
+                        .transition(.move(edge: .bottom))
+                }
+                if model.scene.studioOpen {
+                    LightingStudio(model: model, screen: screen.size)
                 }
                 if model.timeLapse.replaying {
                     TimeLapseReplay(model: model)
@@ -207,6 +228,18 @@ struct CanvasScreen: View {
                     GestureControls(model: model)
                         .transition(.move(edge: .bottom))
                 }
+                // a plugin's own panel, while its action keeps it open: a ring where the Pencil was,
+                // or a card under the bar at the right
+                if let panel = PluginsModel.shared.panel {
+                    if panel.ring {
+                        PluginRingView(model: model, panel: panel, screen: screen.size)
+                    } else {
+                        PluginPanelView(model: model, panel: panel)
+                            .padding(.top, Pc.barHeight + 12)
+                            .padding(.trailing, 12)
+                            .frame(width: screen.size.width, height: screen.size.height, alignment: .topTrailing)
+                    }
+                }
                 ColorDropDot(drop: model.drop)
                 ProgressCard(shown: model.exportShown, title: "Exporting", glyph: PcIcons.tabShare) {
                     model.exportCancelled = true
@@ -232,6 +265,16 @@ struct CanvasScreen: View {
                     },
                     onCancel: { model.saying = nil },
                     onAction: { model.saying = nil }
+                )
+                // what a model newly opened may not paint well with, said once
+                AlertView(
+                    content: model.scene.warnings.isEmpty ? nil : AlertContent(
+                        title: "Unsupported model features",
+                        message: "Painting on this model may not go as expected because of:\n" + model.scene.warnings.joined(separator: "\n"),
+                        action: "OK", destructive: false, alone: true
+                    ),
+                    onCancel: { model.scene.warnings = [] },
+                    onAction: { model.scene.warnings = [] }
                 )
                 // the time-lapse in full or cut to 30 seconds (a tap outside: neither)
                 AlertView(
@@ -297,18 +340,30 @@ struct CanvasScreen: View {
             .sized(screen)
         }
         .ignoresSafeArea()
-        .fileImporter(isPresented: asked(.file), allowedContentTypes: [.image]) { result in
+        // a video's frames come in too, but not on a model, where a picture is placed on the surface
+        .fileImporter(isPresented: asked(.file), allowedContentTypes: model.scene.open ? [UTType.image] : [UTType.image, UTType.movie]) { result in
             if case let .success(url) = result {
                 model.insertFile(url, isPrivate: model.insertPrivate)
             }
         }
-        .photosPicker(isPresented: asked(.photo), selection: $photo, matching: .images)
+        .photosPicker(isPresented: asked(.photo), selection: $photo, matching: model.scene.open ? PHPickerFilter.images : PHPickerFilter.any(of: [.images, .videos]))
         .onChange(of: photo) { _, item in
             guard let item else { return }
             photo = nil
+            let isPrivate = model.insertPrivate
             Task { @MainActor in
+                if item.supportedContentTypes.contains(where: { $0.conforms(to: .movie) }) {
+                    guard let movie = try? await item.loadTransferable(type: PickedMovie.self) else {
+                        model.showNotice("This video can't be opened.", warning: true)
+                        return
+                    }
+                    model.insertVideo(movie.url, isPrivate: isPrivate) { _ in
+                        try? FileManager.default.removeItem(at: movie.url)
+                    }
+                    return
+                }
                 let data = try? await item.loadTransferable(type: Data.self)
-                model.insertPicture(data, name: nil, isPrivate: model.insertPrivate)
+                model.insertPicture(data, name: nil, isPrivate: isPrivate)
             }
         }
         .fullScreenCover(isPresented: asked(.camera)) {
@@ -373,7 +428,7 @@ private struct BlockedDialog: View {
                 title: "Several layers are chosen", message: "This works on one layer at a time: choose just one.",
                 action: "Open Layers", icon: PcIcons.folder, destructive: false
             )
-        // only on a model, which this app doesn't open yet
+        // only on a model
         case .meshHidden:
             return AlertContent(
                 title: "Mesh is hidden", message: "\u{201C}\(model.session.meantMeshName() ?? "")\u{201D} can't be painted while it is hidden.",
@@ -525,6 +580,8 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
             }
         }
         canvas.afterTouches = { [weak self] ended in self?.model.layerOpacityTouched(ended: ended) }
+        canvas.ringAt = { [weak self] in self?.model.showLiquifyRing($0) }
+        canvas.tapAssistance = SystemSettings.tapAssistance
         let pencil = UIPencilInteraction()
         pencil.delegate = self
         canvas.addInteraction(pencil)
@@ -536,7 +593,9 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
             forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main
         ) { [weak self] _ in
             self?.model.resumeTracking()
+            self?.model.followStrokeSound()
             self?.model.readAppSettings()
+            self?.canvas.tapAssistance = SystemSettings.tapAssistance
         })
         // Paste offered once anything holds a picture: what another app copied meanwhile, or this
         // app's clipboard changing
@@ -563,6 +622,34 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
         key.keyCode == .keyboardLeftAlt || key.keyCode == .keyboardRightAlt
     }
 
+    /// The shortcuts as key commands, which the system lists while ⌘ is held.
+    private lazy var shortcuts = shortcutKeyCommands(action: #selector(CanvasViewController.shortcutCommand(_:)))
+    /// The press a shortcut last ran for, and when: one press may come both as a key command and
+    /// as a press, and is done once.
+    private var lastShortcut: (press: String, at: CFTimeInterval)?
+    /// Within this long (seconds) the same press is that one press come again.
+    private static let samePress: CFTimeInterval = 0.05
+
+    override var keyCommands: [UIKeyCommand]? {
+        shortcuts
+    }
+
+    /// Whether a shortcut just ran for `press`.
+    private func justRan(_ press: String) -> Bool {
+        guard let last = lastShortcut else { return false }
+        return last.press == press && CACurrentMediaTime() - last.at < Self.samePress
+    }
+
+    /// A shortcut's key command: what its press does.
+    @objc private func shortcutCommand(_ command: UIKeyCommand) {
+        guard let name = command.propertyList as? String else { return }
+        let flags = command.modifierFlags
+        let press = CanvasModel.pressText(name, flags)
+        guard !justRan(press) else { return }
+        lastShortcut = (press, CACurrentMediaTime())
+        _ = model.runShortcut(name, command: flags.contains(.command), shift: flags.contains(.shift), alt: flags.contains(.alternate))
+    }
+
     /// A hardware keyboard's shortcuts on the canvas (keys no text field took); Alt held is □ held.
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
         var taken = false
@@ -570,7 +657,15 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
             if Self.isAlt(key) {
                 model.modifyPressed()
                 taken = true
+                continue
+            }
+            guard let name = CanvasModel.name(of: key) else { continue }
+            let press = CanvasModel.pressText(name, key.modifierFlags.intersection([.command, .control, .shift, .alternate]))
+            // done already as its key command
+            if justRan(press) {
+                taken = true
             } else if model.keyPressed(key) {
+                lastShortcut = (press, CACurrentMediaTime())
                 taken = true
             }
         }
@@ -612,7 +707,7 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
     // the screen's edges paint first; a second swipe is the system's
     override var preferredScreenEdgesDeferringSystemGestures: UIRectEdge { .all }
 
-    /// What the touches asked; those of tools not on the iPad yet do nothing until they are.
+    /// What the touches asked.
     private func obey(_ commands: [TouchCommand]) {
         for command in commands {
             switch command {
@@ -728,6 +823,7 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
         model.noteTime()
         model.stopWatching()
         model.keepChoicesNow()
+        StrokeSound.shared.follow(nil, on: false)
         canvas.detach()
         observers.forEach { NotificationCenter.default.removeObserver($0) }
         observers.removeAll()
@@ -744,7 +840,7 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
                 try session.save(dir: dir)
             } catch {
                 failure = "\(error)"
-                NSLog("ProCraft: keeping the artwork: %@", "\(error)")
+                AppLog.error("save", "keeping the artwork: \(error)")
             }
             // the artwork file keeps a time-lapse as video
             _ = lapse.forPackage()
@@ -759,6 +855,8 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
     /// task); the app may be ended without a word once it is in the background.
     private func saveInBackground() {
         model.noteTime()
+        // away, the strokes' sound stops
+        StrokeSound.shared.follow(nil, on: false)
         let model = model
         let session = model.session
         let dir = model.dir
@@ -776,7 +874,7 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
                 try session.save(dir: dir)
             } catch {
                 failure = "\(error)"
-                NSLog("ProCraft: keeping the artwork: %@", "\(error)")
+                AppLog.error("save", "keeping the artwork: \(error)")
             }
             DispatchQueue.main.async {
                 if let failure {

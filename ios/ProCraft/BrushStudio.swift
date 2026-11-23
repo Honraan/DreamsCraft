@@ -47,6 +47,9 @@ enum StudioInk {
     static var aboutRowInk: Color { pick(0xFFBB_BBBB, 0xFF4A_4A4A) }
     static var aboutSignature: Color { pick(0xFF59_5959, 0xFFA8_A8A8) }
     static var padBehind: Color { back }
+    static var partCard: Color { pick(0xFF21_2121, 0xFFE0_E0E0) }
+    static let callout = Color(argb: 0xFFE9_E9E9)
+    static let calloutInk = Color(argb: 0xFF1C_1C1C)
     static let switchFixed = Color(argb: 0xFF51_5153)
     static let switchFixedKnob = Color(argb: 0xFF9B_9B9B)
     static let done = Color(argb: 0xFF01_90FF)
@@ -60,6 +63,10 @@ final class StudioUi {
     var nodeMenu: NodeMenuAsk?
     /// A slider has the touch: the settings don't scroll under it meanwhile.
     var sliding = false
+    /// Where a dual brush's parts start, for their cards to open over them.
+    var partsAt = CGPoint.zero
+    /// The Secondary card held: where, for the Uncombine callout under it.
+    var callout: CGPoint?
 }
 
 /// The brush studio: tabs down the left, the drawing pad above, the tab's settings below; turned
@@ -80,7 +87,7 @@ struct BrushStudio: View {
                 StudioInk.back
                 if landscape {
                     HStack(spacing: 0) {
-                        StudioPagesCard()
+                        StudioPagesCard(studio: studio, ui: ui)
                         StudioSettings(model: model, ui: ui, landscape: true)
                             .frame(width: settingsWidth)
                         StudioInk.line.frame(width: 1)
@@ -88,7 +95,7 @@ struct BrushStudio: View {
                     }
                 } else {
                     HStack(spacing: 0) {
-                        StudioRail()
+                        StudioRail(studio: studio, ui: ui)
                         VStack(spacing: 0) {
                             StudioPad(model: model)
                                 .frame(height: padHeight)
@@ -99,6 +106,12 @@ struct BrushStudio: View {
                 }
                 if studio.padMenuOpen {
                     PadMenu(studio: studio, width: screen.size.width)
+                }
+                if studio.partsOpen {
+                    PartCards(studio: studio, ui: ui, landscape: landscape)
+                }
+                if let at = ui.callout {
+                    UncombineCallout(studio: studio, ui: ui, at: at)
                 }
                 if let ask = ui.blendList {
                     BlendModeList(ask: ask, height: screen.size.height) { picked in
@@ -119,6 +132,21 @@ struct BrushStudio: View {
                     SourceEditor(studio: studio, kind: kind, landscape: landscape)
                         .id(kind)
                 }
+                // Uncombine, asking first
+                AlertView(
+                    content: studio.uncombineAsking ? AlertContent(
+                        title: "Uncombine these brushes?",
+                        message: "The pair becomes two brushes again, side by side in the set. It can't be undone.",
+                        action: "Uncombine",
+                        icon: PcIcons.alertQuestion,
+                        destructive: false
+                    ) : nil,
+                    onCancel: { studio.uncombineAsking = false },
+                    onAction: {
+                        studio.uncombineAsking = false
+                        studio.uncombine()
+                    }
+                )
             }
             .coordinateSpace(.named(studioSpace))
             #if DEBUG
@@ -131,12 +159,31 @@ struct BrushStudio: View {
     }
 }
 
-/// Portrait: the pages as icons down the left.
+/// The pages a dual brush's second part has: the first alone has the rest, which go for the pair.
+private let secondPages: Set<String> = [
+    "Stroke path", "Stabilization", "Taper", "Shape", "Grain", "Rendering", "Dynamics", "Stylus", "Properties",
+]
+
+/// The pages listed, by their place among all of them: fewer while a dual brush's second shows.
+private func shownTabs(_ studio: StudioModel) -> [(index: Int, tab: StudioTab)] {
+    studioTabs.enumerated()
+        .filter { !studio.second || secondPages.contains($0.element.name) }
+        .map { (index: $0.offset, tab: $0.element) }
+}
+
+/// Portrait: the pages as icons down the left, a dual brush's two parts above them.
 private struct StudioRail: View {
+    let studio: StudioModel
+    let ui: StudioUi
+
     var body: some View {
         let settings = AppSettings.shared
         VStack(alignment: .leading, spacing: 3) {
-            ForEach(Array(studioTabs.enumerated()), id: \.offset) { i, tab in
+            if studio.dual {
+                StudioParts(studio: studio, ui: ui, width: partRailWidth, landscape: false)
+                    .padding(.leading, 8)
+            }
+            ForEach(shownTabs(studio), id: \.index) { i, tab in
                 let on = settings.studioTab == i
                 ZStack {
                     Capsule().fill(on ? Pc.accent : Color.clear)
@@ -157,8 +204,11 @@ private struct StudioRail: View {
 }
 
 /// Landscape: the pages by icon and name on a card headed "Brush Studio", the list scrolling under
-/// the title.
+/// the title, a dual brush's two parts heading it.
 private struct StudioPagesCard: View {
+    let studio: StudioModel
+    let ui: StudioUi
+
     var body: some View {
         let settings = AppSettings.shared
         let shape = RoundedRectangle(cornerRadius: 20, style: .circular)
@@ -171,7 +221,11 @@ private struct StudioPagesCard: View {
                 .padding(.top, 19)
             ScrollView {
                 VStack(spacing: 4) {
-                    ForEach(Array(studioTabs.enumerated()), id: \.offset) { i, tab in
+                    if studio.dual {
+                        StudioParts(studio: studio, ui: ui, width: partListWidth, landscape: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    ForEach(shownTabs(studio), id: \.index) { i, tab in
                         let on = settings.studioTab == i
                         HStack(spacing: 0) {
                             PcIconView(tab.icon, size: tab.iconSize, color: on ? .white : StudioInk.tabIcon)
@@ -201,6 +255,227 @@ private struct StudioPagesCard: View {
         .clipShape(shape)
         .padding(.leading, 10)
         .padding(.vertical, 10)
+    }
+}
+
+/// A dual brush's two parts as the pages' column heads them: each this wide (upright, or on the
+/// card turned sideways), this tall and this far apart, and the room they take before the pages.
+private let partRailWidth: CGFloat = 57
+private let partListWidth: CGFloat = 288
+private let partHeight: CGFloat = 61
+private let partGap: CGFloat = 3
+private let partsHeight: CGFloat = 146
+/// Tapped, the part shown opens both as cards, Combine Mode between; its list opens this far in.
+private let partCardWidth: CGFloat = 340
+private let partCardHeight: CGFloat = 111
+private let combineRowHeight: CGFloat = 51
+private let combineListLeft: CGFloat = 368
+
+/// A dual brush's two parts, the one shown barred: tapped, it opens their cards, and the other
+/// shows. Upright they are narrow, a piece of each part's sample stroke in them.
+private struct StudioParts: View {
+    let studio: StudioModel
+    let ui: StudioUi
+    let width: CGFloat
+    let landscape: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: partGap) {
+            ForEach([false, true], id: \.self) { second in
+                let on = second == studio.second
+                ZStack(alignment: .leading) {
+                    if let image = studio.parts[second ? 1 : 0] {
+                        if landscape {
+                            Image(uiImage: image)
+                                .resizable()
+                                .scaledToFit()
+                                .frame(width: width, height: partHeight)
+                        } else {
+                            Image(uiImage: image)
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: width, height: partHeight)
+                                .clipped()
+                        }
+                    }
+                    if on {
+                        RoundedRectangle(cornerRadius: 2, style: .circular)
+                            .fill(Pc.accent)
+                            .frame(width: 5, height: partHeight - 1)
+                    }
+                }
+                .frame(width: width, height: partHeight, alignment: .leading)
+                .overlay {
+                    GeometryReader { g in
+                        Color.clear
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                if on {
+                                    // the cards open where the parts start
+                                    let at = g.frame(in: .named(studioSpace)).origin
+                                    ui.partsAt = CGPoint(x: at.x, y: at.y - (second ? partHeight + partGap : 0))
+                                    studio.partsOpen = true
+                                } else {
+                                    studio.showPart(second: second)
+                                }
+                            }
+                    }
+                }
+            }
+        }
+        .frame(height: partsHeight, alignment: .top)
+    }
+}
+
+/// A dual brush's parts as cards over the parts they opened from, Combine Mode between: a card
+/// tapped shows that part, the cards staying; Secondary held offers Uncombine; a tap beside them
+/// only closes them. Upright they sit on a card of their own.
+private struct PartCards: View {
+    let studio: StudioModel
+    let ui: StudioUi
+    let landscape: Bool
+
+    var body: some View {
+        let edge: CGFloat = landscape ? 0 : 8
+        let shape = RoundedRectangle(cornerRadius: 12 + edge, style: .circular)
+        let name = studio.combineModes.first { Int($0.id) == studio.combineMode }?.name ?? ""
+        ZStack(alignment: .topLeading) {
+            Color.clear
+                .contentShape(Rectangle())
+                .onTapGesture { studio.partsOpen = false }
+            VStack(spacing: partGap) {
+                PartCard(studio: studio, second: false)
+                HStack(spacing: 0) {
+                    Text(verbatim: "Combine Mode")
+                        .font(.system(size: 17))
+                        .foregroundStyle(StudioInk.dim)
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                    Text(verbatim: name)
+                        .font(.system(size: 15))
+                        .foregroundStyle(Pc.accent)
+                        .lineLimit(1)
+                    Color.clear.frame(width: 6)
+                    PcIconView(PcIcons.chevronRight, size: 24, color: StudioInk.dim)
+                }
+                .padding(.leading, 11)
+                .padding(.trailing, 12)
+                .frame(width: partCardWidth, height: combineRowHeight)
+                .overlay {
+                    GeometryReader { g in
+                        Color.clear
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                ui.blendList = BlendListAsk(
+                                    modes: studio.combineModes,
+                                    current: studio.combineMode,
+                                    centreY: g.frame(in: .named(studioSpace)).midY,
+                                    left: combineListLeft
+                                ) { studio.setCombineMode($0) }
+                            }
+                    }
+                }
+                PartCard(studio: studio, second: true) { ui.callout = $0 }
+            }
+            .padding(edge)
+            .background(shape.fill(StudioInk.tabs))
+            .clipShape(shape)
+            .contentShape(shape)
+            .offset(x: max(ui.partsAt.x - edge, 0), y: max(ui.partsAt.y - edge, 0))
+        }
+    }
+}
+
+/// A part as a card: blue when it shows; tapped, it shows; held a second (Secondary only),
+/// `onHold` hears where, in the studio's space.
+private struct PartCard: View {
+    let studio: StudioModel
+    let second: Bool
+    var onHold: ((CGPoint) -> Void)?
+    @State private var holding: Task<Void, Never>?
+    @State private var held = false
+
+    var body: some View {
+        let on = second == studio.second
+        let shape = RoundedRectangle(cornerRadius: 12, style: .circular)
+        let card = ZStack(alignment: .topLeading) {
+            shape.fill(on ? Pc.accent : StudioInk.partCard)
+            if let image = studio.parts[second ? 1 : 0] {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .padding(.horizontal, 30)
+                    .padding(.vertical, 20)
+                    .frame(width: partCardWidth, height: partCardHeight)
+            }
+            Text(verbatim: second ? "Secondary" : "Primary")
+                .font(.system(size: 12.5, weight: .semibold))
+                .foregroundStyle(on ? Color.white : StudioInk.pageInk)
+                .lineLimit(1)
+                .padding(.leading, 11)
+                .padding(.top, 7)
+        }
+        .frame(width: partCardWidth, height: partCardHeight)
+        .clipShape(shape)
+        .contentShape(shape)
+        if let onHold {
+            // one touch tells the tap from the hold: let go before a second, it is a tap
+            card.gesture(
+                DragGesture(minimumDistance: 0, coordinateSpace: .named(studioSpace))
+                    .onChanged { drag in
+                        if holding == nil {
+                            let at = drag.startLocation
+                            holding = Task { @MainActor in
+                                try? await Task.sleep(for: .seconds(1))
+                                guard !Task.isCancelled else { return }
+                                held = true
+                                onHold(at)
+                            }
+                        } else if hypot(drag.translation.width, drag.translation.height) > 10 {
+                            holding?.cancel()
+                        }
+                    }
+                    .onEnded { drag in
+                        holding?.cancel()
+                        holding = nil
+                        if !held, hypot(drag.translation.width, drag.translation.height) <= 10 {
+                            studio.showPart(second: second)
+                        }
+                        held = false
+                    }
+            )
+        } else {
+            card.onTapGesture { studio.showPart(second: second) }
+        }
+    }
+}
+
+/// The light Uncombine callout under where the Secondary card was held: tapped, the cards close
+/// and Uncombine is asked; a tap beside it closes it.
+private struct UncombineCallout: View {
+    let studio: StudioModel
+    let ui: StudioUi
+    let at: CGPoint
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            Color.clear
+                .contentShape(Rectangle())
+                .onTapGesture { ui.callout = nil }
+            Text(verbatim: "Uncombine")
+                .font(.system(size: 15))
+                .foregroundStyle(StudioInk.calloutInk)
+                .lineLimit(1)
+                .frame(width: 104, height: 36)
+                .background(Capsule().fill(StudioInk.callout))
+                .contentShape(Capsule())
+                .onTapGesture {
+                    ui.callout = nil
+                    studio.partsOpen = false
+                    studio.uncombineAsking = true
+                }
+                .offset(x: at.x - 52, y: at.y + 10)
+        }
     }
 }
 
@@ -247,6 +522,19 @@ private struct StudioPad: View {
             }
             .offset(x: 21, y: 21)
             HStack(spacing: 13) {
+                // a plugin's: the brush set at random
+                if studio.randomises {
+                    Text(verbatim: "Randomise")
+                        .font(.system(size: 17))
+                        .foregroundStyle(StudioInk.buttonInk)
+                        .lineLimit(1)
+                        .padding(.horizontal, 16)
+                        .frame(height: 43)
+                        .background(Capsule().fill(StudioInk.button))
+                        .overlay(Capsule().strokeBorder(StudioInk.buttonEdge, lineWidth: 1))
+                        .contentShape(Capsule())
+                        .onTapGesture { studio.randomise() }
+                }
                 Text(verbatim: "Cancel")
                     .font(.system(size: 17))
                     .foregroundStyle(StudioInk.buttonInk)
@@ -354,21 +642,24 @@ func studioGap(_ above: StudioNeighbour, _ below: StudioNeighbour) -> CGFloat {
 private enum StudioRow {
     case space(CGFloat)
     case title(String)
+    /// The About page's heading: the brush's name.
+    case name
     case control(StudioControl)
 }
 
-/// The rows of `tab`, spaced as measured; the About page is headed by the brush's name.
-private func studioRows(_ tab: StudioTab, name: String) -> [StudioRow] {
+/// The rows of `tab`, spaced as measured; the About page is headed by the brush's name. The rows
+/// plugins add (`plugins`) follow, each under its own label.
+private func studioRows(_ tab: StudioTab, plugins: [PluginBrushControl]) -> [StudioRow] {
     var rows: [StudioRow] = []
     var above = StudioNeighbour.top
     for (k, section) in tab.sections.enumerated() {
-        var title = section.title
+        var title = section.title.map { StudioRow.title($0) }
         if title == nil, let first = section.controls.first, case .about = first {
-            title = name
+            title = .name
         }
         if let title {
             rows.append(.space(k == 0 ? 25 : studioGap(above, .title)))
-            rows.append(.title(title))
+            rows.append(title)
             above = .title
         }
         for control in section.controls {
@@ -376,6 +667,14 @@ private func studioRows(_ tab: StudioTab, name: String) -> [StudioRow] {
             rows.append(.control(control))
             above = .control(control)
         }
+    }
+    for row in plugins {
+        let control = StudioControl.choice(key: row.key, options: row.choices)
+        rows.append(.space(studioGap(above, .title)))
+        rows.append(.title(row.label))
+        rows.append(.space(studioGap(.title, .control(control))))
+        rows.append(.control(control))
+        above = .control(control)
     }
     return rows
 }
@@ -389,7 +688,8 @@ private struct StudioSettings: View {
     var body: some View {
         let index = AppSettings.shared.studioTab
         let tab = studioTabs[min(max(index, 0), studioTabs.count - 1)]
-        let rows = studioRows(tab, name: model.studio.name)
+        // the rows plugins that are on add go under Properties
+        let rows = studioRows(tab, plugins: tab.name == "Properties" ? model.studio.pluginControls : [])
         ScrollViewReader { reader in
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
@@ -404,6 +704,8 @@ private struct StudioSettings: View {
                                     .foregroundStyle(StudioInk.header)
                                     .lineLimit(1)
                                     .padding(.leading, 8)
+                            case .name:
+                                StudioNameHeading(studio: model.studio)
                             case let .control(control):
                                 StudioControlView(model: model, ui: ui, control: control, landscape: landscape)
                             }
@@ -441,6 +743,35 @@ private struct StudioSettings: View {
         }
     }
     #endif
+}
+
+/// The About page's heading: the brush's name, tapped to change it there (named as it is typed, so
+/// Done with the keyboard up keeps it).
+private struct StudioNameHeading: View {
+    let studio: StudioModel
+    @State private var renaming = false
+
+    var body: some View {
+        if renaming {
+            InlineName(
+                name: studio.name, color: StudioInk.header, fontSize: 21, weight: .bold,
+                onDone: {
+                    studio.rename($0)
+                    renaming = false
+                },
+                onChange: { studio.rename($0) }
+            )
+            .padding(.leading, 8)
+        } else {
+            Text(verbatim: studio.name)
+                .font(.system(size: 21, weight: .bold))
+                .foregroundStyle(StudioInk.header)
+                .lineLimit(1)
+                .padding(.leading, 8)
+                .contentShape(Rectangle())
+                .onTapGesture { renaming = true }
+        }
+    }
 }
 
 /// The drawing pad's settings: preview size, the pad's colour, and clearing or resetting. It opens

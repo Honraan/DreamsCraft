@@ -30,6 +30,9 @@ private let tabs = [
     ActionsTab(label: "Help", icon: PcIcons.tabHelp),
 ]
 
+/// On a model, its own tab takes Video's place.
+private let modelTabs = tabs.map { $0.label == "Video" ? ActionsTab(label: "3D", icon: PcIcons.tab3D) : $0 }
+
 /// The actions panel: six tabs of grouped rows (adding, the canvas, sharing, video, preferences,
 /// help).
 struct ActionsPanel: View {
@@ -105,7 +108,7 @@ struct ActionsPanel: View {
                     .padding(.leading, 24)
                     .padding(.top, 22)
                 HStack(spacing: 10) {
-                    ForEach(Array(tabs.enumerated()), id: \.offset) { i, tab in
+                    ForEach(Array((model.scene.open ? modelTabs : tabs).enumerated()), id: \.offset) { i, tab in
                         let lit = i == model.actionsTab
                         ZStack(alignment: .top) {
                             // a 50 frame centred 24 down
@@ -128,6 +131,10 @@ struct ActionsPanel: View {
                         ForEach(Array(groups().enumerated()), id: \.offset) { _, rows in
                             ActionsGroup(rows: rows)
                         }
+                        // the plugins' own rows in the Canvas tab, after its own
+                        if model.actionsTab == 1, !model.scene.open {
+                            PluginPlaceRows(model: model, place: .canvas)
+                        }
                     }
                     .padding(.horizontal, 12)
                     .padding(.top, 20)
@@ -144,10 +151,29 @@ struct ActionsPanel: View {
         model.insertAsk = how
     }
 
+    /// The log as a text file, to the share sheet; made off the main thread (the panel may close
+    /// meanwhile).
+    private func shareLog() {
+        let model = model
+        DispatchQueue.global(qos: .userInitiated).async {
+            let log = AppLog.toShare()
+            DispatchQueue.main.async {
+                if let log {
+                    Sharing.share([log])
+                } else {
+                    model.saying = ("Share log", "The log couldn't be made ready to share.")
+                }
+            }
+        }
+    }
+
     /// The shown tab's groups of rows.
     private func groups() -> [[ActionRow]] {
         let settings = AppSettings.shared
         let undoRange = AppSettings.rapidUndoRange
+        if model.scene.open, model.actionsTab <= 3 {
+            return modelGroups()
+        }
         switch model.actionsTab {
         case 0:
             return [
@@ -281,8 +307,83 @@ struct ActionsPanel: View {
                         withAnimation(Motion.studioIn) { model.licencesOpen = true }
                     }),
                 ],
+                // the app's own settings are in the system's Settings app
+                [.act("Share log", action: { shareLog() })],
             ]
         }
+    }
+}
+
+extension ActionsPanel {
+    /// The first four tabs' rows on a model: adding without text or private layers, the canvas's
+    /// reference and information, sharing the model, pictures of it and its textures, and the 3D
+    /// tab (the 2D texture, painting through, lighting, the model in the room). Prefs and Help are
+    /// as on a canvas.
+    fileprivate func modelGroups() -> [[ActionRow]] {
+        let scene = model.scene
+        switch model.actionsTab {
+        case 0:
+            return [
+                [
+                    .act("Insert a file", action: { insertOnModel(.file) }),
+                    .act("Insert a photo", action: { insertOnModel(.photo) }),
+                    .act("Take a photo", action: { insertOnModel(.camera) }),
+                ],
+                [
+                    .act("Cut", action: { model.cutLayer() }),
+                    .act("Copy", action: { model.copyLayer() }),
+                    .act("Copy canvas", action: { model.copyCanvas() }),
+                    .act("Paste", action: model.canPaste ? { model.paste() } : nil),
+                ],
+            ]
+        case 1:
+            return [
+                [.toggle("Reference", on: model.reference.on, change: { model.reference.setOn($0) })],
+                [.act("Canvas information", action: {
+                    model.closePanels()
+                    withAnimation(Motion.studioIn) { model.canvasInfoOpen = true }
+                })],
+            ]
+        case 2:
+            return [
+                [
+                    .heading("Share Model"),
+                    // ours comes back whole in another copy of the app; the other package holds no model
+                    .act("ProCraft", action: { model.shareModel(.artwork) }),
+                    .act("Procreate", action: nil),
+                    .act("USDZ", action: { model.shareModel(.usdz) }),
+                    .act("OBJ", action: { model.shareModel(.obj) }),
+                ],
+                [
+                    .heading("Share Image"),
+                    .act("JPEG", action: { model.shareModel(.jpeg) }),
+                    .act("PNG", action: { model.shareModel(.png) }),
+                    .act("TIFF", action: { model.shareModel(.tiff) }),
+                    .act("Animated GIF", action: { scene.openAnimatedExport(.gif) }),
+                    .act("Animated PNG", action: { scene.openAnimatedExport(.png) }),
+                    .act("Animated MP4", action: { scene.openAnimatedExport(.mp4) }),
+                    .act("Animated HEVC", action: { scene.openAnimatedExport(.hevc) }),
+                ],
+                [.heading("Share Textures"), .act("PNG", action: { model.shareModel(.textures) })],
+            ]
+        default:
+            // showing the 2D texture, the rest is for the model
+            let shown = !scene.flat
+            return [
+                [
+                    .toggle("Show 2D texture", on: scene.flat, change: { scene.setFlat($0) }),
+                    .toggle("Paint through mesh", on: scene.paintThrough, change: shown ? { scene.setPaintThrough($0) } : nil),
+                    .act("Edit lighting & environment", action: shown ? { scene.openStudio() } : nil),
+                ],
+                [.act("View in AR", action: { model.viewModelInAR() })],
+            ]
+        }
+    }
+
+    /// A picture brought in from the Add tab on a model: placed on its surface, never private.
+    private func insertOnModel(_ how: InsertAsk) {
+        model.insertPrivate = false
+        model.insertAsk = how
     }
 }
 
