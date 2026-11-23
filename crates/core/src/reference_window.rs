@@ -270,7 +270,7 @@ impl CanvasSession {
     /// cost no more reads. None before the canvas exists. Read once the frames have laid what
     /// they lay a share at a time (the stroke's end it is read after), which the read would
     /// otherwise lay at once, frames and touches waiting on it: not from the thread that draws
-    /// (the desktop asks [`CanvasSession::lays_over_frames`] first).
+    /// (both apps read it on a thread of their own).
     pub fn reference_canvas(&self, max_side: u32) -> Option<crate::ThumbnailImage> {
         let _ = self.shared.await_frames_laid();
         let edits = self.edits();

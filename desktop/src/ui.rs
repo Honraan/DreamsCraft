@@ -3485,6 +3485,10 @@ mod tests {
         time: f64,
         events: Vec<Event>,
         pointer_touch: Option<u64>,
+        /// The GPU, and the picture the canvas is drawn into after each frame once
+        /// [`Window::draw_canvas`] asks it to be, as the app's window draws it.
+        gpu: procraft_gpu::Gpu,
+        drawn: Option<procraft_gpu::wgpu::Texture>,
     }
 
     impl Window {
@@ -3496,18 +3500,34 @@ mod tests {
 
         /// As [`Window::open`], with `prefs`.
         fn open_with(size: egui::Vec2, prefs: crate::prefs::Prefs) -> Option<Window> {
+            Window::open_canvas(size, (400, 300), prefs)
+        }
+
+        /// As [`Window::open_with`], the canvas `canvas` pixels.
+        fn open_canvas(size: egui::Vec2, canvas: (u32, u32), prefs: crate::prefs::Prefs) -> Option<Window> {
             let gpu = procraft_gpu::Gpu::headless().map_err(|e| eprintln!("skipped: {e}")).ok()?;
-            let session = CanvasSession::new(400, 300);
+            let session = CanvasSession::new(canvas.0, canvas.1);
             session.set_display_scale(1.0);
-            session.use_gpu(gpu);
+            session.use_gpu(gpu.clone());
             session.show_in(size.x as u32, size.y as u32);
             let ctx = egui::Context::default();
             crate::look::install_fonts(&ctx);
             let mut ui = Interface::with_prefs(prefs);
             ui.opened(&session, 1.0);
             let (input, touches) = (Input::default(), Default::default());
-            let mut window =
-                Window { ctx, ui, input, session, touches, size, time: 0.0, events: Vec::new(), pointer_touch: None };
+            let mut window = Window {
+                ctx,
+                ui,
+                input,
+                session,
+                touches,
+                size,
+                time: 0.0,
+                events: Vec::new(),
+                pointer_touch: None,
+                gpu,
+                drawn: None,
+            };
             for _ in 0..3 {
                 window.frame();
             }
@@ -3523,9 +3543,38 @@ mod tests {
                 events: std::mem::take(&mut self.events),
                 ..RawInput::default()
             };
-            let Window { ctx, ui, input, session, .. } = self;
+            let Window { ctx, ui, input, session, .. } = &mut *self;
             let mut output = ctx.clone().run_ui(raw, |egui_ui| ui.show(egui_ui, session, input));
             output.textures_delta.clear();
+            // then the canvas, as the app's window draws it after the interface's pass
+            if let Some(target) = &self.drawn {
+                let view = target.create_view(&Default::default());
+                let format = procraft_gpu::wgpu::TextureFormat::Rgba8Unorm;
+                let size = (self.size.x as u32, self.size.y as u32);
+                let started = std::time::Instant::now();
+                self.session.draw(&view, format, size, procraft_engine::profile::Profile::Srgb, started);
+                self.gpu.flush();
+            }
+        }
+
+        /// From now on each frame draws the canvas too, as the app's window does: the frames lay
+        /// what they lay (a stroke's end), and the Reference window reads the canvas after them.
+        fn draw_canvas(&mut self) {
+            use procraft_gpu::wgpu;
+            self.drawn = Some(self.gpu.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("window"),
+                size: wgpu::Extent3d {
+                    width: self.size.x as u32,
+                    height: self.size.y as u32,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            }));
         }
 
         /// A window event to the canvas, which leaves what lands on the interface to it.
@@ -3612,6 +3661,43 @@ mod tests {
             }
             self.pen(TouchPhase::Ended, from + vec2(120.0, 0.0));
             self.frame();
+        }
+
+        /// A pen stroke from `from` to `to` in `moves` moves, a frame after each.
+        fn pen_stroke(&mut self, from: Pos2, to: Pos2, moves: usize) {
+            self.hover(from);
+            self.pen(TouchPhase::Started, from);
+            self.frame();
+            for k in 1..=moves {
+                self.pen(TouchPhase::Moved, from + (to - from) * (k as f32 / moves as f32));
+                self.frame();
+            }
+            self.pen(TouchPhase::Ended, to);
+            self.frame();
+        }
+
+        /// A mouse stroke from `from` to `to` in `moves` moves, its button held.
+        fn mouse_stroke(&mut self, from: Pos2, to: Pos2, moves: usize) {
+            self.hover(from);
+            self.mouse_button(from, true);
+            self.mouse_drag(from, to, moves);
+            self.mouse_button(to, false);
+        }
+
+        /// How many of the current layer's pixels are painted.
+        fn painted(&self) -> usize {
+            let layer = self.session.layers().into_iter().find(|l| l.current);
+            let pixels = layer.and_then(|l| self.session.copy_layer_contents(l.id));
+            pixels.map_or(0, |p| p.rgba.as_chunks::<4>().0.iter().filter(|px| px[3] > 0).count())
+        }
+
+        /// Where the canvas shows in the window (points, a pixel a point here).
+        fn paper(&self) -> Rect {
+            let info = self.session.info();
+            let (w, h) = (info.width as f32, info.height as f32);
+            let m = self.session.view_matrix();
+            let at = |x: f32, y: f32| pos2(m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]);
+            Rect::from_points(&[at(0.0, 0.0), at(w, 0.0), at(0.0, h), at(w, h)])
         }
 
         /// The pen hovering to `at` and tapping there, sliding a little as it lands.
@@ -3951,5 +4037,155 @@ mod tests {
         // back where it began is still a change to keep (the live changes were sent)
         assert_eq!(pick.follow([0.6, 0.0, 1.0]), Some(0xFFFFFF));
         assert_eq!(pick.kept(), Some(0xFFFFFF));
+    }
+
+    /// Discord (Windows 11, 0.0.7: "can't draw while the Reference window is open"): with the
+    /// window open, strokes on the canvas beside it reach the canvas, the pen's and the mouse's,
+    /// one after another, the window showing the canvas (read again after each stroke) and then a
+    /// picture; one on its picture paints nothing. Each frame's time is printed, the slowest bounded.
+    #[test]
+    fn strokes_beside_a_reference_window_reach_the_canvas() {
+        use std::time::{Duration, Instant};
+        let Some(mut w) = Window::open(vec2(1200.0, 800.0), false) else { return };
+        w.draw_canvas();
+        w.ui.reference.on = true;
+        for _ in 0..10 {
+            w.frame();
+        }
+        let (window, _) = w
+            .area_shown(egui::Order::Middle, egui::Id::unique("reference").with(0u32))
+            .expect("the Reference window shows");
+        // left alone, it changes nothing of the artwork (else it would read the canvas again and
+        // again, and the artwork be saved again and again)
+        let edits = w.session.edits();
+        for _ in 0..30 {
+            w.frame();
+        }
+        assert_eq!(w.session.edits(), edits, "the open window left alone changes nothing");
+        let (side_bar, _) = w.area_shown(egui::Order::Middle, egui::Id::unique("side bar")).expect("the side bar");
+        let paper = w.paper();
+        // rows on the paper left of the window, clear of the side bar
+        let (x0, x1) = (side_bar.right().max(paper.left()) + 40.0, window.left() - 30.0);
+        assert!(x1 - x0 > 100.0, "room beside the window: {paper:?} {window:?} {side_bar:?}");
+        let rows: Vec<(Pos2, Pos2)> = (0..6)
+            .map(|i| {
+                let y = window.top() + 40.0 + 60.0 * i as f32;
+                (pos2(x0, y), pos2(x1, y))
+            })
+            .collect();
+        for &(from, to) in &rows {
+            for p in [from, to] {
+                assert!(paper.contains(p) && !window.contains(p) && !side_bar.contains(p), "{p:?}");
+            }
+        }
+        /// The stroke along `row` (the pen's on even rows, the mouse's on odd ones), then frames as
+        /// time goes by: its end laid over them, and the window reading the canvas once they have
+        /// (at most every 300 ms). The slowest of those frames.
+        fn stroke_on(w: &mut Window, row: usize, (from, to): (Pos2, Pos2)) -> Duration {
+            if row.is_multiple_of(2) {
+                w.pen_stroke(from, to, 12);
+            } else {
+                w.mouse_stroke(from, to, 12);
+            }
+            let mut slowest = Duration::ZERO;
+            for _ in 0..3 {
+                std::thread::sleep(Duration::from_millis(110));
+                let t = Instant::now();
+                w.frame();
+                slowest = slowest.max(t.elapsed());
+            }
+            slowest
+        }
+        let mut painted = w.painted();
+        let mut slowest = Duration::ZERO;
+        for (row, &line) in rows.iter().enumerate() {
+            // the window showing the canvas, then a picture (none imported: its Import button)
+            let case = if row < 4 { "showing the canvas" } else { "showing a picture" };
+            if row == 4 {
+                // a stroke on its picture moves the picture: nothing is painted
+                let middle = window.center();
+                w.pen_stroke(middle - vec2(60.0, 0.0), middle + vec2(60.0, 0.0), 12);
+                w.frame();
+                assert_eq!(w.painted(), painted, "a stroke on the window's picture paints nothing");
+                let state = w.session.reference_window_at(0).expect("the artwork's window");
+                let shows = procraft_core::ReferenceShows::Image;
+                w.session.set_reference_window_at(0, procraft_core::ReferenceWindowState { shows, ..state });
+                w.ui.reference.restore(&w.session);
+                assert!(w.ui.reference.on);
+                w.frame();
+            }
+            slowest = slowest.max(stroke_on(&mut w, row, line));
+            let now = w.painted();
+            let pointer = if row.is_multiple_of(2) { "pen" } else { "mouse" };
+            assert!(now > painted, "{case}: the {pointer}'s stroke {row} reached the canvas ({painted} -> {now})");
+            painted = now;
+        }
+        println!("the slowest frame after a stroke with the Reference window open: {slowest:?}");
+        assert!(slowest < Duration::from_millis(250), "{slowest:?}");
+    }
+
+    /// The frames after a stroke take no longer with the Reference window showing the canvas than
+    /// with it closed, on a 4000 x 3000 canvas: the window's read of the canvas after each stroke
+    /// is made on a thread of its own, not on the thread that takes the pen's input and draws the
+    /// frames (where it took 4.4 ms more, 9.8 against 5.4). Per stroke, the slowest frame in the
+    /// 350 ms after it; their medians either way are printed, the strokes taken in turns, and
+    /// bounded: open within 2 ms of closed.
+    #[test]
+    #[ignore = "timing: run alone, with --ignored --nocapture"]
+    fn the_frames_after_a_stroke_wait_for_no_read_of_the_reference_window() {
+        use std::time::{Duration, Instant};
+        let prefs = crate::prefs::Prefs { right_handed: false, ..Default::default() };
+        let Some(mut w) = Window::open_canvas(vec2(1440.0, 900.0), (4000, 3000), prefs) else { return };
+        w.draw_canvas();
+        w.ui.reference.on = true;
+        for _ in 0..10 {
+            w.frame();
+        }
+        let (window, _) = w
+            .area_shown(egui::Order::Middle, egui::Id::unique("reference").with(0u32))
+            .expect("the Reference window shows");
+        let (side_bar, _) = w.area_shown(egui::Order::Middle, egui::Id::unique("side bar")).expect("the side bar");
+        let paper = w.paper();
+        let (x0, x1) = (side_bar.right().max(paper.left()) + 40.0, window.left() - 30.0);
+        assert!(x1 - x0 > 100.0, "room beside the window: {paper:?} {window:?} {side_bar:?}");
+        let after_stroke = |w: &mut Window, row: usize| {
+            let y = window.top() + 40.0 + 60.0 * (row % 6) as f32;
+            w.pen_stroke(pos2(x0, y), pos2(x1, y), 12);
+            let mut most = Duration::ZERO;
+            let until = Instant::now() + Duration::from_millis(350);
+            while Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(15));
+                let t = Instant::now();
+                w.frame();
+                most = most.max(t.elapsed());
+            }
+            most
+        };
+        let (mut open, mut closed) = (Vec::new(), Vec::new());
+        for round in 0..4 {
+            for shown in [true, false] {
+                // turned on or off and settled (shown again, it reads the canvas first)
+                w.ui.reference.on = shown;
+                for _ in 0..25 {
+                    std::thread::sleep(Duration::from_millis(15));
+                    w.frame();
+                }
+                for k in 0..2 {
+                    let most = after_stroke(&mut w, round * 2 + k);
+                    if shown { open.push(most) } else { closed.push(most) }
+                }
+            }
+        }
+        open.sort();
+        closed.sort();
+        let (open_median, closed_median) = (open[open.len() / 2], closed[closed.len() / 2]);
+        println!(
+            "the slowest frame in the 350 ms after a stroke, median of 8: the Reference window open \
+             {open_median:?}, closed {closed_median:?} (open {open:?}, closed {closed:?})"
+        );
+        assert!(
+            open_median <= closed_median + Duration::from_millis(2),
+            "open {open_median:?}, closed {closed_median:?}"
+        );
     }
 }

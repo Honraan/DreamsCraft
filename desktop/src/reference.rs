@@ -4,13 +4,14 @@
 //! picture, and a click on it slides them away and back. Each artwork keeps its own window (the
 //! core saves it with the artwork): shown, what it shows, its size and place, and its picture.
 
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use egui::{Align2, Color32, Id, Order, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2, pos2, vec2};
 use procraft_core::{
-    CanvasSession, ReferenceShows, ReferenceSizes, ReferenceView, ReferenceWindowState, reference_picture_point,
-    reference_picture_rect, reference_picture_size, reference_view_pinched, reference_window_fitted,
-    reference_window_size,
+    CanvasSession, ReferenceShows, ReferenceSizes, ReferenceView, ReferenceWindowState, ThumbnailImage,
+    reference_picture_point, reference_picture_rect, reference_picture_size, reference_view_pinched,
+    reference_window_fitted, reference_window_size,
 };
 
 use crate::icons;
@@ -47,6 +48,10 @@ const ANOTHER_STEP: f32 = 24.0;
 /// The canvas is read again at most this often while it changes, this large.
 const REFRESH: Duration = Duration::from_millis(300);
 const CANVAS_PIXELS: u32 = 700;
+/// How often the window looks whether a read on its way has come.
+const READ_LOOK: Duration = Duration::from_millis(16);
+/// Held by a read of the windows' picture while it is made.
+static READS: Mutex<()> = Mutex::new(());
 /// The side of the picture of a model it shows.
 const MODEL_PIXELS: u32 = 720;
 
@@ -131,6 +136,39 @@ enum Mode {
     Model,
 }
 
+/// A read of the canvas (or of the model, `model`) on its way from a thread of its own, made as the
+/// artwork's edits were `edits`; `again` if the picture is wanted again once it has come.
+struct Reading {
+    edits: u64,
+    model: bool,
+    again: bool,
+    done: std::sync::mpsc::Receiver<Option<Read>>,
+}
+
+/// The canvas (or the model) as read, made ready to show on the thread that read it: its picture,
+/// the same to show crisp when magnified if it is the canvas at its own size, that picture a few
+/// pixels across for the bars' glass, and its pixels to pick colours from.
+struct Read {
+    picture: egui::ColorImage,
+    crisp: Option<egui::ColorImage>,
+    glass: egui::ColorImage,
+    pixels: Pixels,
+}
+
+impl Read {
+    /// `t` (premultiplied) of the canvas `session` shows.
+    fn of(t: ThumbnailImage, session: &CanvasSession) -> Read {
+        let (width, height) = (t.width as usize, t.height as usize);
+        let picture = egui::ColorImage::from_rgba_premultiplied([width, height], &t.rgba);
+        Read {
+            crisp: (t.width == session.info().width).then(|| picture.clone()),
+            picture,
+            glass: glass_of(width, height, &t.rgba),
+            pixels: Pixels { width, height, rgba: t.rgba },
+        }
+    }
+}
+
 /// What a window's top bar asked of the app, beside what the window does itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Asked {
@@ -163,6 +201,7 @@ pub struct Reference {
     canvas_crisp: Option<TextureHandle>,
     canvas_edits: Option<u64>,
     read_at: Option<Instant>,
+    reading: Option<Reading>,
     image: Option<TextureHandle>,
     canvas_pixels: Option<Pixels>,
     image_pixels: Option<Pixels>,
@@ -200,6 +239,7 @@ impl Default for Reference {
             canvas_crisp: None,
             canvas_edits: None,
             read_at: None,
+            reading: None,
             image: None,
             canvas_pixels: None,
             image_pixels: None,
@@ -310,7 +350,36 @@ impl Reference {
         self.image_pixels = Some(Pixels { width: size[0], height: size[1], rgba: rgba.into_raw() });
     }
 
-    fn read_canvas(&mut self, ctx: &egui::Context, session: &CanvasSession) {
+    /// The canvas (or the model) read again for the picture while it changes, at most every
+    /// [`REFRESH`], on a thread of its own: this thread takes the pen's input and draws the frames,
+    /// and they waited on each read after a stroke (for the GPU's copy, and in 0.0.7 for the
+    /// stroke's end laid at once as well, most of a second with a heavy brush). The picture is
+    /// taken once it has come.
+    fn read_canvas(&mut self, ctx: &egui::Context, session: &Arc<CanvasSession>) {
+        if let Some(reading) = &self.reading {
+            match reading.done.try_recv() {
+                Ok(picture) => {
+                    let Reading { edits, model, again, .. } = *reading;
+                    self.reading = None;
+                    // (one of the model while the window turned to the canvas, or the other way, is
+                    // no use; none read is tried again in a while)
+                    if let Some(read) = picture.filter(|_| model == (self.mode == Mode::Model)) {
+                        self.take_canvas(ctx, read);
+                        self.canvas_edits = (!again).then_some(edits);
+                    }
+                    // a turn of the model or another kind asked for meanwhile is read at once
+                    self.read_at = (!again).then(Instant::now);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(READ_LOOK);
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.reading = None;
+                    self.read_at = Some(Instant::now());
+                }
+            }
+        }
         let edits = session.edits();
         if self.canvas_edits == Some(edits) {
             return;
@@ -321,28 +390,48 @@ impl Reference {
             ctx.request_repaint_after(REFRESH - at.elapsed());
             return;
         }
-        // (read once the frames have laid a stroke's end: this thread draws them)
-        if session.lays_over_frames() {
-            ctx.request_repaint_after(REFRESH);
-            return;
+        let model = self.mode == Mode::Model;
+        let (done, reading) = std::sync::mpsc::channel();
+        let session = Arc::clone(session);
+        let started = std::thread::Builder::new().name("procraft-reference-read".into()).spawn(move || {
+            // one read at a time: the windows showing the canvas take the same picture, read once
+            let _one = READS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            // (it waits for the frames to lay a stroke's end, as a read from the thread that
+            // draws them couldn't)
+            let picture = if model {
+                session.reference_model_picture(MODEL_PIXELS)
+            } else {
+                session.reference_canvas(CANVAS_PIXELS)
+            };
+            let _ = done.send(picture.map(|t| Read::of(t, &session)));
+        });
+        match started {
+            Ok(_) => {
+                self.reading = Some(Reading { edits, model, again: false, done: reading });
+                ctx.request_repaint_after(READ_LOOK);
+            }
+            Err(e) => {
+                log::warn!("the Reference window's picture isn't read: {e}");
+                self.read_at = Some(Instant::now());
+            }
         }
-        let picture = if self.mode == Mode::Model {
-            session.reference_model_picture(MODEL_PIXELS)
-        } else {
-            session.reference_canvas(CANVAS_PIXELS)
-        };
-        if let Some(t) = picture {
-            let image = egui::ColorImage::from_rgba_premultiplied([t.width as usize, t.height as usize], &t.rgba);
-            let crisp =
-                egui::TextureOptions { magnification: egui::TextureFilter::Nearest, ..egui::TextureOptions::LINEAR };
-            self.canvas_crisp = (t.width == session.info().width)
-                .then(|| ctx.load_texture("reference canvas crisp", image.clone(), crisp));
-            self.canvas = Some(ctx.load_texture("reference canvas", image, egui::TextureOptions::LINEAR));
-            let glass = glass_of(t.width as usize, t.height as usize, &t.rgba);
-            self.canvas_glass = Some(ctx.load_texture("reference canvas glass", glass, egui::TextureOptions::LINEAR));
-            self.canvas_pixels = Some(Pixels { width: t.width as usize, height: t.height as usize, rgba: t.rgba });
-            self.canvas_edits = Some(edits);
-            self.read_at = Some(Instant::now());
+    }
+
+    /// `read` (the canvas or the model) is the window's picture now.
+    fn take_canvas(&mut self, ctx: &egui::Context, read: Read) {
+        let crisp =
+            egui::TextureOptions { magnification: egui::TextureFilter::Nearest, ..egui::TextureOptions::LINEAR };
+        self.canvas_crisp = read.crisp.map(|image| ctx.load_texture("reference canvas crisp", image, crisp));
+        self.canvas = Some(ctx.load_texture("reference canvas", read.picture, egui::TextureOptions::LINEAR));
+        self.canvas_glass = Some(ctx.load_texture("reference canvas glass", read.glass, egui::TextureOptions::LINEAR));
+        self.canvas_pixels = Some(read.pixels);
+    }
+
+    /// The picture is read again at once: the model turned, or the window shows another kind.
+    fn read_again(&mut self) {
+        (self.canvas_edits, self.read_at) = (None, None);
+        if let Some(reading) = &mut self.reading {
+            reading.again = true;
         }
     }
 
@@ -375,7 +464,7 @@ impl Reference {
         &mut self,
         ctx: &egui::Context,
         look: &mut Look,
-        session: &CanvasSession,
+        session: &Arc<CanvasSession>,
         hold: Duration,
     ) -> Option<Picked> {
         if !self.on {
@@ -385,7 +474,7 @@ impl Reference {
         let (dx, dy) = std::mem::take(&mut self.turned);
         if dx != 0.0 || dy != 0.0 {
             session.reference_model_turn(dx, dy, self.size.x);
-            (self.canvas_edits, self.read_at) = (None, None);
+            self.read_again();
         }
         if matches!(self.mode, Mode::Canvas | Mode::Model) {
             self.read_canvas(ctx, session);
@@ -584,8 +673,7 @@ impl Reference {
                     text(ui.painter(), cell.center(), Align2::CENTER_CENTER, label, 15.0, Weight::Regular, ink);
                     if ui.interact(cell, ui.scope_id().with(("mode", i)), Sense::click()).clicked() {
                         self.mode = mode;
-                        self.read_at = None;
-                        self.canvas_edits = None;
+                        self.read_again();
                     }
                 }
             });
