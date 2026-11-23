@@ -693,9 +693,16 @@ impl CanvasSession {
         let mut guard = self.shared.lock();
         let st = &mut *guard;
         // a filter layer's settings: kept as a step, or put back
-        if st.filters.layer.is_some() {
+        if let Some(edit) = st.filters.layer.as_ref() {
+            let (layer, added) = (edit.layer, edit.added);
             st.end_layer_edit(commit);
             self.shared.frame(st);
+            drop(guard);
+            // Cancel in the settings a filter layer opened with as it was added: it goes again,
+            // its adding undone and nothing left to redo, as if it was never added
+            if added && !commit {
+                self.take_back_added(layer);
+            }
             return;
         }
         if st.adjusting {

@@ -172,6 +172,9 @@ pub(crate) struct FilterLayers {
     given: BTreeMap<String, Arc<str>>,
     /// The canvas they were given to.
     given_to: Option<u64>,
+    /// The filter layer just added, and the artwork's revision then: its settings opened next, with
+    /// nothing changed between, are its first, and Cancel there takes the layer away again.
+    just_added: Option<(LayerId, u64)>,
 }
 
 impl State {
@@ -297,6 +300,8 @@ pub(crate) struct LayerEdit {
     pub(crate) controls: Vec<PluginControl>,
     /// The artwork as it was then.
     before: Document,
+    /// Opened as its layer was added: Cancel takes the layer away again.
+    pub(crate) added: bool,
 }
 
 impl LayerEdit {
@@ -310,7 +315,7 @@ impl LayerEdit {
             }
             control.make_starting();
         }
-        LayerEdit { layer, name: def.label.clone(), controls, before }
+        LayerEdit { layer, name: def.label.clone(), controls, before, added: false }
     }
 
     /// Its values onto its layer in `doc`; false if that is no filter layer any more.
@@ -464,6 +469,8 @@ impl CanvasSession {
     /// A new filter layer running filter `id` (as [`crate::Plugins::layer_filters`] lists it) above
     /// the current layer (in its group), named after the filter and made current, its values where
     /// the filter starts them. 0 if no plugin on offers it, or the canvas has no room for another.
+    /// Its settings opened next ([`Self::filter_layer_settings`]) are its first: Cancel there takes
+    /// it away again, as if it was never added.
     pub fn add_filter_layer(&self, id: String) -> u64 {
         let def = self.shared.lock().filter_layers.defs.get(&id).cloned();
         let Some(def) = def else { return 0 };
@@ -477,15 +484,16 @@ impl CanvasSession {
         }
         let id = self
             .change(NEW_STEP, |d| {
-                d.has_room(1).then(|| {
-                    let name = format!("{} {}", def.label, d.layers().len() + 1);
-                    d.add_filter_layer(filter, &name).0
-                })
+                // named after its filter alone
+                d.has_room(1).then(|| d.add_filter_layer(filter, &def.label).0)
             })
             .unwrap_or(0);
         if id != 0 {
+            let mut st = self.shared.lock();
+            st.filter_layers.just_added = Some((LayerId(id), st.revision));
             // its filter made now, so whatever draws the canvas next shows it
-            self.shared.lock().give_layer_filters();
+            st.give_layer_filters();
+            drop(st);
             self.tell_plugins(crate::plugin_run::Hook::LayerAdded);
         }
         id
@@ -493,8 +501,8 @@ impl CanvasSession {
 
     /// Opens the current layer's filter settings in its filter's panel, as an adjustment is
     /// open (keeping one open first): its values show at once as they are set, Apply keeps them
-    /// as one step, Cancel puts them back. False if the current layer is no filter layer, or no
-    /// plugin on offers its filter.
+    /// as one step, Cancel puts them back (and takes away a layer just added, opened as it was
+    /// added). False if the current layer is no filter layer, or no plugin on offers its filter.
     pub fn filter_layer_settings(&self) -> bool {
         self.adjustment_end(true);
         let mut guard = self.shared.lock();
@@ -507,7 +515,10 @@ impl CanvasSession {
         if st.doc.is_locked(current) {
             return false;
         }
-        let edit = LayerEdit::of(current, &filter, &def, st.doc.clone());
+        let mut edit = LayerEdit::of(current, &filter, &def, st.doc.clone());
+        // its first settings, opened as it was added with nothing changed since
+        let revision = st.revision;
+        edit.added = st.filter_layers.just_added.take() == Some((current, revision));
         match def.editor {
             Some(editor) => open_editor(st, edit, editor, &filter),
             None => {
@@ -584,6 +595,22 @@ impl CanvasSession {
         open_editor(st, edit, editor, &filter);
         self.shared.frame(st);
         true
+    }
+}
+
+impl CanvasSession {
+    /// Filter layer `layer`, just added and cancelled in its first settings, taken away again: its
+    /// adding undone, with nothing to redo.
+    pub(crate) fn take_back_added(&self, layer: LayerId) {
+        let undone = self.undo();
+        let gone = self.shared.lock().doc.layer(layer).is_none();
+        if gone && undone.as_deref() == Some(NEW_STEP) {
+            if let Some(canvas) = self.shared.lock().canvas.as_mut() {
+                canvas.forget_redo();
+            }
+        } else {
+            log::warn!("a filter layer just added wasn't the last step: {undone:?} undone, the layer gone {gone}");
+        }
     }
 }
 
@@ -682,5 +709,54 @@ mod tests {
         // an ordinary layer takes none
         let plain = doc.add_layer();
         assert!(!doc.set_filter_value(plain, "amount", 0.1));
+    }
+
+    #[test]
+    fn cancel_in_a_filter_layer_s_first_settings_takes_it_away_and_it_is_named_after_its_filter() {
+        const INFINITE: &str = "io.github.artcraftandroid.infinite-plugins";
+        let dir = std::env::temp_dir().join(format!("procraft-filter-layer-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let plugins = crate::Plugins::with_bundled(dir.to_string_lossy().into_owned());
+        assert!(plugins.set_on(INFINITE.to_owned(), true));
+        assert!(plugins.set_switch(format!("{INFINITE}.filter_layers"), true));
+        let Some(s) = crate::tests::session(32, 32) else { return };
+        s.use_plugins(Arc::clone(&plugins));
+        s.set_color(1.0, 0.0, 0.0);
+        let base = s.layers().last().unwrap().id;
+        assert!(s.fill_layer(base));
+        let shown = |s: &CanvasSession| crate::tests::pixel(s, 16, 16);
+        let redo = |s: &CanvasSession| s.shared.lock().canvas.as_ref().is_some_and(|c| c.can_redo());
+        let count = s.layers().len();
+        let invert = format!("{INFINITE}.invert");
+        // added: named after its filter alone, and shown at once as its settings open
+        let layer = s.add_filter_layer(invert.clone());
+        assert_ne!(layer, 0);
+        assert_eq!(s.layers().into_iter().find(|l| l.id == layer).map(|l| l.name).as_deref(), Some("Invert"));
+        assert!(s.filter_layer_settings());
+        assert_eq!(shown(&s), [0, 255, 255, 255]);
+        // Cancel: it goes again, the canvas as it was, nothing to redo
+        assert!(s.adjustment_end(false));
+        assert_eq!(s.layers().len(), count);
+        assert!(s.layers().iter().all(|l| l.id != layer));
+        assert_eq!(shown(&s), [255, 0, 0, 255]);
+        assert!(!redo(&s), "its adding isn't there to redo");
+        // Apply keeps it; Cancel in its settings opened again later leaves it, its value as kept
+        let kept = s.add_filter_layer(invert.clone());
+        assert!(s.filter_layer_settings());
+        assert!(s.adjustment_end(true));
+        assert!(s.filter_layer_settings());
+        assert!(s.adjustment_end(false));
+        assert!(s.layers().iter().any(|l| l.id == kept));
+        assert_eq!(shown(&s), [0, 255, 255, 255]);
+        // added, then something else changed before its settings open: not its first, so Cancel
+        // leaves it too
+        let other = s.add_filter_layer(invert);
+        assert!(s.rename_layer(other, "Mine".to_owned()));
+        assert!(s.filter_layer_settings());
+        assert!(s.adjustment_end(false));
+        assert!(s.layers().iter().any(|l| l.id == other && l.name == "Mine"));
+        assert_eq!(s.layers().len(), count + 2);
+        assert_eq!(shown(&s), [255, 0, 0, 255], "inverted twice");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
