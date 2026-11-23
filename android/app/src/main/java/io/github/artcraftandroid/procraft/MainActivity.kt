@@ -160,7 +160,11 @@ class MainActivity : ComponentActivity() {
     @Suppress("DEPRECATION")
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
-        if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) vm.session?.trimMemory()
+        if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
+            vm.session?.trimMemory()
+            // the library's sample strokes too: the rows showing draw theirs again from the core's copy
+            vm.letGoOfPreviews()
+        }
     }
 
     /** Project canvas: while it is on, the canvas shows on the first second display there is. */

@@ -44,6 +44,15 @@ static STUDIO_PREVIEW_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Whether a sample stroke the GPU couldn't draw has been said in the log.
 static PREVIEW_FAILURE_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// What the canvas the sample strokes are drawn on may take of the GPU's memory, bytes, at its
+/// most (its layers and stroke textures, its brushes' images, and the allocator's blocks for them:
+/// a first set's strokes took 132 MB of a downlevel GPU's): with less than that and what the
+/// system keeps free left, it isn't kept between strokes.
+const PREVIEW_CANVAS_BYTES: u64 = 128 << 20;
+
+/// Whether the sample strokes' canvas let go for want of memory has been said in the log.
+static PREVIEW_SHORT_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Draws the pictures `brushes` stand in with that are still to be drawn (each brush's shape and
 /// grain, and its second's), on a thread of their own: a brush chosen is ready by its first stroke,
 /// which otherwise waits for them under the canvas's lock. What a stroke or preview wants first is
@@ -130,6 +139,17 @@ pub struct BrushSetInfo {
     pub icon: u32,
     /// The brush last chosen in it, if one has been.
     pub chosen: Option<u32>,
+}
+
+/// How many of the library's sample strokes, each `width` x `height` at four bytes a pixel, the app
+/// keeps as pictures on a device of `memory` bytes (its last drawn; a row showing one let go draws
+/// it again from the stroke the core keeps packed): a 64th of the memory's worth, at least 48 (a
+/// few screens of rows) and at most 400 (more than the stock library). Unbounded, every set looked
+/// through held all of them, some 100 MB of pictures on a tablet of 2 or 3 GB.
+#[uniffi::export]
+pub fn brush_previews_kept(memory: u64, width: u32, height: u32) -> u32 {
+    let each = u64::from(width.max(1)) * u64::from(height.max(1)) * 4;
+    u32::try_from(memory / 64 / each).unwrap_or(u32::MAX).clamp(48, 400)
 }
 
 /// How near a slider value pulls onto a notch, and how many notches a slider holds.
@@ -631,6 +651,15 @@ impl CanvasSession {
         if gpu.is_lost() {
             return None;
         }
+        // a device short of memory (an old tablet's, the canvas open) lets go of what draws them
+        // after each, rather than hold it while the library is looked through and be closed by
+        // the system; each stroke still comes out (one at a time, as ever)
+        let short = crate::device::short_of_memory(PREVIEW_CANVAS_BYTES);
+        if short && !PREVIEW_SHORT_SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::info!(
+                "the brushes' sample strokes are drawn on a canvas let go after each: the device is short of memory"
+            );
+        }
         // drawn on a canvas of the sample stroke's own, then fitted into the preview; what the GPU
         // couldn't do (no memory for it, the device lost meanwhile) costs this preview, never the
         // app: none is shown, the canvas goes, and the first such is said
@@ -662,8 +691,10 @@ impl CanvasSession {
             Ok(drawn) => drawn?,
             Err(e) => return failed(&e.to_string()),
         };
-        // kept for the next (one drawn meanwhile elsewhere already is)
-        self.shared.lock().preview.get_or_insert((canvas, doc));
+        // kept for the next (one drawn meanwhile elsewhere already is), unless memory is short
+        if !short {
+            self.shared.lock().preview.get_or_insert((canvas, doc));
+        }
         if !whole {
             return failed("part of it was left out");
         }
@@ -838,6 +869,18 @@ mod tests {
     use procraft_engine::brush::Brush;
 
     use crate::CanvasSession;
+
+    /// A 2 GB tablet keeps 97 of the library's 530 x 162 strokes (32 MB), a 3 GB one 146, an 8 GB
+    /// one 390; a 1 GB one still a few screens' worth (48), and none past 400.
+    #[test]
+    fn the_library_keeps_strokes_by_the_device_s_memory() {
+        const GB: u64 = 1 << 30;
+        let kept = |gb: f64| super::brush_previews_kept((gb * GB as f64) as u64, 530, 162);
+        assert_eq!([kept(1.0), kept(2.0), kept(3.0), kept(8.0), kept(64.0)], [48, 97, 146, 390, 400]);
+        let held = |n: u32| u64::from(n) * 530 * 162 * 4;
+        assert!(held(kept(2.0)) <= 2 * GB / 64, "{} MB", held(kept(2.0)) >> 20);
+        assert_eq!(super::brush_previews_kept(0, 0, 0), 48);
+    }
 
     /// Hovering, the cursor fills as the brush would paint at its estimated pressure: a brush whose
     /// opacity follows the pressure fills faintly at 44% and the picture shows through (#332),

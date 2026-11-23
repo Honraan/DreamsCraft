@@ -6158,6 +6158,28 @@ fn color_fill_shows_exactly_the_fill_it_makes_on_an_alpha_locked_faded_layer() {
     assert!(most <= 2, "the fill shown is the fill made, to {most} levels");
 }
 
+/// A device short of memory lets go of the canvas the library's sample strokes are drawn on after
+/// each (discord: an old Android 12 tablet closed as the library loaded), rather than hold it while
+/// the library is looked through: with 400 MB free (less than that canvas may take, 128 MB, and the
+/// 512 MB kept free) each stroke still comes out, nothing kept after it; with 4 GB free the canvas
+/// is kept for the next, which, memory short again, draws on it and lets it go.
+#[test]
+fn a_device_short_of_memory_lets_go_of_what_draws_the_library_s_strokes() {
+    let Some(s) = session(64, 64) else { return };
+    let free = |bytes: Option<u64>| crate::device::MEMORY_FREE.with(|m| m.set(bytes));
+    let drawn = |t: &crate::layers::ThumbnailImage| t.width == 530 && t.rgba.iter().skip(3).step_by(4).any(|&a| a > 0);
+    free(Some(400 << 20));
+    assert!(s.brush_preview(0, 0, 530, 162).is_some_and(|t| drawn(&t)));
+    assert!(s.shared.lock().preview.is_none(), "nothing kept, memory short");
+    free(Some(4 << 30));
+    assert!(s.brush_preview(0, 1, 530, 162).is_some_and(|t| drawn(&t)));
+    assert!(s.shared.lock().preview.is_some(), "kept for the next");
+    free(Some(400 << 20));
+    assert!(s.brush_preview(0, 2, 530, 162).is_some_and(|t| drawn(&t)));
+    assert!(s.shared.lock().preview.is_none(), "let go, memory short");
+    free(None);
+}
+
 /// Where a colour dropped inside a ring of line art goes, at the default threshold (50%), as the
 /// line art is drawn and laid out (discord: "it paints the entire canvas"): the share of the canvas
 /// outside the ring it fills. It fills the whole canvas only where it measures an empty layer (the

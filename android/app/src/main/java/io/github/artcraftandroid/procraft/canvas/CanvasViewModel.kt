@@ -1532,6 +1532,38 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     var foundBrush by mutableStateOf<String?>(null)
     val previews = mutableStateMapOf<String, ImageBitmap>()
 
+    /**
+     * The sample strokes in [previews], the last drawn last: past [previewsMost] (by the device's
+     * memory, the core's brushPreviewsKept) the first go, a row showing one drawing it again from
+     * the core's packed copy. Kept all, every set looked through held some 100 MB of pictures.
+     */
+    private val previewOrder = ArrayDeque<String>()
+    private val previewsMost by lazy {
+        val memory = android.app.ActivityManager.MemoryInfo()
+        getApplication<Application>().getSystemService(android.app.ActivityManager::class.java)?.getMemoryInfo(memory)
+        io.github.artcraftandroid.procraft.core.brushPreviewsKept(memory.totalMem.coerceAtLeast(0).toULong(), 530u, 162u).toInt()
+    }
+
+    /** [bitmap] kept as brush [key]'s sample stroke, the oldest let go past the most kept. */
+    private fun keepPreview(key: String, bitmap: ImageBitmap, shaded: Boolean) {
+        shadedNames[key] = shaded
+        previews[key] = bitmap
+        previewOrder.remove(key)
+        previewOrder.addLast(key)
+        while (previewOrder.size > previewsMost) {
+            val old = previewOrder.removeFirst()
+            previews.remove(old)
+            shadedNames.remove(old)
+        }
+    }
+
+    /** Every sample stroke let go (the system short of memory, or the library changed): rows showing draw theirs again. */
+    fun letGoOfPreviews() {
+        previews.clear()
+        shadedNames.clear()
+        previewOrder.clear()
+    }
+
     /** Counts the library's changes: a sample stroke asked for before the last one isn't kept. */
     var previewRound by androidx.compose.runtime.mutableIntStateOf(0)
         private set
@@ -3509,8 +3541,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         activeSince = android.os.SystemClock.elapsedRealtime()
         thumbnails.clear()
         thumbnailVersions.clear()
-        previews.clear()
-        shadedNames.clear()
+        letGoOfPreviews()
         panel = Panel.NONE
         barsHidden = false
         restoreReference(s)
@@ -5620,8 +5651,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         if (shownSet != RECENT_SET) shownSet = shownSet.coerceIn(0, (brushSets.size - 1).coerceAtLeast(0))
         recentBrushes = s.recentBrushes()
         readSliders()
-        previews.clear()
-        shadedNames.clear()
+        letGoOfPreviews()
         keepBrushLibrary(s)
     }
 
@@ -6709,10 +6739,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                     bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(t.rgba))
                     bitmap.asImageBitmap() to under
                 }
-                if (made != null && round == previewRound) {
-                    shadedNames[key] = made.second
-                    previews[key] = made.first
-                }
+                if (made != null && round == previewRound) keepPreview(key, made.first, made.second)
             }
         }
     }
