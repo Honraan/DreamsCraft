@@ -7555,6 +7555,81 @@ fn a_time_lapse_frame_is_read_at_the_size_it_is_kept() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The panels opened while recording (Layers reading its thumbnails and picking a layer, Brushes
+/// drawing its previews and picking a brush, Colours setting a colour, Actions reading the canvas's
+/// picture), with the app asking for a frame after each as it does after a change, change nothing on
+/// the canvas, so they add no frame: the time-lapse records changes to the canvas only. On a
+/// portrait and a landscape canvas, neither side a multiple of 16. Bounds: no frame from the four
+/// panels, one from the stroke after them, and no frame kept anything of the green a frame left
+/// unfilled shows.
+#[test]
+fn panels_opened_while_recording_add_no_frame() {
+    for (w, h) in [(906, 1283), (1283, 906)] {
+        let Ok(gpu) = Gpu::headless() else { return };
+        let s = CanvasSession::new(w, h);
+        {
+            let mut st = s.shared.lock();
+            st.window_size = (1024, 1024);
+            st.view = Some(View::fit((w, h), (1024, 1024)));
+            st.gpu = Some(gpu);
+            st.ensure_canvas();
+        }
+        let dir = std::env::temp_dir().join(format!("procraft-lapse-panels-{}-{w}x{h}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let lapse = crate::TimeLapse::new(dir.to_string_lossy().into_owned());
+        let stroke = |y: f32| {
+            s.stroke_begin(PointerKind::Finger, vec![sample(100.0, y, 0.0)]);
+            s.stroke_add(vec![sample(700.0, y + 200.0, 40.0)]);
+            s.stroke_end(vec![]);
+        };
+        s.set_color(0.1, 0.2, 0.8);
+        stroke(100.0);
+        assert!(s.record_time_lapse(std::sync::Arc::clone(&lapse)));
+        let ask = || s.record_time_lapse(std::sync::Arc::clone(&lapse));
+        // Layers
+        let layers = s.layers();
+        for l in &layers {
+            let _ = s.layer_thumbnail(l.id, 96);
+        }
+        if let Some(l) = layers.first() {
+            s.select_layer(l.id);
+        }
+        let layers_added = ask();
+        // Brushes
+        let _ = s.brush_preview(0, 0, 300, 60);
+        let _ = s.brush_preview(0, 1, 300, 60);
+        let _ = s.select_brush(0, 1);
+        let brushes_added = ask();
+        // Colours
+        s.set_color(0.9, 0.4, 0.1);
+        let colours_added = ask();
+        // Actions
+        let _ = s.canvas_thumbnail(256);
+        let actions_added = ask();
+        let after_panels = lapse.count();
+        stroke(500.0);
+        assert!(ask());
+        println!(
+            "{w}x{h}: frames after a stroke and four panels {after_panels}, after the next stroke {}",
+            lapse.count()
+        );
+        assert_eq!([layers_added, brushes_added, colours_added, actions_added], [false; 4], "a panel added a frame");
+        assert_eq!((after_panels, lapse.count()), (1, 2));
+        for i in 0..lapse.count() {
+            let f = lapse.frame(i).unwrap();
+            let green = f
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|&&[r, g, b, _]| r < 24 && b < 24 && (105..=165).contains(&g))
+                .count();
+            assert_eq!(green, 0, "frame {i} has {green} pixels of an unfilled frame's green");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// The graphics device lost as a frame is read back (or before): no frame, and nothing panics,
 /// whether the read was started before the loss or after it.
 /// A window `side` pixels square to draw frames into, as the apps draw them.
