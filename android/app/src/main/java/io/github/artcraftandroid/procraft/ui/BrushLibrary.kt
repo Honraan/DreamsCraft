@@ -4,8 +4,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.Animatable
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
@@ -311,7 +309,6 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
             vm.renamingBrush = null
         }
     }
-    val pick = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let { vm.importBrushes(it) } }
     // a brush held and dragged: which, where the finger is and where on the brush it took hold
     // (window pixels); and where the sets, the brushes and the lists are on the screen
     var dragged by remember { mutableStateOf<BrushInfo?>(null) }
@@ -430,7 +427,7 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
                         MenuDivider(11.dp)
                         MenuItem(PcIcons.MenuFolder, "Import from Files") {
                             adding = false
-                            pick.launch(arrayOf("*/*"))
+                            vm.pickBrushFile?.invoke()
                         }
                     }
                 }
@@ -1131,7 +1128,6 @@ private fun LibrariesPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier, 
     var gridOrigin by remember { mutableStateOf(Offset.Zero) }
     var pinchedCard by remember { mutableStateOf<Int?>(null) }
     var cardZoom by remember { mutableFloatStateOf(1f) }
-    val pick = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let { vm.importBrushes(it) } }
     Popover(floating?.width ?: LibraryWidth, arrowX, modifier, side = if (floating != null) ArrowSide.NONE else ArrowSide.TOP) {
         floating?.let { FloatingTop(it) }
         val renaming = !showing && vm.renamingLibrary == vm.libraryPlace
@@ -1171,7 +1167,7 @@ private fun LibrariesPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier, 
                             }
                             MenuItem(PcIcons.MenuFolder, "Import from Files") {
                                 adding = false
-                                pick.launch(arrayOf("*/*"))
+                                vm.pickBrushFile?.invoke()
                             }
                         } else {
                             MenuItem(PcIcons.MenuNewSet, "Create new set") {
@@ -1181,7 +1177,7 @@ private fun LibrariesPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier, 
                             MenuDivider(11.dp)
                             MenuItem(PcIcons.MenuFolder, "Import from Files") {
                                 adding = false
-                                pick.launch(arrayOf("*/*"))
+                                vm.pickBrushFile?.invoke()
                             }
                         }
                     }

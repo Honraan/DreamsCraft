@@ -5842,6 +5842,14 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     private fun exportFolder(): File = File(getApplication<Application>().cacheDir, "exports/${System.nanoTime()}").apply { mkdirs() }
 
     /**
+     * Opens the system's file picker for a brush, set or library file to import (set by the
+     * activity, whose picker hands what is picked to [importBrushes]): kept by the activity rather
+     * than the library, so the file still comes in if the library has closed meanwhile, or the
+     * system ended the app while the picker was up and started it again.
+     */
+    var pickBrushFile: (() -> Unit)? = null
+
+    /**
      * A brush, set or library file from elsewhere, with the import card: it joins the library and
      * its set is shown, or comes in as a library of its own, in use (not if the card's Cancel was
      * tapped meanwhile).

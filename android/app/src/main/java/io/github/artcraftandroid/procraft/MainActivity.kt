@@ -40,6 +40,19 @@ class MainActivity : ComponentActivity() {
     /** Hides the system's bars, as the model asks (let go as this activity goes: the model outlives it). */
     private val barsHider: () -> Unit = { hideSystemBars() }
 
+    /**
+     * The brush library's file picker, registered with the activity rather than the library: what
+     * is picked comes in even if the library closed while the picker was up, or the system ended
+     * the app meanwhile (it is registered again as the activity is made again, and the pick is
+     * handed to it then). Any kind of file can be picked: brush files have no type of their own.
+     */
+    private val brushFilePicker = registerForActivityResult(androidx.activity.result.contract.ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let(vm::importBrushes)
+    }
+    private val brushPickerOpener: () -> Unit = {
+        runCatching { brushFilePicker.launch(arrayOf("*/*")) }.onFailure { AppLog.e("ProCraft", "opening the brush file picker", it) }
+    }
+
     // Project canvas: the presentation on a second display, and the displays coming and going
     private var projection: ProjectionPresentation? = null
     private val displays by lazy { getSystemService(DisplayManager::class.java) }
@@ -60,6 +73,7 @@ class MainActivity : ComponentActivity() {
         hideSystemBars()
         // a colour dragged down from the top bar puts back the bars the drag showed
         vm.hideSystemBars = barsHider
+        vm.pickBrushFile = brushPickerOpener
         // which graphics backend the app is trying, kept before the model makes the GPU device: a
         // driver that crashes the app then sends the next start to the next backend (one that drew
         // is trusted until the app or the system is updated)
@@ -257,6 +271,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         if (vm.hideSystemBars === barsHider) vm.hideSystemBars = null
+        if (vm.pickBrushFile === brushPickerOpener) vm.pickBrushFile = null
         super.onDestroy()
     }
 
