@@ -1798,8 +1798,9 @@ mod tests {
     }
 
     /// A pen drawing a line for a second while no frame comes (a slow one): its moves wait, and
-    /// when the QuickShape wait its press set runs out they go first, so the pen still moving snaps
-    /// no shape; held still past the wait it snaps, as ever.
+    /// no QuickShape wait runs out meanwhile (draw and hold waits only for a stroke seen going 15
+    /// points), so the pen still moving snaps no shape; its moves handed on by the next frame, held
+    /// still past the wait it snaps, as ever.
     #[test]
     fn a_pen_still_moving_snaps_no_shape_however_long_its_moves_wait() {
         let _one = crate::pen::tests::mouse_pointer_tests();
@@ -1822,7 +1823,11 @@ mod tests {
         }
         assert_eq!(input.handed(), Handed::default(), "no frame came");
         input.tick(session);
+        assert!(!input.commands.contains(&TouchCommand::ShapeSnapped), "{:?}", input.commands);
+        // the next frame
+        input.flush(session);
         assert_eq!(input.handed(), Handed { batches: 1, samples: 1000 });
+        input.tick(session);
         assert!(!input.commands.contains(&TouchCommand::ShapeSnapped), "{:?}", input.commands);
         input.test_clock = Some(1000.0 + 700.0);
         input.tick(session);

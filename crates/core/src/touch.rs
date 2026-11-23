@@ -88,8 +88,15 @@ const SCRUB_TURNS: i32 = 3;
 const SCRUB_STEP: f32 = 24.0;
 /// Three fingers swiped down this far (points), mostly straight.
 const SWIPE_DOWN: f32 = 70.0;
-/// A stroke counts as still within this many points.
-const QUICKSHAPE_STILL: f32 = 6.0;
+/// A touch waited on to be held still keeps still while it has gone less than this (points, all
+/// told) since the wait began: each time it has gone this far, the wait starts again. So a touch
+/// drawing small circles never keeps still, however near it stays to where it began.
+const STILL: f32 = 3.0;
+/// A finger that has gone this far (points, all told) since it came down is no hold.
+const HOLD_REACH: f32 = 15.0;
+/// A stroke waits to be held still (draw and hold) only once it has gone this far (points, all
+/// told): a dot or a small scribble held never snaps to a shape.
+const QUICKSHAPE_FROM: f32 = 15.0;
 /// A snapped shape being edited: a handle within this takes a drag, and its outline within this.
 const QUICKSHAPE_GRAB: f32 = 22.0;
 /// A shape's node stays where it is until the finger has gone this far (points), and then goes as
@@ -554,7 +561,8 @@ pub(crate) struct Touches {
     scrub_turns: i32,
     swipe_start: (f32, f32),
     swiped: bool,
-    hold_at: (f32, f32),
+    /// How far the touch waited on for a hold or draw and hold has gone.
+    travel: Travel,
     hold_due: Option<f64>,
     quickshape_due: Option<f64>,
     rapid_due: Option<f64>,
@@ -701,7 +709,7 @@ impl Default for Touches {
             scrub_turns: 0,
             swipe_start: (0.0, 0.0),
             swiped: false,
-            hold_at: (0.0, 0.0),
+            travel: Travel::default(),
             hold_due: None,
             quickshape_due: None,
             rapid_due: None,
@@ -769,6 +777,59 @@ impl Default for Touches {
             scale: 1.0,
             handle_scale: 1.0,
         }
+    }
+}
+
+/// How far a touch waited on to be held still has gone (window pixels): all told, since a hold's
+/// wait last began and since draw and hold's did; and where it was last.
+#[derive(Clone, Copy, Debug, Default)]
+struct Travel {
+    last: (f32, f32),
+    all: f32,
+    hold: f32,
+    shape: f32,
+}
+
+impl Touches {
+    /// The touch waited on to be held still came down at `at`: nothing gone yet, and draw and hold
+    /// waits until it has gone far enough.
+    fn travel_from(&mut self, at: (f32, f32)) {
+        self.travel = Travel { last: at, ..Travel::default() };
+        self.quickshape_due = None;
+    }
+
+    /// The touch waited on went on through `samples`. A hold's wait starts again each time it has
+    /// gone [`STILL`] since it began, and is given up once it has gone [`HOLD_REACH`] all told; with
+    /// `shapes` (a stroke that may snap to a shape), draw and hold waits only once it has gone
+    /// [`QUICKSHAPE_FROM`] all told, starting again likewise. True if draw and hold's wait began
+    /// again.
+    fn travelled(&mut self, samples: &[PenSample], shapes: bool) -> bool {
+        let (still, reach, from) = (STILL * self.scale, HOLD_REACH * self.scale, QUICKSHAPE_FROM * self.scale);
+        let mut again = false;
+        for s in samples {
+            let at = (s.x, s.y);
+            let step = dist(at, std::mem::replace(&mut self.travel.last, at));
+            let travel = &mut self.travel;
+            travel.all += step;
+            if self.hold_due.is_some() {
+                travel.hold += step;
+                if travel.all > reach {
+                    self.hold_due = None;
+                } else if travel.hold > still {
+                    travel.hold = 0.0;
+                    self.hold_due = Some(s.time_ms + self.settings.hold_ms);
+                }
+            }
+            if shapes && travel.all > from {
+                travel.shape += step;
+                if travel.shape > still {
+                    travel.shape = 0.0;
+                    self.quickshape_due = Some(s.time_ms + self.settings.quickshape_ms);
+                    again = true;
+                }
+            }
+        }
+        again
     }
 }
 
@@ -1458,15 +1519,11 @@ impl CanvasSession {
         let slop = TAP_SLOP * t.scale;
         match t.mode {
             Mode::Pen | Mode::Finger if id == t.stroke_pointer => {
-                if t.mode == Mode::Finger && dist(at, t.down_at) > slop {
-                    t.hold_due = None;
-                }
-                // moving on restarts the wait for a hold
-                if dist(at, t.hold_at) > QUICKSHAPE_STILL * t.scale {
-                    t.hold_at = at;
-                    let snapped = self.shared.lock().shape.is_some();
-                    t.quickshape_due =
-                        (!snapped && t.settings.draw_and_hold).then_some(last.time_ms + t.settings.quickshape_ms);
+                // moving on restarts the waits for a hold and for draw and hold (none while a shape
+                // it snapped to is being held)
+                let shapes = t.settings.draw_and_hold;
+                if t.travelled(&samples, shapes) && self.shared.lock().shape.is_some() {
+                    t.quickshape_due = None;
                 }
                 drop(t);
                 self.clone_stroke_at(at, false);
@@ -1474,6 +1531,7 @@ impl CanvasSession {
                 out.push(TouchCommand::Cursor { x: at.0, y: at.1 });
             }
             Mode::Held if id == t.stroke_pointer => {
+                t.travelled(&samples, false);
                 if let Some(held) = t.held.as_mut() {
                     held.moves.extend(samples);
                 }
@@ -1535,9 +1593,7 @@ impl CanvasSession {
             }
             Mode::Turn if id == t.stroke_pointer => {
                 let last = std::mem::replace(&mut t.turn_last, at);
-                if dist(at, t.down_at) > TAP_SLOP * t.scale {
-                    t.hold_due = None;
-                }
+                t.travelled(&samples, false);
                 drop(t);
                 self.turn_model(at.0 - last.0, at.1 - last.1);
             }
@@ -1666,8 +1722,9 @@ impl CanvasSession {
                 }
             }
             Mode::Idle => {
-                if dist(at, t.down_at) > slop {
-                    t.hold_due = None;
+                // (a hold is waited for with one finger down alone)
+                if t.hold_due.is_some() {
+                    t.travelled(&samples, false);
                 }
                 // the lone finger set to move the canvas moves it, from where it went down
                 if let Some(last) = t.pan_last.filter(|_| id == t.stroke_pointer && t.down.len() == 1)
@@ -1912,6 +1969,7 @@ impl CanvasSession {
         t.stroke_pointer = t.down.first().map_or(0, |d| d.id);
         t.held = Some(Held { kind, first: samples, moves: Vec::new() });
         t.mode = Mode::Held;
+        t.travel_from(t.down_at);
         if !is_pen(kind) && t.settings.hold.is_some() {
             t.hold_due = Some(first.time_ms + t.settings.hold_ms);
         }
@@ -2048,7 +2106,7 @@ impl CanvasSession {
             // cloning, and the pen (or a mouse, a desktop's drawing tool) painting an adjustment
             // on, paint (no eyedropper); the clone source follows the brush
             t.mode = if is_pen(kind) { Mode::Pen } else { Mode::Finger };
-            t.hold_at = at;
+            t.travel_from(at);
             self.clone_stroke_at(at, true);
             self.stroke_begin(kind, samples.to_vec());
             return;
@@ -2090,7 +2148,6 @@ impl CanvasSession {
         if t.selecting.is_some() && !self.finger_turns_model(kind, t) {
             t.stroke_pointer = id;
             t.select_moved = false;
-            t.hold_at = at;
             t.pour_last = (at.0, now);
             t.select_threshold = t.selecting.map_or(0.5, |s| s.threshold);
             t.mode = Mode::Select;
@@ -2132,6 +2189,7 @@ impl CanvasSession {
             t.stroke_pointer = id;
             t.turn_last = at;
             t.mode = Mode::Turn;
+            t.travel_from(at);
             if t.settings.hold.is_some() {
                 t.hold_due = Some(now + t.settings.hold_ms);
             }
@@ -2176,6 +2234,7 @@ impl CanvasSession {
                 t.pan_last = Some(at);
                 t.panned = false;
             }
+            t.travel_from(at);
             if t.settings.hold.is_some() {
                 t.hold_due = Some(now + t.settings.hold_ms);
             }
@@ -2203,10 +2262,8 @@ impl CanvasSession {
         if t.mode == Mode::Finger && t.settings.hold.is_some() {
             t.hold_due = Some(now + t.settings.hold_ms);
         }
-        t.hold_at = at;
-        if t.settings.draw_and_hold {
-            t.quickshape_due = Some(now + t.settings.quickshape_ms);
-        }
+        // draw and hold waits until the stroke has gone far enough
+        t.travel_from(at);
     }
 
     /// Whether a touch of `kind` on the screen turns a shown model.
@@ -4412,6 +4469,104 @@ mod tests {
         assert!(out.contains(&TouchCommand::Pick { x: 210.0, y: 200.0 }));
         let out = s.touch_up(1, at(210.0, 200.0, 500.0));
         assert!(out.contains(&TouchCommand::PickDone));
+    }
+
+    /// A point `r` window pixels from (200, 200) round a circle, `turns` of the way round, at `ms`.
+    fn round(r: f32, turns: f32, ms: f64) -> Vec<PenSample> {
+        let a = turns * std::f32::consts::TAU;
+        at(200.0 + r * a.cos(), 200.0 + r * a.sin(), ms)
+    }
+
+    /// The window pixels a point takes in `s` (as its touches take them).
+    fn per_point(s: &CanvasSession) -> f32 {
+        s.shared.lock().display_scale
+    }
+
+    /// A finger drawing small circles (2 points across, a turn every 200 ms, a sample every 8 ms)
+    /// never stays within a still touch's 3 points long enough to hold, however near it stays to
+    /// where it came down, and once it has gone 15 points all told it holds no more, kept still
+    /// after for a second. Before, a finger anywhere within 24 points of where it came down picked
+    /// a colour 400 ms after it came down, moving or not.
+    #[test]
+    fn a_finger_drawing_small_circles_picks_no_colour() {
+        let s = session();
+        let r = per_point(&s);
+        s.touch_down(1, PointerKind::Finger, round(r, 0.0, 0.0));
+        let mut out = Vec::new();
+        let mut ms = 0.0;
+        while ms < 1200.0 {
+            ms += 8.0;
+            out.extend(s.touch_move(1, round(r, (ms / 200.0) as f32, ms)));
+            out.extend(s.touch_tick(ms));
+        }
+        // held still for a second after
+        for k in 1..=10 {
+            out.extend(s.touch_tick(ms + f64::from(k) * 100.0));
+        }
+        let picked = out.iter().find(|c| matches!(c, TouchCommand::Pick { .. }));
+        assert!(picked.is_none(), "{picked:?}");
+        assert!(s.touches().hold_due.is_none());
+    }
+
+    /// A finger held all but still holds: one creeping under 3 points in the 400 ms picks a colour
+    /// then; one that went 3 points (and no more than 15 all told) waits 400 ms again from there.
+    #[test]
+    fn a_finger_s_hold_waits_again_each_time_it_goes_three_points() {
+        let s = session();
+        let pt = per_point(&s);
+        s.touch_down(1, PointerKind::Finger, at(200.0, 200.0, 0.0));
+        for k in 1..=4 {
+            s.touch_move(1, at(200.0 + 0.6 * pt * k as f32, 200.0, f64::from(k) * 90.0));
+        }
+        assert!(!s.touch_tick(399.0).iter().any(|c| matches!(c, TouchCommand::Pick { .. })));
+        assert!(s.touch_tick(400.0).iter().any(|c| matches!(c, TouchCommand::Pick { .. })));
+        s.touch_up(1, at(200.0 + 2.4 * pt, 200.0, 450.0));
+
+        s.touch_down(1, PointerKind::Finger, at(200.0, 200.0, 1000.0));
+        // 4 points across at 1300 ms, then still
+        s.touch_move(1, at(200.0 + 2.0 * pt, 200.0, 1200.0));
+        s.touch_move(1, at(200.0 + 4.0 * pt, 200.0, 1300.0));
+        assert!(!s.touch_tick(1400.0).iter().any(|c| matches!(c, TouchCommand::Pick { .. })));
+        assert!(!s.touch_tick(1699.0).iter().any(|c| matches!(c, TouchCommand::Pick { .. })));
+        assert!(s.touch_tick(1700.0).iter().any(|c| matches!(c, TouchCommand::Pick { .. })));
+    }
+
+    /// Draw and hold: a pen drawing small circles (2 points across) never keeps still for the
+    /// 650 ms, so its stroke never snaps to a shape; a dab under 15 points long held still doesn't
+    /// either; a line held still at its end does, 650 ms after it last went 3 points. Before, a
+    /// stroke kept within 6 points of where its wait began snapped 650 ms on, moving or not.
+    #[test]
+    fn draw_and_hold_waits_for_a_stroke_gone_far_and_kept_still() {
+        let s = session();
+        let due = |s: &CanvasSession| s.touches().quickshape_due;
+        let pt = per_point(&s);
+        s.touch_down(1, PointerKind::Stylus, round(pt, 0.0, 0.0));
+        let mut ms = 0.0;
+        while ms < 2000.0 {
+            ms += 8.0;
+            s.touch_move(1, round(pt, (ms / 200.0) as f32, ms));
+            // the wait always ahead: it starts again before it runs out
+            assert!(due(&s).is_none_or(|d| d > ms), "{ms} {:?}", due(&s));
+            assert!(!s.touch_tick(ms).contains(&TouchCommand::ShapeSnapped));
+        }
+        s.touch_up(1, round(pt, 10.0, ms + 8.0));
+
+        // a dab 10 points long, held: no wait
+        s.touch_down(1, PointerKind::Stylus, at(100.0, 100.0, 3000.0));
+        for k in 1..=10 {
+            s.touch_move(1, at(100.0 + pt * k as f32, 100.0, 3000.0 + f64::from(k) * 8.0));
+        }
+        assert_eq!(due(&s), None);
+        s.touch_up(1, at(100.0 + 10.0 * pt, 100.0, 4000.0));
+
+        // a line 100 points long in 400 ms, then still: the wait began again within its last 3
+        // points, so it ends 650 ms after the line did, give or take that
+        s.touch_down(1, PointerKind::Stylus, at(100.0, 100.0, 5000.0));
+        for k in 1..=50 {
+            s.touch_move(1, at(100.0 + 2.0 * pt * k as f32, 100.0, 5000.0 + f64::from(k) * 8.0));
+        }
+        let d = due(&s).unwrap_or_default();
+        assert!((5400.0 - 16.0..=5400.0).contains(&(d - 650.0)), "{d}");
     }
 
     #[test]
