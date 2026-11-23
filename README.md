@@ -69,6 +69,22 @@
 
 <br>
 
+## Brush files
+
+Brushes come in from a file manager (open with ProCraft) or from the brush library's **+ › Add from File**.
+
+| File Type | Parsing Method | Plugin Engine Support |
+|---|---|---|
+| `.brush`, `.brushset`, `.brushlibrary` | read as they are, every setting kept; edited in the Brush Studio | not needed |
+| `.abr` (Photoshop) | tips, textures and dynamics made into ProCraft brushes | not yet |
+| `.gbr`, `.gih`, `.vbr` (GIMP) | tips (each image of a pipe, the shape of a generated brush) made into ProCraft brushes | not yet |
+| `.kpp`, `.bundle` (Krita) | made into ProCraft brushes | **Krita brushes** plugin: drawn as Krita draws them, with a Krita brush studio of its own |
+| `.sut`, `.sutg` (Clip Studio Paint) | made into ProCraft brushes; textures it keeps encrypted come in as their previews | not yet |
+
+<sub>A brush made from another app's file keeps its look as closely as ProCraft's engine allows; a plugin engine draws it the way that app does. Plugins are off until you turn them on in Prefs › Plugins.</sub>
+
+<br>
+
 ## Layers and colour
 
 <table>
