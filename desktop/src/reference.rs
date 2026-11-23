@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use egui::{Align2, Color32, Id, Order, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2, pos2, vec2};
 use procraft_core::{
     CanvasSession, ReferenceShows, ReferenceSizes, ReferenceView, ReferenceWindowState, ThumbnailImage,
-    reference_picture_point, reference_picture_rect, reference_picture_size, reference_view_pinched,
-    reference_window_fitted, reference_window_size,
+    reference_canvas_side, reference_picture_point, reference_picture_rect, reference_picture_size,
+    reference_view_pinched, reference_window_fitted, reference_window_size,
 };
 
 use crate::icons;
@@ -45,9 +45,9 @@ const START: Vec2 = Vec2 { x: 350.0, y: 423.0 };
 const ABOVE_BOTTOM: f32 = 50.0;
 /// How far down and right of the window it is opened from another window opens (points).
 const ANOTHER_STEP: f32 = 24.0;
-/// The canvas is read again at most this often while it changes, this large.
+/// The canvas is read again at most this often while it changes (at the size the window shows it:
+/// the core's `reference_canvas_side`).
 const REFRESH: Duration = Duration::from_millis(300);
-const CANVAS_PIXELS: u32 = 700;
 /// How often the window looks whether a read on its way has come.
 const READ_LOOK: Duration = Duration::from_millis(16);
 /// Held by a read of the windows' picture while it is made.
@@ -141,6 +141,8 @@ enum Mode {
 struct Reading {
     edits: u64,
     model: bool,
+    /// The side the canvas is read at (the model's, for the model).
+    side: u32,
     again: bool,
     done: std::sync::mpsc::Receiver<Option<Read>>,
 }
@@ -200,6 +202,8 @@ pub struct Reference {
     /// at its own size (not made smaller).
     canvas_crisp: Option<TextureHandle>,
     canvas_edits: Option<u64>,
+    /// The side the canvas was last read at (0: not yet).
+    canvas_side: u32,
     read_at: Option<Instant>,
     reading: Option<Reading>,
     image: Option<TextureHandle>,
@@ -238,6 +242,7 @@ impl Default for Reference {
             canvas: None,
             canvas_crisp: None,
             canvas_edits: None,
+            canvas_side: 0,
             read_at: None,
             reading: None,
             image: None,
@@ -359,13 +364,14 @@ impl Reference {
         if let Some(reading) = &self.reading {
             match reading.done.try_recv() {
                 Ok(picture) => {
-                    let Reading { edits, model, again, .. } = *reading;
+                    let Reading { edits, model, side, again, .. } = *reading;
                     self.reading = None;
                     // (one of the model while the window turned to the canvas, or the other way, is
                     // no use; none read is tried again in a while)
                     if let Some(read) = picture.filter(|_| model == (self.mode == Mode::Model)) {
                         self.take_canvas(ctx, read);
                         self.canvas_edits = (!again).then_some(edits);
+                        self.canvas_side = side;
                     }
                     // a turn of the model or another kind asked for meanwhile is read at once
                     self.read_at = (!again).then(Instant::now);
@@ -381,7 +387,10 @@ impl Reference {
             }
         }
         let edits = session.edits();
-        if self.canvas_edits == Some(edits) {
+        let model = self.mode == Mode::Model;
+        // as sharp as the window shows it, zoomed as it is: read again once that is another size
+        let side = if model { MODEL_PIXELS } else { self.canvas_side(ctx, session) };
+        if self.canvas_edits == Some(edits) && (model || self.canvas_side == side) {
             return;
         }
         if let Some(at) = self.read_at
@@ -390,7 +399,6 @@ impl Reference {
             ctx.request_repaint_after(REFRESH - at.elapsed());
             return;
         }
-        let model = self.mode == Mode::Model;
         let (done, reading) = std::sync::mpsc::channel();
         let session = Arc::clone(session);
         let started = std::thread::Builder::new().name("procraft-reference-read".into()).spawn(move || {
@@ -398,16 +406,12 @@ impl Reference {
             let _one = READS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             // (it waits for the frames to lay a stroke's end, as a read from the thread that
             // draws them couldn't)
-            let picture = if model {
-                session.reference_model_picture(MODEL_PIXELS)
-            } else {
-                session.reference_canvas(CANVAS_PIXELS)
-            };
+            let picture = if model { session.reference_model_picture(side) } else { session.reference_canvas(side) };
             let _ = done.send(picture.map(|t| Read::of(t, &session)));
         });
         match started {
             Ok(_) => {
-                self.reading = Some(Reading { edits, model, again: false, done: reading });
+                self.reading = Some(Reading { edits, model, side, again: false, done: reading });
                 ctx.request_repaint_after(READ_LOOK);
             }
             Err(e) => {
@@ -415,6 +419,21 @@ impl Reference {
                 self.read_at = Some(Instant::now());
             }
         }
+    }
+
+    /// The side to read the canvas at for the window as it shows now: a pixel of it for each pixel
+    /// of the screen it covers, zoomed as it is (see `reference_canvas_side`).
+    fn canvas_side(&self, ctx: &egui::Context, session: &CanvasSession) -> u32 {
+        let size = shown_size(self.size, ctx.content_rect());
+        let pixels = ctx.pixels_per_point();
+        let info = session.info();
+        reference_canvas_side(
+            size.x * pixels,
+            (TOP_BAR + size.y + BOTTOM_BAR) * pixels,
+            self.canvas_view.zoom,
+            info.width,
+            info.height,
+        )
     }
 
     /// `read` (the canvas or the model) is the window's picture now.

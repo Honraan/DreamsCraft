@@ -5042,6 +5042,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             size = new
             offset = onScreen(offset)
             keep()
+            sharpen()
         }
 
         fun importPicture(uri: android.net.Uri) {
@@ -5107,6 +5108,28 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             val next = io.github.artcraftandroid.procraft.core.referenceViewPinched(view, sizes, from.x, from.y, to.x, to.y, spread)
             if (image) imageView = next else canvasView = next
             keep()
+            sharpen()
+        }
+
+        /** The side the canvas was last read at for the window (0: not yet). */
+        private var readSide = 0
+
+        /**
+         * The side to read the canvas at for the window as it shows now: a pixel of it for each
+         * pixel of the screen it covers, zoomed as it is (the core's reference_canvas_side).
+         */
+        private fun canvasSide(s: CanvasSession): Int {
+            val shown = shown
+            val info = s.info()
+            return io.github.artcraftandroid.procraft.core.referenceCanvasSide(
+                shown.width.value * density, shown.height.value * density + bars, canvasView.zoom, info.width, info.height,
+            ).toInt()
+        }
+
+        /** The canvas read again when the window, zoomed or sized, shows it at another size than it was read at. */
+        private fun sharpen() {
+            val s = session ?: return
+            if (on && mode == ReferenceMode.CANVAS && readSide != 0 && canvasSide(s) != readSide) refresh()
         }
 
         /** Reads the canvas again for the window, at most every so often while changes come. */
@@ -5120,9 +5143,11 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             job = viewModelScope.launch {
                 do {
                     stale = false
+                    val model = mode == ReferenceMode.MODEL
+                    // as sharp as the window shows it, zoomed as it is (not a few hundred pixels blown up)
+                    val side = if (model) MODEL_REFERENCE_PIXELS else canvasSide(s)
                     val made = withContext(Dispatchers.Default) {
-                        val model = mode == ReferenceMode.MODEL
-                        val t = (if (model) s.referenceModelPicture(MODEL_REFERENCE_PIXELS.toUInt()) else s.referenceCanvas(REFERENCE_PIXELS.toUInt()))
+                        val t = (if (model) s.referenceModelPicture(side.toUInt()) else s.referenceCanvas(side.toUInt()))
                             ?: return@withContext null
                         val bitmap = io.github.artcraftandroid.procraft.ui.CanvasSpace.tag(Bitmap.createBitmap(t.width.toInt(), t.height.toInt(), Bitmap.Config.ARGB_8888))
                         bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(t.rgba))
@@ -5131,6 +5156,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                     if (made != null && session === s) {
                         canvas = made.first
                         canvasWhole = made.second
+                        if (!model) readSide = side
                     }
                     kotlinx.coroutines.delay(REFERENCE_INTERVAL_MS)
                 } while (stale)
@@ -9583,7 +9609,6 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         const val REFERENCE_WIDTH_DP = 350f
         const val REFERENCE_HEIGHT_DP = 423f
         const val REFERENCE_BOTTOM_DP = 50f
-        const val REFERENCE_PIXELS = 700
         const val REFERENCE_INTERVAL_MS = 300L
         /** How far down and right of the window it is opened from another Reference window opens (dp). */
         const val REFERENCE_STEP_DP = 24f

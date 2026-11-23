@@ -248,7 +248,8 @@ pub use quick_menu::{
 };
 pub use quickshape::{QuickShapeAnchor, QuickShapeInfo, QuickShapeKind};
 pub use reference_view::{
-    ReferenceSizes, ReferenceView, reference_picture_point, reference_picture_rect, reference_view_pinched,
+    REFERENCE_CANVAS_FIRST, ReferenceSizes, ReferenceView, reference_canvas_side, reference_picture_point,
+    reference_picture_rect, reference_view_pinched,
 };
 pub use reference_window::{
     ReferencePictureSize, ReferencePlace, ReferenceShows, ReferenceSize, ReferenceWindowState, reference_picture_size,

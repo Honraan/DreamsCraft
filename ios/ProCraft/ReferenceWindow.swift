@@ -25,8 +25,8 @@ private let firstSize = CGSize(width: 350, height: 423)
 /// How far above the screen's foot it starts.
 private let firstBottom: CGFloat = 50
 private let bars = topBarHeight + bottomBarHeight
-/// How many pixels the canvas is read at for the window, and how long between reads.
-private let canvasPixels: UInt32 = 700
+/// How long between reads of the canvas for the window (each at the size the window shows it: the
+/// core's referenceCanvasSide).
 private let readEvery = 0.3
 /// The longest side a picture imported keeps.
 private let mostPicture = 4096
@@ -64,6 +64,8 @@ final class ReferenceTool {
 
     @ObservationIgnored private var reading = false
     @ObservationIgnored private var stale = false
+    /// The side the canvas was last read at (0: not yet).
+    @ObservationIgnored private var readSide: UInt32 = 0
 
     init(model: CanvasModel) {
         self.model = model
@@ -209,6 +211,7 @@ final class ReferenceTool {
         size = next
         offset = offset.map { onScreen($0) }
         keep()
+        sharpen()
     }
 
     private static func decode(_ data: Data) -> UIImage? {
@@ -265,6 +268,26 @@ final class ReferenceTool {
             toX: Float(to.x), toY: Float(to.y), spread: Float(spread)
         ))
         keep()
+        sharpen()
+    }
+
+    /// The side to read the canvas at for the window as it shows now: a pixel of it for each pixel
+    /// of the screen it covers, zoomed as it is (the core's referenceCanvasSide).
+    private func canvasSide() -> UInt32 {
+        let shown = shownSize
+        let info = model.session.info()
+        return referenceCanvasSide(
+            windowWidth: Float(shown.width * model.pixels), windowHeight: Float((shown.height + bars) * model.pixels),
+            zoom: canvasView.zoom, canvasWidth: info.width, canvasHeight: info.height
+        )
+    }
+
+    /// The canvas read again when the window, zoomed or sized, shows it at another size than it was
+    /// read at.
+    private func sharpen() {
+        if on, mode == .canvas, readSide != 0, canvasSide() != readSide {
+            refresh()
+        }
     }
 
     /// The colour of one pixel of `image`.
@@ -313,8 +336,10 @@ final class ReferenceTool {
     private func read() {
         stale = false
         let session = model.session
+        // as sharp as the window shows it, zoomed as it is (not a few hundred pixels blown up)
+        let side = canvasSide()
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let read = session.canvasThumbnail(maxSide: canvasPixels)
+            let read = session.canvasThumbnail(maxSide: side)
             let picture = read.flatMap { CanvasModel.image($0) }
             let whole = read?.width == session.info().width
             DispatchQueue.main.async {
@@ -322,6 +347,7 @@ final class ReferenceTool {
                 if let picture {
                     self.canvas = picture
                     self.canvasWhole = whole
+                    self.readSide = side
                 }
                 DispatchQueue.main.asyncAfter(deadline: .now() + readEvery) { [weak self] in
                     guard let self else { return }
