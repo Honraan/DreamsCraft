@@ -322,6 +322,12 @@ extension CanvasModel {
         let plugins = PluginsModel.shared.store
         session.usePlugins(plugins: plugins)
         session.setInterfaceSize(size: Float(Interface.shared.scale))
+        // what they show changes with them: the layers' rows (a label a plugin gives), and the
+        // library, once a plugin turned on gave it the brushes it comes with
+        layers = session.layers()
+        if session.takeBrushesChanged() {
+            libraryChanged()
+        }
     }
 
     /// A Pencil gesture set to a plugin's action: it runs where the Pencil is (window pixels), off

@@ -730,7 +730,7 @@ pub(crate) struct State {
     /// begins and undo and redo wait, or they would join its step.
     pub(crate) plugin_stepping: u32,
     /// The brush a plugin's brush studio edits (set, index), while it is open; and whether a plugin
-    /// changed a brush since the app last asked.
+    /// changed a brush, or gave the library a set, since the app last asked.
     pub(crate) engine_studio: Option<(usize, usize)>,
     pub(crate) brushes_changed: bool,
     /// The pad shows only its sample scribble: a stroke of one's own takes it away.

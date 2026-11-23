@@ -4882,9 +4882,15 @@ mod tests {
         assert!(!s.open_brushes(brushes.clone()));
         s.use_plugins(Arc::clone(&plugins));
         assert_eq!(fills(&s), 0);
-        // on: its Fills at the top of the library, each filling by the plugin's row
+        assert!(!s.take_brushes_changed());
+        let sets = s.shared.lock().library.len();
+        // on: its Fills at the top of the library, each filling by the plugin's row; the app told
+        // the library changed, every set a place on, to read it again
         assert!(plugins.set_on(LASSO_FILL.to_owned(), true));
         s.use_plugins(Arc::clone(&plugins));
+        assert_eq!(s.shared.lock().library.len(), sets + 1);
+        assert!(s.take_brushes_changed());
+        assert!(!s.take_brushes_changed(), "told once");
         let row = card(&plugins, LASSO_FILL).brush_controls[0].key.clone();
         {
             let st = s.shared.lock();
@@ -4907,6 +4913,8 @@ mod tests {
         assert!(plugins.set_on(LASSO_FILL.to_owned(), true));
         s.use_plugins(Arc::clone(&plugins));
         assert_eq!(fills(&s), 1);
+        assert_eq!(s.shared.lock().library.len(), sets + 1);
+        assert!(!s.take_brushes_changed(), "nothing given again, nothing to read again");
         // kept with the library: the brushes opened again have it, and aren't given it twice (told
         // the plugins before the brushes open, as Android does)
         let t = viewed();

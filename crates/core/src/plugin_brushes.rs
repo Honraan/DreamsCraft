@@ -1652,8 +1652,8 @@ impl CanvasSession {
         Some(action)
     }
 
-    /// Whether a plugin changed a brush of the library since this was last asked (the library to
-    /// be read again and kept).
+    /// Whether a plugin changed a brush of the library, or gave it the set of brushes it comes with,
+    /// since this was last asked (the library to be read again and kept).
     pub fn take_brushes_changed(&self) -> bool {
         std::mem::take(&mut self.shared.lock().brushes_changed)
     }

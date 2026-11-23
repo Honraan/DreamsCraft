@@ -1616,7 +1616,8 @@ impl CanvasSession {
     /// ([`State::plugin_sets`]), each a set of its own at the top, once the brushes are open
     /// ([`Self::open_brushes`]): kept with the library, then written down as given beside the
     /// brushes, so each plugin's set comes once, and one deleted stays deleted. Cut short between
-    /// the two, a set comes again rather than never.
+    /// the two, a set comes again rather than never. The library changed, as a plugin changing a
+    /// brush changes it ([`Self::take_brushes_changed`]): every set after the new one is a place on.
     pub(crate) fn give_plugin_sets(&self) {
         let (dir, sets) = {
             let st = self.shared.lock();
@@ -1639,6 +1640,7 @@ impl CanvasSession {
             }
             given.push(id);
         }
+        self.shared.lock().brushes_changed = true;
         let (library, choices) = self.files_in_use(&dir);
         if self.save_brush_library_file(library.to_string_lossy().into_owned()) {
             let _writing = library_writes();

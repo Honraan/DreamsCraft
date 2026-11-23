@@ -1019,7 +1019,13 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     /** What the plugins do now; one nothing answers to does nothing. */
     private fun pluginsChanged() {
         readPlugins()
-        session?.let(::applyPlugins)
+        session?.let { s ->
+            applyPlugins(s)
+            // what they show changes with them: the layers' rows (a label a plugin gives), and the
+            // library, once a plugin turned on gave it the brushes it comes with
+            layers = s.layers()
+            if (s.takeBrushesChanged()) libraryChanged()
+        }
         // the bars as they show now
         applyFitInsets()
     }
