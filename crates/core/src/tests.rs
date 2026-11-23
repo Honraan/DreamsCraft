@@ -6158,6 +6158,100 @@ fn color_fill_shows_exactly_the_fill_it_makes_on_an_alpha_locked_faded_layer() {
     assert!(most <= 2, "the fill shown is the fill made, to {most} levels");
 }
 
+/// Where a colour dropped inside a ring of line art goes, at the default threshold (50%), as the
+/// line art is drawn and laid out (discord: "it paints the entire canvas"): the share of the canvas
+/// outside the ring it fills. It fills the whole canvas only where it measures an empty layer (the
+/// ring on another layer, none made the reference: ColorDrop measures the current layer), or a ring
+/// too faint to stop it (drawn at half opacity: 50% from what is round it, within a 50% threshold;
+/// 40% holds it); never with the ring on its layer, dark, light or at three quarters' opacity, or
+/// on the reference layer.
+#[test]
+fn a_colour_dropped_in_a_ring_fills_the_whole_canvas_only_on_an_empty_layer_measured_alone() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Case {
+        SameLayer,
+        ThreeQuarters,
+        HalfOpacity,
+        HalfOpacityLowered,
+        WhiteLine,
+        ReferenceLayer,
+        OtherLayer,
+    }
+    for case in [
+        Case::SameLayer,
+        Case::ThreeQuarters,
+        Case::HalfOpacity,
+        Case::HalfOpacityLowered,
+        Case::WhiteLine,
+        Case::ReferenceLayer,
+        Case::OtherLayer,
+    ] {
+        let Some(s) = session(100, 100) else { return };
+        let below = s.layers()[0].id;
+        let lines = if matches!(case, Case::ReferenceLayer | Case::OtherLayer) { s.add_layer() } else { below };
+        s.set_brush_size(0.2);
+        s.set_brush_opacity(match case {
+            Case::ThreeQuarters => 0.75,
+            Case::HalfOpacity | Case::HalfOpacityLowered => 0.5,
+            _ => 1.0,
+        });
+        let ink = if case == Case::WhiteLine { 1.0 } else { 0.0 };
+        s.set_color(ink, ink, ink);
+        let ring: Vec<PenSample> = (0..=64)
+            .map(|i| {
+                let t = i as f32 / 64.0 * std::f32::consts::TAU;
+                sample(50.0 + 30.0 * t.cos(), 50.0 + 30.0 * t.sin(), f64::from(i) * 8.0)
+            })
+            .collect();
+        s.stroke_begin(PointerKind::Finger, ring[..1].to_vec());
+        s.stroke_add(ring[1..].to_vec());
+        s.stroke_end(vec![]);
+        if case == Case::ReferenceLayer {
+            assert!(s.set_layer_reference(lines, true));
+        }
+        if lines != below {
+            assert!(s.select_layer(below));
+        }
+        let threshold = if case == Case::HalfOpacityLowered { 0.4 } else { 0.5 };
+        assert!(s.pour_drop(50.0, 50.0, 1.0, 0.0, 0.0, threshold), "{case:?}");
+        s.pour_end(true, None);
+        s.shared.lock().end_reveal();
+        let px = {
+            let mut guard = s.shared.lock();
+            let st = &mut *guard;
+            let (canvas, gpu) = (st.canvas.as_mut().unwrap(), st.gpu.as_ref().unwrap());
+            canvas.render(gpu, &mut st.doc, None);
+            canvas.read_composite(gpu).unwrap()
+        };
+        let red = |x: u32, y: u32| {
+            let i = ((y * 100 + x) * 4) as usize;
+            px[i] > 200 && px[i + 1] < 80 && px[i + 2] < 80
+        };
+        // outside the ring and its line (more than 36 from the middle), inside it (within 24)
+        let (mut outside, mut out_red, mut inside, mut in_red) = (0, 0, 0, 0);
+        for y in 0..100 {
+            for x in 0..100 {
+                let d = ((x as f32 - 50.0).powi(2) + (y as f32 - 50.0).powi(2)).sqrt();
+                if d > 36.0 {
+                    outside += 1;
+                    out_red += usize::from(red(x, y));
+                } else if d < 24.0 {
+                    inside += 1;
+                    in_red += usize::from(red(x, y));
+                }
+            }
+        }
+        let (out_share, in_share) = (out_red as f32 / outside as f32, in_red as f32 / inside as f32);
+        println!("{case:?}: inside the ring {:.0}% filled, outside it {:.0}%", in_share * 100.0, out_share * 100.0);
+        assert_eq!(in_share, 1.0, "{case:?}");
+        if matches!(case, Case::OtherLayer | Case::HalfOpacity) {
+            assert_eq!(out_share, 1.0, "{case:?}: an empty layer measured alone, or a faint ring, lets it all through");
+        } else {
+            assert_eq!(out_share, 0.0, "{case:?}: it got out of the ring");
+        }
+    }
+}
+
 #[test]
 fn a_reference_layer_above_bounds_colordrop_and_color_fill_on_the_layer_below() {
     use crate::selection::{SelectionDisplay, SelectionJoin};
