@@ -445,6 +445,8 @@ final class CanvasModel {
 
     deinit {
         CanvasLife.gone(.model)
+        // (one left: the log says how long after)
+        CanvasLife.modelGone(ObjectIdentifier(self))
     }
 
     /// Where the brush library and the brushes in use are kept.
