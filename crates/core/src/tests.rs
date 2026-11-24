@@ -3524,8 +3524,8 @@ fn what_runs_ahead_of_a_predicted_stroke_shows_as_worked_out_at_each_sample() {
             s.stroke_begin(PointerKind::Stylus, vec![at(0)]);
             {
                 let st = s.shared.lock();
-                shows_tip = st.stroke.as_ref().is_some_and(procraft_engine::stroke::StrokeBuilder::shows_tip)
-                    && st.canvas.as_ref().is_some_and(procraft_gpu::Canvas::shows_tip);
+                shows_tip = st.stroke.as_deref().is_some_and(procraft_engine::stroke::StrokeBuilder::shows_tip)
+                    && st.canvas.as_deref().is_some_and(procraft_gpu::Canvas::shows_tip);
             }
             for i in 1..40 {
                 // (without, each sample works out what runs ahead at once, as before)
@@ -3794,7 +3794,7 @@ fn a_dual_brush_built_up_by_its_rule_keeps_what_its_parts_are_carried_in_from_st
     let (samples, strokes) = (200, 3);
     let carried_in = |s: &CanvasSession| -> Vec<wgpu::Texture> {
         let st = s.shared.lock();
-        let all = st.canvas.as_ref().map(procraft_gpu::Canvas::textures).unwrap_or_default();
+        let all = st.canvas.as_deref().map(procraft_gpu::Canvas::textures).unwrap_or_default();
         all.into_iter().filter(|t| t.format() == wgpu::TextureFormat::Rgba32Uint).collect()
     };
     let stroke = |s: &CanvasSession, n: usize| -> Duration {
@@ -4138,7 +4138,7 @@ fn a_stroke_laid_again_as_it_ends_goes_on_over_frames_as_the_next_begins() {
         assert_eq!(s.shared.lock().canvas.as_ref()?.relaying(), sliced, "begun before the last was laid again");
         let settle = || -> usize {
             let mut frames = 0;
-            while s.shared.lock().canvas.as_ref().is_some_and(procraft_gpu::Canvas::relaying) {
+            while s.shared.lock().canvas.as_deref().is_some_and(procraft_gpu::Canvas::relaying) {
                 framed(&s, &texture, &gpu, side);
                 frames += 1;
                 assert!(frames < 10_000, "laid again in time");
@@ -4224,7 +4224,7 @@ fn a_stroke_begun_right_after_another_doesnt_wait_for_its_end() {
         let mut polls = 0;
         loop {
             let st = s.shared.lock();
-            if st.frames > drawn && !st.canvas.as_ref().is_some_and(procraft_gpu::Canvas::relaying) {
+            if st.frames > drawn && !st.canvas.as_deref().is_some_and(procraft_gpu::Canvas::relaying) {
                 break;
             }
             drop(st);
@@ -4442,7 +4442,7 @@ fn stroke_end_cost() {
             s.stroke_begin(PointerKind::Stylus, vec![point(0, y0 + 120.0)]);
             s.stroke_add(vec![point(1, y0 + 120.0), point(2, y0 + 120.0)]);
             let started = t.elapsed();
-            while s.shared.lock().canvas.as_ref().is_some_and(procraft_gpu::Canvas::relaying) {
+            while s.shared.lock().canvas.as_deref().is_some_and(procraft_gpu::Canvas::relaying) {
                 std::thread::sleep(Duration::from_micros(500));
             }
             let ended = lift.elapsed();
@@ -4550,7 +4550,7 @@ fn an_autosave_after_a_stroke_waits_for_the_frames_to_lay_its_end() {
         s.draw(&view, format, (512, 512), procraft_engine::profile::Profile::Srgb, Instant::now());
         gpu.flush();
     };
-    let lays = || s.shared.lock().canvas.as_ref().is_some_and(procraft_gpu::Canvas::lays_over_frames);
+    let lays = || s.shared.lock().canvas.as_deref().is_some_and(procraft_gpu::Canvas::lays_over_frames);
     let dir = std::env::temp_dir().join(format!("procraft-autosave-end-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::sync::Arc::clone(&s).keep_saved(
@@ -8215,7 +8215,7 @@ fn a_time_lapse_frame_is_taken_by_the_frame_that_lays_a_strokes_end() {
         s.draw(&view, format, (512, 512), procraft_engine::profile::Profile::Srgb, Instant::now());
         gpu.flush();
     };
-    let lays = || s.shared.lock().canvas.as_ref().is_some_and(procraft_gpu::Canvas::lays_over_frames);
+    let lays = || s.shared.lock().canvas.as_deref().is_some_and(procraft_gpu::Canvas::lays_over_frames);
     let stroke = |y: f32| {
         s.stroke_begin(PointerKind::Stylus, vec![sample(40.0, y, 0.0)]);
         for i in 1..60 {
@@ -8294,7 +8294,7 @@ fn a_time_lapse_frame_waits_on_slow_frames_and_lays_nothing_at_once() {
         s.draw(&view, format, (512, 512), procraft_engine::profile::Profile::Srgb, Instant::now());
         gpu.flush();
     };
-    let lays = || s.shared.lock().canvas.as_ref().is_some_and(procraft_gpu::Canvas::lays_over_frames);
+    let lays = || s.shared.lock().canvas.as_deref().is_some_and(procraft_gpu::Canvas::lays_over_frames);
     s.stroke_begin(PointerKind::Stylus, vec![sample(40.0, 200.0, 0.0)]);
     // back and forth across the canvas, long enough for hundreds of stamps
     for i in 1..200 {
@@ -8362,7 +8362,7 @@ fn the_reference_windows_read_of_the_canvas_leaves_a_strokes_end_to_the_frames()
         s.draw(&view, format, (512, 512), procraft_engine::profile::Profile::Srgb, Instant::now());
         gpu.flush();
     };
-    let lays = || s.shared.lock().canvas.as_ref().is_some_and(procraft_gpu::Canvas::lays_over_frames);
+    let lays = || s.shared.lock().canvas.as_deref().is_some_and(procraft_gpu::Canvas::lays_over_frames);
     s.stroke_begin(PointerKind::Stylus, vec![sample(40.0, 200.0, 0.0)]);
     for i in 1..60 {
         let x = 40.0 + i as f32 * 7.0;
@@ -8414,7 +8414,7 @@ fn a_time_lapse_frame_waits_for_an_ended_strokes_end_not_the_stroke_begun_after_
         s.draw(&view, format, (512, 512), procraft_engine::profile::Profile::Srgb, Instant::now());
         gpu.flush();
     };
-    let lays = || s.shared.lock().canvas.as_ref().is_some_and(procraft_gpu::Canvas::lays_over_frames);
+    let lays = || s.shared.lock().canvas.as_deref().is_some_and(procraft_gpu::Canvas::lays_over_frames);
     let at = |i: usize, y: f32| {
         let x = 40.0 + (i % 60) as f32 * 7.0;
         PenSample { pressure: 0.5, ..sample(x, y + (x / 40.0).sin() * 60.0, i as f64 * 8.0) }
@@ -10735,7 +10735,7 @@ fn the_brush_cursor_turns_as_the_newest_stamp_while_a_stroke_is_painted() {
     {
         // as the newest stamp lies on the canvas past the brush's own rotation, and with the canvas
         let st = s.shared.lock();
-        let last = st.stroke.as_ref().and_then(procraft_engine::stroke::StrokeBuilder::newest_stamp).map(|n| n.angle);
+        let last = st.stroke.as_deref().and_then(procraft_engine::stroke::StrokeBuilder::newest_stamp).map(|n| n.angle);
         let own = st.brush(st.tool).shape.rotation;
         let expected = last.map_or(f32::NAN, |a| a - own + view_turn);
         assert!((down - expected).abs() < 1e-5, "{down} {expected}");
@@ -10784,7 +10784,7 @@ fn the_brush_cursor_is_as_big_as_the_newest_stamp_while_a_stroke_is_painted() {
             s.stroke_add(vec![pressed(60.0 + i as f32 * 4.0, f64::from(i) * 8.0, 1.0)]);
         }
         let full = s.cursor_radius();
-        let newest = s.shared.lock().stroke.as_ref().and_then(procraft_engine::stroke::StrokeBuilder::newest_stamp);
+        let newest = s.shared.lock().stroke.as_deref().and_then(procraft_engine::stroke::StrokeBuilder::newest_stamp);
         for i in 30..60 {
             s.stroke_add(vec![pressed(60.0 + i as f32 * 4.0, f64::from(i) * 8.0, 0.25)]);
         }
@@ -21829,7 +21829,7 @@ fn the_window_shows_canvas_pixels_as_squares_from_100_percent_and_smoothed_short
 
 /// Whether the canvas shows its plugins' layers drawn sharp now.
 fn shows_sharp(s: &CanvasSession) -> bool {
-    s.shared.lock().canvas.as_ref().is_some_and(procraft_gpu::Canvas::shows_sharp)
+    s.shared.lock().canvas.as_deref().is_some_and(procraft_gpu::Canvas::shows_sharp)
 }
 
 /// How many of the `block` × `block` squares of `rgba` (`side` wide) aren't one colour.
@@ -23471,7 +23471,7 @@ fn a_wet_dual_brushs_second_is_put_together_in_its_paints_window_as_in_one_of_it
             s.set_brush_size(size);
             s.set_color(0.2, 0.5, 0.3);
             s.shared.lock().canvas.as_mut()?.join_synthesis(joined);
-            let windows = || s.shared.lock().canvas.as_ref().map_or(0, procraft_gpu::Canvas::smudge_windows);
+            let windows = || s.shared.lock().canvas.as_deref().map_or(0, procraft_gpu::Canvas::smudge_windows);
             let before = windows();
             let mut frames = Vec::new();
             s.stroke_begin(PointerKind::Stylus, vec![point(0)]);
@@ -23645,7 +23645,7 @@ fn a_thin_stroke_painting_in_place_keeps_thin_tiles_and_comes_out_the_same() {
             let gl = s.shared.lock().gpu.as_ref()?.is_gl();
             picture(&s);
             let held =
-                |s: &CanvasSession| s.shared.lock().canvas.as_ref().map_or(0, procraft_gpu::Canvas::texture_bytes);
+                |s: &CanvasSession| s.shared.lock().canvas.as_deref().map_or(0, procraft_gpu::Canvas::texture_bytes);
             let before = held(&s);
             let (mut most, mut tile) = (0, 0);
             s.stroke_begin(PointerKind::Stylus, vec![point(0)]);
@@ -23776,7 +23776,7 @@ fn a_fast_scribble_of_a_big_wet_brush_keeps_its_frames_and_memory_bounded() {
                 held.push(started.elapsed());
                 gpu.flush();
                 whole.push(started.elapsed());
-                let bytes = s.shared.lock().canvas.as_ref().map_or(0, procraft_gpu::Canvas::texture_bytes);
+                let bytes = s.shared.lock().canvas.as_deref().map_or(0, procraft_gpu::Canvas::texture_bytes);
                 most_bytes = most_bytes.max(bytes);
                 std::thread::sleep(Duration::from_millis(8).saturating_sub(started.elapsed()));
             }

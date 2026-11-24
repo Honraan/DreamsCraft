@@ -124,7 +124,7 @@ impl State {
     /// Takes in how the filter's last draw went. One that failed has put the layer back, and it
     /// ends the adjustment here; true if so.
     pub(crate) fn heed_filter_run(&mut self) -> bool {
-        let Some(run) = self.canvas.as_mut().and_then(Canvas::take_filter_run) else { return false };
+        let Some(run) = self.canvas.as_deref_mut().and_then(Canvas::take_filter_run) else { return false };
         let Some(open) = self.filters.open.as_mut() else { return false };
         let trying = std::mem::take(&mut open.trying);
         if trying {

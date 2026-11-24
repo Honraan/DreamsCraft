@@ -170,7 +170,7 @@ pub(crate) fn draw_loop<S: Screen>(shared: &Shared, screen: &mut S, mut presente
                 // and on a slow GPU it would hold up the one that is. What comes meanwhile goes in
                 // it. (Work done a part a render, remaking the caches, goes on as fast as it can
                 // then; timed to the refreshes, a part each.)
-                let working = st.canvas.as_ref().is_some_and(procraft_gpu::Canvas::wants_render);
+                let working = st.canvas.as_deref().is_some_and(procraft_gpu::Canvas::wants_render);
                 let spacing = st.frame_spacing.filter(|_| !working);
                 let next = match planned {
                     Some((_, plan)) => Some(plan.begin),

@@ -111,6 +111,8 @@ mod sharp;
 mod side_bar;
 mod side_slider;
 mod sound_file;
+#[cfg(test)]
+mod stack_tests;
 mod stand_ins;
 mod stock_brushes;
 mod stock_library;
@@ -620,8 +622,8 @@ pub(crate) struct State {
     pub(crate) sound_hover: Option<(procraft_engine::geom::Vec2, std::time::Instant)>,
     /// Crops kept for undo: the canvas and document from before; and one undone, for redo, with
     /// the steps the canvas then put back had made (redo only while that hasn't changed).
-    crop_undo: Option<(Canvas, Document)>,
-    crop_redo: Option<(Canvas, Document, u64)>,
+    crop_undo: Option<(Box<Canvas>, Document)>,
+    crop_redo: Option<(Box<Canvas>, Document, u64)>,
     /// The text layer being edited, the document as the edit began, and the width changes made
     /// inside it.
     text_edit: Option<text::TextEdit>,
@@ -684,7 +686,7 @@ pub(crate) struct State {
     /// Strokes started, to seed each one's randomness.
     strokes: u32,
     /// The small canvas brush previews are drawn on.
-    preview: Option<(Canvas, Document)>,
+    preview: Option<(Box<Canvas>, Document)>,
     /// Sample strokes drawn already, kept by what they were drawn from.
     drawn_previews: drawn_previews::DrawnPreviews,
     color: [f32; 3],
@@ -692,12 +694,14 @@ pub(crate) struct State {
     secondary: [f32; 3],
     /// The app's colour history, which paint strokes add to.
     colour_history: Option<std::sync::Arc<ColourHistory>>,
-    stroke: Option<StrokeBuilder>,
+    stroke: Option<Box<StrokeBuilder>>,
     /// The open stroke's second, a dual brush's (drawn along the same input).
-    second: Option<StrokeBuilder>,
+    second: Option<Box<StrokeBuilder>>,
     #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
     pub(crate) gpu: Option<Gpu>,
-    pub(crate) canvas: Option<Canvas>,
+    /// The canvas, on the heap as everywhere one is kept: a canvas takes some 16 KB, and this
+    /// state, moved whole as a session is made, once took more than a dispatch queue's thread has.
+    pub(crate) canvas: Option<Box<Canvas>>,
     pub(crate) needs_frame: bool,
     /// A frame wanted at this time, not before: the selection's bands drift slowly, so a frame
     /// shows them moved only every so often (a pixel at a time).
@@ -747,7 +751,7 @@ pub(crate) struct State {
     /// The open stroke's pressure as plugins give it.
     pub(crate) pressing: pressure::Pressing,
     /// The open stroke filling what it encloses, as a plugin said it does.
-    pub(crate) filling: Option<lasso_fill::Filling>,
+    pub(crate) filling: Option<Box<lasso_fill::Filling>>,
     /// The open stroke's brush engine, as it is told the colours under the dabs it asks about.
     pub(crate) engine_asking: plugin_brushes::Asking,
     /// Brush files' grains at their own size.
@@ -836,7 +840,7 @@ pub(crate) struct State {
     pub(crate) closed: bool,
     /// A model open to paint on, in place of the flat canvas (the document is its current
     /// texture set's).
-    pub(crate) scene: Option<scene3d::Scene>,
+    pub(crate) scene: Option<Box<scene3d::Scene>>,
     /// A selection drawn on a model reaches every surface under it, not only the nearest.
     pub(crate) x_ray: bool,
     /// What fitting the canvas keeps clear of (left, top, right, bottom, window pixels).
@@ -932,14 +936,14 @@ pub(crate) struct State {
     drawn_at: f64,
     /// Its input as the stroke took it, for a shape to go back to.
     drawn_samples: Vec<Sample>,
-    shape: Option<quickshape::ShapeEdit>,
+    shape: Option<Box<quickshape::ShapeEdit>>,
     /// The open stroke as it began, and the last stroke kept, for QuickShape afterwards.
-    began: Option<quickshape::LastStroke>,
-    last_stroke: Option<quickshape::LastStroke>,
+    began: Option<Box<quickshape::LastStroke>>,
+    last_stroke: Option<Box<quickshape::LastStroke>>,
     /// The last shape kept, which undo gives back the stroke it was made of; and the shape whose
     /// stroke that gave back, which redo makes a shape again.
-    kept_shape: Option<quickshape::KeptShape>,
-    unkept_shape: Option<quickshape::KeptShape>,
+    kept_shape: Option<Box<quickshape::KeptShape>>,
+    unkept_shape: Option<Box<quickshape::KeptShape>>,
     /// Strokes follow the drawing guide even where drawing assist is off (□ held down).
     force_assist: bool,
     /// Where the stroke began (canvas pixels), for assisted drawing; the guide and view as the
@@ -962,7 +966,7 @@ impl State {
     /// [`procraft_gpu::Canvas::lays_over_frames`]).
     pub(crate) fn frames_laying(&self) -> bool {
         self.frame_drawn_at.is_some_and(|at| at.elapsed() < FRAMES_GONE)
-            && self.canvas.as_ref().is_some_and(procraft_gpu::Canvas::lays_over_frames)
+            && self.canvas.as_deref().is_some_and(procraft_gpu::Canvas::lays_over_frames)
     }
 
     /// Window pixels per point of what the interface draws, its handles over the canvas too.
@@ -1065,18 +1069,18 @@ impl State {
         // one on a plugin's layer goes to the plugin as it ends (made a shape, as that: its geometry
         // kept, laid along its outline); undo takes it back whole, not to the stroke it was
         if let Some(mut recording) = self.recording.take()
-            && let Some(open) = self.stroke.take()
+            && let Some(open) = self.stroke.take().map(|b| *b)
         {
             if let Some(edit) = &shape {
                 let (kind, nodes) = edit.geometry();
                 recording.made_shape(&edit.samples(), kind, &nodes);
             }
-            let second = self.second.take();
+            let second = self.second.take().map(|b| *b);
             self.end_recorded(recording, open, second);
             return;
         }
         if let (Some(open), Some(canvas)) = (self.stroke.take(), self.canvas.as_mut()) {
-            close_stroke(canvas, open, self.second.take(), &self.doc.stroke_guide());
+            close_stroke(canvas, *open, self.second.take().map(|b| *b), &self.doc.stroke_guide());
             self.bake_painted_on();
         }
         self.note_kept_shape(shape);
@@ -1877,7 +1881,7 @@ impl Shared {
     /// short hold.
     pub(crate) fn quiet(&self) -> bool {
         let st = self.lock();
-        st.idle() && !(st.frames_drawn() && st.canvas.as_ref().is_some_and(procraft_gpu::Canvas::lays_over_frames))
+        st.idle() && !(st.frames_drawn() && st.canvas.as_deref().is_some_and(procraft_gpu::Canvas::lays_over_frames))
     }
 
     /// The lock, taken once the canvas has finished remaking its caches (made a render at a
@@ -1957,7 +1961,8 @@ impl Shared {
 
 /// What [`canvas_of_opened`] makes: the canvas, each layer's hash as read, and the layers that
 /// couldn't be read (they show empty).
-type MadeCanvas = (Canvas, HashMap<procraft_engine::document::LayerId, u64>, Vec<procraft_engine::document::LayerId>);
+type MadeCanvas =
+    (Box<Canvas>, HashMap<procraft_engine::document::LayerId, u64>, Vec<procraft_engine::document::LayerId>);
 
 /// A canvas for `doc` made with the opened layers `ids` put on it, `opened(i)` giving layer `i`'s
 /// pixels as they were opened (none: the artwork changed meanwhile, and nothing is put). The
@@ -2015,7 +2020,7 @@ fn canvas_of_opened(
         };
         // the canvas made as the first layer comes (its textures take a while, and the next
         // layers are read meanwhile)
-        let mut canvas: Option<Canvas> = None;
+        let mut canvas: Option<Box<Canvas>> = None;
         let mut failed = None;
         let mut hashes = HashMap::new();
         let mut unread = Vec::new();
@@ -2023,7 +2028,8 @@ fn canvas_of_opened(
             let Some(id) = ids.get(i) else { return true };
             if canvas.is_none() {
                 match Canvas::unfilled(gpu, doc) {
-                    Ok(mut c) => {
+                    Ok(c) => {
+                        let mut c = Box::new(c);
                         c.set_resident_budget(budget);
                         canvas = Some(c);
                     }
@@ -2069,7 +2075,7 @@ fn canvas_of_opened(
         let mut c = match canvas {
             Some(c) => c,
             None => {
-                let mut c = Canvas::unfilled(gpu, doc)?;
+                let mut c = Box::new(Canvas::unfilled(gpu, doc)?);
                 c.set_resident_budget(budget);
                 c
             }
@@ -2602,7 +2608,7 @@ impl CanvasSession {
             _ => None,
         };
         st.began = (matches!(tool.stroke_tool(), StrokeTool::Paint | StrokeTool::Erase) && fill.is_none()).then(|| {
-            quickshape::LastStroke {
+            Box::new(quickshape::LastStroke {
                 layer: current,
                 // as it was laid: a brush engine's, its tips
                 style: laid.as_ref().map_or(style, |(laid, _)| *laid),
@@ -2617,7 +2623,7 @@ impl CanvasSession {
                 samples: Vec::new(),
                 line: builder.clone(),
                 seed,
-            }
+            })
         });
         // a fill's path goes on with the stroke's
         match fill {
@@ -2654,8 +2660,8 @@ impl CanvasSession {
         if fill != Some(lasso_fill::FillShown::Growing) {
             draw_samples(canvas, &mut builder, second_builder.as_mut(), &canvas_samples, &st.doc.stroke_guide(), false);
         }
-        st.stroke = Some(builder);
-        st.second = second_builder;
+        st.stroke = Some(Box::new(builder));
+        st.second = second_builder.map(Box::new);
         st.ahead = false;
         st.ahead_of.clear();
         self.shared.note_painted_turn(st);
@@ -2752,7 +2758,7 @@ impl Shared {
         // while the platform predicts input, what runs ahead waits for the frame (its prediction
         // follows these samples): on to the input, until a prediction comes
         let later = st.predicting;
-        if draw_samples(canvas, builder, st.second.as_mut(), &canvas_samples, &st.doc.stroke_guide(), later) {
+        if draw_samples(canvas, builder, st.second.as_deref_mut(), &canvas_samples, &st.doc.stroke_guide(), later) {
             st.ahead = later;
             // (a prediction made before these samples no longer runs ahead of them)
             st.ahead_of.clear();
@@ -2838,8 +2844,8 @@ impl CanvasSession {
         st.ahead_of.clear();
         // a stroke filling what it encloses fills it
         if !st.end_fill(&canvas_samples) {
-            let (Some(mut builder), Some(canvas)) = (st.stroke.take(), st.canvas.as_mut()) else { return };
-            let mut second = st.second.take();
+            let (Some(mut builder), Some(canvas)) = (st.stroke.take().map(|b| *b), st.canvas.as_mut()) else { return };
+            let mut second = st.second.take().map(|b| *b);
             lift_samples(canvas, &mut builder, second.as_mut(), &canvas_samples, &st.doc.stroke_guide());
             match st.recording.take() {
                 // on a plugin's layer, handed to the plugin
@@ -3390,7 +3396,7 @@ impl CanvasSession {
         // cloning, the source goes back to where it was before the stroke
         self.shared.lock().adjust.puck_step(true);
         self.edit(Canvas::undo);
-        self.shared.lock().canvas.as_ref().and_then(Canvas::redo_name)
+        self.shared.lock().canvas.as_deref().and_then(Canvas::redo_name)
     }
 
     /// Redoes the last step undone; returns what it was called, if it was named.
@@ -3440,7 +3446,7 @@ impl CanvasSession {
     fn redo_step(&self) -> Option<String> {
         self.shared.lock().adjust.puck_step(false);
         self.edit(Canvas::redo);
-        self.shared.lock().canvas.as_ref().and_then(Canvas::undo_name)
+        self.shared.lock().canvas.as_deref().and_then(Canvas::undo_name)
     }
 
     pub fn clear_layer(&self) {
@@ -3504,7 +3510,7 @@ impl CanvasSession {
             // Liquify open: its first step undone closes it
             can_undo: st.plugin_steps().is_some_and(|(undo, _)| undo)
                 || st.liquify_open()
-                || st.canvas.as_ref().is_some_and(Canvas::can_undo)
+                || st.canvas.as_deref().is_some_and(Canvas::can_undo)
                 || st.crop_undo.is_some()
                 || st.shape.is_some()
                 || st.adjust.touched()
@@ -3515,9 +3521,9 @@ impl CanvasSession {
             can_redo: if st.liquify_open() {
                 st.liquify_can_redo()
             } else {
-                st.shape.as_ref().map_or_else(
+                st.shape.as_deref().map_or_else(
                     || {
-                        st.canvas.as_ref().is_some_and(Canvas::can_redo)
+                        st.canvas.as_deref().is_some_and(Canvas::can_redo)
                             || st.crop_redo_ready()
                             || st.shape_to_redo()
                             || st.liquify_redo_ready()

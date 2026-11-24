@@ -136,7 +136,7 @@ impl State {
     pub(crate) fn begin_fill(&mut self, shown: FillShown, builder: &StrokeBuilder, samples: &[Sample]) {
         let mut path = builder.fill_path();
         path.add(samples);
-        self.filling = Some(Filling { shown, path, pen: pen_of(samples), shown_at: None });
+        self.filling = Some(Box::new(Filling { shown, path, pen: pen_of(samples), shown_at: None }));
     }
 
     /// More of the fill stroke's samples (canvas pixels): its path goes on. Whether its own stamps

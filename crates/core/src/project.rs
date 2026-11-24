@@ -1320,7 +1320,7 @@ impl CanvasSession {
             st.layer_data_unread.extend(data_unread);
             st.info = file.info;
             st.turns = file.turns.unwrap_or(0) % 4;
-            st.scene = scene;
+            st.scene = scene.map(Box::new);
             st.reference_window = file.reference.unwrap_or_default();
             st.reference_picture = reference_picture.map(Arc::new);
             st.more_references = more_references;

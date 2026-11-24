@@ -669,7 +669,7 @@ impl CanvasSession {
                 None => {
                     let mut doc = Document::new(cw, ch);
                     doc.background_visible = false;
-                    let mut canvas = Canvas::new(&gpu, &doc).ok()?;
+                    let mut canvas = Box::new(Canvas::new(&gpu, &doc).ok()?);
                     // drawn beside the window's frames: its work goes to the GPU a short piece at
                     // a time, each waited for (a weak GPU took seconds over a wet brush's stroke,
                     // and the frame that queued behind it held the canvas all that while)
