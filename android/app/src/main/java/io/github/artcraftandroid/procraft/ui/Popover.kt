@@ -5,6 +5,9 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
@@ -141,10 +144,31 @@ internal fun frostBox(onCanvas: Offset, width: Int, height: Int, left: Float, ri
 enum class ArrowSide { TOP, BOTTOM, LEFT, RIGHT, NONE }
 
 /**
+ * Where the panel opening now hangs from a button Edit layout moved: the side its arrow is on, and how
+ * far along that side its tip is (the panel's own dp). The panel's own popover takes it in place of
+ * an arrow up from under the top bar; nothing that opens inside it does.
+ */
+class Hang(val side: ArrowSide, val arrow: Dp)
+
+/** The hang of the panel opening now, while Edit layout moved its button. */
+val LocalHang = staticCompositionLocalOf<Hang?> { null }
+
+/**
+ * A panel floating in a window of its own (every panel may, while a plugin lets it): how wide and tall the window lays it
+ * out (its own dp), and what its strip and corner do. The panel's own popover draws as that window, with no arrow and a
+ * strip over it; nothing that opens inside it does.
+ */
+class FloatWindow(val width: Dp, val height: Dp, val frame: FloatingFrame, val sizable: Boolean)
+
+/** The window the panel showing now floats in, if it does. */
+val LocalFloat = staticCompositionLocalOf<FloatWindow?> { null }
+
+/**
  * A panel hanging from the top bar, with an arrow pointing up at its button: [arrowX] is the tip's
  * distance from the panel's left edge (from its top, for an arrow on the [side]). [popoverPlace]
  * finds where it goes. Without a [fill] of its own it is frosted over the canvas: translucent,
- * with what is behind it blurred. [width] is the body's: a side arrow adds to it.
+ * with what is behind it blurred. [width] is the body's: a side arrow adds to it. Hanging from a
+ * button Edit layout moved ([LocalHang]), an arrow that would point up points at it instead.
  */
 @Composable
 fun Popover(
@@ -154,6 +178,34 @@ fun Popover(
     fill: Color? = null,
     corner: Dp = Pc.PopoverCorner,
     side: ArrowSide = ArrowSide.TOP,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    val hang = LocalHang.current?.takeIf { side == ArrowSide.TOP }
+    val float = LocalFloat.current?.takeIf { side == ArrowSide.TOP }
+    androidx.compose.runtime.CompositionLocalProvider(LocalHang provides null, LocalFloat provides null) {
+        if (float != null) {
+            // floating: as big as its window, its strip over it and the room for its corner under it
+            PopoverBody(float.width, 0.dp, modifier.height(float.height), fill, corner, ArrowSide.NONE) {
+                FloatingTop(float.frame)
+                androidx.compose.foundation.layout.Box(Modifier.weight(1f).fillMaxWidth()) {
+                    Column(Modifier.fillMaxSize(), content = content)
+                }
+                if (float.sizable) FloatingBottom(float.frame)
+            }
+        } else {
+            PopoverBody(width, hang?.arrow ?: arrowX, modifier, fill, corner, hang?.side ?: side, content)
+        }
+    }
+}
+
+@Composable
+private fun PopoverBody(
+    width: Dp,
+    arrowX: Dp,
+    modifier: Modifier,
+    fill: Color?,
+    corner: Dp,
+    side: ArrowSide,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val backdrops = LocalBackdrops.current.takeIf { fill == null && Pc.PopoverFrost.alpha < 1f }

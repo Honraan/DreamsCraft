@@ -2530,6 +2530,12 @@ impl Plugins {
         self.hooks().floating_panel(panel as i32)
     }
 
+    /// Whether a plugin lets the panel numbered `number` on the `floating_panels` hook float (see
+    /// [`crate::LayoutPiece`]).
+    pub(crate) fn floats_number(&self, number: i32) -> bool {
+        self.hooks().floating_panel(number)
+    }
+
     /// The choices the menus at `place` offer, of each plugin on that has one there (in order of
     /// id), as their manifests list them. None: the app shows no button for them.
     pub fn menu_choices(&self, place: PluginMenuPlace) -> Vec<PluginChoice> {
@@ -2630,6 +2636,27 @@ impl Plugins {
         SliderLook {
             track_opacity: hooks.slider_look(crate::hooks::SLIDER_OPACITY),
             frosted: hooks.slider_look(crate::hooks::SLIDER_FROSTED).map(|v| v >= 0.5),
+        }
+    }
+
+    /// How the floating panels are laid out, as the plugins on the panel layout's hook say
+    /// (interface 20): with none on, as the app always had them.
+    pub fn panel_layout(&self) -> crate::layout::PanelLayoutLook {
+        use crate::hooks::{LAYOUT_EDIT, LAYOUT_FOLD, LAYOUT_ROOM, LAYOUT_SNAP};
+        let hooks = self.hooks();
+        if !hooks.listens(crate::plugin_run::Hook::PanelLayout) {
+            return crate::layout::PanelLayoutLook::default();
+        }
+        let [snap, fold, room, edit] =
+            [LAYOUT_SNAP, LAYOUT_FOLD, LAYOUT_ROOM, LAYOUT_EDIT].map(|p| hooks.panel_layout(p));
+        let yes = |said: Option<f32>| said.is_some_and(|v| v >= 0.5);
+        crate::layout::PanelLayoutLook {
+            // the panels are laid out while a plugin says anything of how; the bars alone don't
+            on: snap.is_some() || fold.is_some() || room.is_some(),
+            snap: snap.unwrap_or(0.0),
+            fold: yes(fold),
+            make_room: yes(room),
+            edit: yes(edit),
         }
     }
 
@@ -3458,6 +3485,7 @@ mod tests {
     const BRUSH_EXTRAS: &str = "io.github.artcraftandroid.brush-extras";
     const LAYER_TOOLBOX: &str = "io.github.artcraftandroid.layer-toolbox";
     const INFINITE: &str = "io.github.artcraftandroid.infinite-plugins";
+    const EDIT_LAYOUT: &str = "io.github.artcraftandroid.edit-layout";
     /// The features the plugins these named once are now, by the plugin holding them.
     const EFFECTS: &str = LAYER_TOOLBOX;
     const COLORDROP: &str = COLOUR_TOOLS;
@@ -3690,13 +3718,9 @@ mod tests {
         assert_eq!(plugins.accent_colour(), Some(0xFD0000));
         assert!(plugins.set_slider(format!("{INTERFACE}.saturation"), 0.0).is_some());
         assert_eq!(plugins.accent_colour(), Some(0xFDFDFD));
-        for (switch, hook) in
-            [("hide_undo", Hooks::hide_undo_notice as fn(&Hooks) -> bool), ("pin_panels", Hooks::pin_panels)]
-        {
-            assert!(!hook(&plugins.hooks()), "{switch}");
-            assert!(plugins.set_switch(format!("{INTERFACE}.{switch}"), true));
-            assert!(hook(&plugins.hooks()), "{switch}");
-        }
+        assert!(!plugins.hooks().hide_undo_notice());
+        assert!(plugins.set_switch(format!("{INTERFACE}.hide_undo"), true));
+        assert!(plugins.hooks().hide_undo_notice());
         // the triangle draws Classic, and says where a touch lands: its right corner is the pure hue
         assert!(plugins.picker_on());
         let corner = plugins.picker_pick(0.933, 0.5).unwrap();
@@ -3779,32 +3803,30 @@ mod tests {
             [("Colour triangle", false, 0), ("Colour labels", false, 0), ("ColorDrop tools", true, 3)]
         );
         assert!(colour.features.iter().all(|f| !f.description.is_empty()));
-        let looks = ["Interface", "Slider look", "Canvas surround", "Floating panels", "Coloured brush previews"];
+        let looks = ["Interface", "Slider look", "Canvas surround", "Coloured brush previews"];
         assert_eq!(labels(&plugins, INTERFACE_LOOK), looks);
         assert!(plugins.set_switch(format!("{INTERFACE}.interface"), true));
-        let interface =
-            ["Interface size", "Interface colour", "Hide undo notices", "Hide all action notices", "Panels stay open"];
-        assert_eq!(labels(&plugins, INTERFACE_LOOK)[1..6], interface);
+        let interface = ["Interface size", "Interface colour", "Hide undo notices", "Hide all action notices"];
+        assert_eq!(labels(&plugins, INTERFACE_LOOK)[1..5], interface);
         assert!(plugins.set_switch(format!("{INTERFACE}.size_on"), true));
         assert!(plugins.set_switch(format!("{INTERFACE}.colour"), true));
         let all = [
             "Interface size",
             "Size",
             "Size parts separately",
-            "Clear of status bar and camera",
+            "UI stays below status bar",
             "Interface colour",
             "Hue",
             "Saturation",
             "Hide undo notices",
             "Hide all action notices",
-            "Panels stay open",
         ];
-        assert_eq!(labels(&plugins, INTERFACE_LOOK)[1..11], all);
+        assert_eq!(labels(&plugins, INTERFACE_LOOK)[1..10], all);
         // a switch under a switch under a feature, and what comes under it while all are on
         assert!(plugins.set_switch(format!("{INTERFACE}.parts"), true));
         let parts = ["Floating panels", "Popovers and menus", "Side bar", "Top bar", "Panels"];
         let with_parts: Vec<&str> = all[..3].iter().chain(&parts).chain(&all[3..]).copied().collect();
-        assert_eq!(labels(&plugins, INTERFACE_LOOK)[1..16], with_parts);
+        assert_eq!(labels(&plugins, INTERFACE_LOOK)[1..15], with_parts);
         assert!(plugins.set_switch(format!("{INTERFACE}.size_on"), false));
         assert_eq!(labels(&plugins, INTERFACE_LOOK)[1..3], ["Interface size", "Interface colour"]);
         // the feature off: none of it, its values as they were
@@ -3819,6 +3841,22 @@ mod tests {
         let lines = ["Effects", "Extract lines", "Paper", "Softness", "Keep the colour", "Outline", "Posterise"];
         assert_eq!(labels(&plugins, LAYER_TOOLBOX)[5..12], lines);
         assert_eq!(labels(&plugins, LAYER_TOOLBOX).len(), 12, "Filter layers are Infinite Plugins' now");
+        // Edit layout: its panels and its bars; Movable panels with what it does
+        let edit_features = ["Movable panels", "All panels float", "Panels stay open", "Edit layout"];
+        assert_eq!(labels(&plugins, EDIT_LAYOUT), edit_features);
+        assert!(plugins.set_switch(format!("{EDIT_LAYOUT}.movable_panels"), true));
+        let movable = [
+            "Movable panels",
+            "Layers panel can float",
+            "Brush library can float",
+            "Snap to edges and panels",
+            "Snap distance",
+            "Panels fold to a tab",
+            "Docked panels make room",
+        ];
+        assert_eq!(labels(&plugins, EDIT_LAYOUT)[..7], movable);
+        assert!(card(&plugins, EDIT_LAYOUT).features.iter().all(|f| !f.description.is_empty()));
+        assert!(plugins.set_switch(format!("{EDIT_LAYOUT}.movable_panels"), false));
         // Infinite Plugins: a feature for each of what painters asked for
         let infinite = ["Lasso fill", "Paper", "Trace view", "Filter layers", "Colour extras"];
         assert_eq!(labels(&plugins, INFINITE), infinite);
@@ -4349,11 +4387,158 @@ mod tests {
     }
 
     #[test]
+    fn edit_layout_lays_the_panels_out_and_lets_the_bars_move_as_its_switches_say() {
+        use crate::floating::FloatingPanel;
+        use crate::layout::PanelLayoutLook;
+        let dir = store("bundled-edit-layout");
+        let plugins = featured_app(&dir, EDIT_LAYOUT, "movable_panels");
+        let floats = |plugins: &Plugins| [FloatingPanel::Layers, FloatingPanel::Brushes].map(|p| plugins.floats(p));
+        // off: as the app always had it
+        assert_eq!(plugins.panel_layout(), PanelLayoutLook::default());
+        assert_eq!(floats(&plugins), [false; 2]);
+        // on: snapping within 16, folding, no room made; both panels float
+        assert!(plugins.set_on(EDIT_LAYOUT.to_owned(), true));
+        let look = PanelLayoutLook { on: true, snap: 16.0, fold: true, make_room: false, edit: false };
+        assert_eq!(plugins.panel_layout(), look);
+        assert_eq!(floats(&plugins), [true; 2]);
+        // the other panels (by their numbers on the hook, interface 20) as they always are: All panels
+        // float is off as it starts
+        assert!((2..=7).all(|n| !plugins.floats_number(n)));
+        let layout = crate::PanelLayout::new();
+        layout.follow(Arc::clone(&plugins));
+        let others = [
+            crate::LayoutPiece::Actions,
+            crate::LayoutPiece::Adjustments,
+            crate::LayoutPiece::Adjusting,
+            crate::LayoutPiece::Selection,
+            crate::LayoutPiece::Transform,
+            crate::LayoutPiece::Liquify,
+        ];
+        assert!(others.iter().all(|&p| !layout.may_float(p)), "they hang where they always do");
+        assert!(layout.may_float(crate::LayoutPiece::Layers));
+        assert!(plugins.set_switch(format!("{EDIT_LAYOUT}.all_panels"), true));
+        assert!((2..=7).all(|n| plugins.floats_number(n)));
+        assert!(!plugins.floats_number(8), "a panel it doesn't know");
+        layout.follow(Arc::clone(&plugins));
+        assert!(others.iter().all(|&p| layout.may_float(p)));
+        assert_eq!(floats(&plugins), [true; 2], "the Layers panel and the library by their own switches");
+        // on by itself, Movable panels off: the others float, with no layout of their own
+        assert!(plugins.set_switch(format!("{EDIT_LAYOUT}.movable_panels"), false));
+        assert!((2..=7).all(|n| plugins.floats_number(n)));
+        assert_eq!(floats(&plugins), [false; 2]);
+        assert!(plugins.set_switch(format!("{EDIT_LAYOUT}.all_panels"), false));
+        assert!((2..=7).all(|n| !plugins.floats_number(n)));
+        assert!(plugins.set_switch(format!("{EDIT_LAYOUT}.movable_panels"), true));
+        assert!(!plugins.hooks().pin_panels(), "panels stay open by a feature of their own");
+        // as its switches say
+        assert_eq!(plugins.set_slider(format!("{EDIT_LAYOUT}.snap_distance"), 30.0), Some(30.0));
+        assert!(plugins.set_switch(format!("{EDIT_LAYOUT}.make_room"), true));
+        assert!(plugins.set_switch(format!("{EDIT_LAYOUT}.fold"), false));
+        let moved = PanelLayoutLook { snap: 30.0, fold: false, make_room: true, ..look };
+        assert_eq!(plugins.panel_layout(), moved);
+        assert!(plugins.set_switch(format!("{EDIT_LAYOUT}.snap"), false));
+        assert_eq!(plugins.panel_layout().snap, 0.0);
+        // Panels stay open and Edit layout, each by its own feature
+        assert!(plugins.set_switch(format!("{EDIT_LAYOUT}.pin_panels"), true));
+        assert!(plugins.hooks().pin_panels());
+        assert!(plugins.set_switch(format!("{EDIT_LAYOUT}.edit_layout"), true));
+        assert!(plugins.panel_layout().edit);
+        // Edit layout alone: the bars move, the panels as the app has them
+        assert!(plugins.set_switch(format!("{EDIT_LAYOUT}.movable_panels"), false));
+        let bars_only = PanelLayoutLook { edit: true, ..PanelLayoutLook::default() };
+        assert_eq!(plugins.panel_layout(), bars_only);
+        assert_eq!(floats(&plugins), [false; 2]);
+        // kept, through a restart
+        let next = app_at(&dir);
+        read_lines(&next, &plugins.kept_lines());
+        assert_eq!(next.panel_layout(), bars_only);
+        assert!(next.hooks().pin_panels());
+        assert!(next.set_on(EDIT_LAYOUT.to_owned(), false));
+        assert_eq!(next.panel_layout(), PanelLayoutLook::default());
+        assert!(!next.hooks().pin_panels());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What Interface look kept for Floating panels and Panels stay open, which Edit layout takes:
+    /// the switch there, its values (the key there, as kept, and the key here), and the switch here.
+    type LookValue = (&'static str, &'static str, &'static str);
+    const FROM_LOOK: &[(&str, &[LookValue], &str)] = &[
+        (
+            "floating_panels",
+            &[("float_layers", "true", "float_layers"), ("float_brushes", "false", "float_brushes")],
+            "movable_panels",
+        ),
+        ("pin_panels", &[], "pin_panels"),
+    ];
+
+    #[test]
+    fn what_interface_look_kept_for_floating_panels_and_panels_staying_open_comes_back_under_edit_layout() {
+        use crate::floating::FloatingPanel;
+        let dir = store("edit-layout-taken");
+        for (feature, values, now) in FROM_LOOK {
+            let lines_of = |on: bool, feature_on: bool| {
+                let mut lines =
+                    vec![format!("{INTERFACE_LOOK}.on {on}"), format!("{INTERFACE_LOOK}.{feature} {feature_on}")];
+                lines.extend(values.iter().map(|(key, value, _)| format!("{INTERFACE_LOOK}.{key} {value}")));
+                lines
+            };
+            // Interface look and the feature on, in either order: Edit layout on with it, its values
+            // taken; Interface look on as it was
+            for reversed in [false, true] {
+                let plugins = app_at(&dir);
+                let mut lines = lines_of(true, true);
+                if reversed {
+                    lines.reverse();
+                }
+                read_lines(&plugins, &lines);
+                assert!(card(&plugins, EDIT_LAYOUT).on, "{feature}");
+                assert!(card(&plugins, INTERFACE_LOOK).on, "{feature}");
+                assert!(switch_of(&plugins, &format!("{EDIT_LAYOUT}.{now}")), "{feature}");
+                for (key, value, here) in *values {
+                    let got = kept_value(&plugins, &format!("{EDIT_LAYOUT}.{here}"));
+                    assert!(same_value(&got, value), "{key} as {here}: {got}, not {value}");
+                }
+                // kept as Edit layout's from then on, through the next start
+                let kept = plugins.kept_lines();
+                assert!(kept.contains(&format!("{EDIT_LAYOUT}.on true")), "{kept:?}");
+                let old = |line: &String| {
+                    line.starts_with(&format!("{INTERFACE_LOOK}.{feature} "))
+                        || values.iter().any(|(key, ..)| line.starts_with(&format!("{INTERFACE_LOOK}.{key} ")))
+                };
+                assert!(!kept.iter().any(old), "{kept:?}");
+                let next = app_at(&dir);
+                read_lines(&next, &kept);
+                assert_eq!(next.plugins(), plugins.plugins(), "{feature}");
+            }
+            // Interface look off, or the feature: Edit layout stays off, the switch as it was
+            for (on, feature_on) in [(false, true), (true, false)] {
+                let plugins = app_at(&dir);
+                read_lines(&plugins, &lines_of(on, feature_on));
+                assert!(!card(&plugins, EDIT_LAYOUT).on, "{feature}: {on} {feature_on}");
+                assert_eq!(switch_of(&plugins, &format!("{EDIT_LAYOUT}.{now}")), feature_on, "{feature}");
+            }
+        }
+        // both at once: one Edit layout, the Layers panel floating and not the library, and panels
+        // staying open
+        let plugins = app_at(&dir);
+        let mut lines = vec![format!("{INTERFACE_LOOK}.on true")];
+        for (feature, values, _) in FROM_LOOK {
+            lines.push(format!("{INTERFACE_LOOK}.{feature} true"));
+            lines.extend(values.iter().map(|(key, value, _)| format!("{INTERFACE_LOOK}.{key} {value}")));
+        }
+        read_lines(&plugins, &lines);
+        assert!(card(&plugins, EDIT_LAYOUT).on);
+        assert_eq!([FloatingPanel::Layers, FloatingPanel::Brushes].map(|p| plugins.floats(p)), [true, false]);
+        assert!(plugins.hooks().pin_panels());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn panels_float_while_the_floating_panels_switches_say() {
         use crate::floating::FloatingPanel;
-        const FLOATING: &str = INTERFACE_LOOK;
+        const FLOATING: &str = EDIT_LAYOUT;
         let dir = store("bundled-floating");
-        let plugins = featured_app(&dir, FLOATING, "floating_panels");
+        let plugins = featured_app(&dir, FLOATING, "movable_panels");
         let floats = |plugins: &Plugins| [FloatingPanel::Layers, FloatingPanel::Brushes].map(|p| plugins.floats(p));
         // with it off nothing floats; on, both do at once, each while its switch is
         assert_eq!(floats(&plugins), [false; 2]);
@@ -5516,7 +5701,6 @@ mod tests {
                 ("saturation", "0.5", "saturation"),
                 ("hide_undo", "true", "hide_undo"),
                 ("hide_notices", "true", "hide_notices"),
-                ("pin_panels", "true", "pin_panels"),
             ],
         },
         Old {
@@ -5538,8 +5722,8 @@ mod tests {
         },
         Old {
             name: "floating-panels",
-            now: INTERFACE_LOOK,
-            switches: &["floating_panels"],
+            now: EDIT_LAYOUT,
+            switches: &["movable_panels"],
             values: &[("layers", "false", "float_layers"), ("brushes", "false", "float_brushes")],
         },
         Old {
@@ -5567,7 +5751,7 @@ mod tests {
             values: &[("hue", "20", "hue"), ("saturation", "0.4", "saturation")],
         },
         Old { name: "hide-undo-notice", now: INTERFACE_LOOK, switches: &["interface", "hide_undo"], values: &[] },
-        Old { name: "pin-panels", now: INTERFACE_LOOK, switches: &["interface", "pin_panels"], values: &[] },
+        Old { name: "pin-panels", now: EDIT_LAYOUT, switches: &["pin_panels"], values: &[] },
         Old {
             name: "value-check",
             now: VIEW_TOOLS,
@@ -5767,9 +5951,9 @@ mod tests {
                 assert!(same_value(&got, value), "{id} off: {now}: {got}, not {value}");
             }
         }
-        // twelve in all, each off as the app comes
+        // thirteen in all, each off as the app comes
         let plugins = app_at(&dir);
-        assert_eq!(plugins.plugins().len(), 12);
+        assert_eq!(plugins.plugins().len(), 13);
         assert!(plugins.plugins().iter().all(|p| !p.on));
         let _ = std::fs::remove_dir_all(&dir);
     }

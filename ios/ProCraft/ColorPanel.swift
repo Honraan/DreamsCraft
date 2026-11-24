@@ -2340,11 +2340,12 @@ private struct UndockHandle: View {
                         guard model.colorsUndocking || hypot(drag.translation.width, drag.translation.height) > undockDrag else { return }
                         let at = Interface.shared.point(drag.location)
                         model.colorsUndocking = true
-                        model.floatingColorsAt = CGPoint(x: at.x - floatingGrab.x, y: at.y - floatingGrab.y)
+                        model.undockColours(at: at, grab: floatingGrab)
                     }
                     .onEnded { _ in
                         if model.colorsUndocking {
                             model.colorsUndocking = false
+                            model.letGoColours()
                             model.closePanels()
                         }
                     }
@@ -2519,9 +2520,12 @@ struct FloatingColors: View {
                             let from = dragFrom ?? model.floatingColorsAt ?? .zero
                             dragFrom = from
                             let k = Interface.shared.scale
-                            model.floatingColorsAt = CGPoint(x: from.x + drag.translation.width / k, y: from.y + drag.translation.height / k)
+                            model.moveColours(by: CGSize(width: drag.translation.width / k, height: drag.translation.height / k), from: from)
                         }
-                        .onEnded { _ in dragFrom = nil }
+                        .onEnded { _ in
+                            dragFrom = nil
+                            model.letGoColours()
+                        }
                 )
         }
         .frame(maxWidth: .infinity)
@@ -2562,11 +2566,29 @@ struct FloatingColors: View {
     }
 
     var body: some View {
-        if let at = model.floatingColorsAt {
-            let height: CGFloat = model.colorMode == .disc ? 351 : 390
+        let height: CGFloat = model.colorMode == .disc ? 351 : 390
+        // while a plugin lays the panels out, where the layout has it (folded, its tab)
+        let laid = model.layoutLook.on ? model.shownColours(width: compactWidth, height: height) : nil
+        // hidden from its menu: unseen until its button or Show Hidden brings it back
+        let away = model.layoutLook.on && model.hiddenPieces().contains(.colours)
+        if away {
+            EmptyView()
+        } else if model.floatingColorsAt != nil, let tab = laid, tab.folded {
+            FloatingTab(
+                shown: tab,
+                title: model.colorMode == .palettes ? "Palettes" : "Colors",
+                onUnfold: { model.foldColours(false) },
+                onDrag: { model.moveColours(by: $0, from: .zero) },
+                onLetGo: { model.letGoColours() }
+            )
+            .frame(width: screen.width, height: screen.height, alignment: .topLeading)
+        } else if let kept = model.floatingColorsAt {
+            let at = laid.map { CGPoint(x: CGFloat($0.x), y: CGFloat($0.y)) } ?? kept
             // kept on the screen
-            let x = min(max(at.x, 0), max(screen.width - compactWidth, 0))
-            let y = min(max(at.y, 0), max(screen.height - height, 0))
+            // at the floating windows' size, as the other floating windows are
+            let k = Look.shared.scale(.floating)
+            let x = min(max(at.x, 0), max(screen.width - compactWidth * k, 0))
+            let y = min(max(at.y, 0), max(screen.height - height * k, 0))
             Popover(width: compactWidth, arrowX: 0, side: .none) {
                 ZStack(alignment: .topLeading) {
                     VStack(spacing: 0) {
@@ -2575,10 +2597,22 @@ struct FloatingColors: View {
                     }
                     title
                     grabber
-                    FloatingClose { model.floatingColorsAt = nil }
+                    FloatingClose { model.closeColours() }
                         .padding(.top, 4)
                         .padding(.trailing, 4)
                         .frame(maxWidth: .infinity, alignment: .trailing)
+                    if model.layoutLook.on, model.layoutLook.fold {
+                        FloatingFold { model.foldColours(true) }
+                            .padding(.top, 4)
+                            .padding(.trailing, 44)
+                            .frame(maxWidth: .infinity, alignment: .trailing)
+                    }
+                    if model.layoutLook.on {
+                        FloatingMenuButton(menu: windowMenu(model, .colours))
+                            .padding(.top, 4)
+                            .padding(.trailing, 84)
+                            .frame(maxWidth: .infinity, alignment: .trailing)
+                    }
                 }
                 .frame(height: height - 52, alignment: .top)
                 CompactTabs(mode: model.colorMode) { model.colorMode = $0 }
@@ -2597,13 +2631,14 @@ struct FloatingColors: View {
                 }
             }
             .overlay(alignment: .topLeading) { ColorMenus(model: model, ui: ui) }
+            .scaleEffect(k, anchor: .topLeading)
             .offset(x: x, y: y)
             .onAppear { ui.harmonyAt = CGPoint(x: 0, y: 72) }
             // a plugin showing Classic's picker alone: this window gives way to that one
             .opacity(ColourLooks.shared.floatingPickerOnly ? 0 : 1)
             .allowsHitTesting(!ColourLooks.shared.floatingPickerOnly)
         }
-        if model.floatingColorsAt != nil, ColourLooks.shared.floatingPickerOnly {
+        if model.floatingColorsAt != nil, ColourLooks.shared.floatingPickerOnly, !away {
             FloatingPicker(model: model, screen: screen)
         }
     }
@@ -2629,8 +2664,10 @@ private struct FloatingPicker: View {
         let height = floatingPickerTop + 248 + (ringed ? 0 : 40) + 6
         let at = model.floatingColorsAt ?? .zero
         // kept on the screen
-        let x = min(max(at.x, 0), max(screen.width - compactWidth, 0))
-        let y = min(max(at.y, 0), max(screen.height - height, 0))
+        // at the floating windows' size, as the other floating windows are
+        let k = Look.shared.scale(.floating)
+        let x = min(max(at.x, 0), max(screen.width - compactWidth * k, 0))
+        let y = min(max(at.y, 0), max(screen.height - height * k, 0))
         Popover(width: compactWidth, arrowX: 0, side: .none) {
             ZStack(alignment: .top) {
                 Capsule()
@@ -2661,6 +2698,7 @@ private struct FloatingPicker: View {
         // the canvas under it takes no touch
         .contentShape(Rectangle())
         .onTapGesture {}
+        .scaleEffect(k, anchor: .topLeading)
         .offset(x: x, y: y)
     }
 }

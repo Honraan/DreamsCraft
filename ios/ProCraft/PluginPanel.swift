@@ -110,6 +110,8 @@ struct PluginChoiceRow: View {
 struct PluginPlaceRows: View {
     let model: CanvasModel
     let place: PluginPlace
+    /// A row of the app's own after theirs, for what a plugin lets it do there (Edit Layout).
+    var more: (label: String, action: () -> Void)?
 
     var body: some View {
         let plugins = PluginsModel.shared
@@ -117,7 +119,7 @@ struct PluginPlaceRows: View {
         let _ = plugins.changes
         let controls = plugins.store.controlsIn(place: place)
         let actions = plugins.store.actionsIn(place: place)
-        if !controls.isEmpty || !actions.isEmpty {
+        if !controls.isEmpty || !actions.isEmpty || more != nil {
             let shape = RoundedRectangle(cornerRadius: 22, style: .circular)
             VStack(spacing: 0) {
                 ForEach(controls.indices, id: \.self) { i in
@@ -131,6 +133,12 @@ struct PluginPlaceRows: View {
                         Rectangle().fill(Pc.actionsSeparator).frame(height: 1)
                     }
                     PluginActionRow(label: actions[i].label) { model.runPluginAction(actions[i].key) }
+                }
+                if let more {
+                    if !controls.isEmpty || !actions.isEmpty {
+                        Rectangle().fill(Pc.actionsSeparator).frame(height: 1)
+                    }
+                    PluginActionRow(label: more.label, action: more.action)
                 }
             }
             .background(shape.fill(Pc.actionsGroup))

@@ -69,7 +69,8 @@ extension CanvasModel {
             return
         }
         let right = AppSettings.shared.rightHanded
-        let side = showSideBar ? Float((Pc.sideBarShown + Pc.popoverGap) * pixels) : 0
+        // (moved off its edge by Edit layout, the side bar leaves the canvas the whole width)
+        let side = showSideBar && barMoved(.sideBar) == nil ? Float((Pc.sideBarShown + Pc.popoverGap) * pixels) : 0
         session.setFitInsets(left: right ? 0 : side, top: Float(Pc.barShown * pixels), right: right ? side : 0, bottom: 0)
     }
 

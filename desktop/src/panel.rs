@@ -3,7 +3,7 @@
 
 use egui::emath::TSTransform;
 use egui::{Align2, Color32, Pos2, Rect, Sense, Ui, Vec2, pos2};
-use procraft_core::InterfacePart;
+use procraft_core::{HangSide, InterfacePart};
 use resvg::tiny_skia;
 
 use crate::icons;
@@ -41,12 +41,176 @@ pub enum Hang {
 }
 
 /// What a floating panel's strips had done to them this frame: the grabber strip pressed (its
-/// window moves with the pointer from there), the corner pressed (it is sized), Close tapped.
+/// window moves with the pointer from there), the corner pressed (it is sized), Close tapped, the
+/// fold button tapped.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FloatingChrome {
     pub moving: bool,
     pub sizing: bool,
     pub closed: bool,
+    pub folded: bool,
+    /// What its menu chose.
+    pub act: Option<WindowAct>,
+}
+
+/// What a floating window's menu chose: fold it, hide it, pin it over the others (or not), or put it
+/// back where it first goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowAct {
+    Fold,
+    Hide,
+    Pin,
+    Reset,
+}
+
+/// Whether the window drawn next is pinned over the others (its menu says Unpin).
+pub fn window_pinned(ctx: &egui::Context, pinned: bool) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::unique("window pinned"), pinned));
+}
+
+/// A window's menu button at `at` (three dots on a disc), and while it is open its menu under it:
+/// Fold (while the panels fold), Hide, Pin to Top (Unpin while pinned) and Reset Position. What was
+/// chosen this frame.
+pub fn window_menu(ui: &Ui, at: Rect) -> Option<WindowAct> {
+    let c = at.center();
+    ui.painter().circle_filled(c, 8.5, argb(CLOSE_DISC));
+    for dx in [-3.6, 0.0, 3.6] {
+        ui.painter().circle_filled(c + egui::vec2(dx, 0.0), 1.1, argb(CLOSE_CROSS));
+    }
+    let ctx = ui.ctx().clone();
+    let id = ui.scope_id().with("window menu");
+    let mut open = ctx.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+    let pressed = ui.interact(at, id.with("button"), Sense::click()).clicked();
+    if pressed {
+        open = !open;
+    }
+    let mut act = None;
+    if open {
+        let pinned = ctx.data(|d| d.get_temp::<bool>(egui::Id::unique("window pinned"))).unwrap_or(false);
+        let mut rows = Vec::new();
+        if panels_fold(&ctx) {
+            rows.push((WindowAct::Fold, "Fold"));
+        }
+        rows.push((WindowAct::Hide, "Hide"));
+        rows.push((WindowAct::Pin, if pinned { "Unpin" } else { "Pin to Top" }));
+        rows.push((WindowAct::Reset, "Reset Position"));
+        // in the window's points, over everything
+        let origin = to_window(&ctx) * at.left_bottom();
+        let menu = Rect::from_min_size(origin, egui::vec2(180.0, 8.0 + 40.0 * rows.len() as f32));
+        egui::Area::new(id.with("menu")).fixed_pos(menu.min).order(egui::Order::Tooltip).show(&ctx, |ui| {
+            ui.painter().rect_filled(menu, 12, argb(pc::BAR));
+            for (i, (choice, label)) in rows.iter().enumerate() {
+                let row = Rect::from_min_size(
+                    pos2(menu.left(), menu.top() + 4.0 + 40.0 * i as f32),
+                    egui::vec2(menu.width(), 40.0),
+                );
+                if ui.interact(row, id.with(("row", i)), Sense::click()).clicked() {
+                    act = Some(*choice);
+                }
+                text(
+                    ui.painter(),
+                    pos2(row.left() + 16.0, row.center().y),
+                    Align2::LEFT_CENTER,
+                    label,
+                    17.0,
+                    Weight::Regular,
+                    argb(pc::MENU_INK),
+                );
+            }
+        });
+        // a press anywhere else closes it
+        let away = ctx.input(|i| i.pointer.any_click() && i.pointer.interact_pos().is_some_and(|p| !menu.contains(p)));
+        if act.is_some() || (away && !pressed) {
+            open = false;
+        }
+    }
+    ctx.data_mut(|d| d.insert_temp(id, open));
+    act
+}
+
+/// The window a panel drawn now floats in (every panel may, while a plugin lets it), in the panels'
+/// space, and whether it has a corner to size it by; or none.
+pub fn floating_in(ctx: &egui::Context, window: Option<(Rect, bool)>) {
+    ctx.data_mut(|d| {
+        d.insert_temp(egui::Id::unique("panel floating in"), window);
+        d.insert_temp(egui::Id::unique("panel float chrome"), FloatingChrome::default());
+        d.insert_temp(egui::Id::unique("panel float wants"), None::<f32>);
+    });
+}
+
+fn float_window(ctx: &egui::Context) -> Option<(Rect, bool)> {
+    ctx.data(|d| d.get_temp::<Option<(Rect, bool)>>(egui::Id::unique("panel floating in"))).flatten()
+}
+
+/// What was done to the strips of the panel floating as a window this frame (see [`floating_in`]).
+pub fn float_chrome(ctx: &egui::Context) -> FloatingChrome {
+    ctx.data(|d| d.get_temp::<FloatingChrome>(egui::Id::unique("panel float chrome"))).unwrap_or_default()
+}
+
+/// How tall the panel floating as a window wants its body to be (its own points, its arrow's room
+/// included), as it laid itself out this frame: for one that isn't sized, what the layout is told.
+pub fn float_wants(ctx: &egui::Context) -> Option<f32> {
+    ctx.data(|d| d.get_temp::<Option<f32>>(egui::Id::unique("panel float wants"))).flatten()
+}
+
+/// Whether the panel hanging now may be torn off (its grabber shows at its top).
+pub fn tearing(ctx: &egui::Context, may: bool) {
+    ctx.data_mut(|d| {
+        d.insert_temp(egui::Id::unique("panel tears"), may);
+        d.insert_temp(egui::Id::unique("panel torn"), None::<(Pos2, Pos2)>);
+    });
+}
+
+/// The hanging panel's grabber dragged this frame: where the press began and where the pointer is
+/// (the window's points).
+pub fn torn(ctx: &egui::Context) -> Option<(Pos2, Pos2)> {
+    ctx.data(|d| d.get_temp::<Option<(Pos2, Pos2)>>(egui::Id::unique("panel torn"))).flatten()
+}
+
+/// A toolbar or an adjustment's controls being drawn now, `piece` in the layout, and where its
+/// top-left shows while it floats (the window's points); or none.
+pub fn drawing_bottom(ctx: &egui::Context, bottom: Option<(procraft_core::LayoutPiece, Option<Pos2>)>) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::unique("bottom drawn"), bottom));
+}
+
+/// `rect`, where the toolbar or adjustment's controls drawn now always is: where it shows, at the
+/// place the layout has it while it floats. Where it always is is kept for the interface (its size,
+/// its grabber and its strip), with the frame it was told in.
+pub fn bottom_rect(ctx: &egui::Context, rect: Rect) -> Rect {
+    let Some((piece, at)) = ctx
+        .data(|d| d.get_temp::<Option<(procraft_core::LayoutPiece, Option<Pos2>)>>(egui::Id::unique("bottom drawn")))
+        .flatten()
+    else {
+        return rect;
+    };
+    let frame = ctx.cumulative_frame_nr();
+    ctx.data_mut(|d| d.insert_temp(egui::Id::unique("bottom home").with(piece), (rect, frame)));
+    at.map_or(rect, |p| Rect::from_min_size(p, rect.size()))
+}
+
+/// Where `piece` (a toolbar or an adjustment's controls) always is, if it was drawn this frame.
+pub fn bottom_home(ctx: &egui::Context, piece: procraft_core::LayoutPiece) -> Option<Rect> {
+    let (rect, frame) = ctx.data(|d| d.get_temp::<(Rect, u64)>(egui::Id::unique("bottom home").with(piece)))?;
+    (frame == ctx.cumulative_frame_nr()).then_some(rect)
+}
+
+/// Whether the floating panels have a fold button this frame, as the plugins laying them out say.
+pub fn set_panels_fold(ctx: &egui::Context, fold: bool) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::unique("panels fold"), fold));
+}
+
+/// Whether the floating panels have a fold button this frame.
+pub fn panels_fold(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(egui::Id::unique("panels fold"))).unwrap_or(false)
+}
+
+/// Fold: a disc of white with a bar across it, at `rect`'s middle; whether it was tapped.
+pub fn fold_button(ui: &Ui, rect: Rect) -> bool {
+    let c = rect.center();
+    ui.painter().circle_filled(c, 8.5, argb(CLOSE_DISC));
+    ui.painter()
+        .line_segment([c - egui::vec2(3.6, 0.0), c + egui::vec2(3.6, 0.0)], egui::Stroke::new(1.3, argb(CLOSE_CROSS)));
+    ui.interact(rect, ui.scope_id().with(("fold", rect.min.x as i32, rect.min.y as i32)), Sense::click()).clicked()
 }
 
 /// The rect a panel floating in `window` is laid out in as a panel hanging from a button is, its
@@ -76,6 +240,11 @@ pub fn floating_panel_frame(ui: &Ui, look: &mut Look, slot: &'static str, window
 /// moves the window) and Close at its right, and two short lines across the lower right corner,
 /// which sizes it. What was done to them.
 pub fn floating_chrome(ui: &Ui, window: Rect) -> FloatingChrome {
+    floating_chrome_of(ui, window, true)
+}
+
+/// As [`floating_chrome`], its corner only if it is `sizable`, and its menu at its strip's left.
+fn floating_chrome_of(ui: &Ui, window: Rect, sizable: bool) -> FloatingChrome {
     let grabber = Rect::from_center_size(pos2(window.center().x, window.top() + 12.0), egui::vec2(40.0, 4.0));
     ui.painter().rect_filled(grabber, 2, argb(GRABBER));
     let strip = Rect::from_min_size(window.min, egui::vec2(window.width(), FLOATING_TOP));
@@ -88,6 +257,15 @@ pub fn floating_chrome(ui: &Ui, window: Rect) -> FloatingChrome {
         ui.painter().line_segment([c + a, c + b], stroke);
     }
     let closed = ui.interact(close, ui.scope_id().with("floating close"), Sense::click()).clicked();
+    // beside Close, while the panels fold
+    let folded = panels_fold(ui.ctx()) && fold_button(ui, close.translate(egui::vec2(-40.0, 0.0)));
+    let act = window_menu(
+        ui,
+        Rect::from_center_size(pos2(window.left() + 14.0 + 20.0, window.top() + 22.0), egui::vec2(40.0, 40.0)),
+    );
+    if !sizable {
+        return FloatingChrome { moving, sizing: false, closed, folded, act };
+    }
     let corner = Rect::from_min_size(
         pos2(window.right() - 6.0 - 36.0, window.bottom() - FLOATING_BOTTOM),
         egui::vec2(36.0, FLOATING_BOTTOM),
@@ -98,7 +276,20 @@ pub fn floating_chrome(ui: &Ui, window: Rect) -> FloatingChrome {
         ui.painter().line_segment([end - egui::vec2(reach, 0.0), end - egui::vec2(0.0, reach)], line);
     }
     let sizing = ui.interact(corner, ui.scope_id().with("floating corner"), Sense::drag()).drag_started();
-    FloatingChrome { moving, sizing, closed }
+    FloatingChrome { moving, sizing, closed, folded, act }
+}
+
+/// The strips of a toolbar or an adjustment's controls floating (`strip` over it, in the window's
+/// points): its grabber (the whole strip moves it), Close, its fold while the panels fold, and its
+/// menu. What was done to them.
+pub fn strip_chrome(ui: &Ui, strip: Rect) -> FloatingChrome {
+    let window = Rect::from_min_size(strip.min, egui::vec2(strip.width(), FLOATING_TOP + FLOATING_BOTTOM));
+    floating_chrome_of(ui, window, false)
+}
+
+/// The grabbers' ink.
+pub fn grabber_ink() -> Themed {
+    GRABBER
 }
 
 /// A panel hanging from its button, while a plugin lets it float: the grabber at the top of its
@@ -205,7 +396,9 @@ pub fn in_panel_by(ctx: &egui::Context, by: Vec2) -> Vec2 {
 /// The area a panel at `rect` (arrow included) is drawn in, over the canvas: kept to the window
 /// and clipped to it as the panel measures it.
 pub fn area(ctx: &egui::Context, id: egui::Id, rect: Rect) -> egui::Area {
-    egui::Area::new(id).fixed_pos(rect.min).order(egui::Order::Foreground).constrain_to(screen(ctx))
+    // floating as a window: with the other windows, under the panels hanging from the bar
+    let order = if float_window(ctx).is_some() { egui::Order::Middle } else { egui::Order::Foreground };
+    egui::Area::new(id).fixed_pos(rect.min).order(order).constrain_to(screen(ctx))
 }
 
 /// The side bar shows (or not) on the right (or the left), its centre kept at `centre` (a share of
@@ -223,11 +416,104 @@ pub fn side_bar_shown_at(ctx: &egui::Context) -> Option<Rect> {
     })
 }
 
+/// What a panel opened from a button of a bar Edit layout moved hangs from: the bars (which work out
+/// where), the bar, and the button's middle in the window.
+type HangFrom = Option<(std::sync::Arc<procraft_core::BarLayout>, procraft_core::LayoutBar, Pos2)>;
+
+/// Where the panel open now hangs from a button Edit layout moved, in the panels' space: the side
+/// of the bar it is on, its left edge, its top (its bottom, over the bar), its arrow's tip along its
+/// edge (from its left, or its top beside the bar) and the room it has. See
+/// [`procraft_core::BarLayout::hang`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Hung {
+    side: HangSide,
+    x: f32,
+    y: f32,
+    arrow: f32,
+    room: f32,
+}
+
+/// The panel opened from now on hangs from the button whose middle is at `from`'s point on its bar,
+/// which Edit layout moved; with none, from where its button always is.
+pub fn hang_from(ctx: &egui::Context, from: HangFrom) {
+    ctx.data_mut(|d| {
+        d.insert_temp(egui::Id::unique("panel hang from"), from);
+        d.insert_temp(egui::Id::unique("panel hung"), None::<Hung>);
+    });
+}
+
+/// Where a panel `width` wide hangs from a button Edit layout moved, while one does (see
+/// [`hang_from`]): kept for its frame and body.
+fn hang(ctx: &egui::Context, width: f32) -> Option<Hung> {
+    let (bars, bar, middle) = ctx.data(|d| d.get_temp::<HangFrom>(egui::Id::unique("panel hang from"))).flatten()?;
+    let (place, r) = (bars.shown(bar)?, bars.rect(bar)?);
+    let along = if place.vertical { middle.y - r.y } else { middle.x - r.x };
+    let to_window = to_window(ctx);
+    let k = to_window.scaling;
+    let hang = bars.hang(bar, along, width * k, ARROW_SHIFT, POPOVER_GAP, ARROW_HEIGHT * k)?;
+    let at = to_window.inverse() * pos2(hang.x, hang.y);
+    let hung = Hung { side: hang.side, x: at.x, y: at.y, arrow: hang.arrow / k, room: hang.room / k };
+    ctx.data_mut(|d| d.insert_temp(egui::Id::unique("panel hung"), Some(hung)));
+    Some(hung)
+}
+
+fn hung(ctx: &egui::Context) -> Option<Hung> {
+    ctx.data(|d| d.get_temp::<Option<Hung>>(egui::Id::unique("panel hung"))).flatten()
+}
+
+/// A panel at `rect` (its arrow on top included) under its button, wanting `content` tall (arrow
+/// included) and ending `margin` short of the window's edge: as it is; or, hanging from a button
+/// Edit layout moved, under, over or beside it, as tall as fits.
+pub fn hung_rect(ctx: &egui::Context, rect: Rect, content: f32, margin: f32) -> Rect {
+    // floating as a window: under its strip, down to its corner's room
+    if let Some((window, sizable)) = float_window(ctx) {
+        ctx.data_mut(|d| d.insert_temp(egui::Id::unique("panel float wants"), Some(content)));
+        let bottom = if sizable { window.bottom() - FLOATING_BOTTOM } else { window.bottom() };
+        return Rect::from_min_max(
+            pos2(window.left(), window.top() + FLOATING_TOP - ARROW_HEIGHT),
+            pos2(window.right(), bottom),
+        );
+    }
+    let Some(h) = hung(ctx) else { return rect };
+    let width = rect.width();
+    match h.side {
+        HangSide::Below => Rect::from_min_size(pos2(h.x, h.y), Vec2::new(width, content.min(h.room - margin).max(0.0))),
+        HangSide::Above => {
+            let height = content.min(h.room - margin).max(0.0);
+            Rect::from_min_size(pos2(h.x, h.y - height), Vec2::new(width, height))
+        }
+        HangSide::Left | HangSide::Right => {
+            let height = (content - ARROW_HEIGHT).min(h.room).max(0.0);
+            Rect::from_min_size(pos2(h.x, h.y), Vec2::new(width + ARROW_HEIGHT, height))
+        }
+    }
+}
+
+/// A panel's body for a panel at `rect` (arrow included), its arrow on the side it hangs from now.
+pub fn body_in(ctx: &egui::Context, rect: Rect) -> Rect {
+    if float_window(ctx).is_some() {
+        return body(rect);
+    }
+    match hung(ctx).map(|h| h.side) {
+        Some(HangSide::Above) => Rect::from_min_max(rect.min, pos2(rect.right(), rect.bottom() - ARROW_HEIGHT)),
+        Some(HangSide::Right) => side_body(rect, true),
+        Some(HangSide::Left) => side_body(rect, false),
+        _ => body(rect),
+    }
+}
+
 /// Where a panel `width` wide goes, hanging from a button centred at `button_x`: its left edge and
 /// its arrow's tip from that edge, in the panels' space while one is drawn. It shows centred on
 /// the button (the tip `ARROW_SHIFT` right of the button's centre) and inside the window, clear of
-/// the side bar as it shows, on whichever side it is.
+/// the side bar as it shows, on whichever side it is. From a button Edit layout moved, it goes
+/// where [`hang_from`] says.
 pub fn place(ctx: &egui::Context, width: f32, button_x: f32) -> (f32, f32) {
+    if let Some((window, _)) = float_window(ctx) {
+        return (window.left(), 0.0);
+    }
+    if let Some(h) = hang(ctx, width) {
+        return (h.x, h.arrow);
+    }
     let to_window = to_window(ctx);
     let (k, x) = (to_window.scaling, to_window.translation.x);
     let screen = ctx.content_rect();
@@ -252,14 +538,29 @@ pub fn body(rect: Rect) -> Rect {
     Rect::from_min_max(pos2(rect.left(), rect.top() + ARROW_HEIGHT), rect.max)
 }
 
-/// Draws a panel at `rect` (its arrow on top, the tip `arrow_x` from its left edge): the shadow
-/// round it, then its frosted body, whose blur goes into `backdrops` (window pixels). Its layer
-/// shows it as the panels' space does, its icons and shapes drawn for that.
+/// Draws a panel at `rect` (its arrow on top, the tip `arrow_x` from its left edge; or on the side
+/// it hangs from a moved button by, see [`hang_from`]): the shadow round it, then its frosted body,
+/// whose blur goes into `backdrops` (window pixels). Its layer shows it as the panels' space does,
+/// its icons and shapes drawn for that.
 pub fn frame(ui: &Ui, look: &mut Look, slot: &'static str, rect: Rect, arrow_x: f32, backdrops: &mut Vec<f32>) {
+    // floating as a window: its frame and strips, what was done to them kept for the interface
+    if let Some((window, sizable)) = float_window(ui.ctx()) {
+        floating_panel_frame(ui, look, slot, window, backdrops);
+        let chrome = floating_chrome_of(ui, window, sizable);
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("panel float chrome"), chrome));
+        return;
+    }
     let to_window = to_window(ui.ctx());
     ui.ctx().set_transform_layer(ui.layer_id(), to_window);
     look.set_zoom(ui.layer_id(), to_window.scaling);
-    let body = body(rect);
+    let side = hung(ui.ctx()).map(|h| h.side);
+    let body = body_in(ui.ctx(), rect);
+    // hanging under its button, while a plugin lets it float: its grabber tears it off
+    let tears = ui.ctx().data(|d| d.get_temp::<bool>(egui::Id::unique("panel tears"))).unwrap_or(false);
+    if tears && matches!(side, None | Some(HangSide::Below)) {
+        let torn = undock_grabber(ui, body);
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("panel torn"), torn));
+    }
     let ppp = ui.ctx().pixels_per_point();
     let shown = to_window.mul_rect(body);
     let edges = [shown.left(), shown.top(), shown.right(), shown.bottom(), POPOVER_CORNER * to_window.scaling];
@@ -274,13 +575,36 @@ pub fn frame(ui: &Ui, look: &mut Look, slot: &'static str, rect: Rect, arrow_x: 
     };
     ui.painter().add(shadow.as_shape(body, POPOVER_CORNER));
     let size = rect.size();
-    look.shape(ui, slot, (arrow_x * 100.0).round() as i32, rect, |pixmap, t| {
-        let mut pb = tiny_skia::PathBuilder::new();
+    let key = ((arrow_x * 100.0).round() as i32, side.map(|s| s as i32));
+    look.shape(ui, slot, key, rect, |pixmap, t| {
         let (half, tip) = (ARROW_HEIGHT, 2.0);
+        let near = |from: f32| (from - half - tip).clamp(0.0, POPOVER_CORNER);
+        match side {
+            Some(HangSide::Left | HangSide::Right) => {
+                let left = side == Some(HangSide::Right);
+                frost(pixmap, side_outline(size, arrow_x, left, POPOVER_CORNER), t);
+                return;
+            }
+            // its arrow down at the button, under it
+            Some(HangSide::Above) => {
+                let mut pb = tiny_skia::PathBuilder::new();
+                let bottom = size.y - ARROW_HEIGHT;
+                let corners = [POPOVER_CORNER, POPOVER_CORNER, near(size.x - arrow_x), near(arrow_x)];
+                round_rect(&mut pb, Rect::from_min_max(Pos2::ZERO, pos2(size.x, bottom)), corners);
+                pb.move_to(arrow_x - half - tip, bottom - 0.5);
+                pb.line_to(arrow_x - tip, size.y - tip);
+                pb.quad_to(arrow_x, size.y, arrow_x + tip, size.y - tip);
+                pb.line_to(arrow_x + half + tip, bottom - 0.5);
+                pb.close();
+                frost(pixmap, pb, t);
+                return;
+            }
+            Some(HangSide::Below) | None => {}
+        }
+        let mut pb = tiny_skia::PathBuilder::new();
         // a corner the arrow comes near is rounded less, so that the arrow rises from a straight
         // edge rather than hanging over the curve (at a small interface size, or a button near
         // the window's edge)
-        let near = |from: f32| (from - half - tip).clamp(0.0, POPOVER_CORNER);
         let corners = [near(arrow_x), near(size.x - arrow_x), POPOVER_CORNER, POPOVER_CORNER];
         round_rect(&mut pb, Rect::from_min_max(pos2(0.0, ARROW_HEIGHT), size.to_pos2()), corners);
         pb.move_to(arrow_x - half - tip, ARROW_HEIGHT + 0.5);

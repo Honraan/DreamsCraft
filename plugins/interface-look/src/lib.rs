@@ -1,11 +1,10 @@
-//! Interface look: the interface as one likes it, five features each with a switch of its own and
-//! its controls under it. Interface: its size (part by part if one likes) and accent colour, undo
-//! and redo or every action without a notice, and panels left open while one paints
-//! ([`interface`]). Slider look: the side bar's sliders as frosted glass ([`sliders`]). Canvas
-//! surround: the area round the canvas in a colour of one's own, or a picture ([`surround`]).
-//! Floating panels: the Layers panel and the brush library in windows of their own ([`floating`]).
-//! Coloured brush previews: the brush library's strokes in the colour one paints with
-//! ([`previews`]). It's a plugin made of those features, not part of the app:
+//! Interface look: the interface as one likes it, four features each with a switch of its own and
+//! its controls under it. Interface: its size (part by part if one likes) and accent colour, and
+//! undo and redo or every action without a notice ([`interface`]). Slider look: the side bar's
+//! sliders as frosted glass ([`sliders`]). Canvas surround: the area round the canvas in a colour of
+//! one's own, or a picture ([`surround`]). Coloured brush previews: the brush library's strokes in
+//! the colour one paints with ([`previews`]). Floating panels and panels left open went to Edit
+//! layout, with what was set for them. It's a plugin made of those features, not part of the app:
 //! `tools/pack_plugin.py` makes a `.procraft-plugin` file of it.
 //!
 //! The app runs each feature that is on in a copy of this code of its own, and tells that copy the
@@ -13,7 +12,6 @@
 //! has it while that feature's switch is off. The interface is written down at the top of
 //! `crates/core/src/plugin_run.rs`.
 
-mod floating;
 mod interface;
 mod previews;
 mod sliders;
@@ -21,20 +19,19 @@ mod surround;
 
 /// The controls by their place in the manifest, as they start: each feature's switch off, and
 /// Canvas surround's picture none.
-const STARTS: [f32; 34] = [
-    0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 212.0, 1.0, 0.0, 0.0, 0.0, // Interface
+const STARTS: [f32; 30] = [
+    0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 212.0, 1.0, 0.0, 0.0, // Interface
     0.0, 0.35, 1.0, // Slider look
     0.0, 30.0, 0.1, 0.3, 0.0, 0.0, // Canvas surround
-    0.0, 1.0, 1.0, // Floating panels
     0.0, 0.0, 200.0, 0.6, 1.0, 0.0, // Coloured brush previews
 ];
-static CONTROLS: kit::Controls<34> = kit::Controls::new(STARTS);
+static CONTROLS: kit::Controls<30> = kit::Controls::new(STARTS);
 kit::controls!(CONTROLS);
 
 /// Interface's switch, then its own: the size's switch, the size, whether the parts are sized
 /// separately, the parts' sizes (in the order the app numbers the parts: floating panels, popovers
 /// and menus, the side bar, the top bar, the panels), keeping clear, the accent's switch, hue and
-/// saturation, and the switches for the notices and the panels.
+/// saturation, and the switches for the notices.
 pub const INTERFACE: usize = 0;
 pub const SIZE_ON: usize = 1;
 pub const SIZE: usize = 2;
@@ -50,33 +47,28 @@ pub const HUE: usize = 11;
 pub const SATURATION: usize = 12;
 pub const HIDE_UNDO: usize = 13;
 pub const HIDE_NOTICES: usize = 14;
-pub const PIN_PANELS: usize = 15;
 /// Slider look's switch, then its own: how opaque the tracks are (0 to 1), and whether what is
 /// behind them is frosted.
-pub const SLIDER_LOOK: usize = 16;
-pub const SLIDER_OPACITY: usize = 17;
-pub const FROSTED: usize = 18;
+pub const SLIDER_LOOK: usize = 15;
+pub const SLIDER_OPACITY: usize = 16;
+pub const FROSTED: usize = 17;
 /// Canvas surround's switch, then its own: the colour's hue (degrees), saturation and brightness
 /// (0 to 1), whether a picture shows, and whether one is picked.
-pub const CANVAS_SURROUND: usize = 19;
-pub const SURROUND_HUE: usize = 20;
-pub const SURROUND_SATURATION: usize = 21;
-pub const SURROUND_BRIGHTNESS: usize = 22;
-pub const OWN_PICTURE: usize = 23;
-pub const PICTURE: usize = 24;
-/// Floating panels' switch, then its own: whether the Layers panel and the brush library may float.
-pub const FLOATING_PANELS: usize = 25;
-pub const FLOAT_LAYERS: usize = 26;
-pub const FLOAT_BRUSHES: usize = 27;
+pub const CANVAS_SURROUND: usize = 18;
+pub const SURROUND_HUE: usize = 19;
+pub const SURROUND_SATURATION: usize = 20;
+pub const SURROUND_BRIGHTNESS: usize = 21;
+pub const OWN_PICTURE: usize = 22;
+pub const PICTURE: usize = 23;
 /// Coloured brush previews' switch, then its own: whether it draws in a colour of its own, that
 /// colour's hue (degrees), saturation and brightness (0 to 1), and whether the brush in use is
 /// drawn so too.
-pub const COLOURED_PREVIEWS: usize = 28;
-pub const OWN_COLOUR: usize = 29;
-pub const PREVIEW_HUE: usize = 30;
-pub const PREVIEW_SATURATION: usize = 31;
-pub const PREVIEW_BRIGHTNESS: usize = 32;
-pub const CHOSEN: usize = 33;
+pub const COLOURED_PREVIEWS: usize = 24;
+pub const OWN_COLOUR: usize = 25;
+pub const PREVIEW_HUE: usize = 26;
+pub const PREVIEW_SATURATION: usize = 27;
+pub const PREVIEW_BRIGHTNESS: usize = 28;
+pub const CHOSEN: usize = 29;
 
 /// The colour (0xRRGGBB) the interface draws `role` in: the accent as Interface says, the surround
 /// as Canvas surround says (each leaves every other role); -1 for any other role, or one whose
@@ -113,7 +105,7 @@ fn rgb(hue: f32, saturation: f32, brightness: f32) -> i32 {
 
 /// Each feature's switch, in order: what comes after one, up to the next, is its own.
 #[cfg(test)]
-const FEATURES: [usize; 5] = [INTERFACE, SLIDER_LOOK, CANVAS_SURROUND, FLOATING_PANELS, COLOURED_PREVIEWS];
+const FEATURES: [usize; 4] = [INTERFACE, SLIDER_LOOK, CANVAS_SURROUND, COLOURED_PREVIEWS];
 
 /// The tests one at a time, as they share the controls.
 #[cfg(test)]

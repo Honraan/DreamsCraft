@@ -20,6 +20,7 @@ mod copy_paste;
 mod crop;
 mod curve;
 mod custom_canvas;
+mod edit_layout;
 mod export_card;
 mod files;
 mod filter_list;

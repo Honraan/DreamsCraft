@@ -100,6 +100,21 @@ final class CanvasModel {
     private(set) var panelFading = false
     /// The colour panel floating, dragged out by its grabber: its window's top left.
     var floatingColorsAt: CGPoint?
+    /// The floating panels' places, the core's to work out while a plugin lays them out (see
+    /// PanelLayoutModel.swift); how the plugins lay them out, as last asked; and what goes up as the
+    /// layout changes, for what shows it to show it again.
+    @ObservationIgnored let panelLayout = PanelLayout()
+    var layoutLook = PanelLayoutLook(on: false, snap: 0, fold: false, makeRoom: false, edit: false)
+    /// The interface's bars as Edit layout moves them (see PanelLayoutModel.swift), whether it is
+    /// on, and what goes up as a bar moves.
+    @ObservationIgnored let barLayout = BarLayout()
+    /// Edit layout's named layouts (see PanelLayoutModel.swift), and what goes up as they change.
+    @ObservationIgnored let namedLayouts = NamedLayouts()
+    var namedChanges = 0
+    var editingLayout = false
+    var barChanges = 0
+    @ObservationIgnored var barsLandscape: Bool?
+    var layoutChanges = 0
     /// The colour panel's grabber is being dragged out: the panel stays, unseen, until let go.
     var colorsUndocking = false
     private(set) var canUndo = false
@@ -389,6 +404,7 @@ final class CanvasModel {
         // the plugins on first: their brush engines make brushes of the files waiting too
         applyPlugins()
         PluginsModel.shared.onChange = { [weak self] in self?.applyPlugins() }
+        readLayout()
         addPendingBrushes()
         brushSets = session.brushLibrary()
         readLibraries()
@@ -1161,16 +1177,26 @@ final class CanvasModel {
         }
         feedback()
         _ = switchModes(.panel(colour: p == .color))
+        // the colour button with the panel floating hidden: it shows again
+        if p == .color, floatingColorsAt != nil, layoutLook.on, panelLayout.isHidden(piece: .colours) {
+            hidePiece(.colours, false)
+            return
+        }
         // the colour button with the panel floating: it goes back in its place
         if p == .color, floatingColorsAt != nil {
-            floatingColorsAt = nil
+            closeColours()
             panel = .none
         }
         panelFading = false
-        // as do the Layers and the brush library's buttons with theirs floating
-        let floatingPanel: FloatingPanel? = p == .layers ? .layers : p == .brushes ? .brushes : nil
-        if let floatingPanel, floating.shown(floatingPanel) != nil {
-            floating.close(floatingPanel)
+        // a panel's button with its window hidden shows the window again
+        let piece = floatingPiece(p)
+        if let piece, panelLayout.mayFloat(piece: piece), panelLayout.isOpen(piece: piece), panelLayout.isHidden(piece: piece) {
+            hidePiece(piece, false)
+            return
+        }
+        // as do the Layers and the brush library's buttons with theirs floating, and the others' with theirs
+        if let piece, shownPiece(piece) != nil {
+            closePiece(piece)
             panel = .none
         }
         panel = panel == p ? .none : p
@@ -1194,7 +1220,7 @@ final class CanvasModel {
 
     /// The Layers panel shows: hanging from its button, or floating.
     var layersShown: Bool {
-        panel == .layers || floating.shown(.layers) != nil
+        panel == .layers || floatingWindow(.layers) != nil
     }
 
     func closePanels() {

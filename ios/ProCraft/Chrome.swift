@@ -16,45 +16,14 @@ struct TopBar: View {
     var body: some View {
         GeometryReader { bar in
             let gaps = Pc.barGaps(bar.size.width)
-            // the layers and colour panels take the highlight from the current tool while open
-            let panelOpen = model.panel == .layers || model.panel == .color || model.transforming
-                || model.selecting || model.adjusting
             ZStack {
                 HStack(spacing: gaps.action) {
-                    Text("Gallery")
-                        .font(.system(size: 18, weight: .medium))
-                        .foregroundStyle(Pc.barText)
-                        .lineLimit(1)
-                        .fixedSize()
-                        .offset(y: -1)
-                        .frame(width: Pc.galleryWidth, height: Pc.barButtonHeight, alignment: .leading)
-                        .contentShape(Rectangle())
-                        .onTapGesture { model.onClose() }
-                    ActionButton(icon: PcIcons.actions, selected: model.panel == .actions) { model.toggle(.actions) }
-                    ActionButton(icon: PcIcons.adjustments, selected: model.panel == .adjustments || model.adjusting || model.recoloring) {
-                        model.toggle(.adjustments)
-                    }
-                    ActionButton(icon: PcIcons.selection, selected: model.selecting, glyph: 33) {
-                        model.toggleSelecting()
-                    }
-                    ActionButton(icon: PcIcons.transform, selected: model.transforming, glyph: 44) {
-                        model.toggleTransform()
-                    }
+                    ActionButtons(model: model, upright: false)
                 }
                 .padding(.leading, Pc.barMargin)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 HStack(spacing: gaps.tool) {
-                    ToolButton(icon: PcIcons.brush, selected: !panelOpen && model.tool == .paint, onHold: { model.toolHeld(.paint) }) {
-                        model.toolPressed(.paint)
-                    }
-                    ToolButton(icon: PcIcons.smudge, selected: !panelOpen && model.tool == .smudge, onHold: { model.toolHeld(.smudge) }) {
-                        model.toolPressed(.smudge)
-                    }
-                    ToolButton(icon: PcIcons.erase, selected: !panelOpen && model.tool == .erase, onHold: { model.toolHeld(.erase) }) {
-                        model.toolPressed(.erase)
-                    }
-                    ToolButton(icon: PcIcons.layers, selected: model.panel == .layers) { model.toggle(.layers) }
-                    ColorButton(model: model)
+                    ToolButtons(model: model, upright: false)
                 }
                 .padding(.trailing, Pc.barMargin)
                 .frame(maxWidth: .infinity, alignment: .trailing)
@@ -73,6 +42,102 @@ struct TopBar: View {
             }
         }
         .modifier(ScaledAcross(k: Look.shared.scale(.topBar), height: Pc.barHeight))
+    }
+}
+
+/// Gallery and the actions: the top bar's left half, each button turned to stand in a column while
+/// `upright`.
+private struct ActionButtons: View {
+    let model: CanvasModel
+    let upright: Bool
+
+    var body: some View {
+        Text("Gallery")
+            .font(.system(size: 18, weight: .medium))
+            .foregroundStyle(Pc.barText)
+            .lineLimit(1)
+            .fixedSize()
+            .offset(y: upright ? 0 : -1)
+            .frame(width: Pc.galleryWidth, height: Pc.barButtonHeight, alignment: upright ? .center : .leading)
+            // upright, the word reads up the column
+            .rotationEffect(.degrees(upright ? -90 : 0))
+            .frame(width: upright ? Pc.barButtonHeight : Pc.galleryWidth, height: upright ? Pc.galleryWidth : Pc.barButtonHeight)
+            .contentShape(Rectangle())
+            .onTapGesture { model.onClose() }
+        ActionButton(icon: PcIcons.actions, selected: model.panel == .actions, upright: upright) { model.toggle(.actions) }
+        ActionButton(icon: PcIcons.adjustments, selected: model.panel == .adjustments || model.adjusting || model.recoloring, upright: upright) {
+            model.toggle(.adjustments)
+        }
+        ActionButton(icon: PcIcons.selection, selected: model.selecting, glyph: 33, upright: upright) {
+            model.toggleSelecting()
+        }
+        ActionButton(icon: PcIcons.transform, selected: model.transforming, glyph: 44, upright: upright) {
+            model.toggleTransform()
+        }
+    }
+}
+
+/// The tools, Layers and the colour: the top bar's right half, standing in a column while `upright`.
+private struct ToolButtons: View {
+    let model: CanvasModel
+    let upright: Bool
+
+    var body: some View {
+        // the layers and colour panels take the highlight from the current tool while open
+        let panelOpen = model.panel == .layers || model.panel == .color || model.transforming
+            || model.selecting || model.adjusting
+        ToolButton(icon: PcIcons.brush, selected: !panelOpen && model.tool == .paint, upright: upright, onHold: { model.toolHeld(.paint) }) {
+            model.toolPressed(.paint)
+        }
+        ToolButton(icon: PcIcons.smudge, selected: !panelOpen && model.tool == .smudge, upright: upright, onHold: { model.toolHeld(.smudge) }) {
+            model.toolPressed(.smudge)
+        }
+        ToolButton(icon: PcIcons.erase, selected: !panelOpen && model.tool == .erase, upright: upright, onHold: { model.toolHeld(.erase) }) {
+            model.toolPressed(.erase)
+        }
+        ToolButton(icon: PcIcons.layers, selected: model.panel == .layers, upright: upright) { model.toggle(.layers) }
+        ColorButton(model: model, upright: upright)
+    }
+}
+
+/// Half of the top bar (`left`, else the right) where Edit layout moved it: on glass of its own, its
+/// buttons in a row, or in a column while `upright` against a side; as long either way, laid out at
+/// its own points and shown as big as the top bar shows.
+struct TopBarHalf: View {
+    let model: CanvasModel
+    let left: Bool
+    let upright: Bool
+    let screenWidth: CGFloat
+
+    var body: some View {
+        let k = Look.shared.scale(.topBar)
+        let gaps = Pc.barGaps(screenWidth / k)
+        let length = topBarHalfLength(left: left, gaps: gaps)
+        let gap = left ? gaps.action : gaps.tool
+        let w = upright ? Pc.barHeight : length
+        let h = upright ? length : Pc.barHeight
+        Group {
+            if upright {
+                VStack(spacing: gap) {
+                    if left { ActionButtons(model: model, upright: true) } else { ToolButtons(model: model, upright: true) }
+                }
+            } else {
+                HStack(spacing: gap) {
+                    if left { ActionButtons(model: model, upright: false) } else { ToolButtons(model: model, upright: false) }
+                }
+            }
+        }
+        .frame(width: w, height: h)
+        .background {
+            ZStack {
+                Rectangle().fill(.ultraThinMaterial)
+                    .environment(\.colorScheme, Look.shared.light ? .light : .dark)
+                Pc.bar
+            }
+            .clipShape(RoundedRectangle(cornerRadius: Pc.barHeight / 2, style: .circular))
+        }
+        .scaleEffect(k, anchor: .topLeading)
+        .frame(width: w * k, height: h * k, alignment: .topLeading)
     }
 }
 
@@ -103,6 +168,7 @@ private struct ActionButton: View {
     let icon: PcIcon
     let selected: Bool
     var glyph: CGFloat = 36
+    var upright = false
     let action: () -> Void
 
     var body: some View {
@@ -114,7 +180,7 @@ private struct ActionButton: View {
             PcIconView(icon, size: glyph, color: selected ? .white : Pc.actionGlyph)
         }
         .animation(highlight(selected), value: selected)
-        .frame(width: Pc.barButtonWidth, height: Pc.barButtonHeight)
+        .frame(width: upright ? Pc.barButtonHeight : Pc.barButtonWidth, height: upright ? Pc.barButtonWidth : Pc.barButtonHeight)
         .contentShape(Rectangle())
         .onTapGesture(perform: action)
     }
@@ -124,6 +190,7 @@ private struct ActionButton: View {
 private struct ToolButton: View {
     let icon: PcIcon
     let selected: Bool
+    var upright = false
     var onHold: (() -> Void)?
     let action: () -> Void
 
@@ -131,7 +198,7 @@ private struct ToolButton: View {
         // a 44 frame shown as it is, over the 38 tall button
         let button = PcIconView(icon, size: 44, color: selected ? Pc.barGlyphSelected : Pc.barGlyph)
             .animation(highlight(selected), value: selected)
-            .frame(width: Pc.barButtonWidth, height: Pc.barButtonHeight)
+            .frame(width: upright ? Pc.barButtonHeight : Pc.barButtonWidth, height: upright ? Pc.barButtonWidth : Pc.barButtonHeight)
             .contentShape(Rectangle())
             .onTapGesture(perform: action)
         if let onHold {
@@ -145,6 +212,7 @@ private struct ToolButton: View {
 /// The colour button: the colour painted with, ringed only where it would fade into the bar.
 private struct ColorButton: View {
     let model: CanvasModel
+    var upright = false
 
     /// The brightness (HSB) under which it is ringed on the dark bar.
     private static let darkRingBelow: Float = 0.35
@@ -161,7 +229,7 @@ private struct ColorButton: View {
                 }
             }
             .frame(width: Pc.colorDot, height: Pc.colorDot)
-            .frame(width: Pc.barButtonWidth, height: Pc.barButtonHeight)
+            .frame(width: upright ? Pc.barButtonHeight : Pc.barButtonWidth, height: upright ? Pc.barButtonWidth : Pc.barButtonHeight)
             // held, the colour painted with before; dragged out onto the canvas, it fills there
             .overlay {
                 DropSource(model: model, onHold: { model.previousColor() }, onTap: { model.toggle(.color) })

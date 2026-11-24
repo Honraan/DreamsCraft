@@ -24,7 +24,7 @@ const MANIFEST: &str = "craft-extension.json";
 /// The manifest format read here: a newer one may mean anything, so it is refused.
 const SCHEMA: u64 = 1;
 /// What a plugin's code is written to, see [`crate::plugin_run`]: a newer one is refused too.
-const INTERFACE: u32 = 19;
+const INTERFACE: u32 = 20;
 /// The first interface with features (several plugins' worth in one, each a switch of its own).
 const FEATURES_FROM: u32 = 16;
 /// The interface filter layers came in.
@@ -3098,7 +3098,7 @@ pub(crate) mod tests {
         };
         // a hook or an interface this app doesn't have is for a newer one
         assert_eq!(of("/hooks", json!(["position", "layers"])), Refusal::Newer);
-        assert_eq!(of("/compat/procraft/interface", json!(20)), Refusal::Newer);
+        assert_eq!(of("/compat/procraft/interface", json!(INTERFACE + 1)), Refusal::Newer);
         assert_eq!(of("/hooks", json!([])), Refusal::Described);
         assert_eq!(of("/hooks", json!(["position", "position"])), Refusal::Described);
         assert_eq!(of("/compat/procraft", json!({ "min_app": "0.0.1" })), Refusal::Described);
@@ -3694,7 +3694,7 @@ pub(crate) mod tests {
         };
         // they came with interface 17; an older app says it needs a newer one
         assert_eq!(of("/compat/procraft/interface", json!(16)), Refusal::Described);
-        assert_eq!(of("/compat/procraft/interface", json!(20)), Refusal::Newer);
+        assert_eq!(of("/compat/procraft/interface", json!(INTERFACE + 1)), Refusal::Newer);
         // a heading, a value or few, of their own; none of the plugin's controls
         assert_eq!(of("/filters/0/group", json!(" ")), Refusal::Described);
         assert_eq!(of("/filters/0/group", json!("A heading much longer than it can be")), Refusal::Described);

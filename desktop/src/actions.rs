@@ -103,6 +103,8 @@ pub enum Act {
     /// then [`Showing::plugin_actions`]: a switch flipped, a setting named at every step moved to
     /// the next, an action run.
     PluginPlaced(u8),
+    /// Edit Layout, while a plugin lets the bars move: their handles show.
+    EditLayout,
     GestureControls,
     CanvasInfo,
     AnimationAssist,
@@ -283,6 +285,8 @@ pub struct Showing {
     /// The controls and actions plugins put in the Canvas tab, after its own rows.
     pub plugin_controls: Vec<PluginControl>,
     pub plugin_actions: Vec<PluginAction>,
+    /// A plugin lets the bars move: Edit Layout follows those rows.
+    pub edit_layout: bool,
 }
 
 /// The rows of what plugins put in the Canvas tab: each control as its card shows it, then each
@@ -388,6 +392,8 @@ fn groups(tab: usize, showing: &Showing, prefs: &Prefs) -> Vec<Vec<Row>> {
         .into_iter()
         // what plugins put here
         .chain(Some(plugin_placed_rows(showing)).filter(|rows| !rows.is_empty()))
+        // and Edit Layout, while a plugin lets the bars move
+        .chain(showing.edit_layout.then(|| vec![Button("Edit Layout", None, Some(Act::EditLayout))]))
         .collect(),
         2 => vec![
             vec![
@@ -750,12 +756,13 @@ impl Actions {
         }
         let height = content.min(screen.bottom() - BOTTOM_MARGIN - top);
         let rect = Rect::from_min_size(pos2(left, top), vec2(ACTIONS_WIDTH, height));
+        let rect = panel::hung_rect(ctx, rect, content, BOTTOM_MARGIN);
         let mut tapped = None;
         let page = self.page;
         panel::area(ctx, Id::unique("actions panel"), rect).show(ctx, |ui| {
             ui.allocate_rect(rect, Sense::click());
             panel::frame(ui, look, "actions frame", rect, arrow_x, backdrops);
-            let body = panel::body(rect);
+            let body = panel::body_in(ui.ctx(), rect);
             ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
                 ui.set_clip_rect(body.intersect(ui.clip_rect()));
                 let width = body.width();

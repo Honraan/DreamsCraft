@@ -871,7 +871,9 @@ private fun PluginCanvasRows(vm: CanvasViewModel) {
     val list = vm.pluginList
     val controls = remember(list) { vm.plugins.controlsIn(io.github.artcraftandroid.procraft.core.PluginPlace.CANVAS) }
     val actions = remember(list) { vm.plugins.actionsIn(io.github.artcraftandroid.procraft.core.PluginPlace.CANVAS) }
-    if (controls.isEmpty() && actions.isEmpty()) return
+    // Edit Layout, while a plugin lets the bars move
+    val edits = vm.layoutLook.edit
+    if (controls.isEmpty() && actions.isEmpty() && !edits) return
     Spacer(Modifier.height(20.dp))
     Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(22.dp)).background(Pc.ActionsGroup)) {
         controls.forEachIndexed { i, control ->
@@ -881,6 +883,10 @@ private fun PluginCanvasRows(vm: CanvasViewModel) {
         actions.forEachIndexed { i, action ->
             if (i > 0 || controls.isNotEmpty()) Box(Modifier.fillMaxWidth().height(1.dp).background(Pc.ActionsSeparator))
             PluginActionRow(action.label) { vm.runPluginAction(action.key) }
+        }
+        if (edits) {
+            if (controls.isNotEmpty() || actions.isNotEmpty()) Box(Modifier.fillMaxWidth().height(1.dp).background(Pc.ActionsSeparator))
+            PluginActionRow("Edit Layout") { vm.startEditLayout() }
         }
     }
 }

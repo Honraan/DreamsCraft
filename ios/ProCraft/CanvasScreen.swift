@@ -57,15 +57,37 @@ struct CanvasScreen: View {
                 }
                 ColorDropBand(drop: model.drop, width: screen.size.width)
                 // the top bar slides up off the screen and the side bar out to its side as they fade
-                TopBar(model: model)
-                    .offset(y: hidden ? -Pc.barHeight : 0)
-                    .opacity(hidden ? 0 : 1)
+                if model.barMoved(.topLeft) == nil, model.barMoved(.topRight) == nil {
+                    TopBar(model: model)
+                        .offset(y: hidden ? -Pc.barHeight : 0)
+                        .opacity(hidden ? 0 : 1)
+                } else {
+                    // moved by Edit layout: each half on glass of its own where it was left
+                    ForEach([LayoutBar.topLeft, .topRight], id: \.self) { bar in
+                        if let at = model.barMoved(bar) ?? model.barLayout.shown(bar: bar) {
+                            TopBarHalf(model: model, left: bar == .topLeft, upright: at.vertical, screenWidth: screen.size.width)
+                                .offset(x: CGFloat(at.x), y: CGFloat(at.y))
+                                .opacity(hidden ? 0 : 1)
+                        }
+                    }
+                    .frame(width: screen.size.width, height: screen.size.height, alignment: .topLeading)
+                }
                 NoticeBand(model: model)
-                SideBar(model: model, right: right, windowHeight: screen.size.height, stretch: sideStretch)
-                    .frame(maxWidth: .infinity, alignment: right ? .trailing : .leading)
-                    // stretched, what is on it moves out with its far side
-                    .offset(x: sideBarShift(right) + (right ? -sideStretch : sideStretch), y: CGFloat(sideMoving?.top ?? sideFit.top))
-                    .opacity(hidden ? 0 : 1)
+                if let moved = model.barMoved(.sideBar) {
+                    // moved by Edit layout: where it was left, lying down turned a quarter about its
+                    // top-left
+                    SideBar(model: model, right: right, windowHeight: screen.size.height)
+                        .rotationEffect(.degrees(moved.vertical ? 0 : -90), anchor: .topLeading)
+                        .offset(x: CGFloat(moved.x), y: CGFloat(moved.y) + (moved.vertical ? 0 : Pc.sideBarShown))
+                        .frame(width: screen.size.width, height: screen.size.height, alignment: .topLeading)
+                        .opacity(hidden ? 0 : 1)
+                } else {
+                    SideBar(model: model, right: right, windowHeight: screen.size.height, stretch: sideStretch)
+                        .frame(maxWidth: .infinity, alignment: right ? .trailing : .leading)
+                        // stretched, what is on it moves out with its far side
+                        .offset(x: sideBarShift(right) + (right ? -sideStretch : sideStretch), y: CGFloat(sideMoving?.top ?? sideFit.top))
+                        .opacity(hidden ? 0 : 1)
+                }
                 // over the canvas, under the panels; not over a page that takes the screen
                 if !hidden, !model.canvasInfoOpen, !model.gestureControlsOpen, model.crop.shown == nil, !model.timeLapse.replaying,
                    model.animatedExport == nil, model.scene.animatedExport == nil, !model.scene.studioOpen {
@@ -85,6 +107,30 @@ struct CanvasScreen: View {
                 if !hidden {
                     FloatingColors(model: model, screen: screen.size)
                 }
+                if model.editingLayout, !hidden {
+                    EditLayoutHandles(model: model, screen: screen.size)
+                }
+                // where the bars always are, told to Edit layout as it changes
+                Color.clear
+                    .frame(width: 0, height: 0)
+                    .onChange(
+                        of: BarsKey(
+                            size: screen.size, rightHanded: right, centre: model.sideBarCentre, topBar: Look.shared.scale(.topBar),
+                            sideBar: Look.shared.scale(.sideBar), sideBarShown: Pc.sideBarShown
+                        ),
+                        initial: true
+                    ) { _, bars in model.tellBars(bars) }
+                // the room the floating panels go in, told to their layout as it changes
+                Color.clear
+                    .frame(width: 0, height: 0)
+                    .onChange(
+                        of: LayoutRoomKey(
+                            size: screen.size, sideBar: model.showSideBar && model.barMoved(.sideBar) == nil,
+                            rightHanded: AppSettings.shared.rightHanded,
+                            sideBarShown: Pc.sideBarShown, barShown: Pc.barShown, floating: Look.shared.scale(.floating)
+                        ),
+                        initial: true
+                    ) { _, room in model.layoutRoom(room) }
                 QuickShapeHandles(model: model)
                 if !hidden {
                     QuickShapeBar(model: model)
@@ -114,51 +160,67 @@ struct CanvasScreen: View {
                 }
                 if model.adjustment == .liquify, !hidden {
                     LiquifyPanel(model: model, screen: screen.size)
+                        .modifier(FloatsAtBottom(model: model, piece: .liquify, visible: true))
                         .transition(.move(edge: .bottom))
                 }
                 if model.adjusting, !hidden {
                     AdjustmentMenu(model: model, screen: screen.size)
                 }
                 // the bottom toolbars rise from below the screen, and drop away
+                // (each may float, while a plugin lets it: the layer it is in moves, its menus with it)
                 ZStack {
                     if model.recoloring, !hidden {
                         RecolorPanel(tool: model.recolor)
+                            .reportsPiece(.adjusting, lift: 25)
                             .transition(.move(edge: .bottom))
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                 .animation(model.recoloring ? Motion.toolbarIn : Motion.toolbarOut, value: model.recoloring)
+                .modifier(FloatsAtBottom(model: model, piece: .adjusting, visible: model.recoloring && !hidden))
                 ZStack {
                     if model.adjusting, model.adjustment != .liquify, !hidden {
                         AdjustmentPanel(model: model, screen: screen.size)
+                            .reportsPiece(.adjusting, lift: 25)
                             .transition(.move(edge: .bottom))
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                 .animation(model.adjusting ? Motion.toolbarIn : Motion.toolbarOut, value: model.adjusting)
+                .modifier(FloatsAtBottom(model: model, piece: .adjusting, visible: model.adjusting && model.adjustment != .liquify && !hidden))
                 ZStack {
                     if model.transforming, !hidden {
                         TransformToolbar(model: model, screenWidth: screen.size.width)
+                            .reportsPiece(.transform, lift: 25)
                             .transition(.move(edge: .bottom))
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                 .animation(model.transforming ? Motion.toolbarIn : Motion.toolbarOut, value: model.transforming)
+                .overlay {
+                    if model.transforming, !hidden {
+                        TransformPopover(model: model, screen: screen.size)
+                    }
+                }
+                .modifier(FloatsAtBottom(model: model, piece: .transform, visible: model.transforming && !hidden))
                 if model.transforming, !hidden {
-                    TransformPopover(model: model, screen: screen.size)
                     TransformNumeric(model: model, screen: screen.size)
                 }
                 ZStack {
                     if model.selecting, !hidden {
                         SelectionToolbar(model: model, screenWidth: screen.size.width)
+                            .reportsPiece(.selection, lift: 25)
                             .transition(.move(edge: .bottom))
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                 .animation(model.selecting ? Motion.toolbarIn : Motion.toolbarOut, value: model.selecting)
-                if model.selecting, !hidden {
-                    SelectionPopover(model: model, screen: screen.size)
+                .overlay {
+                    if model.selecting, !hidden {
+                        SelectionPopover(model: model, screen: screen.size)
+                    }
                 }
+                .modifier(FloatsAtBottom(model: model, piece: .selection, visible: model.selecting && !hidden))
                 // a picture being placed on a model: its box, and the bar that keeps it
                 if model.scene.placing {
                     ModelPictureOverlay(model: model)
@@ -494,7 +556,8 @@ private struct PanelHost: View {
     /// Where a panel `width` wide (its own points) goes under its button, `buttonX` across the
     /// window: clear of the side bar, on either side. Its arrow's tip is in its own points.
     private func place(_ width: CGFloat, _ buttonX: CGFloat) -> PopoverPlace {
-        let clear = Pc.sideBarShown + Pc.popoverGap
+        // (moved off its edge by Edit layout, clear of no side bar)
+        let clear = model.barMoved(.sideBar) == nil ? Pc.sideBarShown + Pc.popoverGap : Pc.popoverGap
         let at = AppSettings.shared.rightHanded
             ? popoverPlace(width: width * k, buttonCentreX: buttonX, screenWidth: screen.width, minRight: clear)
             : popoverPlace(width: width * k, buttonCentreX: buttonX, screenWidth: screen.width, minLeft: clear)
@@ -516,52 +579,141 @@ private struct PanelHost: View {
         Pc.actionCentre(index, barWidth: screen.width / bar) * bar
     }
 
-    /// `panel` hung under the bar at `place`, as big as the panels show.
-    private func hung(_ panel: some View, _ place: PopoverPlace) -> some View {
-        panel
-            .scaleEffect(k, anchor: .topLeading)
-            .offset(x: place.left, y: Pc.barShown)
+    /// From button `index` of the top bar's left half (`left`) or its right while Edit layout moved
+    /// that half, where a panel `width` wide (its own points) hangs: under the button, over it or
+    /// beside it, as the core works it out; its arrow `nudge` from the button's middle, as measured
+    /// where it always is. None from a half where it always is.
+    private func moved(_ left: Bool, _ index: Int, _ width: CGFloat, nudge: CGFloat = 0) -> BarHang? {
+        let half: LayoutBar = left ? .topLeft : .topRight
+        guard model.barMoved(half) != nil else { return nil }
+        let gaps = Pc.barGaps(screen.width / bar)
+        let along = left
+            ? topBarHalfEnd + Pc.galleryWidth + gaps.action + Pc.barButtonWidth / 2 + (Pc.barButtonWidth + gaps.action) * CGFloat(index)
+            : topBarHalfLength(left: false, gaps: gaps) - topBarHalfEnd - Pc.barButtonWidth / 2
+                - (Pc.barButtonWidth + gaps.tool) * CGFloat(index)
+        return model.barLayout.hang(
+            bar: half, along: Float(along * bar + nudge), width: Float(width * k), shift: Float(Pc.arrowShift),
+            gap: Float(Pc.popoverGap), arrowHeight: Float(Pc.arrowHeight * k)
+        )
+    }
+
+    /// Over a panel hanging under its button, its grabber, while a plugin lets it float.
+    @ViewBuilder private func grabber(_ piece: LayoutPiece, _ hang: BarHang?) -> some View {
+        if model.mayFloat(piece), hang == nil || hang?.side == .below {
+            PieceGrabber(model: model, piece: piece)
+                .padding(.top, Pc.arrowHeight)
+        }
+    }
+
+    /// The arrow's tip in a panel's own points: hanging from a moved button, the core's; else `place`'s.
+    private func arrow(_ hang: BarHang?, _ place: PopoverPlace) -> CGFloat {
+        hang.map { CGFloat($0.arrow) / k } ?? place.arrowX
+    }
+
+    /// The room a panel has, `less` short of the screen's edge, in its own points: hanging from a
+    /// moved button, what the core leaves it; else under the bar.
+    private func room(_ hang: BarHang?, less: CGFloat) -> CGFloat {
+        hang.map { (CGFloat($0.room) - less) / k } ?? room(less: less)
+    }
+
+    /// Where a panel's top left shows (the window's points): hanging over a moved bar, as tall as
+    /// `height` (its own points) above it.
+    private func origin(_ hang: BarHang?, _ place: PopoverPlace, height: CGFloat) -> CGPoint {
+        guard let hang else { return CGPoint(x: place.left, y: Pc.barShown) }
+        let y = hang.side == .above ? CGFloat(hang.y) - height * k : CGFloat(hang.y)
+        return CGPoint(x: CGFloat(hang.x), y: y)
+    }
+
+    /// `panel` hung under the bar at `place`, as big as the panels show; or, from a button Edit
+    /// layout moved (`hang`), under it, over it (placed by its bottom) or beside it, its arrow on
+    /// that side.
+    @ViewBuilder private func hung(_ panel: some View, _ place: PopoverPlace, _ hang: BarHang? = nil) -> some View {
+        if let hang {
+            let side: ArrowSide = switch hang.side {
+            case .below: .top
+            case .above: .bottom
+            case .right: .left
+            case .left: .right
+            }
+            let arrowed = panel.environment(\.hang, Hang(side: side, arrow: CGFloat(hang.arrow) / k))
+            if hang.side == .above {
+                arrowed
+                    .scaleEffect(k, anchor: .bottomLeading)
+                    .frame(width: screen.width, height: CGFloat(hang.y), alignment: .bottomLeading)
+                    .offset(x: CGFloat(hang.x))
+            } else {
+                arrowed
+                    .scaleEffect(k, anchor: .topLeading)
+                    .offset(x: CGFloat(hang.x), y: CGFloat(hang.y))
+            }
+        } else {
+            panel
+                .scaleEffect(k, anchor: .topLeading)
+                .offset(x: place.left, y: Pc.barShown)
+        }
     }
 
     var body: some View {
         switch model.panel == .none ? model.lastPanel : model.panel {
         case .brushes:
             let place = place(brushLibraryWidth, toolX(libraryButton(model.tool)))
+            let hang = moved(false, libraryButton(model.tool), brushLibraryWidth)
+            let height = room(hang, less: 25)
+            let at = origin(hang, place, height: height)
             // ending 25 above the screen's edge, as measured
             hung(
                 BrushLibrary(
-                    model: model, arrowX: place.arrowX, origin: CGPoint(x: place.left / k, y: Pc.barShown / k),
+                    model: model, arrowX: arrow(hang, place), origin: CGPoint(x: at.x / k, y: at.y / k),
                     screen: CGSize(width: screen.width / k, height: screen.height / k)
                 )
-                .frame(height: room(less: 25))
+                .frame(height: height)
                 // torn off by its grabber: unseen until let go, its window following the finger
                 .opacity(model.floating.undocking == .brushes ? 0 : 1),
-                place
+                place, hang
             )
         case .layers:
             if let held = model.backgroundPick {
                 let place = place(colorPanelWidth, toolX(1) + layersArrowNudge)
-                hung(ColorPanel(model: model, arrowX: place.arrowX, screenHeight: room(less: 0) + Pc.barHeight, background: held), place)
-                    // closed any way at all, the colour is kept
-                    .onDisappear { model.endBackgroundPick() }
+                let hang = moved(false, 1, colorPanelWidth, nudge: layersArrowNudge)
+                hung(
+                    ColorPanel(model: model, arrowX: arrow(hang, place), screenHeight: room(hang, less: 0) + Pc.barHeight, background: held),
+                    place, hang
+                )
+                // closed any way at all, the colour is kept
+                .onDisappear { model.endBackgroundPick() }
             } else {
                 let place = place(layersPanelWidth, toolX(1) + layersArrowNudge)
+                let hang = moved(false, 1, layersPanelWidth, nudge: layersArrowNudge)
                 hung(
-                    LayersPanel(model: model, arrowX: place.arrowX, maxHeight: room(less: Pc.popoverGap))
+                    LayersPanel(model: model, arrowX: arrow(hang, place), maxHeight: room(hang, less: Pc.popoverGap))
                         .opacity(model.floating.undocking == .layers ? 0 : 1),
-                    place
+                    place, hang
                 )
             }
         case .actions:
             let place = place(actionsPanelWidth, actionX(0))
+            let hang = moved(true, 0, actionsPanelWidth)
+            let most = room(hang, less: 25)
             // ending 25 above the screen's edge, its rows scrolling, as measured
-            hung(ActionsPanel(model: model, arrowX: place.arrowX, maxHeight: room(less: 25)).frame(maxHeight: room(less: 25), alignment: .top), place)
+            hung(
+                ActionsPanel(model: model, arrowX: arrow(hang, place), maxHeight: most).frame(maxHeight: most, alignment: .top)
+                    .overlay(alignment: .top) { grabber(.actions, hang) }
+                    .opacity(model.floating.undockingPiece == .actions ? 0 : 1),
+                place, hang
+            )
         case .adjustments:
             let place = place(adjustmentsPanelWidth, actionX(1))
-            hung(AdjustmentsPanel(model: model, arrowX: place.arrowX).frame(maxHeight: room(less: 25), alignment: .top), place)
+            let hang = moved(true, 1, adjustmentsPanelWidth)
+            hung(
+                AdjustmentsPanel(model: model, arrowX: arrow(hang, place)).frame(maxHeight: room(hang, less: 25), alignment: .top)
+                    .overlay(alignment: .top) { grabber(.adjustments, hang) }
+                    .opacity(model.floating.undockingPiece == .adjustments ? 0 : 1),
+                place, hang
+            )
         case .color:
             let place = place(colorPanelWidth, toolX(0) + colorsArrowNudge)
-            hung(ColorPanel(model: model, arrowX: place.arrowX, screenHeight: room(less: 0) + Pc.barHeight), place)
+            let hang = moved(false, 0, colorPanelWidth, nudge: colorsArrowNudge)
+            hung(ColorPanel(model: model, arrowX: arrow(hang, place), screenHeight: room(hang, less: 0) + Pc.barHeight), place, hang)
         default:
             EmptyView()
         }

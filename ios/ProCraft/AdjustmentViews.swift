@@ -439,6 +439,8 @@ struct LiquifyPanel: View {
                     uprightPanel
                 }
             }
+            // (where it shows, for it to float from)
+            .reportsPiece(.liquify)
             .frame(width: screen.width, height: screen.height - 25, alignment: .bottom)
             popups
         }

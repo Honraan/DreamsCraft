@@ -591,6 +591,7 @@ impl Library {
                     pos2(left, top),
                     vec2(LIBRARY_WIDTH, (screen.bottom() - BOTTOM_MARGIN - top).max(200.0)),
                 );
+                let rect = panel::hung_rect(ctx, rect, f32::INFINITY, BOTTOM_MARGIN);
                 (rect, arrow_x, panel::area(ctx, egui::Id::unique("brush library"), rect))
             }
             panel::Hang::Floating(window) => (
@@ -675,7 +676,8 @@ impl Library {
                 panel::Hang::Button(_) => {
                     ui.allocate_rect(rect, Sense::click());
                     panel::frame(ui, look, "library frame", rect, arrow_x, backdrops);
-                    self.undock = if self.floats { panel::undock_grabber(ui, panel::body(rect)) } else { None };
+                    let body = panel::body_in(ui.ctx(), rect);
+                    self.undock = if self.floats { panel::undock_grabber(ui, body) } else { None };
                 }
                 panel::Hang::Floating(window) => {
                     ui.allocate_rect(window, Sense::click());
@@ -683,7 +685,7 @@ impl Library {
                     self.chrome = panel::floating_chrome(ui, window);
                 }
             }
-            let body = panel::body(rect);
+            let body = panel::body_in(ui.ctx(), rect);
             // the library in use's name (typed over while it is renamed), or every library's
             let name = libraries.get(place).map_or("Brush library", |l| l.name.as_str());
             let renaming = !self.showing_libraries && self.renaming_library.as_ref().is_some_and(|r| r.0 == place);

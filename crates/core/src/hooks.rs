@@ -20,6 +20,14 @@ pub(crate) const SLIDER_FROSTED: i32 = 1;
 pub(crate) const COLOUR_STEPS: i32 = 0;
 pub(crate) const COLOUR_BEFORE: i32 = 1;
 
+/// What the panel layout's hook asks (interface 20): how near the floating panels snap, whether they
+/// fold to a tab, whether those docked make room in the drawing area, and whether the interface's
+/// bars may be moved.
+pub(crate) const LAYOUT_SNAP: i32 = 0;
+pub(crate) const LAYOUT_FOLD: i32 = 1;
+pub(crate) const LAYOUT_ROOM: i32 = 2;
+pub(crate) const LAYOUT_EDIT: i32 = 3;
+
 /// The role of the colour hook's that is the area round the canvas (interface 11).
 pub(crate) const SURROUND_ROLE: i32 = 1;
 
@@ -785,6 +793,18 @@ impl Hooks {
         })
     }
 
+    /// The panel layout's hook (interface 20): what the first plugin by id on it that answers says of
+    /// `part` ([`LAYOUT_SNAP`] and on); none for the app's own.
+    pub(crate) fn panel_layout(&self, part: i32) -> Option<f32> {
+        if !self.has(Hook::PanelLayout) {
+            return None;
+        }
+        self.through(Hook::PanelLayout, None, |running, said| match said {
+            Some(v) => Ok(Some(v)),
+            None => running.panel_layout(part),
+        })
+    }
+
     /// The dimming hook (interface 13): how much the layers but the current one are dimmed on the
     /// screen alone, the most any plugin on it says (0 for none).
     pub(crate) fn view_dim_others(&self) -> f32 {
@@ -1475,7 +1495,8 @@ pub(crate) mod tests {
 
     #[test]
     fn the_plugins_that_come_with_the_app_and_only_answer_answer_from_their_own_code() {
-        const ANSWERING: [&str; 4] = ["colour-tools", "interface-look", "layer-toolbox", "radial-segments"];
+        const ANSWERING: [&str; 5] =
+            ["colour-tools", "edit-layout", "interface-look", "layer-toolbox", "radial-segments"];
         let dir = store("answering");
         let plugins = Plugins::with_store(dir.clone());
         let hooks = plugins.hooks();
@@ -1516,7 +1537,7 @@ pub(crate) mod tests {
             ("colour-tools", "all_layers"),
             ("interface-look", "hide_undo"),
             ("layer-toolbox", "opacity"),
-            ("interface-look", "pin_panels"),
+            ("edit-layout", "pin_panels"),
         ] {
             assert!(plugins.set_switch(format!("{}.{switch}", id(name)), true), "{switch}");
         }
@@ -2067,6 +2088,56 @@ pub(crate) mod tests {
             assert_eq!(hooks.slider_look(SLIDER_OPACITY), None, "{odd}");
             assert_eq!(hooks.take_stopped().len(), 1, "{odd}");
         }
+    }
+
+    fn laying_out(body: &str) -> Running {
+        let text = format!(r#"(module (func (export "procraft_panel_layout") (param i32) (result f32) {body}))"#);
+        Running::start(&wat::parse_str(text).unwrap(), &[]).unwrap()
+    }
+
+    #[test]
+    fn the_panels_are_laid_out_as_the_first_plugin_that_answers_each_part_says() {
+        let hooks = Hooks::default();
+        let parts = |hooks: &Hooks| [LAYOUT_SNAP, LAYOUT_FOLD, LAYOUT_ROOM, LAYOUT_EDIT].map(|p| hooks.panel_layout(p));
+        assert_eq!(parts(&hooks), [None; 4], "none on: as the app has it");
+        // snapping within 16, folding, no room made, nothing said of the bars
+        let says = "(if (result f32) (i32.eqz (local.get 0)) (then (f32.const 16)) (else \
+            (if (result f32) (i32.eq (local.get 0) (i32.const 1)) (then (f32.const 1)) (else \
+            (if (result f32) (i32.eq (local.get 0) (i32.const 2)) (then (f32.const 0)) (else (f32.const -1)))))))";
+        hooks.put_on("b".to_owned(), laying_out(says), &[Hook::PanelLayout]);
+        assert_eq!(parts(&hooks), [Some(16.0), Some(1.0), Some(0.0), None]);
+        // one before it by id that leaves a part leaves it to the next; one that answers says
+        hooks.put_on("a".to_owned(), laying_out("(f32.const -1)"), &[Hook::PanelLayout]);
+        assert_eq!(parts(&hooks), [Some(16.0), Some(1.0), Some(0.0), None]);
+        hooks.put_on("a".to_owned(), laying_out("(f32.const 1)"), &[Hook::PanelLayout]);
+        assert_eq!(parts(&hooks), [Some(1.0); 4]);
+        assert!(hooks.take_stopped().is_empty());
+        // asked as the plugins change and as the desktop draws: quick
+        let t = Instant::now();
+        for _ in 0..10_000 {
+            assert_eq!(hooks.panel_layout(std::hint::black_box(LAYOUT_SNAP)), Some(1.0));
+        }
+        let each = t.elapsed() / 10_000;
+        println!("the panel layout asked in {each:?}");
+        assert!(each < std::time::Duration::from_micros(100), "{each:?}");
+        // a snap past 64 points, a yes past 1, or no number, stops it
+        for (part, odd) in [
+            (LAYOUT_SNAP, "(f32.const 64.5)"),
+            (LAYOUT_FOLD, "(f32.const 1.5)"),
+            (LAYOUT_ROOM, "(f32.const nan)"),
+            (LAYOUT_SNAP, "(unreachable)"),
+        ] {
+            let hooks = Hooks::default();
+            hooks.put_on("odd".to_owned(), laying_out(odd), &[Hook::PanelLayout]);
+            assert_eq!(hooks.panel_layout(part), None, "{odd}");
+            assert_eq!(hooks.take_stopped().len(), 1, "{odd}");
+        }
+        // 64 itself is a snap, not a yes
+        let hooks = Hooks::default();
+        hooks.put_on("far".to_owned(), laying_out("(f32.const 64)"), &[Hook::PanelLayout]);
+        assert_eq!(hooks.panel_layout(LAYOUT_SNAP), Some(64.0));
+        assert_eq!(hooks.panel_layout(LAYOUT_FOLD), None);
+        assert_eq!(hooks.take_stopped().len(), 1);
     }
 
     #[test]

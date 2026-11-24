@@ -351,6 +351,8 @@ extension CanvasModel {
             libraryChanged()
         }
         followStrokeSound()
+        // how they lay the floating panels out
+        followLayout()
     }
 
     /// Plays the artwork's strokes while a plugin makes their sound (and the app is in front).

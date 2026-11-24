@@ -483,6 +483,7 @@ impl Layers {
         let (rect, area) = match hang {
             panel::Hang::Button(_) => {
                 let rect = Rect::from_min_size(pos2(left, top), vec2(LAYERS_WIDTH, height));
+                let rect = panel::hung_rect(ctx, rect, panel::ARROW_HEIGHT + HEADER_HEIGHT + rows, panel::POPOVER_GAP);
                 (rect, panel::area(ctx, egui::Id::unique("layers panel"), rect))
             }
             // floating, as big as its window, whatever its rows
@@ -507,7 +508,8 @@ impl Layers {
                 panel::Hang::Button(_) => {
                     ui.allocate_rect(rect, Sense::click());
                     panel::frame(ui, look, "layers frame", rect, arrow_x, backdrops);
-                    self.undock = if self.floats { panel::undock_grabber(ui, panel::body(rect)) } else { None };
+                    let body = panel::body_in(ui.ctx(), rect);
+                    self.undock = if self.floats { panel::undock_grabber(ui, body) } else { None };
                 }
                 panel::Hang::Floating(window) => {
                     ui.allocate_rect(window, Sense::click());
@@ -515,7 +517,7 @@ impl Layers {
                     self.chrome = panel::floating_chrome(ui, window);
                 }
             }
-            let body = panel::body(rect);
+            let body = panel::body_in(ui.ctx(), rect);
             // the chevron turns blue while layers are picked
             let (title_tapped, row) = panel::header_title(ui, look, body, "Layers", 24.0, true, any_picked);
             title = row;

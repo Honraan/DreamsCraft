@@ -22,9 +22,9 @@ A plugin holds one or both of these:
   a function the GPU runs over a layer.
 
 The samples are in [`plugins/`](../plugins). `radial-segments` is the smallest with code and
-`vector-layers` the largest. Six are made of [features](#features), each what a plugin of its own
-once was: `colour-tools`, `interface-look`, `view-tools`, `brush-extras`, `layer-toolbox` and
-`infinite-plugins`.
+`vector-layers` the largest. Seven are made of [features](#features), each what a plugin of its own
+once was: `colour-tools`, `interface-look`, `view-tools`, `brush-extras`, `layer-toolbox`,
+`infinite-plugins` and `edit-layout`.
 
 - `colour-tools`: its Colour triangle is a picker whose picture draws its hue ring as its switch says
   and whose [menu](#a-menu-of-its-own) switches its shape; Colour labels keeps a mark with each layer
@@ -34,8 +34,8 @@ once was: `colour-tools`, `interface-look`, `view-tools`, `brush-extras`, `layer
   switch among them; Slider look makes the side bar's sliders see-through frosted glass on the
   `slider_look` hook; Canvas surround colours the area round the canvas on the `interface_colour`
   hook's surround, or shows a picture picked for its `file` control there on the `surround_picture`
-  hook; Floating panels lets panels float in windows of their own; and Coloured brush previews tints
-  the brush library's strokes on the `brush_preview_colour` hook.
+  hook; and Coloured brush previews tints the brush library's strokes on the `brush_preview_colour`
+  hook.
 - `view-tools`: Rotation reset has an action and two switches in the Canvas tab, Value check a switch
   there with a key of its own, and Reference windows a single slider.
 - `brush-extras`: Finger pressure gives a finger a pressure on the `pressure` hook, Touch position
@@ -51,6 +51,12 @@ once was: `colour-tools`, `interface-look`, `view-tools`, `brush-extras`, `layer
   answers the `colour_panel` hook. It took Lasso fill and Paper's places, and the features it took
   from View tools, Layer tools and Colour tools (see [Taking a feature from a plugin that
   stays](#taking-a-feature-from-a-plugin-that-stays)).
+- `edit-layout`: Movable panels answers the `floating_panels` hook for the Layers panel and the
+  brush library and the `panel_layout` hook's snapping, folding and room (interface 20); All panels
+  float answers the `floating_panels` hook for every other panel (off as it starts); Panels stay open
+  answers the `pin_panels` hook; and Edit
+  layout the `panel_layout` hook's bars. It took Floating panels and Panels stay open from Interface
+  look, with what was set for them.
 
 `keyboard-shortcuts` rebinds keys from a panel of its own and keeps what it binds, and
 `pop-up-palette` has an action a pen's button runs, which shows a ring of the recent colours and
@@ -106,8 +112,8 @@ hooks and `file` controls of pictures 11, the `stroke_fill` hook, the `paper` ho
 picture, actions in the Layers panel, `set_control` and the `colour_panel` hook 12, the
 `view_dim_others` hook 13, a set of brushes 14, `texture` controls, panels' rows of a control and
 the `paper` hook's grain 15, [features](#features), a row in the brush studio kept as a plugin it
-takes the place of kept it, and the marks of one it takes the place of 16, and a feature taken from a
-plugin that stays and a set of brushes under a switch 19.
+takes the place of kept it, and the marks of one it takes the place of 16, a feature taken from a
+plugin that stays and a set of brushes under a switch 19, and the `panel_layout` hook 20.
 
 ### Brushes it comes with
 
@@ -865,15 +871,21 @@ Whether a panel can be torn off into a window of its own (not 0) (interface 7):
 procraft_floating_panel(panel: i32) -> i32
 ```
 
-`panel` is 0 for the Layers panel and 1 for the brush library; answer 0 for one you don't know.
-While a plugin says yes, the panel shows a grabber at its top where it hangs from its button.
+`panel` is 0 for the Layers panel and 1 for the brush library, and from interface 20 2 for the
+Actions panel, 3 for the Adjustments menu, 4 for the controls of the adjustment being made (its panel
+or bar, Recolor's too), 5 for the Selection toolbar, 6 for the Transform toolbar and 7 for Liquify's
+panel; answer 0 for one you don't know. While a plugin says yes, the panel shows a grabber at its top
+where it hangs from its button (a toolbar or an adjustment's controls, a grabber above them).
 Dragged out by it, the panel floats in a window over the canvas, which stays open while you draw:
-moved by the strip at its top, sized from its lower right corner (within what the panel allows) and
-closed by its Close. The panel's own button hangs it from the bar again. Inside, the panel is the
+moved by the strip at its top, sized from its lower right corner (the Layers panel, the library and
+the Actions panel, within what each allows) and closed by its Close. The panel's own button hangs it
+from the bar again; a toolbar or an adjustment's controls closed go back where they always are, and
+come and go with their tool as they always do. Inside, the panel is the
 same as where it hangs. The canvas takes every touch around the window and none on it, and the app
-keeps where it was left and how big from one start to the next. With the plugin off the window goes,
-and comes back where it was when it is on again. With several plugins on this hook, one that lets a
-panel float lets it.
+keeps where it was left and how big from one start to the next, for each way the screen turns (see
+[`panel_layout`](#panel_layout), which also has the windows snap, fold and make room). With the
+plugin off the window goes, and comes back where it was when it is on again. With several plugins on
+this hook, one that lets a panel float lets it.
 
 ### `interface_colour`
 
@@ -956,6 +968,82 @@ than closing it (a tap) or fading it away (a drag). The panel's own button still
 ```
 procraft_pin_panels() -> i32
 ```
+
+Edit layout's Panels stay open, which the app comes with, answers yes while it is on.
+
+### `panel_layout`
+
+How the floating panels are laid out (interface 20), asked part by part:
+
+```
+procraft_panel_layout(part: i32) -> f32
+```
+
+| `part` | |
+|---|---|
+| 0 | How near a floating panel moved or sized comes to a line before it snaps onto it, 0 to 64 points; 0 for no snapping |
+| 1 | Whether each floating panel has a fold button beside its Close, folding it to a tab (1) or not (0) |
+| 2 | Whether the panels docked against the window's edges take that room from the drawing area (1) or not (0) |
+| 3 | Whether the interface's bars may be moved (1) or not (0): Edit Layout, below |
+
+Answer below 0 to leave a part as the app has it, as for one you don't know: more may come. A snap
+past 64, a yes or no past 1, or an answer that isn't a number, stops the plugin. It's asked as the
+plugins change. With several plugins on this hook, the first by id that answers each part is used.
+
+While a plugin is on this hook, the colour panel dragged out by its grabber goes where the panels'
+layout keeps it, as the panels the [`floating_panels`](#floating_panels) hook lets float do:
+
+- **Snapping.** A panel moved, or sized from its corner, near one of these lines goes onto it, the
+  nearest within the distance on each axis on its own: the window's edges (clear of the side bar),
+  the top bar's bottom for its top, and each other floating panel's and the Reference window's
+  edges, its far edge for one beside it (where the two overlap the other way: no gap between them)
+  and its same edge for one in line with it (where one comes after the other). The Reference window
+  snaps the same way as it is moved by its grab line.
+- **Docking.** A panel left against an edge of the window stays against it as the window changes:
+  the side bar moved to the other side, the window sized, the screen split.
+- **Folding.** A folded panel shows as a tab, its name and an unfold mark, at its top-left (its
+  top-right against the right edge, so it stays there); a tap unfolds it, and a drag moves it.
+- **Making room.** A panel against the window's left or right edge, and those beside it in a row
+  from there, take the room from that edge to their far side from the drawing area; one against
+  the top bar's bottom or the window's bottom alone, from there to its far side. The canvas fits
+  in what is left, and as the room changes it moves by half the change, so what was in the middle
+  of the drawing area stays there (a canvas fitted as it was is fitted again). A folded panel takes
+  none.
+- **Kept.** Each panel's place is kept for each way the screen turns (wider than tall, or not), on
+  each device by itself, as a share of the window: a window sized differently has it in the same
+  place in proportion (one docked stays against its edge). A way it was never placed in starts
+  from the other's. The Reference window's place stays the artwork's.
+- **Each window's menu.** A floating panel's strip has a menu: **Fold**; **Hide**, which leaves it
+  open but unseen until its button is pressed or **Show Hidden** in Edit Layout brings it back;
+  **Pin to Top**, which keeps it over every window that isn't pinned (the others go over each other
+  as they are pressed); and **Reset Position**, which puts it back where it first goes: the panels
+  from the top bar's right against the window's right edge under it, those from its left against the
+  left edge, and the toolbars and an adjustment's controls at the bottom in the middle.
+
+While a plugin says part 3, the Actions panel's Canvas tab has **Edit Layout**, among the rows the
+plugins put there. It outlines the top bar's two halves (Gallery and the actions; the tools, Layers
+and the colour) and the side bar, and each is dragged anywhere by its outline, snapping to the
+window's edges and to the other bars with no gap. A bar brought within 96 points of the window's
+left or right edge (and not of its top or bottom) stands upright against it, and lies down again only
+once taken more than 176 points from the sides, or near the top or the bottom, so it doesn't flicker
+as it passes. Reset puts every bar back where it always is; Done ends it. A panel opened from a
+button of a moved bar hangs from that button: under a bar in the window's upper half, over one in
+its lower half, and beside one standing upright, its arrow pointing at the button. Each way the
+screen turns keeps its own places. With no plugin saying so, every bar is where it always is,
+wherever it was left.
+
+Edit Layout's **Layouts** keeps layouts under names of the painter's: **Save Layout** saves the bars
+and the floating panels where they are (for each way the screen turns, and which windows are open,
+folded, hidden or pinned) under a name (one of that name already kept is replaced), and each layout
+listed is brought back by a tap (the one last chosen ticked), renamed or deleted. Up to 16 are kept,
+their names up to 40 characters.
+
+Edit layout's Movable panels, which the app comes with, snaps within its Snap distance (16 points as
+it starts) while Snap to edges and panels is on, folds while Panels fold to a tab is on, and makes
+room while Docked panels make room is on; it also lets the Layers panel and the brush library float,
+as Interface look's Floating panels did. Its All panels float, a feature of its own and off as it
+starts, lets every other panel float too; with it off they hang where they always do. Its Edit layout feature answers part 3, and its Panels stay
+open the [`pin_panels`](#pin_panels) hook, as Interface look's switch of that name did.
 
 ### `opacity_together`
 
@@ -2226,9 +2314,9 @@ plugin comes with, interface 15 `texture` controls, panels' rows of a control an
 hook's grain, interface 16 features (each running in a copy of the code of its own), a row in
 the brush studio kept as a plugin it takes the place of kept it (`from`), and the marks and picked
 files of a plugin it takes the place of, interface 17 filter layers, interface 18 filter
-layers' editors, and interface 19 a feature taken from a plugin that stays (`takes`), a set of
+layers' editors, interface 19 a feature taken from a plugin that stays (`takes`), a set of
 brushes under a switch and given as a plugin's it takes the place of (`brushes`), and an artwork's
-values kept for one it takes the place of. What comes under a switch at the top of the list (a menu and
+values kept for one it takes the place of, and interface 20 the `panel_layout` hook. What comes under a switch at the top of the list (a menu and
 a row in the brush studio too), taking the place of other plugins, a menu of its own, and controls in
 the Canvas tab, on a key or kept with each artwork need no newer interface: an older app shows every
 control, leaves the others where they are, shows no menu and keeps every control with the plugin. What a

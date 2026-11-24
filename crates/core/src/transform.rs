@@ -734,7 +734,7 @@ impl CanvasSession {
         let window = (width.max(1), height.max(1));
         let view = st.view.unwrap_or_else(|| {
             let canvas = (st.doc.width(), st.doc.height());
-            procraft_engine::view::View::fit_turned(canvas, window, st.fit_insets, i32::from(st.turns))
+            procraft_engine::view::View::fit_turned(canvas, window, st.kept_clear(), i32::from(st.turns))
         });
         let m = view.to_screen();
         vec![m.a, m.b, m.c, m.d, m.e, m.f]

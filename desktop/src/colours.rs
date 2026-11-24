@@ -292,6 +292,10 @@ pub struct Colours {
     floating_scale: f32,
     floating_picker_only: bool,
     floating_transform: egui::emath::TSTransform,
+    /// The floating panels' layout, while a plugin lays them out: the window goes where it has it,
+    /// snapping, folding and kept; and whether it changed something to keep.
+    pub layout: Option<std::sync::Arc<procraft_core::PanelLayout>>,
+    pub layout_changed: bool,
     /// The colour model's button left of the swatches, its menu, and a model chosen there (for
     /// the preferences to keep).
     model_button: Rect,
@@ -357,6 +361,8 @@ impl Default for Colours {
             floating_scale: 1.0,
             floating_picker_only: false,
             floating_transform: egui::emath::TSTransform::IDENTITY,
+            layout: None,
+            layout_changed: false,
             model_button: Rect::NOTHING,
             model_menu: crate::menu::Menu::default(),
             model_chosen: None,
@@ -697,10 +703,11 @@ impl Colours {
         self.scrolled = self.scrolled.min(overflow);
         let mut hex_row = Rect::NOTHING;
         let rect = Rect::from_min_size(pos2(left, top), vec2(PANEL_WIDTH, height));
+        let rect = panel::hung_rect(ctx, rect, whole, PANEL_MARGIN);
         panel::area(ctx, egui::Id::unique("colour panel"), rect).show(ctx, |ui| {
             ui.allocate_rect(rect, Sense::click());
             panel::frame(ui, look, "colour frame", rect, arrow_x, backdrops);
-            let body = panel::body(rect);
+            let body = panel::body_in(ui.ctx(), rect);
             if self.background {
                 // titled so on every page, with a tick 12 in from the right that closes it
                 panel::header(ui, look, body, "Background", 20.0, false, false);
@@ -1400,7 +1407,7 @@ impl Colours {
     /// Harmony's kinds: a menu left of the panel, its top level with the wheel; the kind shown
     /// ticked.
     fn harmony_menu(&mut self, ctx: &egui::Context, look: &mut Look, panel: Rect, backdrops: &mut Vec<f32>) {
-        let body = panel::body(panel);
+        let body = panel::body_in(ctx, panel);
         let rect = Rect::from_min_size(
             pos2(body.left() + 20.0 - 204.0, body.top() + 50.0 + 36.0),
             vec2(195.0, 9.0 * 2.0 + 38.0 * HarmonyKind::ALL.len() as f32),

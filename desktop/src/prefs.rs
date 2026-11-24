@@ -72,6 +72,13 @@ pub struct Prefs {
     /// The Layers panel's and the brush library's windows as last left, while a plugin let them
     /// float (by their place in [`crate::floating_panels::PANELS`]).
     pub floating: [Option<procraft_core::FloatingWindow>; 2],
+    /// The floating panels' places, as the core's layout keeps them (a place for each way the window
+    /// is turned); none until one was kept. The windows above are where they start from.
+    pub panel_layout: Option<String>,
+    /// The interface's bars as Edit layout moved them, as the core's bar layout keeps them.
+    pub bar_layout: Option<String>,
+    /// Edit layout's named layouts, as the core keeps them (lines of their own).
+    pub named_layouts: Option<String>,
     /// The brush studio's pad a sphere on every page.
     pub pad_3d: bool,
     /// The canvas shown on a second display too.
@@ -133,6 +140,9 @@ impl Default for Prefs {
             curve: straight(),
             actions_tab: 0,
             floating: [None, None],
+            panel_layout: None,
+            bar_layout: None,
+            named_layouts: None,
             pad_3d: false,
             project_canvas: false,
             plugins: Plugins::new(),
@@ -222,6 +232,12 @@ impl Prefs {
                 name if name == procraft_core::side_bar_centre_key() => {
                     p.side_bar_centre = procraft_core::side_bar_kept_centre(number.unwrap_or(f32::NAN));
                 }
+                name if name == procraft_core::panel_layout_key() => p.panel_layout = Some(value.to_owned()),
+                name if name == procraft_core::bar_layout_key() => p.bar_layout = Some(value.to_owned()),
+                // (its lines kept on one, a record separator between)
+                name if name == procraft_core::named_layouts_key() => {
+                    p.named_layouts = Some(value.replace('\u{1e}', "\n"));
+                }
                 name if floating_at(name).is_some() => {
                     if let Some(slot) = floating_at(name).and_then(|at| p.floating.get_mut(at)) {
                         *slot = procraft_core::floating_read(value.to_owned());
@@ -287,7 +303,15 @@ impl Prefs {
         let floating = crate::floating_panels::PANELS.into_iter().zip(self.floating).filter_map(|(panel, window)| {
             Some(format!("{} {}", procraft_core::floating_key(panel), procraft_core::floating_kept(window?)))
         });
-        let lines: Vec<String> = lines.into_iter().chain(floating).chain(self.plugins.kept_lines()).collect();
+        let layout = self.panel_layout.iter().map(|kept| format!("{} {kept}", procraft_core::panel_layout_key()));
+        let bars = self.bar_layout.iter().map(|kept| format!("{} {kept}", procraft_core::bar_layout_key()));
+        let named = self
+            .named_layouts
+            .iter()
+            .map(|kept| format!("{} {}", procraft_core::named_layouts_key(), kept.replace('\n', "\u{1e}")));
+        let layout = layout.chain(bars).chain(named);
+        let lines: Vec<String> =
+            lines.into_iter().chain(floating).chain(layout).chain(self.plugins.kept_lines()).collect();
         crate::files::keep_text("interface", &(lines.join("\n") + "\n"));
     }
 

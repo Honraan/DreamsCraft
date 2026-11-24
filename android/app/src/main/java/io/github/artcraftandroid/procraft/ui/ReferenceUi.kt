@@ -129,6 +129,12 @@ private fun ReferenceWindowContent(vm: CanvasViewModel, w: CanvasViewModel.Refer
         with(density) { w.place(config.screenWidthDp.dp.toPx(), config.screenHeightDp.dp.toPx(), (TopBarHeight + BottomBarHeight).toPx()) }
     }
     val at = w.offset.takeIf { it != Offset.Unspecified } ?: Offset.Zero
+    // the artwork's own window, for the floating panels to snap against while a plugin lays them out
+    if (w.index == 0) {
+        val rect = io.github.artcraftandroid.procraft.core.LayoutRect(at.x / density.density, at.y / density.density, picture.width.value, tall.value)
+        SideEffect { vm.tellReference(rect) }
+        androidx.compose.runtime.DisposableEffect(Unit) { onDispose { vm.tellReference(null) } }
+    }
     // room around the window for the handles, which reach past its corners (touches outside a
     // layout's bounds don't reach it)
     val margin = HandleSide / 2 - 12.dp
@@ -252,7 +258,21 @@ private fun ReferenceWindowContent(vm: CanvasViewModel, w: CanvasViewModel.Refer
             // the grab line stays when the bars go, and dragging by it moves the window
             Box(
                 Modifier.fillMaxWidth().height(GrabHeight)
-                    .pointerInput(Unit) { detectDragGestures { change, amount -> change.consume(); w.move(amount) } },
+                    .pointerInput(Unit) {
+                        var total = Offset.Zero
+                        detectDragGestures(
+                            onDragStart = {
+                                total = Offset.Zero
+                                w.hold()
+                            },
+                            onDragEnd = { w.letGo() },
+                            onDragCancel = { w.letGo() },
+                        ) { change, amount ->
+                            change.consume()
+                            total += amount
+                            w.drag(total, amount)
+                        }
+                    },
             ) {
                 Box(Modifier.align(Alignment.TopCenter).padding(top = 4.dp).size(40.dp, 4.dp).clip(CircleShape).background(GrabLine))
             }

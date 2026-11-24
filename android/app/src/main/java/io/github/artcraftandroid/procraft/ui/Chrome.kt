@@ -45,6 +45,7 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathFillType
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
@@ -103,50 +104,109 @@ fun TopBar(vm: CanvasViewModel, modifier: Modifier = Modifier) {
             horizontalArrangement = Arrangement.spacedBy(fit.actionGap),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Box(Modifier.size(Pc.GalleryWidth, Pc.BarButtonHeight).tap { vm.closeArtwork() }, contentAlignment = Alignment.CenterStart) {
-                Text("Gallery", color = Pc.BarText, fontSize = 18.sp, fontWeight = FontWeight.Medium, maxLines = 1, softWrap = false, modifier = Modifier.offset(y = (-1).dp))
-            }
-            ActionButton(PcIcons.Actions, "Actions", fit.button, selected = vm.panel == Panel.ACTIONS) { vm.toggle(Panel.ACTIONS) }
-            ActionButton(PcIcons.Adjustments, "Adjustments", fit.button, selected = vm.panel == Panel.ADJUSTMENTS || vm.adjustment != null || vm.opacityLayer != null || vm.recoloring) { vm.adjustmentsPressed() }
-            // lit while the selection tool is open, or while something is selected
-            ActionButton(PcIcons.Selection, "Selection", fit.button, selected = vm.selecting || vm.hasSelection, glyph = 33.dp) { vm.toggleSelecting() }
-            ActionButton(PcIcons.Transform, "Transform", fit.button, selected = vm.transforming, glyph = 44.dp) { vm.toggleTransform() }
+            ActionButtons(vm, fit, upright = false)
         }
-        // the layers and colour panels take the highlight from the current tool while open
-        val panelOpen = vm.panel == Panel.LAYERS || vm.panel == Panel.COLOR || vm.transforming || vm.selecting || vm.adjustment != null
         Row(
             Modifier.align(Alignment.CenterEnd).padding(end = fit.margin),
             horizontalArrangement = Arrangement.spacedBy(fit.toolGap),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            // painting an adjustment on (or cloning), the brush shows it
-            ToolButton(
-                if (vm.adjustPencil) PcIcons.BrushPaintedOn else PcIcons.Brush,
-                "Paint",
-                fit.button,
-                selected = vm.adjustPencil || (!panelOpen && vm.tool == ToolKind.PAINT),
-                onHold = { vm.toolHeld(ToolKind.PAINT) },
-            ) {
-                vm.toolPressed(ToolKind.PAINT)
-            }
-            ToolButton(PcIcons.Smudge, "Smudge", fit.button, selected = !panelOpen && vm.tool == ToolKind.SMUDGE, onHold = { vm.toolHeld(ToolKind.SMUDGE) }) {
-                vm.toolPressed(ToolKind.SMUDGE)
-            }
-            ToolButton(PcIcons.Erase, "Erase", fit.button, selected = !panelOpen && vm.tool == ToolKind.ERASE, onHold = { vm.toolHeld(ToolKind.ERASE) }) {
-                vm.toolPressed(ToolKind.ERASE)
-            }
-            ToolButton(PcIcons.Layers, "Layers", fit.button, selected = vm.panel == Panel.LAYERS) { vm.toggle(Panel.LAYERS) }
-            ColorButton(vm, fit.button)
+            ToolButtons(vm, fit, upright = false)
+        }
+    }
+}
+
+/** Gallery and the actions: the top bar's left half, each button turned to stand in a column while [upright]. */
+@Composable
+private fun ActionButtons(vm: CanvasViewModel, fit: Pc.BarFit, upright: Boolean) {
+    val gallery = if (upright) Modifier.size(Pc.BarButtonHeight, Pc.GalleryWidth) else Modifier.size(Pc.GalleryWidth, Pc.BarButtonHeight)
+    Box(gallery.tap { vm.closeArtwork() }, contentAlignment = if (upright) Alignment.Center else Alignment.CenterStart) {
+        // upright, the word reads up the column
+        val turned = if (upright) Modifier.requiredSize(Pc.GalleryWidth, Pc.BarButtonHeight).graphicsLayer { rotationZ = -90f } else Modifier.offset(y = (-1).dp)
+        Box(turned, contentAlignment = Alignment.CenterStart) {
+            Text("Gallery", color = Pc.BarText, fontSize = 18.sp, fontWeight = FontWeight.Medium, maxLines = 1, softWrap = false)
+        }
+    }
+    ActionButton(PcIcons.Actions, "Actions", fit.button, selected = vm.panel == Panel.ACTIONS, upright = upright) { vm.toggle(Panel.ACTIONS) }
+    ActionButton(PcIcons.Adjustments, "Adjustments", fit.button, selected = vm.panel == Panel.ADJUSTMENTS || vm.adjustment != null || vm.opacityLayer != null || vm.recoloring, upright = upright) { vm.adjustmentsPressed() }
+    // lit while the selection tool is open, or while something is selected
+    ActionButton(PcIcons.Selection, "Selection", fit.button, selected = vm.selecting || vm.hasSelection, glyph = 33.dp, upright = upright) { vm.toggleSelecting() }
+    ActionButton(PcIcons.Transform, "Transform", fit.button, selected = vm.transforming, glyph = 44.dp, upright = upright) { vm.toggleTransform() }
+}
+
+/** The tools, Layers and the colour: the top bar's right half, standing in a column while [upright]. */
+@Composable
+private fun ToolButtons(vm: CanvasViewModel, fit: Pc.BarFit, upright: Boolean) {
+    // the layers and colour panels take the highlight from the current tool while open
+    val panelOpen = vm.panel == Panel.LAYERS || vm.panel == Panel.COLOR || vm.transforming || vm.selecting || vm.adjustment != null
+    // painting an adjustment on (or cloning), the brush shows it
+    ToolButton(
+        if (vm.adjustPencil) PcIcons.BrushPaintedOn else PcIcons.Brush,
+        "Paint",
+        fit.button,
+        selected = vm.adjustPencil || (!panelOpen && vm.tool == ToolKind.PAINT),
+        onHold = { vm.toolHeld(ToolKind.PAINT) },
+        upright = upright,
+    ) {
+        vm.toolPressed(ToolKind.PAINT)
+    }
+    ToolButton(PcIcons.Smudge, "Smudge", fit.button, selected = !panelOpen && vm.tool == ToolKind.SMUDGE, onHold = { vm.toolHeld(ToolKind.SMUDGE) }, upright = upright) {
+        vm.toolPressed(ToolKind.SMUDGE)
+    }
+    ToolButton(PcIcons.Erase, "Erase", fit.button, selected = !panelOpen && vm.tool == ToolKind.ERASE, onHold = { vm.toolHeld(ToolKind.ERASE) }, upright = upright) {
+        vm.toolPressed(ToolKind.ERASE)
+    }
+    ToolButton(PcIcons.Layers, "Layers", fit.button, selected = vm.panel == Panel.LAYERS, upright = upright) { vm.toggle(Panel.LAYERS) }
+    ColorButton(vm, fit.button, upright)
+}
+
+/** The room at either end of half of the top bar moved by Edit layout, past its first and last buttons. */
+val TopBarHalfEnd = 10.dp
+
+/** How long half of the top bar is ([left], else the right), laid in a row on a bar [barWidth] wide: its buttons, gaps and ends. */
+fun topBarHalfLength(left: Boolean, barWidth: Dp): Dp {
+    val fit = Pc.barFit(barWidth)
+    return if (left) {
+        TopBarHalfEnd * 2 + Pc.GalleryWidth + (fit.button + fit.actionGap) * 4
+    } else {
+        TopBarHalfEnd * 2 + fit.button * 5 + fit.toolGap * 4
+    }
+}
+
+/**
+ * Half of the top bar ([left], else the right) where Edit layout moved it: on glass of its own, its buttons in a row,
+ * or in a column while [upright] against a side; as long either way ([topBarHalfLength]).
+ */
+@Composable
+fun TopBarHalf(vm: CanvasViewModel, left: Boolean, upright: Boolean, barWidth: Dp, modifier: Modifier) {
+    val fit = Pc.barFit(barWidth)
+    val gap = if (left) fit.actionGap else fit.toolGap
+    val glass = modifier.clip(RoundedCornerShape(Pc.BarHeight / 2)).background(Pc.Bar)
+    if (upright) {
+        androidx.compose.foundation.layout.Column(
+            glass.size(Pc.BarHeight, topBarHalfLength(left, barWidth)).padding(vertical = TopBarHalfEnd),
+            verticalArrangement = Arrangement.spacedBy(gap),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            if (left) ActionButtons(vm, fit, upright = true) else ToolButtons(vm, fit, upright = true)
+        }
+    } else {
+        Row(
+            glass.size(topBarHalfLength(left, barWidth), Pc.BarHeight).padding(horizontal = TopBarHalfEnd),
+            horizontalArrangement = Arrangement.spacedBy(gap),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (left) ActionButtons(vm, fit, upright = false) else ToolButtons(vm, fit, upright = false)
         }
     }
 }
 
 /** An action button: its glyph on a dark disc, which turns blue while its panel is open. */
 @Composable
-private fun ActionButton(icon: ImageVector, label: String, width: Dp, selected: Boolean = false, glyph: Dp = 36.dp, onClick: () -> Unit = {}) {
+private fun ActionButton(icon: ImageVector, label: String, width: Dp, selected: Boolean = false, glyph: Dp = 36.dp, upright: Boolean = false, onClick: () -> Unit = {}) {
     val lit = animateHighlight(selected)
     val k = Pc.barGlyphScale(width)
-    Box(Modifier.size(width, Pc.BarButtonHeight).tap(onClick = onClick), contentAlignment = Alignment.Center) {
+    Box(Modifier.buttonSize(width, upright).tap(onClick = onClick), contentAlignment = Alignment.Center) {
         Box(Modifier.size(Pc.ActionDiscSize * k).clip(CircleShape).background(lerp(Pc.ActionDisc, Pc.BarGlyphSelected, lit)))
         // the glyphs are drawn in a 44 frame, shown [glyph] across (most 36)
         Icon(icon, contentDescription = label, tint = lerp(Pc.ActionGlyph, Color.White, lit), modifier = Modifier.requiredSize(glyph * k))
@@ -162,23 +222,27 @@ private fun Modifier.tapOrHold(onClick: () -> Unit, onHold: () -> Unit): Modifie
 
 /** A tool button: tapped, the tool (or its brushes); held ([onHold]), it takes the current brush. */
 @Composable
-private fun ToolButton(icon: ImageVector, label: String, width: Dp, selected: Boolean, onHold: (() -> Unit)? = null, onClick: () -> Unit) {
+private fun ToolButton(icon: ImageVector, label: String, width: Dp, selected: Boolean, onHold: (() -> Unit)? = null, upright: Boolean = false, onClick: () -> Unit) {
     val touch = if (onHold != null) Modifier.tapOrHold(onClick, onHold) else Modifier.tap(onClick = onClick)
-    Box(Modifier.size(width, Pc.BarButtonHeight).then(touch), contentAlignment = Alignment.Center) {
+    Box(Modifier.buttonSize(width, upright).then(touch), contentAlignment = Alignment.Center) {
         // a 44 frame shown as it is, over the 38 tall button
         Icon(icon, contentDescription = label, tint = lerp(Pc.BarGlyph, Pc.BarGlyphSelected, animateHighlight(selected)), modifier = Modifier.requiredSize(44.dp * Pc.barGlyphScale(width)))
     }
 }
 
+/** A button of the top bar's: [width] along the bar, its height across; turned, in a column while [upright]. */
+private fun Modifier.buttonSize(width: Dp, upright: Boolean): Modifier =
+    if (upright) size(Pc.BarButtonHeight, width) else size(width, Pc.BarButtonHeight)
+
 @Composable
-private fun ColorButton(vm: CanvasViewModel, width: Dp) {
+private fun ColorButton(vm: CanvasViewModel, width: Dp, upright: Boolean = false) {
     val rgb = vm.colorRgb()
     // ringed only where the colour would fade into the bar: dark ones on the dark bar, light ones
     // on the light bar
     val ringed = if (Pc.light) vm.brightness > LIGHT_RING_ABOVE else vm.brightness < DARK_RING_BELOW
     // held a moment, the previous colour (and held again, back)
     // dragged out onto the canvas, it fills there (ColorDrop)
-    Box(Modifier.size(width, Pc.BarButtonHeight).dropSource(vm, onHold = { vm.previousColor() }) { vm.toggle(Panel.COLOR) }, contentAlignment = Alignment.Center) {
+    Box(Modifier.buttonSize(width, upright).dropSource(vm, onHold = { vm.previousColor() }) { vm.toggle(Panel.COLOR) }, contentAlignment = Alignment.Center) {
         val dot = Modifier.size(Pc.ColorDot * Pc.barGlyphScale(width)).clip(CircleShape).background(CanvasSpace.color(rgb))
         Box(if (ringed) dot.border(1.dp, Pc.ColorRing, CircleShape) else dot)
     }

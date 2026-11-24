@@ -182,6 +182,152 @@ pub fn top_bar(ui: &mut Ui, look: &mut Look, tool: ToolKind, colour: Color32, br
     bar
 }
 
+/// The room at either end of half of the top bar moved by Edit layout, past its first and last
+/// buttons (the bar's own points).
+pub const HALF_END: f32 = 10.0;
+
+/// How long half of the top bar is (`left`, else the right) laid in a row, its gaps those of a bar
+/// `width` wide (its own points): its buttons, gaps and ends.
+pub fn half_length(left: bool, width: f32) -> f32 {
+    let (tool_gap, action_gap) = pc::bar_gaps(width);
+    if left {
+        HALF_END * 2.0 + pc::GALLERY_WIDTH + (pc::BAR_BUTTON_WIDTH + action_gap) * 4.0
+    } else {
+        HALF_END * 2.0 + pc::BAR_BUTTON_WIDTH * 5.0 + tool_gap * 4.0
+    }
+}
+
+/// The top bar's halves where Edit layout moved them (`places`, the left's then the right's: its
+/// top-left in the window, and whether it stands upright), each on glass of its own, which goes into
+/// `glass`; as [`top_bar`] draws them, at the size a plugin gives the top bar, its buttons where they
+/// show. Upright, each button stands in a column, Gallery's word reading up it.
+#[allow(clippy::too_many_arguments)]
+pub fn top_bar_halves(
+    ctx: &egui::Context,
+    look: &mut Look,
+    tool: ToolKind,
+    colour: Color32,
+    brightness: f32,
+    lit: &Lit,
+    places: [procraft_core::BarPlace; 2],
+    glass: &mut Vec<f32>,
+) -> Bar {
+    let mut bar = Bar::default();
+    let k = crate::panel::part_scale(ctx, InterfacePart::TopBar);
+    let width = ctx.content_rect().width() / k;
+    let (tool_gap, action_gap) = pc::bar_gaps(width);
+    for (left, place) in [true, false].into_iter().zip(places) {
+        let at = pos2(place.x, place.y);
+        let length = half_length(left, width);
+        let r = Rect::from_min_size(
+            at,
+            if place.vertical { vec2(pc::BAR_HEIGHT, length) } else { vec2(length, pc::BAR_HEIGHT) },
+        );
+        let to_window = scaled_from(at, k);
+        frost(glass, to_window.mul_rect(r), pc::BAR_HEIGHT / 2.0 * k, ctx.pixels_per_point());
+        let gap = if left { action_gap } else { tool_gap };
+        egui::Area::new(Id::unique("top bar half").with(left)).fixed_pos(at).order(Order::Middle).show(ctx, |ui| {
+            ui.ctx().set_transform_layer(ui.layer_id(), to_window);
+            look.set_zoom(ui.layer_id(), k);
+            ui.painter().rect_filled(r, pc::BAR_HEIGHT / 2.0, argb(pc::BAR));
+            let mut along = HALF_END;
+            let mut next = |w: f32| {
+                let rect = if place.vertical {
+                    Rect::from_min_size(
+                        pos2(r.center().x - pc::BAR_BUTTON_HEIGHT / 2.0, r.top() + along),
+                        vec2(pc::BAR_BUTTON_HEIGHT, w),
+                    )
+                } else {
+                    Rect::from_min_size(
+                        pos2(r.left() + along, r.center().y - pc::BAR_BUTTON_HEIGHT / 2.0),
+                        vec2(w, pc::BAR_BUTTON_HEIGHT),
+                    )
+                };
+                along += w + gap;
+                rect
+            };
+            let mut tap = |ui: &Ui, which: BarButton, rect: Rect| {
+                bar.rects.push((which, to_window.mul_rect(rect)));
+                let response = ui.interact(rect, ui.scope_id().with(which), Sense::click());
+                if response.clicked() {
+                    bar.pressed = Some(which);
+                }
+                let (since, dragging) = ui.input(|i| (i.pointer.press_start_time(), i.pointer.is_decidedly_dragging()));
+                if response.is_pointer_button_down_on()
+                    && !dragging
+                    && let Some(since) = since
+                {
+                    bar.down = Some((which, since));
+                }
+            };
+            if left {
+                let gallery = next(pc::GALLERY_WIDTH);
+                tap(ui, BarButton::Gallery, gallery);
+                let ink = argb(pc::BAR_TEXT);
+                if place.vertical {
+                    // reading up the column
+                    let galley =
+                        crate::look::wrapped(ui.painter(), "Gallery", 18.0, Weight::Medium, ink, f32::INFINITY);
+                    let size = galley.size();
+                    let corner = pos2(gallery.center().x - size.y / 2.0, gallery.center().y + size.x / 2.0);
+                    let shape =
+                        egui::epaint::TextShape::new(corner, galley, ink).with_angle(-std::f32::consts::FRAC_PI_2);
+                    ui.painter().add(shape);
+                } else {
+                    text(
+                        ui.painter(),
+                        pos2(gallery.left(), gallery.center().y - 1.0),
+                        Align2::LEFT_CENTER,
+                        "Gallery",
+                        18.0,
+                        Weight::Medium,
+                        ink,
+                    );
+                }
+                let actions = [
+                    (BarButton::Actions, &icons::ACTIONS, 36.0, lit.actions),
+                    (BarButton::Adjustments, &icons::ADJUSTMENTS, 36.0, lit.adjustments),
+                    (BarButton::Selection, &icons::SELECTION, 33.0, lit.selection),
+                    (BarButton::Transform, &icons::TRANSFORM, 44.0, lit.transform),
+                ];
+                for (which, icon, glyph, on) in actions {
+                    let rect = next(pc::BAR_BUTTON_WIDTH);
+                    tap(ui, which, rect);
+                    let l = highlight(ui.ctx(), ui.scope_id().with(("lit", which)), on);
+                    let disc = mix(argb(pc::ACTION_DISC), argb(pc::BAR_GLYPH_SELECTED), l);
+                    ui.painter().circle_filled(rect.center(), pc::ACTION_DISC_SIZE / 2.0, disc);
+                    look.icon(ui, icon, rect.center(), glyph, mix(argb(pc::ACTION_GLYPH), Color32::WHITE, l));
+                }
+            } else {
+                let tools = [
+                    (BarButton::Paint, &icons::BRUSH, !lit.panel_open && tool == ToolKind::Paint),
+                    (BarButton::Smudge, &icons::SMUDGE, !lit.panel_open && tool == ToolKind::Smudge),
+                    (BarButton::Erase, &icons::ERASE, !lit.panel_open && tool == ToolKind::Erase),
+                    (BarButton::Layers, &icons::LAYERS, lit.layers),
+                ];
+                for (which, icon, on) in tools {
+                    let rect = next(pc::BAR_BUTTON_WIDTH);
+                    tap(ui, which, rect);
+                    let l = highlight(ui.ctx(), ui.scope_id().with(("lit", which)), on);
+                    look.icon(ui, icon, rect.center(), 44.0, mix(argb(pc::BAR_GLYPH), argb(pc::BAR_GLYPH_SELECTED), l));
+                }
+                let rect = next(pc::BAR_BUTTON_WIDTH);
+                ui.painter().circle_filled(rect.center(), pc::COLOR_DOT / 2.0, colour);
+                if brightness < DARK_RING_BELOW {
+                    ui.painter().circle_stroke(
+                        rect.center(),
+                        pc::COLOR_DOT / 2.0 - 0.5,
+                        Stroke::new(1.0, argb(pc::COLOR_RING)),
+                    );
+                }
+                bar.rects.push((BarButton::Colour, to_window.mul_rect(rect)));
+            }
+            look.set_zoom(ui.layer_id(), 1.0);
+        });
+    }
+    bar
+}
+
 /// What shows `k` times as big from `at`: from where it is laid out to where it shows.
 pub fn scaled_from(at: Pos2, k: f32) -> TSTransform {
     TSTransform::from_translation(at.to_vec2())
@@ -267,6 +413,9 @@ pub struct SideBar {
     pub slider_look: procraft_core::SliderLook,
     modify: Option<ModifyDrag>,
     settle: Option<Settle>,
+    /// Where Edit layout moved it (its top-left in the window), standing upright there; none while
+    /// it is against its edge.
+    pub moved: Option<Pos2>,
 }
 
 /// The modify button pressed: the bar's drag, and where the bar shows as it goes.
@@ -353,6 +502,11 @@ impl SideBar {
         let bar_bottom = crate::panel::bar_shown(&ctx);
         let now = ctx.input(|i| i.time);
         let rest = fit_side_bar(window, right, scale, bar_bottom, centre);
+        // where Edit layout moved it, if it did
+        let rest = match self.moved {
+            Some(at) => SideBarFit { at, ..rest },
+            None => rest,
+        };
         let fit = self.shown_at(&ctx, rest, right, now);
         // stretched toward the pointer: placed that far out, and reaching back to the window's edge
         let stretch = (fit.at.x - rest.at.x).abs() / scale;

@@ -369,6 +369,7 @@ private fun UndockHandle(vm: CanvasViewModel, modifier: Modifier) {
             fun letGo() {
                 if (vm.colorsUndocking) {
                     vm.colorsUndocking = false
+                    vm.letGoColours()
                     vm.closePanels()
                 }
             }
@@ -381,7 +382,7 @@ private fun UndockHandle(vm: CanvasViewModel, modifier: Modifier) {
                 total += delta
                 if (vm.colorsUndocking || total.getDistance() > UndockDrag.toPx()) {
                     vm.colorsUndocking = true
-                    vm.floatingColorsAt = origin + change.position - grab
+                    vm.undockColours(origin + change.position, grab)
                 }
             }
         },
@@ -397,16 +398,36 @@ private fun UndockHandle(vm: CanvasViewModel, modifier: Modifier) {
  */
 @Composable
 fun FloatingColors(vm: CanvasViewModel, maxWidth: Dp, maxHeight: Dp) {
-    val at = vm.floatingColorsAt ?: return
+    val kept = vm.floatingColorsAt ?: return
+    // hidden from its menu: unseen until its button or Show Hidden brings it back
+    if (vm.layoutLook.on && vm.hiddenPieces().contains(io.github.artcraftandroid.procraft.core.LayoutPiece.COLOURS)) return
     val c: ColorPick = remember(vm) { BrushColor(vm) }
     // the disc and Classic in the panel's colour model (Value stays HSB or RGB, as its switch picks)
     val m = remember(c, vm.colourModel) { ModelColor(c, vm.colourModel, vm.colourPlace) }
     val k = Pc.partScale(io.github.artcraftandroid.procraft.core.InterfacePart.FLOATING)
+    val ringed = vm.colourModel == ColourModel.HSB && Pc.picker?.huePoint?.invoke(c.hue) != null
+    val height = when {
+        Pc.floatingPickerOnly -> FloatingPickerTop + 248.dp + (if (ringed) 0.dp else 40.dp) + 6.dp
+        vm.colorMode == ColorMode.DISC -> 351.dp
+        else -> 390.dp
+    }
+    // while a plugin lays the panels out, where the layout has it (folded, its tab)
+    val at = if (vm.layoutLook.on) {
+        vm.panelLayout.setColoursSize(FloatingWidth.value, height.value)
+        val shown = vm.shownPiece(io.github.artcraftandroid.procraft.core.LayoutPiece.COLOURS)
+        if (shown?.folded == true) {
+            FloatingTab(vm, io.github.artcraftandroid.procraft.core.LayoutPiece.COLOURS, shown, if (vm.colorMode == ColorMode.PALETTES) "Palettes" else "Colors")
+            return
+        }
+        val density = LocalDensity.current.density
+        shown?.let { Offset(it.x * density, it.y * density) } ?: kept
+    } else {
+        kept
+    }
     if (Pc.floatingPickerOnly) {
-        FloatingPicker(vm, c, m, maxWidth, maxHeight, at)
+        FloatingPicker(vm, c, m, maxWidth, maxHeight, at, height)
         return
     }
-    val height = if (vm.colorMode == ColorMode.DISC) 351.dp else 390.dp
     // kept on the screen, and clear of the side bar as the panels are
     val (x, y) = floatingPlace(vm, at, FloatingWidth * k, height * k, maxWidth, maxHeight)
     // all of it drawn at the floating windows' size, placed in the window's pixels
@@ -425,9 +446,18 @@ fun FloatingColors(vm: CanvasViewModel, maxWidth: Dp, maxHeight: Dp) {
             Box(Modifier.align(Alignment.TopCenter).padding(top = 5.5.dp).size(40.dp, 4.dp).clip(CircleShape).background(Pc.Grabber))
             Box(
                 Modifier.align(Alignment.TopCenter).size(150.dp, 30.dp).pointerInput(vm) {
-                    detectDragGestures { change, delta ->
+                    var total = Offset.Zero
+                    detectDragGestures(
+                        onDragStart = {
+                            total = Offset.Zero
+                            vm.holdColours()
+                        },
+                        onDragEnd = { vm.letGoColours() },
+                        onDragCancel = { vm.letGoColours() },
+                    ) { change, delta ->
                         change.consume()
-                        vm.floatingColorsAt = (vm.floatingColorsAt ?: Offset.Zero) + delta
+                        total += delta
+                        vm.moveColours(total, delta)
                     }
                 },
             )
@@ -435,7 +465,15 @@ fun FloatingColors(vm: CanvasViewModel, maxWidth: Dp, maxHeight: Dp) {
             Box(Modifier.padding(start = 18.dp, top = 4.dp).height(40.dp), contentAlignment = Alignment.CenterStart) {
                 Text(title, color = Pc.PanelTitle, fontSize = 24.sp, fontWeight = FontWeight.Bold)
             }
-            FloatingClose(Modifier.align(Alignment.TopEnd).padding(top = 4.dp, end = 4.dp)) { vm.floatingColorsAt = null }
+            FloatingClose(Modifier.align(Alignment.TopEnd).padding(top = 4.dp, end = 4.dp)) { vm.closeColours() }
+            if (vm.layoutLook.on && vm.layoutLook.fold) {
+                FloatingFold(Modifier.align(Alignment.TopEnd).padding(top = 4.dp, end = 44.dp)) {
+                    vm.foldPiece(io.github.artcraftandroid.procraft.core.LayoutPiece.COLOURS, true)
+                }
+            }
+            if (vm.layoutLook.on) {
+                FloatingMenuButton(Modifier.align(Alignment.TopEnd).padding(top = 4.dp, end = 84.dp), windowMenu(vm, io.github.artcraftandroid.procraft.core.LayoutPiece.COLOURS))
+            }
             Column(Modifier.padding(top = 44.dp)) {
                 when (vm.colorMode) {
                     ColorMode.DISC -> {
@@ -486,10 +524,9 @@ private val FloatingPickerTop = 30.dp
  * slider under it, unless the picker has the hue on a ring of its own), nothing else; at the plugin's scale.
  */
 @Composable
-private fun FloatingPicker(vm: CanvasViewModel, c: ColorPick, m: ModelColor, maxWidth: Dp, maxHeight: Dp, at: Offset) {
+private fun FloatingPicker(vm: CanvasViewModel, c: ColorPick, m: ModelColor, maxWidth: Dp, maxHeight: Dp, at: Offset, height: Dp) {
     val k = Pc.partScale(io.github.artcraftandroid.procraft.core.InterfacePart.FLOATING)
     val ringed = vm.colourModel == ColourModel.HSB && Pc.picker?.huePoint?.invoke(c.hue) != null
-    val height = FloatingPickerTop + 248.dp + (if (ringed) 0.dp else 40.dp) + 6.dp
     val (x, y) = floatingPlace(vm, at, FloatingWidth * k, height * k, maxWidth, maxHeight)
     PartScaled(io.github.artcraftandroid.procraft.core.InterfacePart.FLOATING) {
         Popover(
@@ -504,14 +541,31 @@ private fun FloatingPicker(vm: CanvasViewModel, c: ColorPick, m: ModelColor, max
                 Box(Modifier.align(Alignment.TopCenter).padding(top = 5.5.dp).size(40.dp, 4.dp).clip(CircleShape).background(Pc.Grabber))
                 Box(
                     Modifier.align(Alignment.TopCenter).size(150.dp, FloatingPickerTop).pointerInput(vm) {
-                        detectDragGestures { change, delta ->
+                        var total = Offset.Zero
+                        detectDragGestures(
+                            onDragStart = {
+                                total = Offset.Zero
+                                vm.holdColours()
+                            },
+                            onDragEnd = { vm.letGoColours() },
+                            onDragCancel = { vm.letGoColours() },
+                        ) { change, delta ->
                             change.consume()
-                            vm.floatingColorsAt = (vm.floatingColorsAt ?: Offset.Zero) + delta
+                            total += delta
+                            vm.moveColours(total, delta)
                         }
                     },
                 )
                 Column(Modifier.padding(top = FloatingPickerTop)) { Classic(c, compact = true, m = m) }
-                FloatingClose(Modifier.align(Alignment.TopEnd).padding(top = 0.dp, end = 0.dp)) { vm.floatingColorsAt = null }
+                FloatingClose(Modifier.align(Alignment.TopEnd).padding(top = 0.dp, end = 0.dp)) { vm.closeColours() }
+                if (vm.layoutLook.on && vm.layoutLook.fold) {
+                    FloatingFold(Modifier.align(Alignment.TopEnd).padding(top = 0.dp, end = 40.dp)) {
+                        vm.foldPiece(io.github.artcraftandroid.procraft.core.LayoutPiece.COLOURS, true)
+                    }
+                }
+                if (vm.layoutLook.on) {
+                    FloatingMenuButton(Modifier.align(Alignment.TopEnd).padding(top = 0.dp, end = 80.dp), windowMenu(vm, io.github.artcraftandroid.procraft.core.LayoutPiece.COLOURS))
+                }
             }
         }
     }

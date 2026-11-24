@@ -18,6 +18,7 @@ mod adjust_menu;
 mod adjusting;
 mod animation;
 mod app_log;
+mod bars;
 mod big_pictures;
 mod blend_wheel;
 mod brush_files;
@@ -62,12 +63,14 @@ mod layer_bundle;
 mod layer_ops;
 mod layer_store;
 mod layers;
+mod layout;
 mod liquify;
 mod liquify_steps;
 mod list_slider;
 #[cfg(test)]
 mod low_storage_tests;
 mod modes;
+mod named_layouts;
 mod open_marks;
 mod pacing;
 mod palettes;
@@ -75,6 +78,8 @@ mod pick;
 mod pickers;
 /// A picker plugin's picture compiled: whose it is, its code, the keys it reads its controls by.
 pub(crate) type PickerProgram = (String, Arc<str>, Option<Arc<[String]>>, Arc<procraft_gpu::PictureProgram>);
+#[cfg(test)]
+mod heavy_tests;
 mod paper_picture;
 mod plugin_artwork;
 mod plugin_brushes;
@@ -156,6 +161,7 @@ pub use animation::{
     AnimationPlayback, AnimationSettings, FrameRate, PlayStep, animation_next_step, export_fps_at, export_fps_fraction,
     export_fps_label, frame_rate,
 };
+pub use bars::{BarHang, BarLayout, BarPlace, HangSide, LayoutBar, bar_layout_key};
 pub use big_pictures::{big_pictures_left, wait_for_big_pictures};
 pub use blend_wheel::{
     BLEND_TAP_SECONDS, BlendCoast, BlendStep, blend_centred, blend_coast, blend_coast_at, blend_pull_for, blend_pulled,
@@ -213,9 +219,14 @@ pub use layers::{
     ShownRow, ThumbnailImage, blend_modes, brush_blend_modes, combine_blend_modes, grain_blend_modes, layers_for,
     row_hold_seconds, set_layer_budget, set_resident_budget,
 };
+pub use layout::{
+    LayoutDock, LayoutInsets, LayoutPiece, LayoutRect, PanelLayout, PanelLayoutLook, PieceShown, PieceSizes,
+    panel_layout_key, piece_sizes,
+};
 pub use liquify::liquify_reach;
 pub use list_slider::{ListSliderTouch, list_slider_touch};
 pub use modes::{ModeButton, ModeSwitch, Modes, mode_switch, mode_switch_deselects};
+pub use named_layouts::{NamedLayouts, named_layouts_key};
 pub use open_marks::{
     android_run_ended_short_of_memory, opening_ended_app, opening_ended_app_said, opening_ended_app_title,
     opening_ended_run, set_open_marks_file,
@@ -412,6 +423,14 @@ impl From<PointerKind> for Pointer {
 /// Whether `s` lies on whole screen pixels.
 fn on_whole_pixels(s: &PenSample) -> bool {
     s.x.fract() == 0.0 && s.y.fract() == 0.0
+}
+
+/// Whether two views put the canvas in the same place, to a hundredth of a pixel.
+fn views_alike(a: &View, b: &View) -> bool {
+    let (a, b) = (a.to_screen(), b.to_screen());
+    [(a.a, b.a), (a.b, b.b), (a.c, b.c), (a.d, b.d)].iter().all(|(x, y)| (x - y).abs() <= 1e-5 * x.abs().max(1.0))
+        && (a.e - b.e).abs() <= 0.01
+        && (a.f - b.f).abs() <= 0.01
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, uniffi::Enum)]
@@ -822,6 +841,9 @@ pub(crate) struct State {
     pub(crate) x_ray: bool,
     /// What fitting the canvas keeps clear of (left, top, right, bottom, window pixels).
     fit_insets: [f32; 4],
+    /// What the panels docked against the window's edges take from the drawing area (left, top,
+    /// right, bottom, window pixels): fitting keeps clear of it too.
+    room_insets: [f32; 4],
     /// Frosted panels open over the canvas: left, top, right, bottom and corner radius (window
     /// pixels).
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
@@ -1012,8 +1034,18 @@ impl State {
     pub(crate) fn fitted_view(&self) -> View {
         let turns = self.view.map_or(i32::from(self.turns), |v| v.quarter_turns());
         // in the guide editor, the whole window (behind its bars)
-        let insets = if self.guide_before.is_some() { [0.0; 4] } else { self.fit_insets };
+        let insets = if self.guide_before.is_some() { [0.0; 4] } else { self.kept_clear() };
         View::fit_turned((self.doc.width(), self.doc.height()), self.window_size, insets, turns)
+    }
+
+    /// What fitting the canvas keeps clear of: the interface's (with Fit Canvas Inside Interface on)
+    /// and the panels' docked against the edges, the more of the two on each side.
+    pub(crate) fn kept_clear(&self) -> [f32; 4] {
+        let mut insets = self.fit_insets;
+        for (inset, room) in insets.iter_mut().zip(self.room_insets) {
+            *inset = inset.max(room);
+        }
+        insets
     }
 
     /// Finishes an open stroke.
@@ -2302,6 +2334,7 @@ impl CanvasSession {
             unreadable_untold: Vec::new(),
             closed: false,
             fit_insets: [0.0; 4],
+            room_insets: [0.0; 4],
             backdrops: Vec::new(),
             backdrop_windows: Vec::new(),
             turns: 0,
@@ -3157,6 +3190,34 @@ impl CanvasSession {
     /// pixels): the interface, with Fit Canvas Inside Interface on.
     pub fn set_fit_insets(&self, left: f32, top: f32, right: f32, bottom: f32) {
         self.shared.lock().fit_insets = [left, top, right, bottom];
+    }
+
+    /// What the panels docked against the window's edges take from the drawing area from now on
+    /// (left, top, right, bottom, window pixels; see [`crate::PanelLayout::canvas_insets`]): fitting
+    /// keeps clear of it as of the fit insets, and as it changes the canvas goes with the drawing
+    /// area, moved by half the change of each side so that what was in its middle stays in its
+    /// middle; a canvas fitted as it was is fitted again. All 0, as with no plugin docking panels,
+    /// changes nothing.
+    pub fn set_room_insets(&self, left: f32, top: f32, right: f32, bottom: f32) {
+        let mut st = self.shared.lock();
+        let now = [left, top, right, bottom].map(|v| if v.is_finite() { v.max(0.0) } else { 0.0 });
+        if st.room_insets == now {
+            return;
+        }
+        let before = st.kept_clear();
+        let fitted = st.view.is_some_and(|v| views_alike(&v, &st.fitted_view()));
+        st.room_insets = now;
+        let after = st.kept_clear();
+        let Some(view) = st.view else { return };
+        st.view_motion = None;
+        st.view = Some(if fitted {
+            st.fitted_view()
+        } else {
+            let dx = ((after[0] - before[0]) - (after[2] - before[2])) / 2.0;
+            let dy = ((after[1] - before[1]) - (after[3] - before[3])) / 2.0;
+            View::from_affine(view.to_screen().then(procraft_engine::geom::Affine::translate(Vec2::new(dx, dy))))
+        });
+        self.shared.frame(&mut st);
     }
 
     /// Lets go of the canvas and everything it holds, on the GPU and off it (its layers, parked

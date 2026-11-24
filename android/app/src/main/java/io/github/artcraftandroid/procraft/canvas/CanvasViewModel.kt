@@ -104,6 +104,9 @@ private const val TAG = "ProCraft"
 const val RECENT_SET = -1
 
 /** Where the set at place [set] is once the set at [from] has moved to place [to]. */
+/** How near (dp) a bar moved by Edit layout snaps, at least: to an edge, to turn against it. */
+private const val EDIT_SNAP = 16f
+
 internal fun placeAfterSetMove(set: Int, from: Int, to: Int): Int = when (set) {
     from -> to
     in (from + 1)..to -> set - 1
@@ -1019,6 +1022,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         pluginList = plugins.plugins()
         penActionKeys = plugins.actionsIn(io.github.artcraftandroid.procraft.core.PluginPlace.PEN).map { it.key }.toSet()
         followPluginLooks()
+        followLayout()
     }
 
     /** What the plugins do now; one nothing answers to does nothing. */
@@ -1432,39 +1436,100 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     var colorsUndocking by mutableStateOf(false)
 
     /**
-     * The Layers panel and the brush library, each as its window was last left when torn off into one of its own
-     * (shown or closed), kept with the interface settings. A window shows while a plugin lets its panel float.
+     * The floating panels' places (the Layers panel and the brush library torn off while a plugin lets them float, the
+     * colour panel too while one lays the panels out), each kept for each way the screen turns, with the interface
+     * settings; the core works out where each goes, snapped, folded and docked as the plugins say. It reads the windows
+     * kept before there were layouts, for the first place of each.
      */
-    var floatingWindows by mutableStateOf(readFloatingWindows())
+    val panelLayout: io.github.artcraftandroid.procraft.core.PanelLayout = io.github.artcraftandroid.procraft.core.PanelLayout().also { layout ->
+        val keys = listOf(io.github.artcraftandroid.procraft.core.panelLayoutKey()) +
+            io.github.artcraftandroid.procraft.core.FloatingPanel.entries.map { io.github.artcraftandroid.procraft.core.floatingKey(it) }
+        for (key in keys) interfacePrefs.getString(key, null)?.let { layout.readKept(key, it) }
+    }
+
+    /** Goes up as the layout changes: what shows the floating panels reads it, to show them again. */
+    var layoutChanges by androidx.compose.runtime.mutableIntStateOf(0)
+        private set
+
+    /** How the plugins lay the panels out, as last asked. */
+    var layoutLook by mutableStateOf(io.github.artcraftandroid.procraft.core.PanelLayoutLook(false, 0f, false, false, false))
         private set
 
     /** A panel's grabber is being dragged out: the panel stays, unseen, until let go, its window following the finger. */
     var panelUndocking by mutableStateOf<io.github.artcraftandroid.procraft.core.FloatingPanel?>(null)
         private set
 
-    /** Where the floating windows may go now (dp of the interface): the window, clear of the side bar. */
-    var floatingRoom = io.github.artcraftandroid.procraft.core.FloatingRoom(0f, 0f, 1f, 1f)
+    private fun pieceOf(panel: io.github.artcraftandroid.procraft.core.FloatingPanel) = when (panel) {
+        io.github.artcraftandroid.procraft.core.FloatingPanel.LAYERS -> io.github.artcraftandroid.procraft.core.LayoutPiece.LAYERS
+        io.github.artcraftandroid.procraft.core.FloatingPanel.BRUSHES -> io.github.artcraftandroid.procraft.core.LayoutPiece.BRUSHES
+    }
 
-    private fun readFloatingWindows(): Map<io.github.artcraftandroid.procraft.core.FloatingPanel, io.github.artcraftandroid.procraft.core.FloatingWindow> =
-        io.github.artcraftandroid.procraft.core.FloatingPanel.entries.mapNotNull { p ->
-            interfacePrefs.getString(io.github.artcraftandroid.procraft.core.floatingKey(p), null)?.let { io.github.artcraftandroid.procraft.core.floatingRead(it) }?.let { p to it }
-        }.toMap()
+    /** [piece] as it shows now (dp of the interface), while it does. */
+    fun shownPiece(piece: io.github.artcraftandroid.procraft.core.LayoutPiece): io.github.artcraftandroid.procraft.core.PieceShown? {
+        // (read where it shows, so it shows again as the layout changes)
+        return layoutChanges.let { panelLayout.shown(piece) }
+    }
 
     /** [panel]'s window, while it shows: torn off and not closed, and a plugin lets the panel float. */
-    fun floatingWindow(panel: io.github.artcraftandroid.procraft.core.FloatingPanel): io.github.artcraftandroid.procraft.core.FloatingWindow? =
-        floatingWindows[panel]?.takeIf { it.open && panel in io.github.artcraftandroid.procraft.ui.Pc.floatingPanels }
+    fun floatingWindow(panel: io.github.artcraftandroid.procraft.core.FloatingPanel): io.github.artcraftandroid.procraft.core.PieceShown? =
+        shownPiece(pieceOf(panel))
 
     /** The Layers panel shows: hanging from its button, or floating. */
     val layersShown: Boolean get() = panel == Panel.LAYERS || floatingWindow(io.github.artcraftandroid.procraft.core.FloatingPanel.LAYERS) != null
 
-    private fun setFloating(panel: io.github.artcraftandroid.procraft.core.FloatingPanel, window: io.github.artcraftandroid.procraft.core.FloatingWindow) {
-        floatingWindows = floatingWindows + (panel to window)
+    /** The layout changed: shown again, and what docked panels take from the drawing area told to the canvas. */
+    private fun layoutChanged() {
+        layoutChanges++
+        val insets = panelLayout.canvasInsets()
+        session?.setRoomInsets(insets.left * density, insets.top * density, insets.right * density, insets.bottom * density)
+        // the colour panel floating where the layout has it
+        if (layoutLook.on) {
+            panelLayout.shown(io.github.artcraftandroid.procraft.core.LayoutPiece.COLOURS)?.let { floatingColorsAt = Offset(it.x * density, it.y * density) }
+        }
     }
 
-    /** [panel]'s window as it is now, kept for the next start. */
-    fun keepFloatingWindow(panel: io.github.artcraftandroid.procraft.core.FloatingPanel) {
-        val window = floatingWindows[panel] ?: return
-        interfacePrefs.edit().putString(io.github.artcraftandroid.procraft.core.floatingKey(panel), io.github.artcraftandroid.procraft.core.floatingKept(window)).apply()
+    /** Where the artwork's own Reference window shows (dp of the interface), or none: the panels snap against it. */
+    fun tellReference(rect: io.github.artcraftandroid.procraft.core.LayoutRect?) {
+        if (rect == referenceTold) return
+        referenceTold = rect
+        panelLayout.setReference(rect)
+        layoutChanged()
+    }
+
+    private var referenceTold: io.github.artcraftandroid.procraft.core.LayoutRect? = null
+
+    /** The layout as it is now, kept for the next start. */
+    private fun keepLayout() {
+        interfacePrefs.edit().putString(io.github.artcraftandroid.procraft.core.panelLayoutKey(), panelLayout.kept()).apply()
+    }
+
+    /**
+     * The room the floating panels go in now: [room] (dp of the interface), clear of the side bar, in a window [width] by
+     * [height] under a top bar [bar] down, the floating windows shown [scale] times as big.
+     */
+    fun layoutRoom(room: io.github.artcraftandroid.procraft.core.FloatingRoom, width: Float, height: Float, bar: Float, scale: Float) {
+        val now = listOf(room.left, room.top, room.right, room.bottom, width, height, bar, scale)
+        if (now == layoutRoomWas) return
+        layoutRoomWas = now
+        panelLayout.setRoom(room, width, height, bar, scale)
+        layoutChanged()
+    }
+
+    /** The room as last told, so the same room tells nothing. */
+    private var layoutRoomWas: List<Float>? = null
+
+    /** The plugins changed: which panels float, and how they are laid out. */
+    private fun followLayout() {
+        panelLayout.follow(plugins)
+        layoutLook = panelLayout.look()
+        // the bars back where they always are as no plugin lets them move: no handles
+        if (!layoutLook.edit && editingLayout) doneEditLayout()
+        barChanges++
+        // the colour panel kept floating comes back where it was
+        if (layoutLook.on && floatingColorsAt == null && panelLayout.isOpen(io.github.artcraftandroid.procraft.core.LayoutPiece.COLOURS)) {
+            floatingColorsAt = Offset.Zero
+        }
+        layoutChanged()
     }
 
     /**
@@ -1472,42 +1537,325 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
      * as big as it was last left, its grabber under the finger.
      */
     fun undockPanel(panel: io.github.artcraftandroid.procraft.core.FloatingPanel, x: Float, y: Float) {
-        panelUndocking = panel
-        val k = io.github.artcraftandroid.procraft.ui.Pc.partScale(io.github.artcraftandroid.procraft.core.InterfacePart.FLOATING)
-        val first = io.github.artcraftandroid.procraft.core.floatingAt(panel, x, y - io.github.artcraftandroid.procraft.ui.FloatingGrabY * k, k)
-        val sized = floatingWindows[panel]?.let { was -> first.copy(x = x - was.width * k / 2, width = was.width, height = was.height) } ?: first
-        setFloating(panel, io.github.artcraftandroid.procraft.core.floatingFitted(panel, sized, floatingRoom, k))
+        if (panelUndocking != panel) {
+            panelUndocking = panel
+            panelLayout.openAt(pieceOf(panel), x, y, io.github.artcraftandroid.procraft.ui.FloatingGrabY)
+        } else {
+            panelLayout.drag(x, y)
+        }
+        layoutChanged()
     }
 
     /** [panel]'s grabber let go: it floats where it is, kept, and the panel that hung from its button closes. */
     fun undockedPanel(panel: io.github.artcraftandroid.procraft.core.FloatingPanel) {
         if (panelUndocking != panel) return
         panelUndocking = null
-        keepFloatingWindow(panel)
+        if (panelLayout.letGo()) keepLayout()
+        layoutChanged()
         closePanels()
         if (panel == io.github.artcraftandroid.procraft.core.FloatingPanel.LAYERS) refreshThumbnails()
     }
 
-    /** [panel]'s window moved by ([dx], [dy]) (dp of the interface), inside its room. */
-    fun moveFloating(panel: io.github.artcraftandroid.procraft.core.FloatingPanel, dx: Float, dy: Float) {
-        val window = floatingWindows[panel] ?: return
-        val k = io.github.artcraftandroid.procraft.ui.Pc.partScale(io.github.artcraftandroid.procraft.core.InterfacePart.FLOATING)
-        setFloating(panel, io.github.artcraftandroid.procraft.core.floatingMoved(panel, window, dx, dy, floatingRoom, k))
+    /** [piece]'s strip or tab (or, [sizing], its corner) pressed: it moves (or is sized) with the finger until let go. */
+    fun holdPiece(piece: io.github.artcraftandroid.procraft.core.LayoutPiece, sizing: Boolean) {
+        panelLayout.hold(piece, sizing, 0f, 0f)
     }
 
-    /** [panel]'s window sized from its corner, dragged by ([dx], [dy]) (dp of the interface), within what it may be. */
-    fun resizeFloating(panel: io.github.artcraftandroid.procraft.core.FloatingPanel, dx: Float, dy: Float) {
-        val window = floatingWindows[panel] ?: return
-        val k = io.github.artcraftandroid.procraft.ui.Pc.partScale(io.github.artcraftandroid.procraft.core.InterfacePart.FLOATING)
-        setFloating(panel, io.github.artcraftandroid.procraft.core.floatingResized(panel, window, dx, dy, floatingRoom, k))
+    /** The piece held dragged ([dx], [dy]) all told since it was pressed (dp of the interface). */
+    fun dragPiece(dx: Float, dy: Float): io.github.artcraftandroid.procraft.core.PieceShown? {
+        val shown = panelLayout.drag(dx, dy)
+        layoutChanged()
+        return shown
+    }
+
+    /** The piece held let go, kept where it is. */
+    fun letGoPiece() {
+        if (panelLayout.letGo()) keepLayout()
+        layoutChanged()
+    }
+
+    /** [piece] folded to its tab, or unfolded. */
+    fun foldPiece(piece: io.github.artcraftandroid.procraft.core.LayoutPiece, folded: Boolean) {
+        panelLayout.setFolded(piece, folded)
+        keepLayout()
+        layoutChanged()
     }
 
     /** [panel]'s window closed by its Close: where it was and its size kept for when it floats again. */
     fun closeFloating(panel: io.github.artcraftandroid.procraft.core.FloatingPanel) {
-        val window = floatingWindows[panel] ?: return
-        setFloating(panel, window.copy(open = false))
-        keepFloatingWindow(panel)
+        panelLayout.close(pieceOf(panel))
+        keepLayout()
+        layoutChanged()
     }
+
+    /** A piece being dragged out by its grabber (not the Layers panel or the library): unseen where it was until let go. */
+    var pieceUndocking by mutableStateOf<io.github.artcraftandroid.procraft.core.LayoutPiece?>(null)
+        private set
+
+    /** Whether the plugins let [piece] float now. */
+    fun mayFloat(piece: io.github.artcraftandroid.procraft.core.LayoutPiece): Boolean = layoutChanges.let { panelLayout.mayFloat(piece) }
+
+    /** [piece] dragged out by its grabber past its start, the finger at ([x], [y]) (dp of the interface), its strip's middle [grab] down. */
+    fun undockPiece(piece: io.github.artcraftandroid.procraft.core.LayoutPiece, x: Float, y: Float, grab: Float) {
+        if (pieceUndocking != piece) {
+            pieceUndocking = piece
+            panelLayout.openAt(piece, x, y, grab)
+        } else {
+            panelLayout.drag(x, y)
+        }
+        layoutChanged()
+    }
+
+    /** [piece]'s grabber let go: it floats where it is, kept; a panel that hung from its button closes. */
+    fun undockedPiece(piece: io.github.artcraftandroid.procraft.core.LayoutPiece) {
+        if (pieceUndocking != piece) return
+        pieceUndocking = null
+        if (panelLayout.letGo()) keepLayout()
+        layoutChanged()
+        if (piece == io.github.artcraftandroid.procraft.core.LayoutPiece.ACTIONS || piece == io.github.artcraftandroid.procraft.core.LayoutPiece.ADJUSTMENTS) {
+            closePanels()
+        }
+    }
+
+    /** [piece]'s window closed: a panel goes back to its button, a toolbar or an adjustment's controls to where they always are. */
+    fun closePiece(piece: io.github.artcraftandroid.procraft.core.LayoutPiece) {
+        panelLayout.close(piece)
+        keepLayout()
+        layoutChanged()
+    }
+
+    /** [piece]'s window hidden (from its menu), or shown again. */
+    fun hidePiece(piece: io.github.artcraftandroid.procraft.core.LayoutPiece, hidden: Boolean = true) {
+        if (panelLayout.isHidden(piece) == hidden) return
+        panelLayout.setHidden(piece, hidden)
+        keepLayout()
+        layoutChanged()
+    }
+
+    /** Every hidden window shown again. */
+    fun showHiddenPieces() {
+        panelLayout.showHidden()
+        keepLayout()
+        layoutChanged()
+    }
+
+    /** The windows hidden now. */
+    fun hiddenPieces(): List<io.github.artcraftandroid.procraft.core.LayoutPiece> = layoutChanges.let { panelLayout.hiddenPieces() }
+
+    /** [piece]'s window pinned over the others, or not. */
+    fun pinPiece(piece: io.github.artcraftandroid.procraft.core.LayoutPiece, pinned: Boolean) {
+        panelLayout.setPinned(piece, pinned)
+        keepLayout()
+        layoutChanged()
+    }
+
+    /** Whether [piece]'s window is pinned over the others. */
+    fun pinnedPiece(piece: io.github.artcraftandroid.procraft.core.LayoutPiece): Boolean = layoutChanges.let { panelLayout.isPinned(piece) }
+
+    /** [piece]'s window back where it first goes. */
+    fun resetPiece(piece: io.github.artcraftandroid.procraft.core.LayoutPiece) {
+        panelLayout.resetPlace(piece)
+        keepLayout()
+        layoutChanged()
+    }
+
+    /** The floating windows in the order they are drawn, from the bottom up. */
+    fun pieceOrder(): List<io.github.artcraftandroid.procraft.core.LayoutPiece> = layoutChanges.let { panelLayout.order() }
+
+    /** The sizes told the layout, so the same size tells nothing. */
+    private val pieceSizesTold = mutableMapOf<io.github.artcraftandroid.procraft.core.LayoutPiece, Pair<Float, Float>>()
+
+    /** How big [piece] is as it is laid out now ([width] by [height], its own dp): for one that isn't sized. */
+    fun tellPieceSize(piece: io.github.artcraftandroid.procraft.core.LayoutPiece, width: Float, height: Float) {
+        val now = width to height
+        if (pieceSizesTold[piece] == now) return
+        pieceSizesTold[piece] = now
+        panelLayout.setSize(piece, width, height)
+        layoutChanged()
+    }
+
+    /** The layout's piece for a panel that may float from its button, if it is one. */
+    private fun floatingPieceOf(p: Panel): io.github.artcraftandroid.procraft.core.LayoutPiece? = when (p) {
+        Panel.LAYERS -> io.github.artcraftandroid.procraft.core.LayoutPiece.LAYERS
+        Panel.BRUSHES -> io.github.artcraftandroid.procraft.core.LayoutPiece.BRUSHES
+        Panel.ACTIONS -> io.github.artcraftandroid.procraft.core.LayoutPiece.ACTIONS
+        Panel.ADJUSTMENTS -> io.github.artcraftandroid.procraft.core.LayoutPiece.ADJUSTMENTS
+        else -> null
+    }
+
+    /**
+     * The interface's bars as Edit layout moves them (the top bar's halves and the side bar), the core's to work out,
+     * each kept for each way the screen turns. While no plugin lets the bars be moved they show where they always do.
+     */
+    val barLayout: io.github.artcraftandroid.procraft.core.BarLayout = io.github.artcraftandroid.procraft.core.BarLayout().also { bars ->
+        interfacePrefs.getString(io.github.artcraftandroid.procraft.core.barLayoutKey(), null)?.let { bars.readKept(it) }
+    }
+
+    /** Goes up as a bar moves: what shows the bars reads it, to show them again. */
+    var barChanges by androidx.compose.runtime.mutableIntStateOf(0)
+        private set
+
+    /** Edit layout is on: the bars show handles, and move. */
+    var editingLayout by mutableStateOf(false)
+        private set
+
+    /** Where [bar] shows while Edit layout moved it (dp of the interface), while a plugin lets the bars be moved; else none: where it always is. */
+    fun barMoved(bar: io.github.artcraftandroid.procraft.core.LayoutBar): io.github.artcraftandroid.procraft.core.BarPlace? =
+        barChanges.let { if (layoutLook.edit && barLayout.isMoved(bar)) barLayout.shown(bar) else null }
+
+    /** Where [bar] shows now, moved or not (dp of the interface). */
+    fun barShown(bar: io.github.artcraftandroid.procraft.core.LayoutBar): io.github.artcraftandroid.procraft.core.BarPlace? =
+        barChanges.let { barMoved(bar) ?: barLayout.shown(bar) }
+
+    /** The window ([width] by [height], dp of the interface), and [bar] where it always is: [own], [length] along it and [thickness] across. */
+    fun tellBar(width: Float, height: Float, bar: io.github.artcraftandroid.procraft.core.LayoutBar, own: io.github.artcraftandroid.procraft.core.BarPlace, length: Float, thickness: Float) {
+        val landscape = width >= height
+        barLayout.setWindow(width, height, layoutLook.snap.coerceAtLeast(EDIT_SNAP))
+        barLayout.setBar(bar, own, length, thickness)
+        // turned, the bars moved the other way show
+        if (landscape != barsLandscape) {
+            barsLandscape = landscape
+            barChanges++
+        }
+    }
+
+    private var barsLandscape: Boolean? = null
+
+    /** Edit layout on (from the Canvas tab): the panels close, and the bars show handles. */
+    fun startEditLayout() {
+        closePanels()
+        barLayout.setEditing(true)
+        editingLayout = true
+    }
+
+    /** Edit layout's Done: the bars stay where they are, kept. */
+    fun doneEditLayout() {
+        barLayout.setEditing(false)
+        editingLayout = false
+        keepBars()
+    }
+
+    /** Edit layout's Reset: every bar back where it always is. */
+    fun resetLayout() {
+        barLayout.reset()
+        keepBars()
+        barChanges++
+    }
+
+    /** [bar]'s handle pressed, while editing. */
+    fun holdBar(bar: io.github.artcraftandroid.procraft.core.LayoutBar) {
+        barLayout.hold(bar, 0f, 0f)
+    }
+
+    /** The bar held dragged ([dx], [dy]) all told since it was pressed (dp of the interface). */
+    fun dragBar(dx: Float, dy: Float) {
+        barLayout.drag(dx, dy)
+        barChanges++
+    }
+
+    /** The bar held let go, kept where it is. */
+    fun letGoBar() {
+        if (barLayout.letGo()) keepBars()
+        barChanges++
+    }
+
+    private fun keepBars() {
+        interfacePrefs.edit().putString(io.github.artcraftandroid.procraft.core.barLayoutKey(), barLayout.kept()).apply()
+    }
+
+    /** Edit layout's named layouts: the bars' and the floating panels' places saved under names of the painter's. */
+    val namedLayouts: io.github.artcraftandroid.procraft.core.NamedLayouts = io.github.artcraftandroid.procraft.core.NamedLayouts().also { named ->
+        interfacePrefs.getString(io.github.artcraftandroid.procraft.core.namedLayoutsKey(), null)?.let { named.readKept(it) }
+    }
+
+    /** Goes up as the named layouts change: what lists them reads it. */
+    var namedChanges by androidx.compose.runtime.mutableIntStateOf(0)
+        private set
+
+    /** The named layouts' names, and the one last saved or chosen. */
+    fun layoutNames(): List<String> = namedChanges.let { namedLayouts.names() }
+
+    fun chosenLayout(): String? = namedChanges.let { namedLayouts.chosen() }
+
+    /** A name for a layout saved now. */
+    fun nextLayoutName(): String = namedLayouts.nextName()
+
+    private fun keepNamed() {
+        interfacePrefs.edit().putString(io.github.artcraftandroid.procraft.core.namedLayoutsKey(), namedLayouts.kept()).apply()
+        namedChanges++
+    }
+
+    /** The bars and panels where they are now, saved as [name] (in place of one of that name). */
+    fun saveLayout(name: String) {
+        if (namedLayouts.save(name, barLayout, panelLayout) != null) keepNamed()
+    }
+
+    /** The layout named [name] brought back: the bars and panels where it had them, kept. */
+    fun chooseLayout(name: String) {
+        if (!namedLayouts.choose(name, barLayout, panelLayout)) return
+        keepNamed()
+        keepBars()
+        barChanges++
+        keepLayout()
+        layoutChanged()
+    }
+
+    fun renameLayout(from: String, to: String) {
+        if (namedLayouts.rename(from, to) != null) keepNamed()
+    }
+
+    fun deleteLayout(name: String) {
+        if (namedLayouts.delete(name)) keepNamed()
+    }
+
+    /** The colour panel's grabber dragged out to [at] (window pixels), the window's grabber [grab] under it. */
+    fun undockColours(at: Offset, grab: Offset) {
+        if (!layoutLook.on) {
+            floatingColorsAt = at - grab
+            return
+        }
+        val piece = io.github.artcraftandroid.procraft.core.LayoutPiece.COLOURS
+        if (panelLayout.holding() != piece) {
+            val k = io.github.artcraftandroid.procraft.ui.Pc.partScale(io.github.artcraftandroid.procraft.core.InterfacePart.FLOATING)
+            panelLayout.openAt(piece, at.x / density, at.y / density, grab.y / density / k)
+        } else {
+            panelLayout.drag(at.x / density, at.y / density)
+        }
+        layoutChanged()
+    }
+
+    /** The floating colour panel's grabber pressed: it moves with the finger until let go. */
+    fun holdColours() {
+        if (layoutLook.on) panelLayout.hold(io.github.artcraftandroid.procraft.core.LayoutPiece.COLOURS, false, 0f, 0f)
+    }
+
+    /** The floating colour panel dragged by its grabber, [total] all told since it was pressed, [delta] since last (window pixels). */
+    fun moveColours(total: Offset, delta: Offset) {
+        if (!layoutLook.on) {
+            floatingColorsAt = (floatingColorsAt ?: Offset.Zero) + delta
+            return
+        }
+        panelLayout.drag(total.x / density, total.y / density)
+        layoutChanged()
+    }
+
+    /** The colour panel's grabber let go (dragged out of its place, or moving its window): kept where it is. */
+    fun letGoColours() {
+        if (layoutLook.on && panelLayout.letGo()) keepLayout()
+        layoutChanged()
+    }
+
+    /** The floating colour panel closed: kept closed where it was, while the layout keeps it. */
+    fun closeColours() {
+        floatingColorsAt = null
+        if (layoutLook.on) {
+            panelLayout.close(io.github.artcraftandroid.procraft.core.LayoutPiece.COLOURS)
+            keepLayout()
+            layoutChanged()
+        }
+    }
+
+    init { followLayout() }
 
     /** The panel just closed fades away (an adjustment picked from its list) instead of going at once. */
     var panelFading by mutableStateOf(false)
@@ -2016,11 +2364,15 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     /** What fitting the canvas keeps clear of: the top bar and the sidebar, with Fit Canvas Inside Interface. */
     fun applyFitInsets() {
         val s = session ?: return
+        // and what the panels docked against the edges take from the drawing area, while a plugin says they make room
+        val room = panelLayout.canvasInsets()
+        s.setRoomInsets(room.left * density, room.top * density, room.right * density, room.bottom * density)
         if (!fitInside) {
             s.setFitInsets(0f, 0f, 0f, 0f)
             return
         }
-        val side = if (showSideBar) (io.github.artcraftandroid.procraft.ui.Pc.sideBarShown.value + io.github.artcraftandroid.procraft.ui.Pc.PopoverGap.value) * density else 0f
+        val atEdge = barMoved(io.github.artcraftandroid.procraft.core.LayoutBar.SIDE_BAR) == null
+        val side = if (showSideBar && atEdge) (io.github.artcraftandroid.procraft.ui.Pc.sideBarShown.value + io.github.artcraftandroid.procraft.ui.Pc.PopoverGap.value) * density else 0f
         s.setFitInsets(if (rightHanded) 0f else side, io.github.artcraftandroid.procraft.ui.Pc.barShown.value * density, if (rightHanded) side else 0f, 0f)
     }
 
@@ -5171,6 +5523,34 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             keep()
         }
 
+        /** Moved by its grab line with the snapping the plugins give the panels (the artwork's own window alone). */
+        private var held = false
+
+        /** Its grab line pressed: while a plugin snaps the panels, the artwork's own window moves snapping from here. */
+        fun hold() {
+            held = index == 0 && layoutLook.on && layoutLook.snap > 0f &&
+                panelLayout.hold(io.github.artcraftandroid.procraft.core.LayoutPiece.REFERENCE, false, 0f, 0f)
+        }
+
+        /** Dragged by its grab line, [total] all told since it was pressed, [by] since last (window pixels). */
+        fun drag(total: Offset, by: Offset) {
+            val shown = if (held) panelLayout.drag(total.x / density, total.y / density) else null
+            if (shown == null) {
+                move(by)
+                return
+            }
+            offset = onScreen(Offset(shown.x * density, shown.y * density))
+            keep()
+        }
+
+        /** Its grab line let go. */
+        fun letGo() {
+            if (!held) return
+            held = false
+            panelLayout.letGo()
+            layoutChanged()
+        }
+
         /** A drag on a size handle, from the size the window shows at; from the left one the window's left edge moves. */
         fun resize(dx: Dp, dy: Dp, fromLeft: Boolean) {
             val old = shown
@@ -7563,19 +7943,25 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         }
         feedback()
         switchModes(ModeButton.Panel(p == Panel.COLOR))
+        // the colour button with the panel floating hidden: it shows again
+        if (p == Panel.COLOR && floatingColorsAt != null && layoutLook.on && panelLayout.isHidden(io.github.artcraftandroid.procraft.core.LayoutPiece.COLOURS)) {
+            hidePiece(io.github.artcraftandroid.procraft.core.LayoutPiece.COLOURS, false)
+            return
+        }
         // the colour button with the panel floating: it goes back in its place
         if (p == Panel.COLOR && floatingColorsAt != null) {
-            floatingColorsAt = null
+            closeColours()
             panel = Panel.NONE
         }
-        // as do the Layers and the brush library's buttons with theirs floating
-        val floating = when (p) {
-            Panel.LAYERS -> io.github.artcraftandroid.procraft.core.FloatingPanel.LAYERS
-            Panel.BRUSHES -> io.github.artcraftandroid.procraft.core.FloatingPanel.BRUSHES
-            else -> null
+        // a panel's button with its window hidden shows the window again
+        val piece = floatingPieceOf(p)
+        if (piece != null && panelLayout.mayFloat(piece) && panelLayout.isOpen(piece) && panelLayout.isHidden(piece)) {
+            hidePiece(piece, false)
+            return
         }
-        if (floating != null && floatingWindow(floating) != null) {
-            closeFloating(floating)
+        // as do the Layers and the brush library's buttons with theirs floating, and the others' with theirs
+        if (piece != null && shownPiece(piece) != null) {
+            closePiece(piece)
             panel = Panel.NONE
         }
         panel = if (panel == p) Panel.NONE else p

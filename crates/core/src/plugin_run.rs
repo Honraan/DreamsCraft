@@ -64,7 +64,8 @@
 //!   0 what undo and redo did, 1 anything else done. A notice of something gone wrong is never asked.
 //! - `procraft_floating_panel(panel: i32) -> i32`: for the hook `floating_panels` (interface 7),
 //!   whether a panel can be torn off into a window of its own (not 0), `panel` by
-//!   [`crate::floating::FloatingPanel`].
+//!   [`crate::floating::FloatingPanel`], and from interface 20 the other panels by their numbers
+//!   2 to 7 (see [`crate::LayoutPiece`]).
 //! - `procraft_gesture_lock(part: i32) -> i32`: for the hook `gesture_lock` (interface 8), whether
 //!   a two-finger gesture leaves part of the view as it is (not 0), `part` 0 its turn and 1
 //!   (interface 10) the fit a quick pinch in makes.
@@ -99,6 +100,11 @@
 //! - `procraft_slider_look(what: i32) -> f32`: for the hook `slider_look` (interface 11), how the
 //!   side bar's slider tracks look: `what` 0 their opacity (0 to 1), 1 whether what is behind them
 //!   is frosted as the bar's glass (1) or only softened (0); below 0 to leave it as it is.
+//! - `procraft_panel_layout(part: i32) -> f32`: for the hook `panel_layout` (interface 20), how the
+//!   floating panels are laid out: `part` 0 how near (points, 0 to 64) a panel comes to an edge or
+//!   another before it snaps to it, 1 whether panels fold to a tab (1) or not (0), 2 whether panels
+//!   docked against the window's edges take that room from the drawing area (1) or not (0), 3
+//!   whether the interface's bars may be moved (1) or not (0); below 0 to leave it as it is.
 //! - `procraft_colour_panel(part: i32) -> i32`: for the hook `colour_panel` (interface 12), whether
 //!   the colour panel does `part` of what it may (not 0 for yes): 0 its sliders step one unit at a
 //!   tap on either end, 1 its swatch shows the colour as the panel opened beside the colour now.
@@ -302,6 +308,7 @@ const BRUSH_PREVIEW_COLOUR: &str = "procraft_brush_preview_colour";
 const LAYER_LABEL: &str = "procraft_layer_label";
 const SURROUND_PICTURE: &str = "procraft_surround_picture";
 const SLIDER_LOOK: &str = "procraft_slider_look";
+const PANEL_LAYOUT: &str = "procraft_panel_layout";
 const COLOUR_PANEL: &str = "procraft_colour_panel";
 const STROKE_FILL: &str = "procraft_stroke_fill";
 const CURVE_BEGIN: &str = "procraft_curve_begin";
@@ -475,6 +482,8 @@ pub(crate) enum Hook {
     ColourPanel,
     /// How much the layers but the current one are dimmed on the screen alone (interface 13).
     ViewDimOthers,
+    /// How the floating panels are laid out: snapped, folded, making room (interface 20).
+    PanelLayout,
 }
 
 impl Hook {
@@ -517,6 +526,7 @@ impl Hook {
             "stroke_fill" => Some(Hook::StrokeFill),
             "colour_panel" => Some(Hook::ColourPanel),
             "view_dim_others" => Some(Hook::ViewDimOthers),
+            "panel_layout" => Some(Hook::PanelLayout),
             _ => None,
         }
     }
@@ -563,6 +573,7 @@ impl Hook {
             Hook::StrokeFill => "This plugin can make your strokes fill what they go round.",
             Hook::ColourPanel => "This plugin can change how the colour panel's sliders and swatch work.",
             Hook::ViewDimOthers => "This plugin can dim the layers but the one you're on, on the screen alone.",
+            Hook::PanelLayout => "This plugin can snap, fold and dock the floating panels.",
         }
     }
 
@@ -608,6 +619,7 @@ impl Hook {
             Hook::StrokeFill => exports(module, STROKE_FILL, &[ValType::I32, ValType::I32], &[ValType::I32]),
             Hook::ColourPanel => exports(module, COLOUR_PANEL, &[ValType::I32], &[ValType::I32]),
             Hook::ViewDimOthers => exports(module, VIEW_DIM_OTHERS, &[], &[ValType::F32]),
+            Hook::PanelLayout => exports(module, PANEL_LAYOUT, &[ValType::I32], &[ValType::F32]),
             Hook::OpacityTogether => exports(module, OPACITY_TOGETHER, &[], &[ValType::I32]),
             Hook::RandomiseBrush => exports(module, RANDOMISE, &[ValType::I32, ValType::I32], &[ValType::F32]),
             Hook::ColourTriangle => exports(module, COLOUR_TRIANGLE, &[], &[ValType::I32]),
@@ -1111,6 +1123,7 @@ pub(crate) struct Running {
     stroke_fill: Option<TypedFunc<(i32, i32), i32>>,
     colour_panel: Option<TypedFunc<i32, i32>>,
     view_dim_others: Option<TypedFunc<(), f32>>,
+    panel_layout: Option<TypedFunc<i32, f32>>,
     curve: Option<CurveCalls>,
     stroke_sound: Option<SoundCall>,
     sound_prepare: Option<TypedFunc<i32, i32>>,
@@ -1274,6 +1287,7 @@ impl Running {
             let stroke_fill = instance.get_typed_func(&store, STROKE_FILL).ok();
             let colour_panel = instance.get_typed_func(&store, COLOUR_PANEL).ok();
             let view_dim_others = instance.get_typed_func(&store, VIEW_DIM_OTHERS).ok();
+            let panel_layout = instance.get_typed_func(&store, PANEL_LAYOUT).ok();
             let curve = (|| {
                 Some(CurveCalls {
                     begin: instance.get_typed_func(&store, CURVE_BEGIN).ok()?,
@@ -1388,6 +1402,7 @@ impl Running {
                 stroke_fill,
                 colour_panel,
                 view_dim_others,
+                panel_layout,
                 curve,
                 stroke_sound,
                 sound_prepare,
@@ -2579,6 +2594,25 @@ impl Running {
         })?;
         match said {
             _ if said.is_nan() || said > 1.0 => Err(Stop::Nonsense),
+            _ if said < 0.0 => Ok(None),
+            _ => Ok(Some(said)),
+        }
+    }
+
+    /// What it says of `part` of how the floating panels are laid out (see
+    /// [`crate::layout::PanelLayoutLook`]): how near they snap, 0 to 64 points (part 0), or a yes
+    /// (1) or no (0) for the rest; none where it leaves it as it is (below 0). One past those, or not
+    /// a number, stops it.
+    pub(crate) fn panel_layout(&mut self, part: i32) -> Result<Option<f32>, Stop> {
+        let Running { store, panel_layout, .. } = self;
+        let Some(panel_layout) = panel_layout else { return Ok(None) };
+        let said = guarded(|| {
+            store.set_fuel(SAMPLE_FUEL).map_err(|_| Stop::Damaged)?;
+            panel_layout.call(&mut *store, part).map_err(|e| stop_of(&e))
+        })?;
+        let most = if part == crate::hooks::LAYOUT_SNAP { crate::layout::MOST_SNAP } else { 1.0 };
+        match said {
+            _ if said.is_nan() || said > most => Err(Stop::Nonsense),
             _ if said < 0.0 => Ok(None),
             _ => Ok(Some(said)),
         }

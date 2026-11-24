@@ -264,7 +264,11 @@ struct ActionsPanel: View {
                     }
                     // the plugins' own rows in the Canvas tab, after its own
                     if tab == 1, !model.scene.open {
-                        PluginPlaceRows(model: model, place: .canvas)
+                        // and Edit Layout, while a plugin lets the bars move
+                        PluginPlaceRows(
+                            model: model, place: .canvas,
+                            more: model.layoutLook.edit ? ("Edit Layout", { model.startEditLayout() }) : nil
+                        )
                     }
                 }
                 .padding(.horizontal, 12)
