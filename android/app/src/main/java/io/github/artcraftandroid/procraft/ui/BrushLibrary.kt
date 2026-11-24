@@ -63,7 +63,9 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.input.pointer.AwaitPointerEventScope
 import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.semantics.onLongClick
@@ -73,7 +75,6 @@ import androidx.compose.ui.geometry.isSpecified
 import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.awaitLongPressOrCancellation
 import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.ui.layout.ContentScale
@@ -97,7 +98,10 @@ import androidx.compose.ui.window.PopupPositionProvider
 import androidx.compose.ui.window.PopupProperties
 import io.github.artcraftandroid.procraft.canvas.CanvasViewModel
 import io.github.artcraftandroid.procraft.canvas.RECENT_SET
+import io.github.artcraftandroid.procraft.core.BrushHoldMove
 import io.github.artcraftandroid.procraft.core.BrushInfo
+import io.github.artcraftandroid.procraft.core.brushHoldMove
+import io.github.artcraftandroid.procraft.core.brushMenuHoldSeconds
 import io.github.artcraftandroid.procraft.core.ToolKind
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
@@ -729,28 +733,38 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
                                     Modifier.fillMaxWidth().height(BrushHeight).onGloballyPositioned { brushBounds[key] = it.boundsInWindow() }
                                         .alpha(if (draggedWith.any { d -> d.set == b.set && d.index == b.index }) 0.3f else 1f)
                                         .pointerInput(key, recent) {
-                                            // held still, its menu shows (and stays when the finger lifts); moved on
-                                            // from there, the menu goes and the brush follows the finger (the Recent
-                                            // set's brushes stay where they are). One hold for both: a tap's own
-                                            // hold would keep the rest of the press from the drag
+                                            // held still the core's menu time (as measured), its menu shows with the
+                                            // finger still down, and stays when it lifts (let go before, it was a
+                                            // tap); moved on within the core's drag window after that, the menu goes
+                                            // and the brush follows the finger (the Recent set's brushes stay where
+                                            // they are); moved on later, the list has the press and scrolls, the menu
+                                            // staying. One hold for both: a tap's own hold would keep the rest of the
+                                            // press from the drag
                                             awaitEachGesture {
                                                 val down = awaitFirstDown(requireUnconsumed = false)
-                                                val long = awaitLongPressOrCancellation(down.id) ?: return@awaitEachGesture
+                                                val long = awaitBrushHold(down) ?: return@awaitEachGesture
+                                                val menuAt = down.uptimeMillis + brushMenuHoldMillis()
                                                 vm.swipedBrush = null
                                                 focus.clearFocus()
                                                 brushMenu = key
-                                                val hold = BrushHold(viewConfiguration.touchSlop, movable = !recent)
-                                                // the rest of the press is the hold's, taken before the tap under it sees
-                                                // it (letting go is no tap), until it drags the brush: the lists' box
-                                                // follows it from there (this row may go, as another set opens)
+                                                // the rest of the press is the hold's until it is decided: let go it is
+                                                // no tap (taken before the tap under it sees it); dragged, the lists' box
+                                                // follows it from there (this row may go, as another set opens); too
+                                                // late to drag, the list scrolls with it (not taken while it waits, or
+                                                // the list would give it up)
                                                 while (true) {
                                                     val change = awaitPointerEvent(PointerEventPass.Initial).changes.firstOrNull { it.id == long.id }
-                                                    if (change == null || change.isConsumed || !change.pressed) {
-                                                        change?.consume()
+                                                    if (change == null || change.isConsumed) break
+                                                    if (!change.pressed) {
+                                                        change.consume()
                                                         break
                                                     }
-                                                    change.consume()
-                                                    if (hold.move(change.position - long.position)) {
+                                                    val moved = (change.position - long.position).getDistance()
+                                                    val since = (change.uptimeMillis - menuAt) / 1000.0
+                                                    val what = brushHoldMove(moved, viewConfiguration.touchSlop, since, !recent)
+                                                    if (what == BrushHoldMove.LEAVES) break
+                                                    if (what == BrushHoldMove.DRAGS) {
+                                                        change.consume()
                                                         brushMenu = null
                                                         vm.swipedBrush = null
                                                         val now = brushNow
@@ -1333,22 +1347,26 @@ private fun LibraryCard(vm: CanvasViewModel, i: Int, library: io.github.artcraft
     }
 }
 
-/**
- * A brush held in the library, as the finger goes on: held still its menu shows; moved on from
- * there past [slop] (pixels, from where it took hold) the menu goes and the brush is dragged, if it
- * is [movable] (the Recent set's brushes stay where they are).
- */
-internal class BrushHold(private val slop: Float, private val movable: Boolean) {
-    /** Whether the brush follows the finger, rather than its menu showing. */
-    var dragging = false
-        private set
+/** How long a brush is held still before its menu shows, milliseconds (the core's, as measured). */
+private fun brushMenuHoldMillis(): Long = (brushMenuHoldSeconds() * 1000).toLong()
 
-    /** The finger is [moved] from where it took hold: true when that starts the drag. */
-    fun move(moved: Offset): Boolean {
-        if (dragging || !movable || moved.getDistance() <= slop) return false
-        dragging = true
-        return true
+/**
+ * The press [down] on a brush held still for the core's menu time: not lifted, not taken (the list
+ * scrolling), not moved past the touch slop. Its last change then (where it took hold), else null.
+ */
+private suspend fun AwaitPointerEventScope.awaitBrushHold(down: PointerInputChange): PointerInputChange? {
+    var last = down
+    val cut = withTimeoutOrNull(brushMenuHoldMillis()) {
+        var still = true
+        while (still) {
+            val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id }
+            still = change != null && change.pressed && !change.isConsumed &&
+                (change.position - down.position).getDistance() <= viewConfiguration.touchSlop
+            if (change != null && still) last = change
+        }
+        true
     }
+    return if (cut == null) last else null
 }
 
 /**

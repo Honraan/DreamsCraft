@@ -5,7 +5,6 @@ import androidx.compose.ui.geometry.Rect
 import io.github.artcraftandroid.procraft.core.BrushDropOver
 import io.github.artcraftandroid.procraft.core.BrushInfo
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -19,21 +18,9 @@ class BrushHoldTest {
 
     private fun over(x: Float, y: Float) = brushDropOver(Offset(x, y), sets, 1, 5, list, rows)
 
+    // (what a held brush's move does, a drag or the list's, is the core's: brush_hold.rs tests it)
     @Test
-    fun aStillHoldShowsTheMenuAndLettingGoKeepsIt() {
-        val hold = BrushHold(slop = 8f, movable = true)
-        // a finger never quite still: nothing past the slop drags
-        for (jitter in listOf(Offset(1f, 0f), Offset(0f, -2f), Offset(-3f, 4f), Offset(5.6f, 5.6f))) assertFalse(hold.move(jitter))
-        assertFalse(hold.dragging)
-    }
-
-    @Test
-    fun aHoldMovedOnDragsTheBrushAndLetGoIsOverTheHalfOfTheBrushUnderIt() {
-        val hold = BrushHold(slop = 8f, movable = true)
-        // held on the second brush, moved down: the drag starts once (the menu goes then)
-        assertTrue(hold.move(Offset(0f, 9f)))
-        assertTrue(hold.dragging)
-        assertFalse(hold.move(Offset(0f, 200f)))
+    fun aDraggedBrushLetGoIsOverTheHalfOfTheBrushUnderIt() {
         // over the fourth brush (300 to 390): its upper half, its lower half (the core puts it just
         // above or just below)
         assertEquals(BrushDropOver.OnBrush(1u, 3u, false), over(400f, 330f))
@@ -80,13 +67,6 @@ class BrushHoldTest {
         val held = androidx.compose.runtime.mutableStateOf(dropFor(1))
         held.value = dropFor(2)
         assertEquals(1, held.value())
-    }
-
-    @Test
-    fun theRecentSetsBrushesKeepTheirMenuAndStay() {
-        val hold = BrushHold(slop = 8f, movable = false)
-        assertFalse(hold.move(Offset(0f, 300f)))
-        assertFalse(hold.dragging)
     }
 
     @Test

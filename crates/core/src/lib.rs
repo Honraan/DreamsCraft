@@ -22,6 +22,7 @@ mod bars;
 mod big_pictures;
 mod blend_wheel;
 mod brush_files;
+mod brush_hold;
 mod brush_libraries;
 mod brush_library;
 mod brush_pictures;
@@ -179,6 +180,7 @@ pub use brush_files::{
     BrushFileBytes, BrushFileReading, BrushFileWriting, BrushesRead, IMPORT_CANCELLED, OTHER_BRUSH_EXTENSIONS,
     ReadBrushes, is_brush_zip, read_any_brushes, read_brushes, read_brushes_file, read_brushes_from,
 };
+pub use brush_hold::{BRUSH_DRAG_WINDOW, BRUSH_MENU_HOLD, BrushHoldMove, brush_hold_move, brush_menu_hold_seconds};
 pub use brush_libraries::BrushLibraryInfo;
 pub use brush_library::{BrushDrop, BrushDropOver, brush_drop_copies, brush_drop_place, prepare_brushes};
 pub use brushes::{BrushInfo, BrushSetInfo, HoverFill, RecentBrush, brush_previews_kept};

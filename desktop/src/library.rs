@@ -2,9 +2,10 @@
 //! brushes with a sample stroke on the right. Tapping a set shows it, the shown one for its menu
 //! (rename, duplicate, share, delete); tapping a brush chooses it; sliding one left shows Share,
 //! Duplicate and Delete; holding one shows its menu (Rename, Duplicate, Share, Delete; in the Recent
-//! set Find, Pin or Unpin, Share, Clear), and moving on from there drags it to another place or
-//! set. The plus makes a brush or a set, or brings brushes in from a file. Two fingers pinched in
-//! on a library go to every library's card, and pinched out on a card open it.
+//! set Find, Pin or Unpin, Share, Clear), and moving straight on from there drags it to another
+//! place or set (the core says how long the hold is, and how soon the move must come). The plus
+//! makes a brush or a set, or brings brushes in from a file. Two fingers pinched in on a library go
+//! to every library's card, and pinched out on a card open it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,7 +16,8 @@ use egui::{
     Align2, Color32, Pos2, Rect, ScrollArea, Sense, TextureHandle, TextureOptions, Ui, UiBuilder, Vec2, pos2, vec2,
 };
 use procraft_core::{
-    BrushDrop, BrushDropOver, BrushFileReading, BrushInfo, BrushSetInfo, CanvasSession, ReadBrushes, read_brushes_from,
+    BRUSH_MENU_HOLD, BrushDrop, BrushDropOver, BrushFileReading, BrushHoldMove, BrushInfo, BrushSetInfo, CanvasSession,
+    ReadBrushes, brush_hold_move, read_brushes_from,
 };
 
 use crate::alert::{Alert, Answer};
@@ -89,10 +91,15 @@ const PICKER_GLASS: menu::Glass = menu::Glass {
     corner: 26.0,
     shadow: false,
 };
-/// A press moved this far (points) has gone somewhere; held still this long, it shows the brush's
-/// menu (and moved on from there, drags the brush).
+/// A press moved this far (points) has gone somewhere; held still this long, a set lifts to be
+/// dragged (a brush's menu shows sooner: [`brush_hold`]).
 pub(crate) const SLOP: f32 = 8.0;
 pub(crate) const HOLD: Duration = Duration::from_millis(400);
+
+/// How long a brush is held still before its menu shows (the core's, as measured).
+fn brush_hold() -> Duration {
+    Duration::try_from_secs_f64(BRUSH_MENU_HOLD).unwrap_or(HOLD)
+}
 /// A dragged brush held this long over another set opens it, to be let go among its brushes
 /// (measured on the original: 1.76 s).
 const SPRING_LOAD: Duration = Duration::from_millis(1800);
@@ -225,8 +232,9 @@ fn way_moved(d: Vec2) -> Option<Way> {
 }
 
 /// A press on a brush, followed until let go: which (set and place), where and when it went down,
-/// what it became, how far the brush was slid, where on it the press took hold, how far the
-/// pointer has moved since the last frame, and how far the list was scrolled.
+/// what it became (and when its menu showed, held), how far the brush was slid, where on it the
+/// press took hold, how far the pointer has moved since the last frame, and how far the list was
+/// scrolled.
 #[derive(Clone, Copy)]
 struct Press {
     list: f32,
@@ -234,6 +242,7 @@ struct Press {
     origin: Pos2,
     since: Instant,
     way: Way,
+    menu_at: Option<Instant>,
     start: f32,
     grab: Vec2,
     last: Pos2,
@@ -1392,8 +1401,10 @@ impl Library {
     }
 
     /// Follows the press on a brush: moved sideways it slides the brush (let go past a third of
-    /// the way, it stays open); moved up or down, the list scrolls; held still, the brush is dragged
-    /// and, let go, goes to the top of the set it is over, or to the place of the brush it is over.
+    /// the way, it stays open); moved up or down, the list scrolls; held still, its menu shows, and
+    /// moved straight on from there the brush is dragged and, let go, goes to the top of the set it
+    /// is over, or to the place of the brush it is over (moved on later, the list scrolls under the
+    /// menu, which stays).
     fn follow_press(&mut self, ctx: &egui::Context, session: &CanvasSession) {
         let Some(mut p) = self.press else { return };
         let (at, down) = ctx.input(|i| (i.pointer.interact_pos(), i.pointer.primary_down()));
@@ -1407,19 +1418,25 @@ impl Library {
                         p.way = way;
                     } else if d.length() > SLOP {
                         // going somewhere, not yet plain which way: it is no hold
-                    } else if p.since.elapsed() >= HOLD {
+                    } else if p.since.elapsed() >= brush_hold() {
                         // held still: its menu shows
                         p.way = Way::Held;
+                        p.menu_at = Some(Instant::now());
                         self.swiped = None;
                         self.open_brush_menu(session, p.key);
                     } else {
-                        ctx.request_repaint_after(HOLD.saturating_sub(p.since.elapsed()));
+                        ctx.request_repaint_after(brush_hold().saturating_sub(p.since.elapsed()));
                     }
                 }
-                // moved on from there, the menu goes and the brush is dragged (the Recent set's
-                // brushes stay where they are)
+                // moved straight on from there, the menu goes and the brush is dragged (the Recent
+                // set's brushes stay where they are); moved on later, the list has the press and
+                // scrolls, the menu staying
                 Way::Held => {
-                    if d.length() > SLOP && !self.recent {
+                    let since_menu = p.menu_at.map_or(0.0, |shown| shown.elapsed().as_secs_f64());
+                    let what = brush_hold_move(d.length(), SLOP, since_menu, !self.recent);
+                    if what == BrushHoldMove::Leaves {
+                        p.way = Way::Scroll;
+                    } else if what == BrushHoldMove::Drags {
                         p.way = Way::Drag;
                         self.brush_menu.close();
                         let current = session.current_brush();
@@ -1724,6 +1741,7 @@ impl Library {
                 origin,
                 since,
                 way: Way::Undecided,
+                menu_at: None,
                 start: slide,
                 grab: origin - cell.min,
                 last: origin,
@@ -2577,6 +2595,40 @@ mod tests {
         assert_eq!(name(&f, target), held);
         assert_ne!(name(&f, key), held);
         assert!(!f.library.brush_menu.is_open());
+    }
+
+    /// A brush held past its menu showing and moved on only after the core's drag window isn't
+    /// lifted (as measured: presses of 0.7 s and 1 s moved on scrolled the list): the list has the
+    /// press and scrolls under the menu, which stays open; let go, nothing is chosen or moved.
+    #[test]
+    fn a_brush_held_and_moved_on_too_late_scrolls_the_list_under_its_menu() {
+        let mut f = Finger::new();
+        let names = |f: &Finger| -> Vec<Vec<String>> {
+            f.session.brush_library().iter().map(|s| s.brushes.iter().map(|b| b.name.clone()).collect()).collect()
+        };
+        let (before, chosen) = (names(&f), f.session.current_brush());
+        let from = f.on_a_brush();
+        f.down(from);
+        std::thread::sleep(brush_hold() + Duration::from_millis(50));
+        f.frame(Vec::new());
+        assert!(f.library.brush_menu.is_open());
+        let top = f.top();
+        std::thread::sleep(Duration::from_secs_f64(procraft_core::BRUSH_DRAG_WINDOW) + Duration::from_millis(100));
+        let mut at = from;
+        for _ in 0..10 {
+            at.y -= 8.0;
+            f.to(at);
+        }
+        assert!(f.library.press.is_some_and(|p| p.way == Way::Scroll), "not left to the list");
+        assert!(f.library.dragged_with.is_empty(), "lifted");
+        assert!(f.library.brush_menu.is_open(), "the menu went");
+        assert!(f.top() < top - 20.0, "the list stayed: {top} to {}", f.top());
+        f.up(at);
+        f.frame(Vec::new());
+        assert!(f.library.brush_menu.is_open());
+        assert_eq!(names(&f), before);
+        let now = f.session.current_brush();
+        assert_eq!((now.set, now.index), (chosen.set, chosen.index));
     }
 
     /// What a dragged brush is over: a set's row; in the shown set's list, the brush nearest up or
