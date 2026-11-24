@@ -680,16 +680,14 @@ final class CanvasModel {
         }
     }
 
-    /// `brushes` (of one set) dragged together and let go at place `index` of set `set`: along
-    /// their own set they move there, the first taking it and the rest after it; onto another set
-    /// they are copied there, those dragged staying where they were (the core's rule).
-    func dropBrushes(_ brushes: [BrushInfo], set: Int, index: Int) {
+    /// `brushes` (of one set) dragged together and let go `over` a set's row, a brush of the set
+    /// shown (its upper or lower half) or its list: along their own set they move there, the first
+    /// there and the rest after it; onto another set they are copied there, those dragged staying
+    /// where they were (the core's `brushDropPlace` says where).
+    func dropBrushesOver(_ brushes: [BrushInfo], over: BrushDropOver) {
         guard let first = brushes.first else { return }
-        if brushes.count == 1, set == Int(first.set), index == Int(first.index) {
-            return
-        }
         let indices = brushes.filter { $0.set == first.set }.map(\.index)
-        if session.dropBrushes(set: first.set, indices: indices, toSet: UInt32(set), toIndex: UInt32(index)) {
+        if session.dropBrushesOver(set: first.set, indices: indices, over: over) {
             libraryChanged()
         }
     }

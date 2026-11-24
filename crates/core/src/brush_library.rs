@@ -480,6 +480,63 @@ pub fn brush_drop_copies(from: u32, to: u32) -> bool {
     from != to
 }
 
+/// What brushes dragged in the library are over where the finger is: what the app found under it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum BrushDropOver {
+    /// Set `set`'s row among the sets.
+    OnSet { set: u32 },
+    /// Brush `index` of set `set` in the list of its brushes shown, the finger on its upper half
+    /// (`lower` false) or its lower half.
+    OnBrush { set: u32, index: u32, lower: bool },
+    /// The list of set `set`'s brushes, which holds `count` of them, away from any: after its last
+    /// (all of an empty set's list).
+    InList { set: u32, count: u32 },
+}
+
+/// Where brushes dragged in the library land let go: place `index` of set `set`, as
+/// [`CanvasSession::drop_brushes`] takes it (along their own set counted without them there), and
+/// whether they are copied there (another set's, a green plus on them saying so) or moved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct BrushDrop {
+    pub set: u32,
+    pub index: u32,
+    pub copies: bool,
+}
+
+/// Where brushes `indices` of set `from`, dragged together, land let go `over` that: on a set's row,
+/// at its top; on a brush, just above it from its upper half and just below it from its lower half;
+/// on a list away from its brushes, after the last. Along their own set they move there, onto
+/// another they are copied (see [`brush_drop_copies`]). None when nothing would change: over their
+/// own set's row, over one of them, or let go where they are already.
+#[uniffi::export]
+pub fn brush_drop_place(from: u32, indices: Vec<u32>, over: BrushDropOver) -> Option<BrushDrop> {
+    let mut moving = indices;
+    moving.sort_unstable();
+    moving.dedup();
+    if moving.is_empty() {
+        return None;
+    }
+    // the set, and the gap between its brushes as it is now (0 above the first)
+    let (set, gap) = match over {
+        BrushDropOver::OnSet { set } => {
+            return brush_drop_copies(from, set).then_some(BrushDrop { set, index: 0, copies: true });
+        }
+        BrushDropOver::OnBrush { set, index, .. } if set == from && moving.binary_search(&index).is_ok() => {
+            return None;
+        }
+        BrushDropOver::OnBrush { set, index, lower } => (set, index.saturating_add(u32::from(lower))),
+        BrushDropOver::InList { set, count } => (set, count),
+    };
+    if brush_drop_copies(from, set) {
+        return Some(BrushDrop { set, index: gap, copies: true });
+    }
+    // along their own set: counted without them there
+    let index = gap - moving.partition_point(|&m| m < gap) as u32;
+    // one after another from that place already: they stay as they are
+    let stays = moving.iter().zip(index..).all(|(&m, place)| m == place);
+    (!stays).then_some(BrushDrop { set, index, copies: false })
+}
+
 /// Reads the library in use kept in folder `dir` ahead of the first artwork (while the gallery
 /// shows), so that it opens without reading it (see [`CanvasSession::open_brushes`]); nothing if it
 /// is held already or there is none. Slow with many brushes brought in: call it off the main thread.
@@ -1326,6 +1383,12 @@ impl CanvasSession {
         } else {
             self.move_brushes(set, indices, to_set, to_index)
         }
+    }
+
+    /// Brushes `indices` of `set` dragged together and let go `over` that: moved or copied where
+    /// [`brush_drop_place`] puts them. Whether any moved or were copied.
+    pub fn drop_brushes_over(&self, set: u32, indices: Vec<u32>, over: BrushDropOver) -> bool {
+        brush_drop_place(set, indices.clone(), over).is_some_and(|to| self.drop_brushes(set, indices, to.set, to.index))
     }
 
     /// Names brush `index` of `set` (from its menu in the library), as a set is named: trimmed, at

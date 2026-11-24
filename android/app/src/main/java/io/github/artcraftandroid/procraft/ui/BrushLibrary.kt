@@ -324,27 +324,38 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
     val setBounds = remember { mutableStateMapOf<Int, Rect>() }
     val brushBounds = remember { mutableStateMapOf<String, Rect>() }
     var listBounds by remember { mutableStateOf(Rect.Zero) }
+    // where the shown set's brushes list is
+    var brushListBounds by remember { mutableStateOf(Rect.Zero) }
     // the set the dragged brush or set is over, if any
     val overSet = if (dragged == null && draggedSet == null) null else setBounds.entries.firstOrNull { it.value.contains(dragAt) }?.key?.takeIf { it != draggedSet }
-    // where the dragged brushes would go let go now: onto a set, to its top; onto a brush of the set
-    // shown, to its place
-    fun dropPlace(): Pair<Int, Int>? {
+    // What the dragged brushes are over now: a set's row, or a brush of the set shown (which half),
+    // or its list. Read afresh from the library and the rows as they are, never from values this
+    // composition worked out: the lists' pointer handler below keeps the drop() of the composition
+    // it started in (a newer reference to a local function is equal to the first, so no state
+    // takes it), and a set opens under a drag.
+    fun dropOver(): io.github.artcraftandroid.procraft.core.BrushDropOver? {
+        val showing = vm.shownSet.takeIf { it != RECENT_SET && it in vm.brushSets.indices }
+        val brushes = showing?.let { vm.brushSets.getOrNull(it) }?.brushes.orEmpty()
+        val rows = brushes.mapNotNull { t -> brushBounds["${t.set}-${t.index}"]?.let { t.index.toInt() to it } }
+        return brushDropOver(dragAt, setBounds, showing, brushes.size, brushListBounds, rows)
+    }
+    // where the dragged brushes land let go now (the core's rule), if anywhere
+    fun dropPlace(): io.github.artcraftandroid.procraft.core.BrushDrop? {
         val b = dragged ?: return null
-        val moving = draggedWith.ifEmpty { listOf(b) }
-        val brushes = shown?.brushes.orEmpty().mapNotNull { t -> brushBounds["${t.set}-${t.index}"]?.let { (t.set.toInt() to t.index.toInt()) to it } }
-        return brushesDropPlace(moving.map { it.set.toInt() to it.index.toInt() }, dragAt, setBounds, brushes)
+        val over = dropOver() ?: return null
+        val moving = draggedWith.ifEmpty { listOf(b) }.filter { it.set == b.set }.map { it.index }
+        return io.github.artcraftandroid.procraft.core.brushDropPlace(b.set, moving, over)
     }
     // into another set they go as copies, as a green plus on them says while they would
-    val dropCopies = dragged?.let { b -> dropPlace()?.let { io.github.artcraftandroid.procraft.core.brushDropCopies(b.set, it.first.toUInt()) } } == true
+    val dropCopies = dragged != null && dropPlace()?.copies == true
     fun drop() {
         val b = dragged ?: return
         val moving = draggedWith.ifEmpty { listOf(b) }
-        val place = dropPlace()
+        val over = dropOver()
         dragged = null
         draggedWith = emptyList()
         dragPointer = null
-        val (set, index) = place ?: return
-        vm.dropBrushes(moving, set, index)
+        vm.dropBrushesOver(moving, over ?: return)
     }
     // held over another set a moment, the dragged brush opens it, to be let go among its brushes
     LaunchedEffect(overSet, dragged != null) {
@@ -353,8 +364,6 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
         kotlinx.coroutines.delay(SPRING_LOAD_MS)
         if (dragged != null) vm.showSet(over)
     }
-    // (for a hold that began before the library last changed)
-    val dropNow by androidx.compose.runtime.rememberUpdatedState(::drop)
     // a set dropped onto another takes its place
     fun dropSet() {
         val from = draggedSet ?: return
@@ -494,7 +503,8 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
                                 } else {
                                     change.consume()
                                     dragAt = listBounds.topLeft + change.position
-                                    if (!change.pressed) dropNow()
+                                    // (an earlier composition's drop(): it reads what it needs as it is now)
+                                    if (!change.pressed) drop()
                                 }
                             }
                             if (event.changes.none { it.pressed }) break
@@ -674,7 +684,7 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
                     listed.indexOfFirst { (b, _) -> "${b.set}-${b.index}" == found }.takeIf { it >= 0 }?.let { listState.scrollToItem(it) }
                 }
                 LazyColumn(
-                    Modifier.weight(1f).fillMaxHeight().background(Pc.BrushColumn),
+                    Modifier.weight(1f).fillMaxHeight().background(Pc.BrushColumn).onGloballyPositioned { brushListBounds = it.boundsInWindow() },
                     state = listState,
                     contentPadding = PaddingValues(start = 12.dp, top = 9.75.dp, end = 12.dp, bottom = 12.dp),
                     verticalArrangement = Arrangement.spacedBy(BrushGap),
@@ -1342,23 +1352,20 @@ internal class BrushHold(private val slop: Float, private val movable: Boolean) 
 }
 
 /**
- * Where a brush from place [from] (set, index) goes, let go at [at] (window pixels): onto a set of
- * [sets] (by place), to its top; onto one of the shown set's [brushes] (by place), to its place;
- * nowhere when that is where it is already, or when it is over neither.
+ * What brushes dragged in the library are over at [at] (window pixels), for the core to say where
+ * they land (`brushDropPlace`): a set's row of [sets] (by place); else, in the list [list] of the
+ * shown set [shown] (none for the Recent set), which holds [count] brushes, the one of its [rows]
+ * (by place in the set) nearest up or down, on its upper or lower half, or with none there the
+ * list itself; else nothing.
  */
-internal fun brushDropPlace(from: Pair<Int, Int>, at: Offset, sets: Map<Int, Rect>, brushes: List<Pair<Pair<Int, Int>, Rect>>): Pair<Int, Int>? =
-    brushesDropPlace(listOf(from), at, sets, brushes)
-
-/**
- * Where brushes from places [from] (set, index; all of one set) dragged together go, let go at
- * [at] (window pixels): onto another set of [sets] (by place), to its top; onto one of the shown
- * set's [brushes] (by place) not among them, to its place (the first of them taking it, the rest
- * after it); nowhere over their own set, over one of them, or over neither.
- */
-internal fun brushesDropPlace(from: List<Pair<Int, Int>>, at: Offset, sets: Map<Int, Rect>, brushes: List<Pair<Pair<Int, Int>, Rect>>): Pair<Int, Int>? {
-    val own = from.firstOrNull()?.first ?: return null
-    sets.entries.firstOrNull { it.value.contains(at) }?.let { return if (it.key == own) null else it.key to 0 }
-    return brushes.firstOrNull { it.second.contains(at) }?.first?.takeIf { it !in from }
+internal fun brushDropOver(at: Offset, sets: Map<Int, Rect>, shown: Int?, count: Int, list: Rect, rows: List<Pair<Int, Rect>>): io.github.artcraftandroid.procraft.core.BrushDropOver? {
+    sets.entries.firstOrNull { it.value.contains(at) }?.let { return io.github.artcraftandroid.procraft.core.BrushDropOver.OnSet(it.key.toUInt()) }
+    if (shown == null || shown < 0 || !list.contains(at)) return null
+    // how far up or down from a row (none on it)
+    fun off(r: Rect) = maxOf(r.top - at.y, at.y - r.bottom, 0f)
+    val (index, row) = rows.minByOrNull { off(it.second) }
+        ?: return io.github.artcraftandroid.procraft.core.BrushDropOver.InList(shown.toUInt(), count.coerceAtLeast(0).toUInt())
+    return io.github.artcraftandroid.procraft.core.BrushDropOver.OnBrush(shown.toUInt(), index.toUInt(), at.y > row.center.y)
 }
 
 /**

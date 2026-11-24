@@ -10694,6 +10694,108 @@ fn brushes_dropped_on_another_set_are_copied_there_and_along_their_own_moved() {
     assert_eq!(s.brush_library(), kept);
 }
 
+/// Where brushes let go in the library land, from what the finger is over: a set's row takes them
+/// at its top; a brush, just above it from its upper half and just below it from its lower half; a
+/// list away from its brushes (an empty set's), after the last. Along their own set they move
+/// (counted without them there), onto another they are copied; let go where they are, nothing.
+#[test]
+fn brushes_let_go_land_above_or_below_the_brush_under_the_finger() {
+    use crate::{BrushDrop, BrushDropOver as Over, brush_drop_place as place};
+    let moved = |set, index| Some(BrushDrop { set, index, copies: false });
+    let copied = |set, index| Some(BrushDrop { set, index, copies: true });
+    let brush = |set, index, lower| Over::OnBrush { set, index, lower };
+    // one brush of set 1 (at 3): down onto 5, above it or below it
+    assert_eq!(place(1, vec![3], brush(1, 5, false)), moved(1, 4));
+    assert_eq!(place(1, vec![3], brush(1, 5, true)), moved(1, 5));
+    // up onto 0
+    assert_eq!(place(1, vec![3], brush(1, 0, false)), moved(1, 0));
+    assert_eq!(place(1, vec![3], brush(1, 0, true)), moved(1, 1));
+    // two in a set, the second let go on the first's upper half: it goes first
+    assert_eq!(place(1, vec![1], brush(1, 0, false)), moved(1, 0));
+    // where it is already (below the one above it, above the one below it, on itself): nothing
+    assert_eq!(place(1, vec![3], brush(1, 2, true)), None);
+    assert_eq!(place(1, vec![3], brush(1, 4, false)), None);
+    assert_eq!(place(1, vec![3], brush(1, 3, true)), None);
+    // after the last of its 6 from the list below them, or on the last's lower half
+    assert_eq!(place(1, vec![3], Over::InList { set: 1, count: 6 }), moved(1, 5));
+    assert_eq!(place(1, vec![3], brush(1, 5, true)), place(1, vec![3], Over::InList { set: 1, count: 6 }));
+    assert_eq!(place(1, vec![5], Over::InList { set: 1, count: 6 }), None);
+    // into another set: copied above or below the brush, after the last, or at the top from its row
+    assert_eq!(place(1, vec![3], brush(2, 4, false)), copied(2, 4));
+    assert_eq!(place(1, vec![3], brush(2, 4, true)), copied(2, 5));
+    assert_eq!(place(1, vec![3], Over::InList { set: 2, count: 9 }), copied(2, 9));
+    assert_eq!(place(1, vec![3], Over::OnSet { set: 2 }), copied(2, 0));
+    // an empty set's list: its first
+    assert_eq!(place(1, vec![3], Over::InList { set: 7, count: 0 }), copied(7, 0));
+    // over their own set's row: nothing
+    assert_eq!(place(1, vec![3], Over::OnSet { set: 1 }), None);
+    // several together (2, 5 and 6 of 8, in any order): along their set counted without them
+    let three = || vec![6, 2, 5];
+    assert_eq!(place(1, three(), brush(1, 0, false)), moved(1, 0));
+    assert_eq!(place(1, three(), brush(1, 4, true)), moved(1, 4));
+    assert_eq!(place(1, three(), brush(1, 7, true)), moved(1, 5));
+    assert_eq!(place(1, three(), brush(1, 3, false)), moved(1, 2));
+    // over one of them: nothing; let go one after another where they are: nothing
+    assert_eq!(place(1, three(), brush(1, 5, true)), None);
+    assert_eq!(place(1, vec![4, 5], brush(1, 3, true)), None);
+    assert_eq!(place(1, vec![4, 5], brush(1, 6, false)), None);
+    assert_eq!(place(1, vec![4, 5], brush(1, 6, true)), moved(1, 5));
+    // copied into another set together, at the brush's place
+    assert_eq!(place(1, three(), brush(0, 1, true)), copied(0, 2));
+    // nothing dragged: nowhere
+    assert_eq!(place(1, vec![], Over::OnSet { set: 2 }), None);
+}
+
+/// Brushes let go on a brush of the set shown take that place: along their own set they move there
+/// (a reorder), into a set opened under them they are copied there, an empty set's list takes
+/// them, and several go together in their order.
+#[test]
+fn brushes_let_go_on_a_brush_move_along_their_set_and_are_copied_into_another() {
+    use crate::BrushDropOver as Over;
+    let s = CanvasSession::new(64, 64);
+    let names = |set: u32| s.brush_library()[set as usize].brushes.iter().map(|b| b.name.clone()).collect::<Vec<_>>();
+    // two new sets (each at the top as it is made), then a stock set
+    s.new_brush_set();
+    s.new_brush_set();
+    let (empty, own) = (0, 1);
+    let library = s.brush_library();
+    let stock = library.iter().position(|set| set.brushes.len() >= 6).unwrap() as u32;
+    let from = names(stock);
+    // a set of two of its brushes (copied onto its row)
+    assert!(s.drop_brushes_over(stock, vec![0], Over::OnSet { set: own }));
+    assert!(s.drop_brushes_over(stock, vec![1], Over::OnSet { set: own }));
+    assert_eq!(names(own), [from[1].clone(), from[0].clone()]);
+    // the second let go on the first: on its lower half it stays, on its upper half they turn round
+    assert!(!s.drop_brushes_over(own, vec![1], Over::OnBrush { set: own, index: 0, lower: true }));
+    assert_eq!(names(own), [from[1].clone(), from[0].clone()]);
+    assert!(s.drop_brushes_over(own, vec![1], Over::OnBrush { set: own, index: 0, lower: false }));
+    assert_eq!(names(own), [from[0].clone(), from[1].clone()]);
+    // and back, the first onto the second's lower half; nothing else copied anywhere
+    assert!(s.drop_brushes_over(own, vec![0], Over::OnBrush { set: own, index: 1, lower: true }));
+    assert_eq!(names(own), [from[1].clone(), from[0].clone()]);
+    assert_eq!(names(stock), from);
+    // from the stock set onto the own set's second brush: copied above or below it
+    assert!(s.drop_brushes_over(stock, vec![4], Over::OnBrush { set: own, index: 1, lower: false }));
+    assert_eq!(names(own), [from[1].clone(), from[4].clone(), from[0].clone()]);
+    assert!(s.drop_brushes_over(stock, vec![5], Over::OnBrush { set: own, index: 2, lower: true }));
+    assert_eq!(names(own), [from[1].clone(), from[4].clone(), from[0].clone(), from[5].clone()]);
+    assert_eq!(names(stock), from);
+    // the other new set, empty: let go in its list, they go in, two together in their order
+    assert!(names(empty).is_empty());
+    assert!(s.drop_brushes_over(stock, vec![3, 2], Over::InList { set: empty, count: 0 }));
+    assert_eq!(names(empty), [from[2].clone(), from[3].clone()]);
+    // several along their own set: the first and third of the own set below its last
+    let before = names(own);
+    assert!(s.drop_brushes_over(own, vec![0, 2], Over::OnBrush { set: own, index: 3, lower: true }));
+    assert_eq!(names(own), [before[1].clone(), before[3].clone(), before[0].clone(), before[2].clone()]);
+    // over one of them or their own set's row: nothing moves
+    let kept = s.brush_library();
+    assert!(!s.drop_brushes_over(own, vec![0, 2], Over::OnBrush { set: own, index: 2, lower: false }));
+    assert!(!s.drop_brushes_over(own, vec![0], Over::OnSet { set: own }));
+    assert!(!s.drop_brushes_over(own, vec![], Over::OnSet { set: stock }));
+    assert_eq!(s.brush_library(), kept);
+}
+
 /// Brush `index` of `set` as a brush file, as Share makes it.
 fn brushfile_of(s: &CanvasSession, set: u32, index: u32) -> Vec<u8> {
     s.brush_as_file(set, index).expect("a brush file")

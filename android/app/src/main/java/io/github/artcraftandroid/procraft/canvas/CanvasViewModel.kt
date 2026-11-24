@@ -6204,15 +6204,15 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * [brushes] (of one set, dragged together, in their order) let go at place [index] of set [set]
-     * (counted without them there): along their own set they move there; onto another set they are
-     * copied there, those dragged staying where they were (see the core's `brushDropCopies`).
+     * [brushes] (of one set, dragged together, in their order) let go [over] a set's row, a brush of
+     * the set shown (its upper or lower half) or its list: along their own set they move there; onto
+     * another set they are copied there, those dragged staying where they were (the core's
+     * `brushDropPlace` says where).
      */
-    fun dropBrushes(brushes: List<BrushInfo>, set: Int, index: Int) {
+    fun dropBrushesOver(brushes: List<BrushInfo>, over: io.github.artcraftandroid.procraft.core.BrushDropOver) {
         val first = brushes.firstOrNull() ?: return
-        if (brushes.size == 1 && set == first.set.toInt() && index == first.index.toInt()) return
         val indices = brushes.filter { it.set == first.set }.map { it.index }
-        if (session?.dropBrushes(first.set, indices, set.toUInt(), index.toUInt()) == true) libraryChanged()
+        if (session?.dropBrushesOver(first.set, indices, over) == true) libraryChanged()
     }
 
     /** A new brush at the top of the shown set, opened in the studio. */
