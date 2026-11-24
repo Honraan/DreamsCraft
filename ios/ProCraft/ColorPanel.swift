@@ -2578,7 +2578,7 @@ struct FloatingColors: View {
                 shown: tab,
                 title: model.colorMode == .palettes ? "Palettes" : "Colors",
                 onUnfold: { model.foldColours(false) },
-                onDrag: { model.moveColours(by: $0, from: .zero) },
+                onDrag: { _, by in model.moveColours(by: by, from: .zero) },
                 onLetGo: { model.letGoColours() }
             )
             .frame(width: screen.width, height: screen.height, alignment: .topLeading)
