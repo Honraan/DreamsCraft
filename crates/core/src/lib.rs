@@ -2160,6 +2160,8 @@ impl CanvasSession {
         name: String,
         pixels: Vec<(procraft_engine::document::LayerId, Vec<u8>)>,
     ) -> Arc<CanvasSession> {
+        #[cfg(test)]
+        open_marks::tests::while_building();
         device::start_log();
         let shipped = stock_library::shipped();
         let shelf = brush_library::LibrarySet::shipped(&shipped);

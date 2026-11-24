@@ -72,7 +72,7 @@ fn ended_in(file: &Path, dir: &Path, run: u32) -> bool {
 }
 
 /// An artwork being opened: its mark goes when this is dropped (it showed, its opening failed
-/// and was told, or it was let go), so only an opening the app ended in leaves one.
+/// and was told, or it was let go), so only an opening the app ended in, or a panic, leaves one.
 pub(crate) struct Mark {
     file: PathBuf,
     name: String,
@@ -101,6 +101,10 @@ impl Mark {
 
 impl Drop for Mark {
     fn drop(&mut self) {
+        // a panic as it opens is as the app ending: the artwork is asked about when next picked
+        if std::thread::panicking() {
+            return;
+        }
         let mut marks = read(&self.file);
         let before = marks.len();
         marks.retain(|(_, n)| *n != self.name);
@@ -160,8 +164,91 @@ fn write(file: &Path, marks: &[(u32, String)]) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// How a session being built on this thread ends, for the tests of an opening that ends the
+    /// app: by a panic, or by aborting the process (as a stack overflow does).
+    #[derive(Clone, Copy)]
+    enum Ending {
+        Panic,
+        Abort,
+    }
+
+    thread_local! {
+        static BUILDING_ENDS: std::cell::Cell<Option<Ending>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Called as a session is built: ends it as this thread's test asked.
+    pub(crate) fn while_building() {
+        match BUILDING_ENDS.with(std::cell::Cell::get) {
+            Some(Ending::Panic) => panic!("the session ends as it is built"),
+            Some(Ending::Abort) => std::process::abort(),
+            None => {}
+        }
+    }
+
+    /// What [`opening_ends_the_process`] is told: "<marks file>|<artwork folder>".
+    const ENDING_PROBE: &str = "PROCRAFT_OPENING_ENDS";
+
+    /// Opens an artwork whose session ends the process as it is built, as [`ENDING_PROBE`] says,
+    /// in a process of its own (run by the test below). Nothing without it.
+    #[test]
+    #[ignore = "run by a_crash_while_the_session_is_built_leaves_the_artwork_noted, in a process of its own"]
+    fn opening_ends_the_process() {
+        let Ok(asked) = std::env::var(ENDING_PROBE) else { return };
+        let Some((marks, dir)) = asked.split_once('|') else { return };
+        use_file_on_this_thread(Some(PathBuf::from(marks)));
+        BUILDING_ENDS.with(|e| e.set(Some(Ending::Abort)));
+        let _ = crate::CanvasSession::open(dir.to_owned());
+    }
+
+    /// The mark is written before the session is built: an opening that ends the app there (a
+    /// stack overflow, an abort, a panic) leaves it, and the artwork is asked about when next
+    /// picked.
+    #[test]
+    fn a_crash_while_the_session_is_built_leaves_the_artwork_noted() {
+        let root = std::env::temp_dir().join(format!("procraft-open-building-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let marks = root.join("opening.txt");
+        use_file_on_this_thread(Some(marks.clone()));
+        let dir = root.join("Artwork");
+        let path = dir.to_string_lossy().into_owned();
+        let picture = crate::ThumbnailImage { width: 8, height: 6, rgba: vec![200; 8 * 6 * 4] };
+        crate::CanvasSession::from_image(picture, "Art".to_owned()).save(path.clone()).unwrap();
+        // a panic as the session is built: noted still, by this run
+        BUILDING_ENDS.with(|e| e.set(Some(Ending::Panic)));
+        let opened = std::panic::catch_unwind(|| crate::CanvasSession::open(path.clone()));
+        BUILDING_ENDS.with(|e| e.set(None));
+        assert!(opened.is_err());
+        let this_run = std::process::id();
+        assert_eq!(read(&marks), [(this_run, "Artwork".to_owned())], "a panic as it was built left no mark");
+        assert!(!opening_ended_app(path.clone()), "told while this run goes on");
+        assert!(ended_in(&marks, &dir, this_run + 1), "not told to the next run");
+        std::fs::write(&marks, "").unwrap();
+        // the process aborted as the session is built (a run of its own): noted, and told now
+        let ended = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "open_marks::tests::opening_ends_the_process", "--test-threads=1", "-q"])
+            .env(ENDING_PROBE, format!("{}|{path}", marks.display()))
+            .output()
+            .unwrap();
+        assert!(!ended.status.success(), "the probe didn't end: {}", String::from_utf8_lossy(&ended.stdout));
+        let noted = read(&marks);
+        println!("noted after the probe's abort: {noted:?}");
+        assert!(
+            noted.iter().any(|(run, name)| *run != this_run && name == "Artwork"),
+            "an abort as it was built left no mark"
+        );
+        assert!(opening_ended_app(path.clone()));
+        // opened anyway: it opens, its mark this run's until it is let go
+        let s = crate::CanvasSession::open(path.clone()).unwrap();
+        assert!(!opening_ended_app(path.clone()));
+        drop(s);
+        assert!(read(&marks).is_empty());
+        use_file_on_this_thread(None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn an_opening_the_app_ended_in_is_told_when_it_starts_again_and_one_that_showed_is_not() {

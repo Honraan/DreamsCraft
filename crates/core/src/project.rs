@@ -1247,6 +1247,10 @@ impl CanvasSession {
     #[uniffi::constructor]
     pub fn open(dir: String) -> Result<Arc<CanvasSession>, MobileError> {
         let dir = PathBuf::from(dir);
+        // noted as being opened before anything is read, until it shows (see `open_marks.rs`): an
+        // opening that ends the app, even as its session is built, is asked about when next picked.
+        // One that fails here is told, and its mark goes
+        let open_mark = crate::open_marks::Mark::new(&dir);
         let text = fs::read_to_string(dir.join("artwork.json")).map_err(|e| file_error("reading the artwork", e))?;
         let file: ArtworkFile = serde_json::from_str(&text).map_err(|e| file_error("reading the artwork", e))?;
         if file.format != FORMAT || file.version > VERSION {
@@ -1313,8 +1317,7 @@ impl CanvasSession {
         }
         {
             let mut st = session.shared.lock();
-            // noted as being opened until it shows (see `open_marks.rs`)
-            st.open_mark = crate::open_marks::Mark::new(&dir);
+            st.open_mark = open_mark;
             st.pending_pixels = pngs;
             st.pending_stores = stores;
             st.layer_data_unread.extend(data_unread);
