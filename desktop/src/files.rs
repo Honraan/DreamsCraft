@@ -8,7 +8,7 @@ use procraft_core::{
     CanvasPreset, CanvasSession, KeptGestures, ModelFile, PagesOutcome, PsdOutcome, ThumbnailImage, export_file_name,
     import_pages, import_psd, preset_height, preset_width,
 };
-use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
+use rfd::{FileDialog, MessageDialog, MessageLevel};
 
 use crate::ui::Interface;
 
@@ -308,6 +308,15 @@ pub fn pick_sound(title: &str) -> Option<(Vec<u8>, String)> {
             None
         }
     }
+}
+
+/// A folder the user picks (titled `title`) for a plugin's folder control: where it is, and its
+/// name.
+pub fn pick_plugin_folder(title: &str) -> Option<(String, String)> {
+    let path = dialog().set_title(title).pick_folder()?;
+    let name =
+        path.file_name().map_or_else(|| path.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
+    Some((path.to_string_lossy().into_owned(), name))
 }
 
 /// A picture the user picks (titled `title`), a PNG or a JPEG, read whole, with its name.
@@ -813,64 +822,9 @@ pub fn dialog() -> FileDialog {
     dialog
 }
 
-/// Whether to open the artwork in gallery folder `dir`: at once, unless the app ended while opening
-/// it last time (stopped for memory, or crashed); then only if the person says so, so that it can't
-/// take the app down each time it is picked (the gallery stays as it is, the artwork in it).
-pub fn open_anyway(dir: &str) -> bool {
-    if !procraft_core::opening_ended_app(dir.to_owned()) {
-        return true;
-    }
-    log::warn!("the app ended while opening {dir} last time: asking before opening it again");
-    // nothing to ask with (Linux without its dialogs' program): opened as before
-    if cfg!(target_os = "linux") && !has_program("zenity") {
-        return true;
-    }
-    // what is said follows how that run ended, as its log tells (a crash, or not known); the log
-    // is asked for, and Share Log shows that run's log to send on
-    let run = procraft_core::opening_ended_run(dir.to_owned());
-    let (said, log) = (crate::startup::opening_ended_said(run), crate::startup::log_of_run(run));
-    let (action, share) = ("Open Anyway".to_owned(), "Share Log".to_owned());
-    loop {
-        let answer = message()
-            .set_level(MessageLevel::Warning)
-            .set_title(procraft_core::opening_ended_app_title())
-            .set_description(said.as_str())
-            .set_buttons(MessageButtons::YesNoCancelCustom(action.clone(), share.clone(), "Cancel".to_owned()))
-            .show();
-        // (Windows without its newer dialogs shows Yes, No and Cancel)
-        match answer {
-            MessageDialogResult::Yes => return true,
-            MessageDialogResult::Custom(chosen) if chosen == action => return true,
-            MessageDialogResult::No => reveal(&log),
-            MessageDialogResult::Custom(chosen) if chosen == share => reveal(&log),
-            _ => return false,
-        }
-    }
-}
-
-/// Asks, with `title` and what it says (`said`), whether to leave an artwork that couldn't be saved without
-/// saving it: Stay, the default (and what closing the question, or a system with no way of asking,
-/// comes to), or Leave Without Saving.
-pub fn leave_without_saving(title: &str, said: &str) -> bool {
-    log::warn!("{title}: {said}");
-    if cfg!(target_os = "linux") && !has_program("zenity") {
-        tell(title, said);
-        return false;
-    }
-    let (stay, leave) = ("Stay".to_owned(), "Leave Without Saving".to_owned());
-    let answer = message()
-        .set_level(MessageLevel::Warning)
-        .set_title(title)
-        .set_description(said)
-        .set_buttons(MessageButtons::OkCancelCustom(stay, leave.clone()))
-        .show();
-    // (Windows without its newer dialogs shows OK and Cancel: both stay)
-    matches!(answer, MessageDialogResult::Custom(chosen) if chosen == leave)
-}
-
 /// Shows the file at `path` in the system's file manager (its folder, on Linux), for the person to
 /// send it on.
-fn reveal(path: &Path) {
+pub fn reveal(path: &Path) {
     let shown = if cfg!(windows) {
         std::process::Command::new("explorer").arg("/select,").arg(path).spawn()
     } else if cfg!(target_os = "macos") {

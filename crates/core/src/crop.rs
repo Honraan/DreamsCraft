@@ -229,7 +229,12 @@ impl CanvasSession {
         // poll (every few seconds) never holds up a touch meanwhile
         let hooks = st.hooks.clone();
         drop(guard);
-        hooks.and_then(|hooks| hooks.take_said())
+        let said = hooks.and_then(|hooks| hooks.take_said());
+        // a plugin's folder that can't be reached, once (interface 22)
+        said.or_else(|| {
+            let folders = self.shared.folders.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            folders.and_then(|f| f.take_notice())
+        })
     }
 
     /// The canvas's colour profile, by name.

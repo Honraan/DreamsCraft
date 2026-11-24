@@ -139,6 +139,10 @@ struct ArtworkFile {
         skip_serializing_if = "Option::is_none"
     )]
     turns: Option<u8>,
+    /// The view it was left with, as versions before `turns` kept it instead: read only for the
+    /// quarter turn it gives a file without `turns`, never written.
+    #[serde(default, deserialize_with = "procraft_engine::document::or_default", skip_serializing)]
+    view: Option<LeftView>,
     /// The model painted on, if it is one (its current texture set is `document`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model: Option<crate::scene3d::SavedModel>,
@@ -176,6 +180,29 @@ struct ArtworkFile {
 
 /// A plugin's artwork's data in its folder.
 pub(crate) const PLUGIN_DATA: &str = "plugin-data.bin";
+
+/// The view an artwork was left with, as earlier versions kept it: of it only its turn counts now
+/// (`rotation`, radians clockwise on screen), less what of that was the view turning with the
+/// device (`followed`); where on the canvas it was and its zoom are not kept.
+#[derive(Clone, Copy, Debug, Default, serde::Deserialize)]
+struct LeftView {
+    #[serde(default)]
+    rotation: f32,
+    #[serde(default)]
+    followed: f32,
+}
+
+impl ArtworkFile {
+    /// The quarter turns clockwise it is kept at: as kept, or, kept by a version before that, the
+    /// turn nearest the view it was left with; upright if neither.
+    fn kept_turns(&self) -> u8 {
+        let left = self.view.and_then(|v| {
+            let followed = if v.followed.is_finite() { v.followed } else { 0.0 };
+            crate::nearest_quarter_turns(v.rotation - followed)
+        });
+        self.turns.or(left).unwrap_or(0) % 4
+    }
+}
 
 /// An artwork's time-lapse in a package: whether it records, its video's settings (quality 0 to 3,
 /// resolution 0 to 2, HEVC or H.264), and its video so far as MP4 files in order, `width` ×
@@ -451,6 +478,7 @@ impl crate::State {
             document: self.doc.clone(),
             info: self.info.clone(),
             turns: Some(self.turns).filter(|&t| t != 0),
+            view: None,
             model: model.as_ref().map(|m| m.saved.clone()),
             reference: Some(self.reference_window.clone()).filter(|w| !w.is_unused()),
             references: self.more_references.iter().map(|m| m.window.clone()).collect(),
@@ -667,7 +695,40 @@ fn write_or_keep_changed(
         canvas.mark_changed(changed);
     }
     session.note_room(&result);
+    if result.is_ok() {
+        session.folder_saved(dir);
+    }
     result
+}
+
+impl CanvasSession {
+    /// The artwork was saved into `dir`: a plugin keeping artworks in a folder writes it there
+    /// before long (interface 22). Nothing with none on that hook.
+    fn folder_saved(&self, dir: &Path) {
+        let folders = self.shared.folders.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(folders) = folders {
+            folders.artwork_saved(self.me.clone(), dir);
+        }
+    }
+
+    /// The artwork in `dir` was left, saved: what a plugin's folder waits for goes before long.
+    fn folder_left(&self, dir: &Path) {
+        let folders = self.shared.folders.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(folders) = folders {
+            folders.artwork_left(dir);
+        }
+    }
+
+    /// Whether its canvas is there to read: made, on a GPU, and not let go.
+    pub(crate) fn shows_canvas(&self) -> bool {
+        let st = self.shared.lock();
+        st.canvas.is_some() && st.gpu.is_some() && !st.closed
+    }
+
+    /// Whether its canvas was let go ([`CanvasSession::release_canvas`]).
+    pub(crate) fn closed(&self) -> bool {
+        self.shared.lock().closed
+    }
 }
 
 impl CanvasSession {
@@ -710,6 +771,8 @@ impl CanvasSession {
             saved.autosave
         };
         let session = Arc::downgrade(&self);
+        // open there: nothing from a plugin's folder comes in over it
+        crate::folders::opened(Path::new(&dir), Arc::downgrade(&self));
         // (its own handle on the changes: waiting on them keeps nothing else of the session alive)
         let nudge = Arc::clone(&self.shared.nudge);
         let mut seen = nudge.seen();
@@ -1267,6 +1330,8 @@ impl CanvasSession {
                 reason: format!("not an artwork this version can open ({} {})", file.format, file.version),
             });
         }
+        // the quarter turn it is kept at (before its parts are taken)
+        let turns = file.kept_turns();
         let mut doc = file.document.repaired();
         // plugins' layers' data, as it is (an empty file: none yet). One whose file is gone or can't
         // be read takes no strokes, which would draw it again without what its pixels show, and
@@ -1331,7 +1396,7 @@ impl CanvasSession {
             st.pending_stores = stores;
             st.layer_data_unread.extend(data_unread);
             st.info = file.info;
-            st.turns = file.turns.unwrap_or(0) % 4;
+            st.turns = turns;
             st.scene = scene.map(Box::new);
             st.reference_window = file.reference.unwrap_or_default();
             st.reference_picture = reference_picture.map(Arc::new);
@@ -1426,7 +1491,10 @@ impl CanvasSession {
         let mut failed = None;
         for _ in 0..LEAVE_SAVES {
             match self.save(dir.clone()) {
-                Ok(()) if self.edits_saved() == Some(self.edits()) => return Leaving::Left,
+                Ok(()) if self.edits_saved() == Some(self.edits()) => {
+                    self.folder_left(Path::new(&dir));
+                    return Leaving::Left;
+                }
                 Ok(()) => failed = None,
                 Err(e) => {
                     failed = Some(e.to_string());
@@ -1435,7 +1503,10 @@ impl CanvasSession {
             }
         }
         // (painted on through every round: what the last saved stands, the rest is the next save's)
-        let Some(reason) = failed else { return Leaving::Left };
+        let Some(reason) = failed else {
+            self.folder_left(Path::new(&dir));
+            return Leaving::Left;
+        };
         let saved = self.shared.edits_saved.load(std::sync::atomic::Ordering::Relaxed);
         let ever_saved = Path::new(&dir).join("artwork.json").is_file();
         let (title, message) = crate::storage::leave_unsaved_said(&reason, ever_saved);
@@ -1544,6 +1615,21 @@ impl CanvasSession {
         seed: u64,
         time_lapse: Option<PackageTimeLapse>,
     ) -> Result<(), MobileError> {
+        self.export_package_when(path, seed, time_lapse, false).map(|_| ())
+    }
+}
+
+impl CanvasSession {
+    /// [`CanvasSession::export_package`]; with `idle_only`, only while nothing is under way that it
+    /// would end (false then, nothing written), and quietly: the progress of an export someone
+    /// started is left as it is (a package made for a plugin's folder).
+    pub(crate) fn export_package_when(
+        &self,
+        path: String,
+        seed: u64,
+        time_lapse: Option<PackageTimeLapse>,
+        idle_only: bool,
+    ) -> Result<bool, MobileError> {
         let time_lapse = match time_lapse {
             Some(t) => {
                 let mut segments = Vec::with_capacity(t.segments.len());
@@ -1563,10 +1649,16 @@ impl CanvasSession {
             }
             None => None,
         };
-        self.exported(0.0);
+        // (made for a plugin's folder: the progress of an export someone started is left alone)
+        if !idle_only {
+            self.exported(0.0);
+        }
         let (doc, composite, name, info, reference, reference_picture, turns, edits) = {
             let mut guard = self.shared.lock_finished();
             let st = &mut *guard;
+            if idle_only && !st.idle() {
+                return Ok(false);
+            }
             st.finish_stroke();
             st.settle();
             let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else {
@@ -1597,7 +1689,8 @@ impl CanvasSession {
         let preview = png_bytes(tw, th, &thumb, &doc.picture_icc())?;
         // every layer and mask read as it is written, a layer at a time
         let count = doc.layers().iter().filter(|l| l.kind != LayerKind::Group).count();
-        let pixels = ExportLayers::new(self, edits, count, (0.1, 0.9));
+        let mut pixels = ExportLayers::new(self, edits, count, (0.1, 0.9));
+        pixels.tells = !idle_only;
         let export = procraft_engine::native::Export {
             document: &doc,
             pixels: &pixels,
@@ -1614,10 +1707,15 @@ impl CanvasSession {
             turns: u32::from(turns),
         };
         write_file_atomically(Path::new(&path), |out| procraft_engine::native::write_to(&export, out).map(|_| ()))?;
-        self.exported(1.0);
-        Ok(())
+        if !idle_only {
+            self.exported(1.0);
+        }
+        Ok(true)
     }
+}
 
+#[uniffi::export]
+impl CanvasSession {
     /// The artwork as a layered PSD (groups, masks, clipping, blend modes kept) at `path`, its
     /// layers read and written one at a time.
     pub fn export_psd(&self, path: String) -> Result<(), MobileError> {
@@ -2051,11 +2149,13 @@ struct ExportLayers<'a> {
     count: usize,
     done: std::cell::Cell<usize>,
     progress: (f32, f32),
+    /// Whether it tells the export's progress (not for a package made for a plugin's folder).
+    tells: bool,
 }
 
 impl<'a> ExportLayers<'a> {
     fn new(session: &'a CanvasSession, edits: u64, count: usize, progress: (f32, f32)) -> ExportLayers<'a> {
-        ExportLayers { session, edits, count, done: std::cell::Cell::new(0), progress }
+        ExportLayers { session, edits, count, done: std::cell::Cell::new(0), progress, tells: true }
     }
 
     /// Layer `id`'s pixels as the canvas has them (premultiplied RGBA8, the canvas's size).
@@ -2074,7 +2174,9 @@ impl<'a> ExportLayers<'a> {
         let done = self.done.get() + 1;
         self.done.set(done);
         let (from, to) = self.progress;
-        self.session.exported(from + (to - from) * done.min(self.count) as f32 / self.count.max(1) as f32);
+        if self.tells {
+            self.session.exported(from + (to - from) * done.min(self.count) as f32 / self.count.max(1) as f32);
+        }
         Ok(pixels)
     }
 

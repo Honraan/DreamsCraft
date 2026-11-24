@@ -334,7 +334,7 @@ fn set_number(control: &mut PluginControl, value: f32) {
     match control {
         PluginControl::Switch { control } => control.on = value >= 0.5,
         PluginControl::Slider { control } => control.value = control.stepped(value),
-        PluginControl::File { .. } | PluginControl::Texture { .. } => {}
+        PluginControl::File { .. } | PluginControl::Texture { .. } | PluginControl::Folder { .. } => {}
     }
 }
 

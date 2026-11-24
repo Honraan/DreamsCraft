@@ -169,6 +169,8 @@ struct PluginControlView: View {
             PluginFileRow(file: one) { model.showNotice($0, warning: true) }
         case let .texture(one):
             PluginTextureRow(texture: one) { model.showNotice($0, warning: true) }
+        case let .folder(one):
+            PluginFolderRow(folder: one) { model.showNotice($0, warning: true) }
         }
     }
 }

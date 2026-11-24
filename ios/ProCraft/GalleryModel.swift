@@ -168,6 +168,25 @@ final class GalleryModel {
         version += 1
     }
 
+    /// The gallery shows: what a plugin brings in from its folder comes in, off the main thread, and
+    /// the gallery is read again if anything came; a folder out of reach is told once. With no plugin
+    /// bringing anything in, nothing happens.
+    func bringIn() {
+        work.async { [weak self] in
+            // (bringing an artwork in goes deep into the core)
+            let brought = onBigStack { PluginsModel.shared.store.galleryOpened(store: Gallery.store) }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if brought.added + brought.updated + brought.copies > 0 {
+                    self.artworkSaved()
+                }
+                if let notice = brought.notice {
+                    self.message = notice
+                }
+            }
+        }
+    }
+
     /// Runs `change` on the store off the main thread, the gallery read again after it.
     private func changing(_ change: @escaping () -> Void) {
         work.async { [weak self] in

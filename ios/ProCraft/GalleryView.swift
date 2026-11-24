@@ -658,6 +658,7 @@ struct GalleryView: View {
             .onAppear {
                 model.onOpen = onOpen
                 model.reload()
+                model.bringIn()
                 #if DEBUG
                     // the capture says what it wants once the window is up
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1) { showForCapture() }

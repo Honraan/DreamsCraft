@@ -676,6 +676,17 @@ impl ArtworkStore {
         order
     }
 
+    /// The artwork folder `new` takes the place of `old` in their folder's order (the two side by
+    /// side, `old` about to go): an artwork brought up to date from a plugin's folder stays where it
+    /// was in the gallery.
+    pub(crate) fn put_in_place_of(&self, old: &Path, new: &Path) {
+        let at = self.parent_of(old);
+        let (old, new) = (name_of(old), name_of(new));
+        let order: Vec<String> =
+            self.order(&at).into_iter().filter(|n| *n != new).map(|n| if n == old { new.clone() } else { n }).collect();
+        write_order(&at, &order);
+    }
+
     /// A new stack in `at` holding `artworks` (moved into it), where `place` was: by default the
     /// first of them, and they keep the gallery's order; with `place`, in the order given.
     fn make_stack(&self, artworks: &[PathBuf], place: Option<&Path>) -> PathBuf {
