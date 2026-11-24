@@ -1101,6 +1101,7 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
     /// saved: the storage full, they stay pictures).
     private func leaveCanvas(saved: Bool) {
         let session = model.session
+        let dir = model.dir
         let lapse = model.timeLapse.lapse
         let then = model.afterLeaving
         model.afterLeaving = nil
