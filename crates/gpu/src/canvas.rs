@@ -25,6 +25,7 @@ mod fragments;
 pub(crate) mod plugin_filter;
 pub(crate) mod plugin_picture;
 mod rewind;
+mod second_marks;
 mod smudge;
 mod store;
 
@@ -2479,6 +2480,9 @@ enum Op {
     /// The open stroke painting in place goes back to its mark before its stamp of this place (see
     /// [`Canvas::rewound`]).
     RewindInPlace(usize),
+    /// The open stroke's second goes back to its mark before its stamp of this place (see
+    /// [`Canvas::second_rewound`]).
+    RewindSecond(usize),
     /// The open stroke's second is laid from scratch next: where it reached before, what was put
     /// together of it there is put together again as the stroke ends.
     SecondReached(IRect),
@@ -3399,6 +3403,14 @@ pub struct Canvas {
     rewound: u64,
     /// Whether the open stroke's end may lay again what it has laid (see [`Canvas::may_lay_again`]).
     may_lay_again: bool,
+    /// What a dual brush's second keeps to go back to as it is laid again (see `second_marks.rs`),
+    /// whether its end may lay again what it laid (see [`Canvas::second_may_lay_again`]); and the
+    /// marks made, the times a second went back to one, and the stamps that left unlaid: for tests.
+    second_marks: Option<second_marks::SecondMarks>,
+    second_may_lay_again: bool,
+    second_marks_made: u64,
+    second_rewound_count: u64,
+    second_rewound_stamps: u64,
     /// How wide the open stroke's brush is (canvas pixels, see [`Canvas::brush_across`]), if told;
     /// and the side of the tiles a stroke painting in place keeps, where a test sets it.
     brush_across: Option<f32>,
@@ -3859,6 +3871,11 @@ impl Canvas {
             windows_laid: 0,
             rewound: 0,
             may_lay_again: true,
+            second_marks: None,
+            second_may_lay_again: true,
+            second_marks_made: 0,
+            second_rewound_count: 0,
+            second_rewound_stamps: 0,
             brush_across: None,
             smudge_tiles: None,
             stamps_queued: 0,
@@ -4331,6 +4348,7 @@ impl Canvas {
     pub fn begin_stroke(&mut self, layer: LayerId, style: StrokeStyle) {
         self.end_stroke();
         self.may_lay_again = true;
+        self.second_may_lay_again = true;
         self.brush_across = None;
         self.prediction.clear();
         self.laid = Some(Vec::new());
@@ -5018,9 +5036,24 @@ impl Canvas {
         self.may_lay_again = may;
     }
 
+    /// Whether the open stroke's second's end may lay again stamps it has laid (its tapers): it
+    /// keeps marks to go back to then (see `second_marks.rs`), which take copies of what it writes as
+    /// it goes. Told after it begins (it may, until told otherwise).
+    pub fn second_may_lay_again(&mut self, may: bool) {
+        self.second_may_lay_again = may;
+    }
+
+    /// The marks dual brushes' seconds have made to go back to so far (see `second_marks.rs`), how
+    /// many times they went back to one, and how many stamps of theirs that left unlaid again.
+    #[doc(hidden)]
+    pub fn second_rewinds(&self) -> (u64, u64, u64) {
+        (self.second_marks_made, self.second_rewound_count, self.second_rewound_stamps)
+    }
+
     /// Whether strokes painting in place keep marks to go back to as they are laid again (see
-    /// `rewind.rs`), and within how many bytes (none: as the device's memory gives them): for tests
-    /// comparing them with strokes laid again from scratch.
+    /// `rewind.rs`), and dual brushes' seconds (see `second_marks.rs`), and within how many bytes
+    /// (none: as the device's memory gives them): for tests comparing them with strokes laid again
+    /// from scratch.
     #[doc(hidden)]
     pub fn set_rewinds(&mut self, on: bool, most: Option<u64>) {
         self.rewinds = on;
@@ -6832,11 +6865,12 @@ impl Canvas {
         // (a stroke painting in place laid again from scratch goes back to a mark instead, where it can)
         let ops = without_passing_tips(std::mem::take(&mut self.ops));
         let ops = self.rewound(ops);
+        let ops = self.second_rewound(ops);
         // a stroke laid again whole as it ends (or from a mark it went back to), in a render that
         // shows the canvas: laid for so long (see `RELAY_AT_ONCE`) and as much as the GPU gets
         // through soon after (see `RELAY_GPU_MS`), in pieces no bigger, the rest left to the
         // renders after, until its end is reached
-        let rewinds = ops.iter().any(|op| matches!(op, Op::RewindInPlace(_)));
+        let rewinds = ops.iter().any(|op| matches!(op, Op::RewindInPlace(_) | Op::RewindSecond(_)));
         let relays = target.is_some() && (self.relaying || rewinds || lays_ended_stroke_again(&ops));
         let relay_most = if relays { self.relay_most(gpu) } else { u64::MAX };
         let ops = in_pieces(ops, self.full(), (self.work_at_once, self.work_at_once.min(relay_most)), most_stamps);
@@ -7037,6 +7071,7 @@ impl Canvas {
                 self.smudge_refused = false;
                 // (its stroke cleared as it goes into its layer, its second as the next begins)
                 self.end_carried();
+                self.second_marks = None;
             }
             match op {
                 Op::Stamps { instances, wet, picks, times, style, layer, clear, second: false, .. }
@@ -7048,6 +7083,7 @@ impl Canvas {
                     self.smudge_stamps(gpu, &mut encoder, uniforms, stamps, &style, layer, clear);
                 }
                 Op::RewindInPlace(at) => self.rewind_in_place(&mut encoder, at),
+                Op::RewindSecond(at) => self.rewind_second(device, &mut encoder, at),
                 Op::SecondReached(rect) => match self.smudge.as_mut().filter(|s| s.apart.is_some()) {
                     Some(smudge) => smudge.stale = smudge.stale.union(rect),
                     None => self.second_unsynthesized = self.second_unsynthesized.union(rect),
@@ -7055,6 +7091,7 @@ impl Canvas {
                 Op::DropSecond => {
                     self.queued_second = None;
                     self.carried[1].forget();
+                    self.second_marks = None;
                     // paint laid apart is laid alone from here (and put together so all over again)
                     if let Some(smudge) = self.smudge.as_mut()
                         && let Some(apart) = smudge.apart.as_mut()
@@ -7066,6 +7103,7 @@ impl Canvas {
                 Op::ClearSecond(second) => {
                     self.queued_second = Some(second);
                     self.carried[1].forget();
+                    self.second_cleared();
                     self.second_unsynthesized = IRect::EMPTY;
                     let (texture, view) = self.second_stroke.get(device);
                     drop(render_pass(
@@ -7076,7 +7114,7 @@ impl Canvas {
                     ));
                     self.clear_built_up(&mut encoder, texture);
                 }
-                Op::Stamps { instances, style, clear, pencil, second, carry, .. } => {
+                Op::Stamps { instances, wet, times, style, clear, pencil, second, carry, .. } => {
                     let count = u32::try_from(instances.len()).unwrap_or(u32::MAX);
                     let first = next_instance;
                     next_instance = next_instance.saturating_add(count);
@@ -7131,6 +7169,20 @@ impl Canvas {
                     let carry = carry && onto_part && rule.is_some() && !in_fragments;
                     if let Some(carried) = self.carried.get_mut(part).filter(|_| onto_part && (clear || !carry)) {
                         carried.forget();
+                    }
+                    // a dual brush's second laid from scratch keeps marks from here, else marks
+                    // before these stamps as it goes (see `second_marks.rs`)
+                    if second && clear {
+                        self.second_cleared();
+                    }
+                    if second {
+                        self.mark_second(
+                            device,
+                            &mut encoder,
+                            &texture,
+                            (&instances, &wet, &times),
+                            rule.is_some() || in_fragments,
+                        );
                     }
                     if in_fragments {
                         if clear {
@@ -10842,6 +10894,7 @@ impl Canvas {
             | Op::SaveTip(_)
             | Op::Untip(_)
             | Op::RewindInPlace(_)
+            | Op::RewindSecond(_)
             | Op::SecondReached(_)
             | Op::Mark
             | Op::Name(_)
@@ -12639,6 +12692,7 @@ impl Canvas {
         all.extend(self.scratch.made());
         all.extend(self.second_stroke.made());
         all.extend(self.carried.iter().filter_map(|c| c.texture.as_ref().map(|(t, _)| t)));
+        all.extend(self.second_marks.iter().flat_map(second_marks::SecondMarks::textures));
         all.extend(self.groups.iter().flat_map(|(pair, _)| pair));
         all.extend(self.clip_group.made().into_iter().chain(self.clip_group_second.made()));
         all.extend(self.filter_out.made().into_iter().chain(self.filter_keep.made()));

@@ -55,8 +55,8 @@ static PREVIEW_SHORT_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::At
 
 /// Draws the pictures `brushes` stand in with that are still to be drawn (each brush's shape and
 /// grain, and its second's), on a thread of their own: a brush chosen is ready by its first stroke,
-/// which otherwise waits for them under the canvas's lock. What a stroke or preview wants first is
-/// drawn once, by whichever gets to it first.
+/// which otherwise waits for them (see [`pictures_to_draw`]). What a stroke or preview wants first
+/// is drawn once, by whichever gets to it first.
 pub(crate) fn warm_pictures<'a>(brushes: impl IntoIterator<Item = &'a procraft_engine::brush::Brush>) {
     let waiting = undrawn(brushes);
     if waiting.is_empty() {
@@ -71,6 +71,21 @@ pub(crate) fn warm_pictures<'a>(brushes: impl IntoIterator<Item = &'a procraft_e
 /// Draws `brush`'s pictures still to be drawn now, side by side (see [`warm_pictures`]).
 pub(crate) fn draw_pictures(brush: &procraft_engine::brush::Brush) {
     draw_side_by_side(&undrawn([brush]));
+}
+
+/// `brush`'s pictures still to be drawn (its shape and grain, and its second's), to draw with
+/// [`draw_these`] before the canvas is held: a stroke begun just after its brush was chosen drew
+/// them under the canvas's lock, the frames held up meanwhile (35 to 140 ms for a dual brush's
+/// four).
+pub(crate) fn pictures_to_draw(brush: &procraft_engine::brush::Brush) -> Vec<procraft_engine::brush::Pixels> {
+    undrawn([brush])
+}
+
+/// Draws `pictures` now, side by side (each once, whoever else draws it meanwhile).
+pub(crate) fn draw_these(pictures: &[procraft_engine::brush::Pixels]) {
+    if !pictures.is_empty() {
+        draw_side_by_side(pictures);
+    }
 }
 
 /// The pictures of `brushes` (each one's shape and grain, and its second's) still to be drawn.

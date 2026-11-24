@@ -3959,6 +3959,122 @@ fn a_dual_brush_whose_second_turns_with_the_stroke_ends_laying_only_the_rest() {
     }
 }
 
+/// A dual brush whose end taper reaches back over what its second laid (Evergreen, Pansy, Elfin
+/// Saddle, Wexcombe, Pin Oak, Bee-eater: paint laid in place) ends a long stroke going back to a mark
+/// its second kept and laying only what follows: its second laid whole again from its start,
+/// thousands of a big brush's stamps, held a tablet half a second or more after the lift. It comes
+/// out bit for bit as laid whole and draws just the same meanwhile; a second laid by its rule keeps
+/// no marks (going on from one, its lots would round elsewhere, and Pansy's threshold put pixels 98
+/// levels apart), and nor does a device of little memory.
+#[test]
+fn a_dual_brush_whose_end_taper_reaches_back_over_its_second_lays_only_the_rest_of_it() {
+    use std::time::{Duration, Instant};
+    let side = 384;
+    let point = |k: usize| PenSample {
+        pressure: 0.4 + 0.5 * (k as f32 * 0.05).sin().abs(),
+        ..sample(
+            20.0 + (k % 220) as f32 * 1.6,
+            70.0 + (k / 220) as f32 * 120.0 + (k as f32 * 0.04).sin() * 40.0,
+            k as f64 * 4.17,
+        )
+    };
+    let samples = 700;
+    #[derive(Clone, Copy, PartialEq)]
+    enum Way {
+        Whole,
+        Marked,
+        Unmarked,
+        LittleMemory,
+    }
+    struct Drawn {
+        layer: Vec<u8>,
+        meanwhile: Vec<u8>,
+        rewinds: (u64, u64, u64),
+        second: usize,
+        lift: Duration,
+        by_rule: bool,
+    }
+    for name in ["Evergreen", "Pansy", "Elfin Saddle", "Wexcombe", "Pin Oak", "Bee-eater"] {
+        let drawn = |way: Way| -> Option<Drawn> {
+            let s = session(side, side)?;
+            let (set, index) = library_brush(&s, |b| b.name == name)?;
+            let by_rule = {
+                use procraft_engine::brush::Rendering;
+                let st = s.shared.lock();
+                let brush = &st.library[set as usize].brushes[index as usize];
+                let second = brush.secondary.as_deref();
+                assert!(second.is_some_and(|b| b.pen_taper.end > 0.0), "{name}'s second has an end taper");
+                second.is_some_and(|b| matches!(b.rendering, Rendering::Gradual | Rendering::Capped))
+            };
+            assert!(s.select_brush(set, index));
+            s.set_brush_size(0.45);
+            s.set_color(0.2, 0.3, 0.7);
+            {
+                let mut st = s.shared.lock();
+                let canvas = st.canvas.as_mut()?;
+                canvas.lay_ends_whole(way == Way::Whole);
+                if way == Way::Unmarked {
+                    canvas.set_rewinds(false, None);
+                }
+                if way == Way::LittleMemory {
+                    canvas.set_resident_budget(1 << 30);
+                }
+            }
+            s.stroke_begin(PointerKind::Stylus, vec![point(0)]);
+            let mut meanwhile = Vec::new();
+            for e in 1..samples / 2 {
+                s.stroke_add(vec![point(2 * e - 1), point(2 * e)]);
+                if e.is_multiple_of(2) {
+                    let shown = picture(&s);
+                    if e >= samples / 4 && meanwhile.is_empty() {
+                        meanwhile = shown;
+                    }
+                }
+            }
+            picture(&s);
+            assert!(s.shared.lock().second.is_some(), "{name} is a dual brush");
+            let second = s.shared.lock().canvas.as_ref()?.laid_second_count().unwrap_or(0);
+            let lifted = Instant::now();
+            s.stroke_end(vec![point(samples - 1)]);
+            picture(&s);
+            let lift = lifted.elapsed();
+            let rewinds = s.shared.lock().canvas.as_ref()?.second_rewinds();
+            let current = s.layers().iter().find(|l| l.current).map_or(0, |l| l.id);
+            Some(Drawn { layer: layer_rgba(&s, current), meanwhile, rewinds, second, lift, by_rule })
+        };
+        let (Some(whole), Some(marked), Some(unmarked), Some(little)) =
+            (drawn(Way::Whole), drawn(Way::Marked), drawn(Way::Unmarked), drawn(Way::LittleMemory))
+        else {
+            continue;
+        };
+        let (most, count) = differ(&whole.layer, &marked.layer);
+        let (made, rewound, unlaid) = marked.rewinds;
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        println!(
+            "{name}: {made} marks, gone back to {rewound} times, {unlaid} of its second's {} stamps not laid again; \
+             {count} channels differ from laid whole, by {most} at most; the lift {:.1} ms against {:.1} laid whole",
+            marked.second,
+            ms(marked.lift),
+            ms(whole.lift),
+        );
+        assert!(whole.layer.iter().skip(3).step_by(4).any(|&a| a > 0), "{name} drew nothing");
+        if marked.by_rule {
+            assert_eq!(made, 0, "{name}: marks kept for a second laid by its rule");
+        } else {
+            // gone back to a mark near its end: at least nine stamps in ten of its second not laid again
+            assert!(rewound >= 1, "{name}: its second laid again from its start");
+            let second = marked.second as u64;
+            assert!(unlaid * 10 >= second * 9, "{name}: {unlaid} of {second} stamps left unlaid");
+        }
+        assert_eq!((most, count), (0, 0), "{name}: ended unlike laid whole");
+        // drawn the same meanwhile, marks or not
+        assert!(!marked.meanwhile.is_empty());
+        assert_eq!(differ(&marked.meanwhile, &unmarked.meanwhile), (0, 0), "{name}: drawn otherwise with marks");
+        assert_eq!(unmarked.rewinds.0, 0, "{name}: marks made though turned off");
+        assert_eq!(little.rewinds.0, 0, "{name}: marks made on a device of little memory");
+    }
+}
+
 /// A stroke shown with a tip whose start taper is a classic one (its first stamps eased over the
 /// points around them, so they change as the next points come) holds those back until they no
 /// longer change, showing them in its tip meanwhile: the stroke shows as far as the pen has come,
@@ -21058,6 +21174,89 @@ fn kept_selections_delete_by_place_and_the_rest_close_up() {
 }
 
 /// The library's first brush (set, place) `wanted` says yes to.
+/// A stroke begun just after its brush was chosen, while its pictures are still being drawn, draws
+/// them before it holds the canvas: drawn under its lock, they held the frames up meanwhile (35 to
+/// 140 ms for a dual brush's four). Here a picture takes 400 ms to draw: the stroke waits for it,
+/// no frame waits past 150 ms, and the stroke comes out as with the picture drawn ahead.
+#[test]
+fn a_stroke_begun_as_its_brushs_pictures_draw_holds_no_frame_up() {
+    use procraft_engine::brush::{Pixels, Source};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    let side = 256;
+    let slow = Duration::from_millis(400);
+    // the layer, how long the stroke's start took, and the slowest frame meanwhile
+    let drawn = |ahead: bool| -> Option<(Vec<u8>, Duration, Duration)> {
+        let s = session(side, side)?;
+        let (set, index) = library_brush(&s, |b| b.shape.source.is_some() && b.secondary.is_none() && !b.mixes_wet())?;
+        {
+            let mut st = s.shared.lock();
+            let brush = &mut st.library[set as usize].brushes[index as usize];
+            let source = brush.shape.source.clone()?;
+            // the same picture, taking a while to draw
+            let original = source.pixels.clone();
+            let pixels = Pixels::later(move || {
+                std::thread::sleep(slow);
+                Some(original.shared().to_vec())
+            });
+            brush.shape.source = Some(Source { pixels, ..source });
+        }
+        picture(&s);
+        let stop = Arc::new(AtomicBool::new(false));
+        let frames = {
+            let (s, stop) = (s.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut slowest = Duration::ZERO;
+                while !stop.load(Ordering::Relaxed) {
+                    let t = Instant::now();
+                    {
+                        let mut guard = s.shared.lock();
+                        let st = &mut *guard;
+                        if let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) {
+                            canvas.render(gpu, &mut st.doc, None);
+                        }
+                    }
+                    slowest = slowest.max(t.elapsed());
+                    std::thread::sleep(Duration::from_millis(8));
+                }
+                slowest
+            })
+        };
+        assert!(s.select_brush(set, index));
+        if ahead {
+            std::thread::sleep(slow + Duration::from_millis(300));
+        }
+        s.set_brush_size(0.3);
+        s.set_color(0.2, 0.5, 0.3);
+        let t = Instant::now();
+        s.stroke_begin(PointerKind::Stylus, vec![sample(40.0, 128.0, 0.0)]);
+        let begin = t.elapsed();
+        for k in 1..60 {
+            s.stroke_add(vec![sample(40.0 + k as f32 * 3.0, 128.0 + (k as f32 * 0.2).sin() * 30.0, k as f64 * 8.0)]);
+        }
+        s.stroke_end(vec![]);
+        picture(&s);
+        stop.store(true, Ordering::Relaxed);
+        let slowest = frames.join().ok()?;
+        let current = s.layers().iter().find(|l| l.current).map_or(0, |l| l.id);
+        Some((layer_rgba(&s, current), begin, slowest))
+    };
+    let (Some((at_once, begin, slowest)), Some((ahead, begin_ahead, _))) = (drawn(false), drawn(true)) else { return };
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    println!(
+        "begun as its picture drew: the start {:.0} ms, the slowest frame meanwhile {:.0} ms; begun after: {:.1} ms",
+        ms(begin),
+        ms(slowest),
+        ms(begin_ahead)
+    );
+    // the stroke waited for its picture, the frames didn't
+    assert!(begin >= slow / 2, "the start took {begin:?}: its picture was drawn already");
+    assert!(slowest < Duration::from_millis(150), "a frame waited {slowest:?} as the picture drew");
+    assert!(at_once.iter().skip(3).step_by(4).any(|&a| a > 0), "nothing drawn");
+    assert_eq!(differ(&at_once, &ahead), (0, 0), "drawn otherwise than with its picture drawn ahead");
+}
+
 fn library_brush(s: &CanvasSession, wanted: impl Fn(&procraft_engine::brush::Brush) -> bool) -> Option<(u32, u32)> {
     let st = s.shared.lock();
     st.library.iter().enumerate().find_map(|(set, entry)| {

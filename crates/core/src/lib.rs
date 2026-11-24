@@ -2450,6 +2450,14 @@ impl CanvasSession {
 
     /// A stroke starts: `samples` are its first input.
     pub fn stroke_begin(&self, pointer: PointerKind, samples: Vec<PenSample>) {
+        // the brush's pictures still to be drawn (it was chosen just now) drawn before the canvas is
+        // held, so that the frames go on meanwhile
+        let pictures = {
+            let st = self.shared.lock();
+            let tool = if pointer == PointerKind::StylusEraser { ToolKind::Erase } else { st.tool };
+            crate::brushes::pictures_to_draw(st.brush(tool))
+        };
+        crate::brushes::draw_these(&pictures);
         let mut guard = self.shared.lock();
         let st = &mut *guard;
         self.shared.forget_painted_turn();
@@ -2658,6 +2666,10 @@ impl CanvasSession {
         }
         // (paint laid in place keeps marks to go back to only if its end may lay it again)
         canvas.may_lay_again(builder.end_may_change_laid());
+        // (and a dual brush's second keeps marks to go back to only if its end may lay it again)
+        if let Some(second) = second_builder.as_ref() {
+            canvas.second_may_lay_again(second.end_may_change_laid());
+        }
         // (a fill shown as it grows lays no stamps: the next frame shows its region)
         if fill != Some(lasso_fill::FillShown::Growing) {
             draw_samples(canvas, &mut builder, second_builder.as_mut(), &canvas_samples, &st.doc.stroke_guide(), false);

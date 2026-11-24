@@ -15,20 +15,20 @@ use super::smudge::{tile_rect, tiles_of};
 use super::{Canvas, Carry, Kept, LAYER_FORMAT, Op, PacedStamp, copy_at, extent, texture, wet_pass};
 
 /// Marks are at least this far apart in the stroke's input time (ms): two display frames.
-const MARK_EVERY_MS: f64 = 2.0 * super::WET_FRAME_MS;
+pub(super) const MARK_EVERY_MS: f64 = 2.0 * super::WET_FRAME_MS;
 /// Marks are kept this far back in input time from the newest (ms), the oldest at least this far
 /// back: past where an end taper reaches (its time is at most `TAPER_TIME_MS`, and it is eased over
 /// a point either side, and walked again from a little before).
-const MARKS_REACH_MS: f64 = 240.0;
+pub(super) const MARKS_REACH_MS: f64 = 240.0;
 /// The most the marks' pictures may take (bytes), and on a device of little memory: past it the
 /// oldest go, and a stroke whose end reaches back past those left is laid again from its start.
-const MARKS_MOST: u64 = 160 << 20;
+pub(super) const MARKS_MOST: u64 = 160 << 20;
 const MARKS_MOST_LOW: u64 = 48 << 20;
 /// The bytes of the plots wet paint carries from one pass to the next (two, taking turns, at the
 /// start of the stroke's carry buffer; see `CARRIED` in the shader).
 const CARRIED_BYTES: u64 = 2 * (super::WET_PLOT_MOST as u64 * super::WET_PLOT_MOST as u64) * 16;
 /// The most stamps a stroke keeps as they were given to go back over (past it, it can't).
-const GIVEN_MOST: usize = 1 << 17;
+pub(super) const GIVEN_MOST: usize = 1 << 17;
 
 /// What a stroke painting in place keeps to go back to (see the module).
 pub(super) struct Rewind {
@@ -85,7 +85,7 @@ impl Mark {
 }
 
 /// Whether two stamps painted in place are the same: as drawn, and where they come in the stroke.
-fn same((a, aw, ap): &PacedStamp, (b, bw, bp): &PacedStamp) -> bool {
+pub(super) fn same((a, aw, ap): &PacedStamp, (b, bw, bp): &PacedStamp) -> bool {
     bytemuck::bytes_of(a) == bytemuck::bytes_of(b)
         && aw.iter().zip(bw).all(|(x, y)| x.to_bits() == y.to_bits())
         && ap.time_ms.to_bits() == bp.time_ms.to_bits()
