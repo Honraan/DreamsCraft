@@ -80,6 +80,7 @@ final class CanvasView: UIView {
     init(session: CanvasSession) {
         self.session = session
         super.init(frame: .zero)
+        CanvasLife.made(.view)
         isMultipleTouchEnabled = true
         isOpaque = true
         backgroundColor = .black
@@ -100,6 +101,10 @@ final class CanvasView: UIView {
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("the canvas is made in code")
+    }
+
+    deinit {
+        CanvasLife.gone(.view)
     }
 
     /// Pixels to a point on the screen the view is on.

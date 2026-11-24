@@ -746,6 +746,7 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
         leave = model.onClose
         canvas = CanvasView(session: model.session)
         super.init(nibName: nil, bundle: nil)
+        CanvasLife.made(.screen)
         // the top bar's Gallery keeps the artwork first
         model.onClose = { [weak self] in self?.close() }
         model.leaveWithoutSaving = { [weak self] in self?.leaveUnsaved() }
@@ -754,6 +755,10 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("the canvas is made in code")
+    }
+
+    deinit {
+        CanvasLife.gone(.screen)
     }
 
     override func loadView() {
@@ -1129,6 +1134,7 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
         Projection.shared.artwork(nil)
         leave()
         Gallery.closingSaves += 1
+        let canvases = CanvasLife.canvases
         DispatchQueue.global(qos: .userInitiated).async {
             // (saved: its autosave ended already; left without saving: it ends now)
             session.stopAutosave()
@@ -1139,6 +1145,8 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
             lapse.close()
             // its memory free at once, not when the object goes
             session.releaseCanvas()
+            // and the rest of it once nothing holds the session: the log says if anything does
+            CanvasLife.lookAfterLeaving(session, canvases: canvases)
             DispatchQueue.main.async { Gallery.artworkKept(failure: nil) }
         }
         then?()
@@ -1210,5 +1218,56 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
             model.closePopovers()
         }
         canvas.pencilSqueezed(squeeze, action: action)
+    }
+}
+
+/// The canvas's objects alive, counted as they are made and as they go, for the log's look once a
+/// canvas is left: each holds the artwork's session, and the session's memory (its brushes, its
+/// document, all but the canvas, let go as it is left) goes only once nothing holds it.
+enum CanvasLife {
+    enum Kind: Int {
+        case model, screen, view
+    }
+
+    private static let lock = NSLock()
+    private static var alive = [0, 0, 0]
+    /// Canvases made so far (on the main thread): one made since a canvas was left is alive rightly.
+    private(set) static var canvases = 0
+
+    static func made(_ kind: Kind) {
+        lock.lock()
+        alive[kind.rawValue] += 1
+        lock.unlock()
+        if kind == .model {
+            canvases += 1
+        }
+    }
+
+    /// (as an object goes, on whichever thread lets it go)
+    static func gone(_ kind: Kind) {
+        lock.lock()
+        alive[kind.rawValue] -= 1
+        lock.unlock()
+    }
+
+    /// The canvas of `session` was left (`since` canvases made by then) and its canvas let go: a few
+    /// seconds on, once its zoom out is over, the log says what is still alive of it (and whether
+    /// the app still holds the session itself, or only the core its state); if anything is, and no
+    /// canvas was made since, as a problem.
+    static func lookAfterLeaving(_ session: CanvasSession, canvases since: Int) {
+        weak var left = session
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+            lock.lock()
+            let counts = alive
+            lock.unlock()
+            let sessions = liveSessions()
+            let line = "\(sessions) sessions, \(counts[0]) canvas models, \(counts[1]) canvas screens, "
+                + "\(counts[2]) canvas views alive; the one left \(left == nil ? "let go" : "still held by the app")"
+            if canvases == since, left != nil || sessions > 0 || counts.contains(where: { $0 > 0 }) {
+                AppLog.error("memory", "a canvas left 5 s ago is still held: \(line)")
+            } else {
+                AppLog.info("memory", "5 s after leaving a canvas: \(line)")
+            }
+        }
     }
 }

@@ -107,6 +107,7 @@ mod reference_window;
 #[cfg(any(target_os = "android", target_os = "ios"))]
 mod render;
 mod reveal;
+mod run_ends;
 mod scene3d;
 mod selection;
 mod sharp;
@@ -152,7 +153,7 @@ use procraft_engine::stroke::StrokeBuilder;
 use procraft_engine::view::View;
 use procraft_gpu::{Canvas, Gpu, SecondStroke, StrokeStyle, StrokeTool};
 
-pub use activity::Activity;
+pub use activity::{Activity, live_sessions};
 pub use adjust::{
     ChromaticKind, GlitchKind, HalftoneKind, LiquifyBrush, LiquifyKind, NoiseKind, PerspectiveKind, SwipeAdjustment,
 };
@@ -165,6 +166,7 @@ pub use animation::{
     AnimationPlayback, AnimationSettings, FrameRate, PlayStep, animation_next_step, export_fps_at, export_fps_fraction,
     export_fps_label, frame_rate,
 };
+pub use app_log::process_line;
 pub use bars::{BarHang, BarLayout, BarPlace, HangSide, LayoutBar, bar_layout_key};
 pub use big_pictures::{big_pictures_left, wait_for_big_pictures};
 pub use blend_wheel::{
@@ -232,8 +234,9 @@ pub use list_slider::{ListSliderTouch, list_slider_touch};
 pub use modes::{ModeButton, ModeSwitch, Modes, mode_switch, mode_switch_deselects};
 pub use named_layouts::{NamedLayouts, named_layouts_key};
 pub use open_marks::{
-    android_run_ended_short_of_memory, opening_ended_app, opening_ended_app_said, opening_ended_app_title,
-    opening_ended_run, set_open_marks_file,
+    RunEnd, android_run_end, android_run_ended_short_of_memory, keep_desktop_logs_of_ended_runs, opening_ended_app,
+    opening_ended_app_said, opening_ended_app_said_after, opening_ended_app_title, opening_ended_run,
+    set_open_marks_file,
 };
 pub use palettes::{PaletteInfo, Palettes, colour_name};
 pub use pick::Pick;
@@ -275,6 +278,10 @@ pub use reference_view::{
 pub use reference_window::{
     ReferencePictureSize, ReferencePlace, ReferenceShows, ReferenceSize, ReferenceWindowState, reference_picture_size,
     reference_window_first_size, reference_window_fitted, reference_window_size,
+};
+pub use run_ends::{
+    CRASH_TARGET, CrashLine, Ended, LoggedRun, RUN_CRASHED, RUN_ENDING, RUN_STARTING_AGAIN, RUN_STOPPED,
+    last_runs_in_folder, last_runs_said, log_of_run, run_end_in_folder, runs_in_log,
 };
 pub use scene3d::{
     ModelFile, ModelInfo, ModelLight, ModelTextureFile, ModelWarning, SubmeshInfo, Turntable, model_warning_name,
@@ -1728,6 +1735,8 @@ pub(crate) struct Shared {
     pub(crate) cursor: cursor_turn::CursorTurns,
     /// Where the artwork is on the screen as last seen, for a dragged colour's rest.
     pub(crate) lands_on: pour::LandsOn,
+    /// Counts this session among those alive until all of it goes (see [`live_sessions`]).
+    _alive: activity::Alive,
 }
 
 /// Pen input waiting for the canvas (see [`Shared::queued`]): the stroke's samples in order (those
@@ -2375,6 +2384,7 @@ impl CanvasSession {
                 input_queued: std::sync::atomic::AtomicBool::new(false),
                 cursor: cursor_turn::CursorTurns::default(),
                 lands_on: pour::LandsOn::default(),
+                _alive: activity::Alive::new(),
             }),
         })
     }
@@ -3598,6 +3608,8 @@ impl CanvasSession {
 impl Drop for CanvasSession {
     fn drop(&mut self) {
         self.detach_window();
+        // a second display's thread too: it holds the state, which would stay with it, drawing
+        self.detach_projection();
         // the autosave's thread, waiting for a change, ends
         self.shared.nudge.close();
     }

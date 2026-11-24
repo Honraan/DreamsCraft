@@ -228,10 +228,14 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * An artwork picked whose opening ended the app last time, and what was to follow its opening:
-     * asked about before it opens again; with whether the system ended that run short of memory
-     * ([lowMemory]), which the question then says rather than ask for the log.
+     * asked about before it opens again; with how that run ended as far as Android kept it ([end]):
+     * short of memory the question says so rather than ask for the log, crashed it says it crashed.
      */
-    data class OpeningEndedApp(val artwork: Artwork, val then: (() -> Unit)?, val lowMemory: Boolean = false)
+    data class OpeningEndedApp(
+        val artwork: Artwork,
+        val then: (() -> Unit)?,
+        val end: io.github.artcraftandroid.procraft.core.RunEnd = io.github.artcraftandroid.procraft.core.RunEnd.UNKNOWN,
+    )
 
     /** The artwork picked whose opening ended the app last time, while the gallery asks whether to open it anyway. */
     var openingEndedApp by mutableStateOf<OpeningEndedApp?>(null)
@@ -3336,9 +3340,9 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         val cell = thumbAt[a.dir.name]
         viewModelScope.launch {
             if (!anyway && withContext(Dispatchers.IO) { io.github.artcraftandroid.procraft.core.openingEndedApp(a.dir.path) }) {
-                val lowMemory = withContext(Dispatchers.IO) { endedShortOfMemory(a.dir) }
+                val end = withContext(Dispatchers.IO) { howOpeningEnded(a.dir) }
                 opening = false
-                openingEndedApp = OpeningEndedApp(a, then, lowMemory)
+                openingEndedApp = OpeningEndedApp(a, then, end)
                 return@launch
             }
             val s = withContext(Dispatchers.IO) {
@@ -3361,18 +3365,19 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * Whether the run whose opening of the artwork in [dir] ended the app was ended by the system short
-     * of memory, as Android keeps how the app's runs ended (Android 11 on); false if it crashed, or
-     * it isn't known.
+     * How the run whose opening of the artwork in [dir] ended the app ended, as Android keeps how the
+     * app's runs ended (Android 11 on): the system short of memory, a crash, or not known (the core
+     * reads Android's reason).
      */
-    private fun endedShortOfMemory(dir: File): Boolean {
-        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R) return false
-        val run = io.github.artcraftandroid.procraft.core.openingEndedRun(dir.path) ?: return false
+    private fun howOpeningEnded(dir: File): io.github.artcraftandroid.procraft.core.RunEnd {
+        val unknown = io.github.artcraftandroid.procraft.core.RunEnd.UNKNOWN
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R) return unknown
+        val run = io.github.artcraftandroid.procraft.core.openingEndedRun(dir.path) ?: return unknown
         val app = getApplication<Application>()
         val ended = runCatching {
             app.getSystemService(android.app.ActivityManager::class.java)?.getHistoricalProcessExitReasons(app.packageName, run.toInt(), 1)?.firstOrNull()
-        }.getOrNull() ?: return false
-        return io.github.artcraftandroid.procraft.core.androidRunEndedShortOfMemory(ended.reason)
+        }.getOrNull() ?: return unknown
+        return io.github.artcraftandroid.procraft.core.androidRunEnd(ended.reason)
     }
 
     /** How many of the gallery's artworks being shared are written, as a share of them. */

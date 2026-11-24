@@ -396,6 +396,7 @@ final class CanvasModel {
     init(session: CanvasSession, dir: String) {
         self.session = session
         self.dir = dir
+        CanvasLife.made(.model)
         // the artwork open: where layers held out of another's layers panel land
         HeldLayers.shared.canvas = self
         _ = session.openBrushes(dir: Self.brushesDir)
@@ -435,6 +436,10 @@ final class CanvasModel {
         // time on it counts from now (the core counts it, and each save keeps what has counted)
         session.setTracking(on: true)
         watchSaves()
+    }
+
+    deinit {
+        CanvasLife.gone(.model)
     }
 
     /// Where the brush library and the brushes in use are kept.
@@ -2635,8 +2640,13 @@ final class CanvasModel {
     /// from any touch: a plugin or a smudge the GPU had no memory for, or its device lost. A plugin's
     /// card says so too, once its page reads the list again.
     private func watchSaves() {
-        let session = session
-        saveWatch = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+        // (the session reached through the model, never held: a repeating timer stays until it is
+        // stopped, and with the session in it the artwork's memory would stay with it)
+        saveWatch = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] timer in
+            guard let session = self?.session else {
+                timer.invalidate()
+                return
+            }
             // off the main thread: a big artwork's first frame holds the session a while
             DispatchQueue.global(qos: .utility).async {
                 let reason = session.takeSaveFailure()

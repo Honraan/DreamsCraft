@@ -16,9 +16,22 @@ static FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
 pub fn set_open_marks_file(path: String) {
     let file = PathBuf::from(path);
     *FILE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(file.clone());
+    crate::app_log::keep_log_of_ended_runs(&ended_runs(&file));
+}
+
+/// The desktop app's: its log is its own (in the app's folder `dir`, with the names the tablet's
+/// has), so the log of a run that closed while it opened an artwork is kept apart from here, as
+/// [`set_open_marks_file`] keeps the tablet's. Once the marks' file is set.
+pub fn keep_desktop_logs_of_ended_runs(dir: &Path) {
+    if let Some(file) = file() {
+        crate::app_log::keep_ended_in(dir, &ended_runs(&file));
+    }
+}
+
+/// The runs whose openings the marks in `file` say closed the app: any but this one.
+fn ended_runs(file: &Path) -> Vec<u32> {
     let this_run = std::process::id();
-    let ended: Vec<u32> = read(&file).into_iter().map(|(run, _)| run).filter(|&run| run != this_run).collect();
-    crate::app_log::keep_log_of_ended_runs(&ended);
+    read(file).into_iter().map(|(run, _)| run).filter(|&run| run != this_run).collect()
 }
 
 /// Whether the artwork in folder `dir` was being opened when the app last ended: its opening
@@ -47,22 +60,59 @@ pub fn opening_ended_app_title() -> String {
 /// other apps may help; else a crash, or not known, when it may close again and its log is wanted.
 #[uniffi::export]
 pub fn opening_ended_app_said(low_memory: bool) -> String {
-    if low_memory {
-        "Your device ran low on memory. Closing other apps first may help.".to_owned()
-    } else {
-        "It may close again if you open it now. Share the log so the problem can be found.".to_owned()
-    }
+    opening_ended_app_said_after(if low_memory { RunEnd::LowMemory } else { RunEnd::Unknown })
 }
 
-/// Android's reason for a run that the system ended short of memory
-/// (`ApplicationExitInfo.REASON_LOW_MEMORY`).
+/// How a run of the app ended, as far as the platform tells.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunEnd {
+    /// The system ended it short of memory (Android says so).
+    LowMemory,
+    /// It crashed (the desktop's log has the crash, or the app stopping itself on an error).
+    Crashed,
+    /// Nothing says how it ended.
+    Unknown,
+}
+
+/// What is asked, by how that run ended (`end`): short of memory, closing other apps may help; a
+/// crash, it may crash again; not known, it may close again. The log is asked for unless the
+/// device ran short of memory.
+#[uniffi::export]
+pub fn opening_ended_app_said_after(end: RunEnd) -> String {
+    match end {
+        RunEnd::LowMemory => "Your device ran low on memory. Closing other apps first may help.",
+        RunEnd::Crashed => {
+            "It crashed. It may crash again if you open it now. Share the log so the problem can be found."
+        }
+        RunEnd::Unknown => "It may close again if you open it now. Share the log so the problem can be found.",
+    }
+    .to_owned()
+}
+
+/// Android's reasons for a run that the system ended short of memory, that crashed, and whose
+/// native code crashed (`ApplicationExitInfo.REASON_LOW_MEMORY`, `REASON_CRASH` and
+/// `REASON_CRASH_NATIVE`).
 const ANDROID_LOW_MEMORY: i32 = 3;
+const ANDROID_CRASH: i32 = 4;
+const ANDROID_CRASH_NATIVE: i32 = 5;
+
+/// How a run Android says ended for `reason` (its `ApplicationExitInfo` reason) ended: short of
+/// memory; a crash, of its Kotlin or its native code; anything else (a signal, not responding, the
+/// person stopping it...) not known.
+#[uniffi::export]
+pub fn android_run_end(reason: i32) -> RunEnd {
+    match reason {
+        ANDROID_LOW_MEMORY => RunEnd::LowMemory,
+        ANDROID_CRASH | ANDROID_CRASH_NATIVE => RunEnd::Crashed,
+        _ => RunEnd::Unknown,
+    }
+}
 
 /// Whether a run Android says ended for `reason` (its `ApplicationExitInfo` reason) was ended for
 /// want of memory; a crash, one not responding, a signal or anything else isn't.
 #[uniffi::export]
 pub fn android_run_ended_short_of_memory(reason: i32) -> bool {
-    reason == ANDROID_LOW_MEMORY
+    android_run_end(reason) == RunEnd::LowMemory
 }
 
 /// Whether the marks in `file` say artwork `dir`'s opening began in a run other than `run`.
@@ -306,5 +356,46 @@ pub(crate) mod tests {
         // nothing known of how it ended (before Android 11, the desktop, the iPad): the log is asked for
         assert_eq!(opening_ended_app_said(false), crashed);
         assert_eq!(opening_ended_app_title(), "ProCraft closed while opening this artwork");
+    }
+
+    /// The desktop knows a crash from its log: said as one, apart from an end not known; Android's
+    /// words stay as they were.
+    #[test]
+    fn a_run_known_to_have_crashed_is_told_as_a_crash() {
+        let said = opening_ended_app_said_after;
+        assert_eq!(said(RunEnd::LowMemory), opening_ended_app_said(true));
+        assert_eq!(said(RunEnd::Unknown), opening_ended_app_said(false));
+        assert_eq!(
+            said(RunEnd::Crashed),
+            "It crashed. It may crash again if you open it now. Share the log so the problem can be found."
+        );
+        assert_ne!(said(RunEnd::Crashed), said(RunEnd::Unknown));
+    }
+
+    /// Android's reason for how a run ended: short of memory (3), a crash of the app's Kotlin (4) or
+    /// of its native code (5), anything else not known; the question says each so.
+    #[test]
+    fn android_s_reasons_tell_a_crash_a_memory_end_or_neither() {
+        assert_eq!(android_run_end(3), RunEnd::LowMemory);
+        assert_eq!(android_run_end(4), RunEnd::Crashed);
+        assert_eq!(android_run_end(5), RunEnd::Crashed);
+        // 0 unknown, 1 exit itself, 2 signaled, 6 not responding, 7 initialization failure, 8
+        // permission change, 9 excessive resource use, 10 user requested, 11 user stopped, 12
+        // dependency died, 13 other, 14 freezer, 15 package state change, 16 package updated
+        for reason in [-1, 0, 1, 2, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 99] {
+            assert_eq!(android_run_end(reason), RunEnd::Unknown, "reason {reason}");
+        }
+        // short of memory still as it was for its callers
+        for reason in -1..20 {
+            assert_eq!(android_run_ended_short_of_memory(reason), reason == 3, "reason {reason}");
+        }
+        // a crash asks with the crash's words, the log wanted
+        assert_eq!(
+            opening_ended_app_said_after(android_run_end(4)),
+            "It crashed. It may crash again if you open it now. Share the log so the problem can be found."
+        );
+        assert_eq!(opening_ended_app_said_after(android_run_end(5)), opening_ended_app_said_after(RunEnd::Crashed));
+        assert_eq!(opening_ended_app_said_after(android_run_end(3)), opening_ended_app_said(true));
+        assert_eq!(opening_ended_app_said_after(android_run_end(6)), opening_ended_app_said(false));
     }
 }

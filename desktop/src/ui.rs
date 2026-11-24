@@ -471,6 +471,9 @@ impl Interface {
         self.end_recolor(session);
         session.set_touch_layer_opacity(None);
         self.selection.close(session);
+        // a picker plugin's square drew from this artwork's session: kept, the session (and all
+        // the artwork's memory) would stay until another artwork showed the colour panel
+        self.colours.set_picker(None);
     }
 
     /// A new artwork just started: without time-lapse if that is turned off.
@@ -4600,5 +4603,46 @@ mod tests {
             open_median <= closed_median + Duration::from_millis(2),
             "open {open_median:?}, closed {closed_median:?}"
         );
+    }
+
+    /// Artworks opened and left one after another in the same interface, as the app goes from one
+    /// to the next through the gallery: each painted on with its panels shown in turn, a picker
+    /// plugin's square drawn from it (the floating colour panel holds its session for that), then
+    /// left as the app leaves one. Nothing of the interface keeps a session left, so all of its
+    /// memory goes with it (once the brushes' sample strokes being drawn from it are done): one
+    /// kept is a whole artwork's state held for as long as the app runs.
+    #[test]
+    fn an_artwork_left_is_held_by_nothing_in_the_interface() {
+        let Some(mut w) = Window::open(vec2(1180.0, 820.0), true) else { return };
+        let dir = std::env::temp_dir().join(format!("procraft-desktop-left-{}", std::process::id()));
+        for round in 0..20 {
+            w.stroke();
+            for open in [Popover::Colour, Popover::Brushes, Popover::Layers, Popover::Actions] {
+                w.ui.open = Some(open);
+                w.frame();
+            }
+            w.ui.open = None;
+            let plugins = Arc::clone(&w.ui.prefs.plugins);
+            w.ui.colours.set_picker(Some((plugins, Arc::clone(&w.session))));
+            w.frame();
+            // left as the app leaves it (saved, the interface told), the next one opened in its place
+            let left = Arc::downgrade(&w.session);
+            w.ui.closing(&w.session);
+            let saved = dir.join(round.to_string()).to_string_lossy().into_owned();
+            assert_eq!(Arc::clone(&w.session).save_to_leave(saved), procraft_core::Leaving::Left);
+            let next = CanvasSession::new(400, 300);
+            next.set_display_scale(1.0);
+            next.use_gpu(w.gpu.clone());
+            next.show_in(w.size.x as u32, w.size.y as u32);
+            w.ui.opened(&next, 1.0);
+            w.session = next;
+            w.frame();
+            let since = std::time::Instant::now();
+            while left.upgrade().is_some() && since.elapsed() < std::time::Duration::from_secs(5) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(left.upgrade().is_none(), "round {round}: the artwork left is still held");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

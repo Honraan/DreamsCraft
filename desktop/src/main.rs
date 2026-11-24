@@ -269,6 +269,8 @@ fn main() {
     // artworks being opened, noted until they show: one the app ended while opening is asked about
     // when next picked, not opened at once into the same end
     procraft_core::set_open_marks_file(files::app_dir().join("opening.txt").to_string_lossy().into_owned());
+    // and the log of a run that closed while it opened one kept apart, to share when it is asked about
+    procraft_core::keep_desktop_logs_of_ended_runs(&files::app_dir());
     // the layers may take half the computer's memory, as on the tablet (so how many a canvas holds
     // grows with it), their textures up to 2 GiB of it; the composite is made around the layers
     // not being worked on, so a frame composites only those

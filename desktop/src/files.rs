@@ -825,21 +825,24 @@ pub fn open_anyway(dir: &str) -> bool {
     if cfg!(target_os = "linux") && !has_program("zenity") {
         return true;
     }
-    // how that run ended isn't known here: the log is asked for, and Share Log shows it to send on
+    // what is said follows how that run ended, as its log tells (a crash, or not known); the log
+    // is asked for, and Share Log shows that run's log to send on
+    let run = procraft_core::opening_ended_run(dir.to_owned());
+    let (said, log) = (crate::startup::opening_ended_said(run), crate::startup::log_of_run(run));
     let (action, share) = ("Open Anyway".to_owned(), "Share Log".to_owned());
     loop {
         let answer = message()
             .set_level(MessageLevel::Warning)
             .set_title(procraft_core::opening_ended_app_title())
-            .set_description(procraft_core::opening_ended_app_said(false))
+            .set_description(said.as_str())
             .set_buttons(MessageButtons::YesNoCancelCustom(action.clone(), share.clone(), "Cancel".to_owned()))
             .show();
         // (Windows without its newer dialogs shows Yes, No and Cancel)
         match answer {
             MessageDialogResult::Yes => return true,
             MessageDialogResult::Custom(chosen) if chosen == action => return true,
-            MessageDialogResult::No => reveal(&crate::startup::last_run_log()),
-            MessageDialogResult::Custom(chosen) if chosen == share => reveal(&crate::startup::last_run_log()),
+            MessageDialogResult::No => reveal(&log),
+            MessageDialogResult::Custom(chosen) if chosen == share => reveal(&log),
             _ => return false,
         }
     }
