@@ -808,10 +808,23 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
             forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main
         ) { [weak self] _ in
             self?.model.session.setShown(shown: true)
-            self?.model.resumeTracking()
             self?.model.followStrokeSound()
             self?.model.readAppSettings()
             self?.canvas.tapAssistance = SystemSettings.tapAssistance
+        })
+        // time on the artwork counts only while the app is active: not while the iPad is locked,
+        // the app is in the background or under the system's own screens (the app switcher,
+        // Control Centre)
+        observers.append(NotificationCenter.default.addObserver(
+            forName: UIApplication.willResignActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.model.noteTime()
+        })
+        observers.append(NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self, !self.leaving else { return }
+            self.model.resumeTracking()
         })
         // Paste offered once anything holds a picture: what another app copied meanwhile, or this
         // app's clipboard changing

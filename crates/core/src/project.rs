@@ -1716,9 +1716,12 @@ impl CanvasSession {
         st.info.clone()
     }
 
-    /// Time on the artwork counts while `on` (it is shown and the app in front), from now; off,
-    /// what was counted is added to the artwork's. Each save and [`Self::artwork_info`] takes the
-    /// time counted so far. (Android counts it itself, by [`Self::add_tracked_time`].)
+    /// Time on the artwork counts while `on` (it is shown and the app active: not while the
+    /// device is locked, or the app is in the background or under the system's own screens, nor
+    /// for being idle otherwise), from now; on again while on, it counts on from when it was
+    /// turned on. Off, what was counted is added to the artwork's. Each save and
+    /// [`Self::artwork_info`] takes the time counted so far. (Android counts it itself, by
+    /// [`Self::add_tracked_time`].)
     pub fn set_tracking(&self, on: bool) {
         let mut st = self.shared.lock();
         st.count_tracked_time();

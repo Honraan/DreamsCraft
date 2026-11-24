@@ -19394,6 +19394,30 @@ fn time_counts_while_tracking_is_on_and_is_saved_with_the_artwork() {
 }
 
 #[test]
+fn time_counts_while_the_app_is_active_from_when_it_first_was_and_not_while_it_is_away() {
+    // no picture needed: the time is the artwork's
+    let s = CanvasSession::new(64, 64);
+    let wait = |ms: u64| std::thread::sleep(std::time::Duration::from_millis(ms));
+    // opened (on), and the app made active at once (on again): it counts from the first
+    s.set_tracking(true);
+    wait(40);
+    s.set_tracking(true);
+    wait(40);
+    // no longer active (locked, the app switcher, Control Centre), then in the background too
+    s.set_tracking(false);
+    let away = s.artwork_info().tracked_ms;
+    assert!(away >= 80, "{away} ms counted before it went away");
+    s.set_tracking(false);
+    wait(60);
+    assert_eq!(s.artwork_info().tracked_ms, away, "nothing counts while it is away");
+    // active again: it counts on from then, not from when it went away
+    s.set_tracking(true);
+    wait(30);
+    let back = s.artwork_info().tracked_ms - away;
+    assert!((30..2000).contains(&back), "{back} ms counted since it came back");
+}
+
+#[test]
 fn undo_while_transforming_takes_back_the_transforms_change_not_a_step_under_it() {
     use crate::transform::TransformHandle;
     let Some(s) = session(100, 100) else { return };

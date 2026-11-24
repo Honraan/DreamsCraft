@@ -281,13 +281,18 @@ struct SideBar: View {
                 let body = SideBarGlass(corners: corners, windows: windows).path(in: CGRect(origin: .zero, size: size))
                 context.fill(body, with: .color(fill), style: FillStyle(eoFill: true))
                 let edge = Pc.sliderEdgeWidth
-                var ring = Path()
                 for w in windows {
                     let r = Pc.sliderCorner
+                    var ring = Path()
                     ring.addRoundedRect(in: w.insetBy(dx: -edge, dy: -edge), cornerSize: CGSize(width: r + edge, height: r + edge), style: .circular)
                     ring.addRoundedRect(in: w, cornerSize: CGSize(width: r, height: r), style: .circular)
+                    // darker down the sides than across the ends
+                    let shade = Pc.sliderEnds(Pc.sliderEdgeEnd, Pc.sliderEdgeSide, height: w.height)
+                    context.fill(
+                        ring, with: .linearGradient(shade, startPoint: CGPoint(x: 0, y: w.minY), endPoint: CGPoint(x: 0, y: w.maxY)),
+                        style: FillStyle(eoFill: true)
+                    )
                 }
-                context.fill(ring, with: .color(Pc.sliderEdge), style: FillStyle(eoFill: true))
             }
             .frame(width: Pc.sideBarWidth + reach, height: Pc.sideBarHeight)
             .offset(x: back)
@@ -552,7 +557,7 @@ private let sliderPanelSide: CGFloat = 190
 private let sliderPanelGap: CGFloat = 8
 private let sliderPanelRise: CGFloat = 10
 // dark glass over the canvas (what is behind it blurred), or light
-private var sliderPanelFill: Color { Look.shared.light ? Color(argb: 0xFFE7_E7E7) : Color(argb: 0xC93E_3E3E) }
+private var sliderPanelFill: Color { Look.shared.light ? Color(argb: 0xFFE7_E7E7) : Pc.onDarkFrost(0xC93E_3E3E) }
 private var sliderPanelInk: Color { Look.shared.light ? Color(argb: 0xFF39_3939) : Color(argb: 0xFFF0_F0F0) }
 // the dot is drawn in the interface's ink, not the brush's colour
 private var sliderPanelDot: Color { Look.shared.light ? .black : .white }
@@ -688,7 +693,6 @@ struct BrushSlider: View {
 
     var body: some View {
         let track = Pc.sliderTrack
-        let rimColour = Pc.sliderRim
         let thumbColour = Pc.sliderThumb
         let accent = Pc.accent
         Canvas { context, size in
@@ -698,17 +702,24 @@ struct BrushSlider: View {
             let at = CGPoint(x: (size.width - thumb.width) / 2, y: inset + travel * CGFloat(1 - value))
             let knobRect = CGRect(origin: at, size: thumb)
             let knob = Path(roundedRect: knobRect, cornerRadius: thumb.height / 2, style: .circular)
-            // the track has a window where the thumb is, so the thumb shows over the bar alone; a
-            // lighter rim runs round it
+            // the track has a window where the thumb is, so the thumb shows over the bar alone
             let corner = Pc.sliderCorner
-            let rim = Pc.sliderRimWidth
-            let inside = Path(roundedRect: CGRect(x: rim, y: rim, width: size.width - rim * 2, height: size.height - rim * 2), cornerRadius: corner - rim, style: .circular)
-            var window = inside
+            var window = Path(roundedRect: CGRect(origin: .zero, size: size), cornerRadius: corner, style: .circular)
             window.addPath(knob)
             context.fill(window, with: .color(track), style: FillStyle(eoFill: true))
-            var ring = Path(roundedRect: CGRect(origin: .zero, size: size), cornerRadius: corner, style: .circular)
-            ring.addPath(inside)
-            context.fill(ring, with: .color(rimColour), style: FillStyle(eoFill: true))
+            // its ends catch the light, a half-point band at a time in from the edge, round the
+            // corners and not down the sides
+            for (i, white) in Pc.sliderShine.enumerated() {
+                let d = CGFloat(i) * 0.5 + 0.25
+                let band = Path(
+                    roundedRect: CGRect(origin: .zero, size: size).insetBy(dx: d, dy: d),
+                    cornerRadius: max(corner - d, 0), style: .circular
+                )
+                let shine = Pc.sliderEnds(Color.white.opacity(white), Color.white.opacity(0), height: size.height)
+                context.stroke(
+                    band, with: .linearGradient(shine, startPoint: .zero, endPoint: CGPoint(x: 0, y: size.height)), lineWidth: 0.5
+                )
+            }
             // the notches: short bars across the track; on one, the thumb shows a blue bar
             let bar = CGSize(width: Self.notchWidth, height: Self.notchHeight)
             for n in notches {

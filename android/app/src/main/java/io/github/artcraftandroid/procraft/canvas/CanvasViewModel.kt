@@ -5362,6 +5362,9 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         var size by mutableStateOf(DpSize(REFERENCE_WIDTH_DP.dp, REFERENCE_HEIGHT_DP.dp))
             private set
 
+        /** Its picture's size until it is sized: 350 wide, the whole window the canvas's shape, so the canvas fills it (the core's). */
+        private var first = DpSize(REFERENCE_WIDTH_DP.dp, REFERENCE_HEIGHT_DP.dp)
+
         /** The screen the window was last laid out on (pixels), and its bars' height together (pixels). */
         private var room by mutableStateOf(androidx.compose.ui.geometry.Size.Unspecified)
         private var bars = 0f
@@ -5395,6 +5398,9 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
         /** The window as the artwork [s] left it, or none if it never had one. */
         fun restore(s: CanvasSession) {
+            val canvas = s.info()
+            val f = io.github.artcraftandroid.procraft.core.referenceWindowFirstSize(canvas.width, canvas.height)
+            first = DpSize(f.width.dp, f.height.dp)
             forget()
             val w = s.referenceWindowAt(index.toUInt()) ?: return
             mode = when (w.shows) {
@@ -5454,7 +5460,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             imageView = io.github.artcraftandroid.procraft.core.ReferenceView(1f, 0f, 0f)
             offset = Offset.Unspecified
             barsHidden = false
-            size = DpSize(REFERENCE_WIDTH_DP.dp, REFERENCE_HEIGHT_DP.dp)
+            size = first
         }
 
         /** The window as it now is, for the core. */
@@ -5467,7 +5473,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                     ReferenceMode.IMAGE -> io.github.artcraftandroid.procraft.core.ReferenceShows.IMAGE
                     ReferenceMode.MODEL -> io.github.artcraftandroid.procraft.core.ReferenceShows.MODEL
                 },
-                sized = size != DpSize(REFERENCE_WIDTH_DP.dp, REFERENCE_HEIGHT_DP.dp),
+                sized = size != first,
                 width = size.width.value,
                 height = size.height.value,
                 placed = placed,
@@ -5500,7 +5506,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
         /**
          * The window laid out on a screen [width] × [height] (pixels), its bars [bars] (pixels) tall
-         * together: the first time in the middle, near the bottom; then where it was put, all of it on
+         * together: the first time in the middle, in the lower half; then where it was put, all of it on
          * the screen (an artwork may have left it on a screen of another shape, or the screen changed:
          * turned, or split). What the artwork keeps changes only as the window is moved or sized.
          */
@@ -5511,7 +5517,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             if (offset == Offset.Unspecified) {
                 val shown = shown
                 val tall = shown.height.value * density + bars
-                offset = Offset((width - shown.width.value * density) / 2f, (height - REFERENCE_BOTTOM_DP * density - tall).coerceAtLeast(0f))
+                offset = Offset((width - shown.width.value * density) / 2f, minOf(height - REFERENCE_TOP_DP * density, height - tall).coerceAtLeast(0f))
                 return
             }
             val at = onScreen(offset)
@@ -8584,9 +8590,9 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         selectionRemoves = removes
     }
 
-    /** How a selection joins the one there is: selecting by colour always adds (Remove greyed). */
+    /** How a selection joins the one there is: selecting by colour always adds, and so does anything with nothing selected yet (Remove greyed). */
     private val join
-        get() = if (selectionRemoves && selectionKind != SelectionKind.AUTOMATIC) SelectionJoin.REMOVE else SelectionJoin.ADD
+        get() = if (selectionRemoves && selectionKind != SelectionKind.AUTOMATIC && hasSelection) SelectionJoin.REMOVE else SelectionJoin.ADD
 
     /** How the canvas's (shared) touches select while the selection tool is open; none otherwise. */
     fun selectTouch(): io.github.artcraftandroid.procraft.core.SelectTouch? {
@@ -10124,10 +10130,14 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         const val MAX_CANVAS_EDGE = 16384
         /** How much smaller than fitted to the screen the canvas is while cropping. */
         /** The reference window: its first place and picture size, its limits, and how sharp and how often its canvas is read. */
-        /** The reference window's picture at first, and its gap to the screen's bottom. */
+        /**
+         * The reference window's picture before an artwork gives it its first size (see `referenceWindowFirstSize`), and how
+         * far above the screen's bottom its top first is, whatever the canvas's shape: where a screen-shaped canvas's (532
+         * tall with its bars) has it, 50 above the bottom.
+         */
         const val REFERENCE_WIDTH_DP = 350f
         const val REFERENCE_HEIGHT_DP = 423f
-        const val REFERENCE_BOTTOM_DP = 50f
+        const val REFERENCE_TOP_DP = 582f
         const val REFERENCE_INTERVAL_MS = 300L
         /** How far down and right of the window it is opened from another Reference window opens (dp). */
         const val REFERENCE_STEP_DP = 24f

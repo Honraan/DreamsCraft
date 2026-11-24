@@ -147,6 +147,7 @@ struct Popover<Content: View>: View {
                     shape.fill(fill)
                 } else {
                     shape.fill(.ultraThinMaterial)
+                        .environment(\.colorScheme, Look.shared.light ? .light : .dark)
                     shape.fill(Pc.popoverFrost)
                 }
             }

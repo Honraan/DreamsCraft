@@ -169,8 +169,6 @@ final class CanvasModel {
     /// A save failed and was told of: the next isn't, until one succeeds again.
     @ObservationIgnored private var saveFailing = false
     @ObservationIgnored private var saveWatch: Timer?
-    /// When time on the artwork last started counting; none while away.
-    @ObservationIgnored private var activeSince: Date?
 
     /// The colour history, kept across artworks and, in its file, from one run of the app to the
     /// next: each canvas's paint strokes add to it.
@@ -434,7 +432,8 @@ final class CanvasModel {
         pushSecondary()
         // a model is lit, and its meshes read, as it opens
         scene.start()
-        activeSince = Date()
+        // time on it counts from now (the core counts it, and each save keeps what has counted)
+        session.setTracking(on: true)
         watchSaves()
     }
 
@@ -2674,17 +2673,13 @@ final class CanvasModel {
 
     /// Time on the artwork stops counting and goes on its record.
     func noteTime() {
-        if let since = activeSince {
-            session.addTrackedTime(ms: UInt64(max(Date().timeIntervalSince(since), 0) * 1000))
-        }
-        activeSince = nil
+        session.setTracking(on: false)
     }
 
-    /// The app is back in front: time on the artwork counts again.
+    /// The app is active again: time on the artwork counts again (from when it first did, if it
+    /// still is).
     func resumeTracking() {
-        if activeSince == nil {
-            activeSince = Date()
-        }
+        session.setTracking(on: true)
     }
 
     /// The artwork is being left: nothing goes on watching it.
