@@ -589,6 +589,7 @@ impl Interface {
         self.floating.follow(&self.prefs.plugins);
         self.floating.place(&ctx);
         crate::panel::set_panels_fold(&ctx, self.floating.layout.look().fold);
+        crate::panel::set_panels_solid(&ctx, self.floating.layout.look().on);
         self.ended_export = None;
         self.canvas_pressed = std::mem::take(&mut input.canvas_pressed);
         // looked at again soon while an insert is read, or brushes made
