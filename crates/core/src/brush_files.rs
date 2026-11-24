@@ -261,7 +261,8 @@ impl CanvasSession {
                 // chosen, not all of them now)
                 let name = if name.trim().is_empty() { IMPORTED.to_owned() } else { name.trim().to_owned() };
                 let origins = vec![None; brushes.len()];
-                st.library.insert(0, LibrarySet { name, brushes, origins, icon: crate::brush_library::IMPORTED_ICON });
+                let icon = crate::brush_library::IMPORTED_ICON;
+                st.library.insert(0, LibrarySet { name, brushes, origins, icon, plugin: None });
                 st.move_brush_refs(|(rs, ri)| Some((rs + 1, ri)));
                 Some(0)
             }
@@ -279,6 +280,7 @@ impl CanvasSession {
                                 brushes: Vec::new(),
                                 origins: Vec::new(),
                                 icon: crate::brush_library::IMPORTED_ICON,
+                                plugin: None,
                             },
                         );
                         st.move_brush_refs(|(rs, ri)| Some((rs + 1, ri)));

@@ -25,6 +25,10 @@ pub(crate) struct LibrarySet {
     pub(crate) origins: Vec<Option<(usize, usize)>>,
     /// Which of the set icons it shows.
     pub(crate) icon: u32,
+    /// The plugin whose set of brushes it is, by the id it was given by (see
+    /// [`CanvasSession::give_plugin_sets`]): it comes and goes with the switch that set comes under.
+    /// None for every other set, a copy of that one too.
+    pub(crate) plugin: Option<String>,
 }
 
 /// How many set icons there are: the 42 to choose from, then the six shipped sets' own.
@@ -114,6 +118,7 @@ impl LibrarySet {
                 brushes: set.brushes.clone(),
                 origins: whole(s, set).collect(),
                 icon: shipped_icon(set.name),
+                plugin: None,
             })
             .collect();
         let ours: Vec<(usize, &BrushSet)> = SHELF.iter().filter_map(|&s| sets.get(s).map(|set| (s, set))).collect();
@@ -123,6 +128,7 @@ impl LibrarySet {
                 brushes: ours.iter().flat_map(|(_, set)| set.brushes.iter().cloned()).collect(),
                 origins: ours.iter().flat_map(|&(s, set)| whole(s, set)).collect(),
                 icon: shipped_icon(LEGACY_SET),
+                plugin: None,
             });
         }
         shelf
@@ -333,6 +339,10 @@ struct SavedSet {
     /// Which numbering [`Self::icon`] is in (none before the first change of it).
     #[serde(default)]
     icons: u32,
+    /// The plugin whose set it is ([`LibrarySet::plugin`]): kept in the library's own files only,
+    /// never in a set shared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plugin: Option<String>,
 }
 
 /// The sets kept in `json`, as many of them and of their brushes as can be read: in a damaged
@@ -578,7 +588,7 @@ pub(crate) fn read_library(
             let icon = set.icon_now();
             let origins = set.brushes.iter().map(|b| b.from).collect();
             let brushes = set.brushes.into_iter().map(|b| State::restored_from(&shipped, b, &pictures)).collect();
-            LibrarySet { name: set.name, brushes, origins, icon }
+            LibrarySet { name: set.name, brushes, origins, icon, plugin: set.plugin }
         })
         .collect();
     Some(library)
@@ -713,6 +723,7 @@ impl State {
                 brushes: (0..set.brushes.len()).filter_map(|i| self.saved_as(set, i, images)).collect(),
                 icon: Some(set.icon),
                 icons: ICON_NUMBERING,
+                plugin: set.plugin.clone(),
             })
             .collect()
     }
@@ -1082,6 +1093,7 @@ impl State {
             brushes: Vec::new(),
             origins: Vec::new(),
             icon: shipped_icon(LEGACY_SET),
+            plugin: None,
         };
         // each place's new one, the folded set's by their place in it (usize::MAX for the set)
         let mut moves: std::collections::HashMap<(usize, usize), (usize, usize)> = std::collections::HashMap::new();
@@ -1531,7 +1543,13 @@ impl CanvasSession {
         let mut st = self.shared.lock();
         st.library.insert(
             0,
-            LibrarySet { name: "Untitled Set".to_owned(), brushes: Vec::new(), origins: Vec::new(), icon: BRUSH_ICON },
+            LibrarySet {
+                name: "Untitled Set".to_owned(),
+                brushes: Vec::new(),
+                origins: Vec::new(),
+                icon: BRUSH_ICON,
+                plugin: None,
+            },
         );
         st.move_brush_refs(|(s, i)| Some((s + 1, i)));
         0
@@ -1620,6 +1638,7 @@ impl CanvasSession {
     /// sets' choices and the brushes' sliders as they were left; with none kept, the library as it
     /// ships. The other libraries are found there too. True if a kept one was put back.
     pub fn open_brushes(&self, dir: String) -> bool {
+        plugin_sets_kept();
         let dir = std::path::PathBuf::from(dir);
         let (library, choices, loaded) = self.open_library_in_use(&dir);
         // the choices first, places in the library as it was kept: what joins it may move them
@@ -1661,7 +1680,9 @@ impl CanvasSession {
             // uses any more: those none of the libraries' files names (under their lock: one being
             // kept meanwhile names its pictures first)
             let _writing = library_writes();
-            let libraries = self.library_files(&dir);
+            // (and the sets of plugins waiting beside them, whose grains are named there)
+            let mut libraries = self.library_files(&dir);
+            libraries.extend(parked_set_files(&dir));
             let st = self.shared.lock();
             st.grain_store.forget_all_but(&st.grains_held(), &libraries);
             drop(st);
@@ -1683,45 +1704,277 @@ impl CanvasSession {
     /// ([`State::plugin_sets`]), each a set of its own at the top, once the brushes are open
     /// ([`Self::open_brushes`]): kept with the library, then written down as given beside the
     /// brushes, so each plugin's set comes once, and one deleted stays deleted. Cut short between
-    /// the two, a set comes again rather than never. The library changed, as a plugin changing a
-    /// brush changes it ([`Self::take_brushes_changed`]): every set after the new one is a place on.
+    /// the two, a set comes again rather than never.
+    ///
+    /// A set given comes and goes with the switch it comes under: once its plugin no longer gives it
+    /// (the switch or the plugin off), it is hidden, never deleted: it waits in a file of its own
+    /// beside the brushes as it was left (its brushes as changed, moved, and any put in it), out of
+    /// the library, the tools on its brushes going to others as when a set is deleted; given again,
+    /// it shows again from there as it was, at the place it had. One that can't be kept there stays
+    /// in the library. Nothing happens until the session has been told the plugins.
+    ///
+    /// The library changed, as a plugin changing a brush changes it
+    /// ([`Self::take_brushes_changed`]): every set after one that came is a place on. It is kept,
+    /// and what was given written down, on a thread of its own (see [`plugin_sets_kept`]).
     pub(crate) fn give_plugin_sets(&self) {
         let (dir, sets) = {
             let st = self.shared.lock();
-            match &st.brushes_dir {
-                Some(dir) if !st.plugin_sets.is_empty() => (dir.clone(), st.plugin_sets.clone()),
+            match (&st.brushes_dir, &st.plugin_sets) {
+                (Some(dir), Some(sets)) => (dir.clone(), sets.clone()),
                 _ => return,
             }
         };
         let file = dir.join(PLUGIN_SETS_FILE);
-        let text = std::fs::read_to_string(&file).unwrap_or_default();
-        let mut given: Vec<String> = text.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect();
-        let due: Vec<_> = sets.into_iter().filter(|(id, _)| !given.contains(id)).collect();
-        if due.is_empty() {
+        let read_given = || -> Vec<String> {
+            let text = std::fs::read_to_string(&file).unwrap_or_default();
+            text.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect()
+        };
+        let mut given = read_given();
+        let mut changed = false;
+        // the sets of plugins that no longer give them, kept aside (from the last, so the places of
+        // those before stay as they were)
+        let away: Vec<(usize, String)> = {
+            let st = self.shared.lock();
+            let given_now = |id: &String| sets.iter().any(|(given, _)| given == id);
+            let of =
+                |(at, set): (usize, &LibrarySet)| set.plugin.clone().filter(|id| !given_now(id)).map(|id| (at, id));
+            st.library.iter().enumerate().filter_map(of).collect()
+        };
+        for (at, id) in away.into_iter().rev() {
+            changed |= self.park_plugin_set(&dir, at, &id);
+        }
+        let shows = |id: &str| self.shared.lock().library.iter().any(|s| s.plugin.as_deref() == Some(id));
+        // a set to be given anew is told by what was given before as it is written down: what an
+        // earlier call keeps meanwhile, written down first
+        if sets.iter().any(|(id, _)| !given.contains(id) && !shows(id) && !parked_set_file(&dir, id).is_file()) {
+            plugin_sets_kept();
+            given = read_given();
+        }
+        let given_before = given.len();
+        // the files of sets that came back, gone only once the library is kept with them
+        let mut came_back = Vec::new();
+        for (id, set) in sets {
+            if shows(&id) {
+                continue;
+            }
+            let parked = parked_set_file(&dir, &id);
+            if parked.is_file() {
+                if self.unpark_plugin_set(&parked, &id) {
+                    came_back.push((parked, id));
+                    changed = true;
+                    continue;
+                }
+                log::warn!("the brushes plugin {id} comes with couldn't be read back as they were left: given anew");
+            } else if given.contains(&id) {
+                // given before sets were marked as a plugin's (an earlier version): its set is the
+                // one of its name, if the library still has it; none, it was deleted and stays so
+                changed |= self.mark_plugin_set(&id, &set);
+                continue;
+            }
+            // one that can't be read never will be: written down all the same
+            match self.import_brushes(set.to_vec()) {
+                Some(at) => {
+                    if let Some(set) = self.shared.lock().library.get_mut(at as usize) {
+                        set.plugin = Some(id.clone());
+                    }
+                }
+                None => log::warn!("the brushes plugin {id} comes with couldn't be added"),
+            }
+            if !given.contains(&id) {
+                given.push(id);
+            }
+            changed = true;
+        }
+        if changed {
+            self.shared.lock().brushes_changed = true;
+        }
+        let given = (given.len() != given_before).then(|| given.join("\n"));
+        if !changed && given.is_none() {
             return;
         }
-        for (id, set) in due {
-            // one that can't be read never will be: written down all the same
-            if self.import_brushes(set.to_vec()).is_none() {
-                log::warn!("the brushes plugin {id} comes with couldn't be added");
+        // the library as it is now kept, then what was given written down, in that order (cut
+        // short between, a set comes again rather than never), off the calling thread: the
+        // interface's, which waited a tenth of a second for it as a feature's switch was flipped
+        let keep = move |session: &CanvasSession| {
+            if changed {
+                let (library, choices) = session.files_in_use(&dir);
+                if !session.save_brush_library_file(library.to_string_lossy().into_owned()) {
+                    return;
+                }
+                let _writing = library_writes();
+                Self::write_choices(&choices, &session.saved_brush_choices());
+                for (parked, id) in came_back {
+                    // (unless it was hidden again meanwhile: its file holds it now)
+                    let shows = session.shared.lock().library.iter().any(|s| s.plugin.as_deref() == Some(id.as_str()));
+                    if !shows {
+                        continue;
+                    }
+                    if let Err(e) = std::fs::remove_file(&parked) {
+                        log::warn!("the file of a plugin's brushes that came back stays: {e}");
+                    }
+                }
             }
-            given.push(id);
+            if let Some(text) = given {
+                let kept = crate::project::write_atomically(&file, |p| {
+                    crate::storage::write(p, &text)
+                        .map_err(|e| crate::project::file_error("keeping the plugins' brushes given", e))
+                });
+                if let Err(e) = kept {
+                    log::error!("{e}");
+                }
+            }
+        };
+        keep_meanwhile(self, keep);
+    }
+}
+
+impl CanvasSession {
+    /// Set `at`, plugin `id`'s, hidden: kept in its file beside the brushes in `dir` (written whole,
+    /// with its place), then taken out of the library as deleting it would; false, leaving it, if it
+    /// couldn't be kept.
+    fn park_plugin_set(&self, dir: &std::path::Path, at: usize, id: &str) -> bool {
+        // (the library's files left alone meanwhile: a set that came back has its file taken away only
+        // while it shows)
+        let _writing = library_writes();
+        let json = {
+            let st = self.shared.lock();
+            let Some(set) = st.library.get(at).filter(|s| s.plugin.as_deref() == Some(id)) else { return false };
+            let sets = serde_json::to_value(st.sets_saved(std::slice::from_ref(set), Images::Whole));
+            sets.and_then(|sets| serde_json::to_string(&ParkedSets { place: at, sets }))
+        };
+        let Ok(json) = json else { return false };
+        let path = parked_set_file(dir, id);
+        if let Some(folder) = path.parent() {
+            let _ = std::fs::create_dir_all(folder);
         }
-        self.shared.lock().brushes_changed = true;
-        let (library, choices) = self.files_in_use(&dir);
-        if self.save_brush_library_file(library.to_string_lossy().into_owned()) {
-            let _writing = library_writes();
-            Self::write_choices(&choices, &self.saved_brush_choices());
-        }
-        let text = given.join("\n");
-        let kept = crate::project::write_atomically(&file, |p| {
-            crate::storage::write(p, &text)
-                .map_err(|e| crate::project::file_error("keeping the plugins' brushes given", e))
+        let kept = crate::project::write_atomically(&path, |p| {
+            crate::storage::write(p, &json).map_err(|e| crate::project::file_error("keeping a plugin's brushes", e))
         });
         if let Err(e) = kept {
-            log::error!("{e}");
+            log::error!("{e}: they stay in the library");
+            return false;
+        }
+        let mut st = self.shared.lock();
+        if st.library.get(at).is_none_or(|s| s.plugin.as_deref() != Some(id)) {
+            return false;
+        }
+        st.library.remove(at);
+        st.move_brush_refs(|(rs, ri)| match rs.cmp(&at) {
+            std::cmp::Ordering::Less => Some((rs, ri)),
+            std::cmp::Ordering::Equal => None,
+            std::cmp::Ordering::Greater => Some((rs - 1, ri)),
+        });
+        true
+    }
+
+    /// Plugin `id`'s set shown again from its file at `path`, as it was left, at the place it had
+    /// (the end of the library, if that has fewer sets now); false if the file can't be read.
+    fn unpark_plugin_set(&self, path: &std::path::Path, id: &str) -> bool {
+        let Ok(json) = std::fs::read_to_string(path) else { return false };
+        let Ok(parked) = serde_json::from_str::<ParkedSets>(&json) else { return false };
+        let Some(mut sets) = read_library(self, &parked.sets.to_string(), None, false) else { return false };
+        for set in &mut sets {
+            set.plugin = Some(id.to_owned());
+        }
+        let n = sets.len();
+        let mut st = self.shared.lock();
+        let place = parked.place.min(st.library.len());
+        for (k, set) in sets.into_iter().enumerate() {
+            st.library.insert(place + k, set);
+        }
+        st.move_brush_refs(|(rs, ri)| Some(if rs >= place { (rs + n, ri) } else { (rs, ri) }));
+        true
+    }
+
+    /// The set of the name of plugin `id`'s (its file `set`) marked as that plugin's, if the library
+    /// has one not marked as anyone's: one it gave before sets were marked. False if none was.
+    fn mark_plugin_set(&self, id: &str, set: &[u8]) -> bool {
+        let Some((name, _)) = procraft_engine::zip::ZipReader::new(set).and_then(|zip| brushfile::set_folders(&zip))
+        else {
+            return false;
+        };
+        let mut st = self.shared.lock();
+        let Some(found) = st.library.iter_mut().find(|s| s.plugin.is_none() && s.name == name) else { return false };
+        found.plugin = Some(id.to_owned());
+        true
+    }
+}
+
+/// The library being kept on a thread of its own after a plugin's set of brushes came or went (see
+/// [`CanvasSession::give_plugin_sets`]).
+static PLUGIN_SETS_KEEPING: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(None);
+
+/// Waits until the library is kept after a plugin's set of brushes came or went, if it is being:
+/// the brushes opened or kept only then, so none reads or writes their files as they are half kept.
+/// (Never called holding the canvas's state or [`library_writes`], which the keeping takes.)
+pub(crate) fn plugin_sets_kept() {
+    let keeping = PLUGIN_SETS_KEEPING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+    if let Some(keeping) = keeping {
+        let _ = keeping.join();
+    }
+}
+
+/// `keep` (the library kept as a plugin's set of brushes came or went, and what was given written
+/// down) done on a thread of its own once any started before it is done, so they go in order and
+/// [`plugin_sets_kept`] waits for all of them; on the calling thread if no thread can be had.
+fn keep_meanwhile(session: &CanvasSession, keep: impl FnOnce(&CanvasSession) + Send + 'static) {
+    let Some(me) = session.me.upgrade() else { return keep(session) };
+    let mut keeping = PLUGIN_SETS_KEEPING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let work = std::sync::Arc::new(std::sync::Mutex::new(Some((keeping.take(), keep))));
+    let given = std::sync::Arc::clone(&work);
+    let thread = std::thread::Builder::new().name("procraft-plugin-sets".into());
+    match thread.spawn(move || {
+        if let Some((before, keep)) = taken(given.as_ref()) {
+            if let Some(before) = before {
+                let _ = before.join();
+            }
+            keep(&me);
+        }
+    }) {
+        Ok(started) => *keeping = Some(started),
+        Err(e) => {
+            drop(keeping);
+            log::warn!("the plugins' brushes kept on the calling thread: {e}");
+            if let Some((before, keep)) = taken(work.as_ref()) {
+                if let Some(before) = before {
+                    let _ = before.join();
+                }
+                keep(session);
+            }
         }
     }
+}
+
+/// What `slot` holds, taken out of it.
+fn taken<T>(slot: &std::sync::Mutex<Option<T>>) -> Option<T> {
+    slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+}
+
+/// A plugin's set of brushes hidden (see [`CanvasSession::give_plugin_sets`]), as its file keeps it:
+/// its place in the library then, and the set as the library's file keeps its sets.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ParkedSets {
+    place: usize,
+    sets: serde_json::Value,
+}
+
+/// Where a plugin's set of brushes waits beside the brushes while its plugin doesn't give it (see
+/// [`CanvasSession::give_plugin_sets`]): a folder of a file a set.
+const PARKED_SETS: &str = "plugin-sets";
+
+/// The file plugin `id`'s set waits in, in the brushes' folder `dir`: the id as a file's name,
+/// anything but letters, digits, dots, dashes and underscores as an underscore.
+fn parked_set_file(dir: &std::path::Path, id: &str) -> std::path::PathBuf {
+    let name: String =
+        id.chars().map(|c| if c.is_ascii_alphanumeric() || ".-_".contains(c) { c } else { '_' }).collect();
+    dir.join(PARKED_SETS).join(format!("{name}.json"))
+}
+
+/// The files of the sets waiting in the brushes' folder `dir`: what is kept of a library, as far
+/// as their grains go.
+fn parked_set_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir.join(PARKED_SETS)) else { return Vec::new() };
+    entries.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "json")).collect()
 }
 
 impl CanvasSession {
@@ -1848,6 +2101,7 @@ impl CanvasSession {
     /// folder `dir`, in that library's own files, for [`Self::open_brushes`]. False if they couldn't
     /// all be written.
     pub fn keep_brushes(&self, dir: String) -> bool {
+        plugin_sets_kept();
         let _writing = library_writes();
         self.keep_library_in_use(std::path::Path::new(&dir))
     }
@@ -1959,7 +2213,8 @@ impl CanvasSession {
         let had = |library: &[LibrarySet], s: usize| {
             library.iter().any(|l| l.origins.iter().flatten().any(|&(from, _)| from == s))
         };
-        let mut late = LibrarySet { name: LEGACY_SET.to_owned(), brushes: Vec::new(), origins: Vec::new(), icon: 0 };
+        let mut late =
+            LibrarySet { name: LEGACY_SET.to_owned(), brushes: Vec::new(), origins: Vec::new(), icon: 0, plugin: None };
         let mut new = Vec::new();
         for set in LibrarySet::shipped(&st.shipped) {
             let Some((first, _)) = set.origins.first().copied().flatten() else { continue };
@@ -2076,7 +2331,13 @@ impl CanvasSession {
         let brushes = (0..entry.brushes.len()).filter_map(|i| st.saved(entry, i)).collect();
         serde_json::to_string(&SetFile {
             procraft_brush_set: 1,
-            set: SavedSet { name: entry.name.clone(), brushes, icon: Some(entry.icon), icons: ICON_NUMBERING },
+            set: SavedSet {
+                name: entry.name.clone(),
+                brushes,
+                icon: Some(entry.icon),
+                icons: ICON_NUMBERING,
+                plugin: None,
+            },
         })
         .ok()
     }
@@ -2094,11 +2355,13 @@ impl CanvasSession {
         let mut st = self.shared.lock();
         let s = set as usize;
         let entry = st.library.get(s)?;
+        // (a copy is the person's own: it stays whatever the plugin's switch does)
         let copy = LibrarySet {
             name: entry.name.clone(),
             brushes: entry.brushes.clone(),
             origins: entry.origins.clone(),
             icon: entry.icon,
+            plugin: None,
         };
         st.library.insert(s, copy);
         st.move_brush_refs(|(rs, ri)| Some(if rs >= s { (rs + 1, ri) } else { (rs, ri) }));
@@ -2114,7 +2377,7 @@ impl CanvasSession {
             let origins = saved.set.brushes.iter().map(|b| b.from).collect();
             let brushes = saved.set.brushes.into_iter().map(|b| st.restored(b)).collect();
             let name = if saved.set.name.trim().is_empty() { "Untitled Set".to_owned() } else { saved.set.name };
-            st.library.insert(0, LibrarySet { name, brushes, origins, icon });
+            st.library.insert(0, LibrarySet { name, brushes, origins, icon, plugin: None });
             st.move_brush_refs(|(rs, ri)| Some((rs + 1, ri)));
             return Some(0);
         }

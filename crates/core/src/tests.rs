@@ -11247,6 +11247,117 @@ fn an_artwork_reopens_fitted_at_the_quarter_turn_nearest_how_it_was_left() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The artwork in `path` opened and shown in a `side` square window, as the app does: its view
+/// placed as it first comes, Canvas Orientation Memory `memory`, the canvas on `gpu`.
+fn opened_shown(path: &str, side: u32, memory: bool, gpu: &Gpu) -> std::sync::Arc<CanvasSession> {
+    let t = CanvasSession::open(path.to_owned()).unwrap();
+    t.use_gpu(gpu.clone());
+    t.set_orientation_memory(memory);
+    {
+        let mut st = t.shared.lock();
+        st.window_size = (side, side);
+        st.place_view();
+        st.ensure_canvas();
+    }
+    t
+}
+
+/// The view's matrix and the one fitting a `side` square canvas in a window of that size turned
+/// `turns` quarter turns clockwise, alike.
+fn fitted_at(m: &[f32], side: u32, turns: u32) -> bool {
+    let f = View::fit_turned((side, side), (side, side), [0.0; 4], turns as i32).to_screen();
+    m.iter().zip([f.a, f.b, f.c, f.d, f.e, f.f]).all(|(a, b)| (a - b).abs() < 1e-3)
+}
+
+/// With Canvas Orientation Memory on, an artwork left turned a quarter turn by the fingers reopens
+/// at that turn, fitted, and keeps it left again; with it off, the turn it is kept at stays as it
+/// was, so one kept upright reopens upright and fitted however it was left.
+#[test]
+fn an_artwork_left_turned_reopens_at_its_turn_with_orientation_memory_and_upright_without() {
+    use std::f32::consts::FRAC_PI_2;
+    for memory in [true, false] {
+        let Some(s) = session(100, 100) else { return };
+        let gpu = s.shared.lock().gpu.clone().unwrap();
+        s.set_orientation_memory(memory);
+        let dir = std::env::temp_dir().join(format!("procraft-memory-{memory}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.to_string_lossy().into_owned();
+        // turned 90 degrees clockwise by two fingers, zoomed in and moved, then left
+        s.view_gesture(50.0, 50.0, 6.0, -4.0, 1.7, FRAC_PI_2);
+        assert_eq!(std::sync::Arc::clone(&s).save_to_leave(path.clone()), crate::Leaving::Left);
+        let turns = if memory { 1 } else { 0 };
+        for round in 0..2 {
+            let t = opened_shown(&path, 100, memory, &gpu);
+            assert_eq!(t.shown_turns(), turns, "memory {memory}, round {round}");
+            // fitted at that turn as it opens and once shown: the zoom and the place not kept
+            let m = t.opening_view_matrix(100, 100);
+            assert!(fitted_at(&m, 100, turns), "memory {memory}, round {round}: {m:?}");
+            assert_eq!(t.view_matrix(), m, "memory {memory}, round {round}");
+            // left again untouched, it comes back the same
+            assert_eq!(std::sync::Arc::clone(&t).save_to_leave(path.clone()), crate::Leaving::Left);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// An artwork kept by an earlier version has, instead of the turn it is kept at, the view it was
+/// left with: it opens at the quarter turn nearest that view's turn (less what of it was the
+/// device's), fitted, and once saved again keeps that turn (the old view no longer written).
+#[test]
+fn an_artwork_kept_with_the_view_it_was_left_with_opens_at_that_view_s_quarter_turn() {
+    use std::f32::consts::{FRAC_PI_2, PI};
+    let Some(s) = session(100, 100) else { return };
+    let gpu = s.shared.lock().gpu.clone().unwrap();
+    let dir = std::env::temp_dir().join(format!("procraft-old-view-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.to_string_lossy().into_owned();
+    s.save(path.clone()).unwrap();
+    let file = dir.join("artwork.json");
+    let kept = |file: &std::path::Path| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap()
+    };
+    let views = [
+        // as files kept them: upside down, and on its side (a little past it)
+        (serde_json::json!({"centre": [1296.19, 1866.75], "zoom": 0.5578, "rotation": 3.1415396}), 2),
+        (serde_json::json!({"centre": [855.48, 597.72], "zoom": 1.0932, "rotation": -1.578848}), 3),
+        (serde_json::json!({"centre": [50.0, 50.0], "zoom": 2.0, "rotation": 1.2}), 1),
+        (serde_json::json!({"centre": [50.0, 50.0], "zoom": 2.0, "rotation": 0.3}), 0),
+        // all of its turn the device's: upright
+        (serde_json::json!({"centre": [50.0, 50.0], "zoom": 1.0, "rotation": FRAC_PI_2, "followed": FRAC_PI_2}), 0),
+        // half its turn the device's
+        (serde_json::json!({"centre": [50.0, 50.0], "zoom": 1.0, "rotation": PI, "followed": FRAC_PI_2}), 1),
+        // no view it can read: upright
+        (serde_json::json!("sideways"), 0),
+        (serde_json::json!({"centre": [50.0, 50.0], "zoom": 1.0}), 0),
+    ];
+    for (view, turns) in views {
+        let mut old = kept(&file);
+        let fields = old.as_object_mut().unwrap();
+        fields.remove("turns");
+        fields.insert("view".to_owned(), view.clone());
+        std::fs::write(&file, serde_json::to_string(&old).unwrap()).unwrap();
+        let t = opened_shown(&path, 100, true, &gpu);
+        assert_eq!(t.shown_turns(), turns, "{view}");
+        let m = t.opening_view_matrix(100, 100);
+        assert!(fitted_at(&m, 100, turns), "{view}: {m:?}");
+        assert_eq!(t.view_matrix(), m, "{view}");
+        // saved again: the turn kept as such, the old view gone, and it opens so again
+        assert_eq!(std::sync::Arc::clone(&t).save_to_leave(path.clone()), crate::Leaving::Left);
+        let now = kept(&file);
+        assert!(now.get("view").is_none(), "{view}");
+        assert_eq!(now.get("turns").and_then(serde_json::Value::as_u64).unwrap_or(0), u64::from(turns), "{view}");
+        assert_eq!(opened_shown(&path, 100, true, &gpu).shown_turns(), turns, "{view}");
+    }
+    // a turn kept as such wins over an old view beside it
+    let mut both = kept(&file);
+    let fields = both.as_object_mut().unwrap();
+    fields.insert("turns".to_owned(), serde_json::json!(1));
+    fields.insert("view".to_owned(), serde_json::json!({"centre": [50.0, 50.0], "zoom": 1.0, "rotation": PI}));
+    std::fs::write(&file, serde_json::to_string(&both).unwrap()).unwrap();
+    assert_eq!(opened_shown(&path, 100, true, &gpu).shown_turns(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn an_artwork_left_turned_shows_turned_in_the_gallery() {
     use std::f32::consts::FRAC_PI_2;
