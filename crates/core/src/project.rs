@@ -982,14 +982,19 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
         saved.layer_data.clear();
     }
     let (w, h) = (file.document.width(), file.document.height());
+    // (what it writes beside isn't taken for a save cut short meanwhile)
+    let _saving = SavingInto::begin(dir);
     fs::create_dir_all(dir.join("layers")).map_err(|e| file_error("making the folder", e))?;
     // Everything new is written beside its place first and only then put in place, the document
     // last: a save cut short while writing (the slow part) leaves the last one as it was. Written
     // in place one by one, a save after a crop cut short left layers of the new size beside a
-    // document of the old, which the next open would drop.
+    // document of the old, which the next open would drop. A first save cut short once its
+    // document is written is put in place when the gallery next looks (see `finish_first_save`).
     let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
     let stage = |result: Result<PathBuf, MobileError>, to: PathBuf, staged: &mut Vec<(PathBuf, PathBuf)>| {
-        result.map(|tmp| staged.push((tmp, to)))
+        let staged = result.map(|tmp| staged.push((tmp, to)));
+        cut_short::step();
+        staged
     };
     // the layers whose stores are in the folder once this save is in place
     let mut stored = stores_kept;
@@ -998,7 +1003,7 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
         // layer's PNG made in memory before it is written
         let each = w as usize * h as usize * 4;
         let results = procraft_engine::par::side_by_side_within(&layers, each, |(id, _, rgba)| {
-            write_beside(&layer_path(dir, *id), |p| write_png(p, w, h, rgba, &[]))
+            stage_beside(&layer_path(dir, *id), |p| write_png(p, w, h, rgba, &[]))
         });
         // every one written kept track of, so a failure among them leaves none of them beside
         let mut failed = None;
@@ -1014,7 +1019,7 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
         for (id, bytes) in &files {
             let to = layer_path(dir, *id);
             stage(
-                write_beside(&to, |p| crate::storage::write(p, bytes).map_err(|e| file_error("writing a layer", e))),
+                stage_beside(&to, |p| crate::storage::write(p, bytes).map_err(|e| file_error("writing a layer", e))),
                 to,
                 &mut staged,
             )?;
@@ -1026,7 +1031,7 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
         let thumb = dir.join("thumbnail.png");
         if let Some((pw, ph, rgba)) = model.and_then(|m| m.picture) {
             let (tw, th, small) = thumbnail(&rgba, pw, ph, THUMBNAIL_SIDE);
-            stage(write_beside(&thumb, |p| write_png(p, tw, th, &small, &[])), thumb, &mut staged)?;
+            stage(stage_beside(&thumb, |p| write_png(p, tw, th, &small, &[])), thumb, &mut staged)?;
         } else if let Some((tw, th, small)) =
             composite.map(|t| (t.width, t.height, straight_alpha(&t.rgba))).or(unshown)
         {
@@ -1037,14 +1042,14 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
                 table.apply_rgba(&mut small, false);
             }
             let icc = file.document.picture_icc();
-            stage(write_beside(&thumb, |p| write_png(p, tw, th, &small, &icc)), thumb, &mut staged)?;
+            stage(stage_beside(&thumb, |p| write_png(p, tw, th, &small, &icc)), thumb, &mut staged)?;
         }
         // the Reference window's picture, unless the folder has it already
         let picture_path = dir.join(crate::reference_window::REFERENCE_PICTURE);
         if let Some(png) = reference_picture.as_deref()
             && (saved.reference_picture != Some(pixels_hash(png)) || !picture_path.exists())
         {
-            let written = write_beside(&picture_path, |p| {
+            let written = stage_beside(&picture_path, |p| {
                 crate::storage::write(p, png).map_err(|e| file_error("writing the reference picture", e))
             });
             stage(written, picture_path, &mut staged)?;
@@ -1056,7 +1061,7 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
             if saved.more_pictures.get(i).copied().flatten() == Some(pixels_hash(png)) && path.exists() {
                 continue;
             }
-            let written = write_beside(&path, |p| {
+            let written = stage_beside(&path, |p| {
                 crate::storage::write(p, png).map_err(|e| file_error("writing a reference picture", e))
             });
             stage(written, path, &mut staged)?;
@@ -1067,7 +1072,7 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
             if saved.layer_data.get(id) == Some(&pixels_hash(data)) && path.exists() {
                 continue;
             }
-            let written = write_beside(&path, |p| {
+            let written = stage_beside(&path, |p| {
                 crate::storage::write(p, data.as_slice()).map_err(|e| file_error("writing a layer's plugin data", e))
             });
             stage(written, path, &mut staged)?;
@@ -1084,7 +1089,7 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
                 .collect::<Result<Vec<_>, _>>()?;
             let bytes = crate::layer_store::encode(kind, (w, h), layer_hash, &planes)?;
             let path = crate::layer_store::store_path(dir, id);
-            let written = write_beside(&path, |p| {
+            let written = stage_beside(&path, |p| {
                 crate::storage::write(p, &bytes).map_err(|e| file_error("writing a layer's store", e))
             });
             stage(written, path, &mut staged)?;
@@ -1092,7 +1097,7 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
         }
         for (id, bytes) in &store_files {
             let path = crate::layer_store::store_path(dir, *id);
-            let written = write_beside(&path, |p| {
+            let written = stage_beside(&path, |p| {
                 crate::storage::write(p, bytes).map_err(|e| file_error("writing a layer's store", e))
             });
             stage(written, path, &mut staged)?;
@@ -1101,7 +1106,7 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
         // a plugin's artwork's own data, whole, before the document that names its kind
         if let Some(data) = plugin_data.as_deref() {
             let path = dir.join(PLUGIN_DATA);
-            let written = write_beside(&path, |p| {
+            let written = stage_beside(&path, |p| {
                 crate::storage::write(p, data).map_err(|e| file_error("writing the plugin's artwork", e))
             });
             stage(written, path, &mut staged)?;
@@ -1109,7 +1114,7 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
         let json = serde_json::to_string(&file).map_err(|e| file_error("writing the artwork", e))?;
         let doc = dir.join("artwork.json");
         stage(
-            write_beside(&doc, |p| {
+            stage_beside(&doc, |p| {
                 crate::storage::write(p, json.as_bytes()).map_err(|e| file_error("writing the artwork", e))
             }),
             doc,
@@ -1118,7 +1123,11 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
     })();
     // in place, in the order written (the document last), or, short of that, none of it
     let placed = written.and_then(|()| {
-        staged.iter().try_for_each(|(tmp, to)| fs::rename(tmp, to).map_err(|e| file_error("saving", e)))
+        staged.iter().try_for_each(|(tmp, to)| {
+            fs::rename(tmp, to).map_err(|e| file_error("saving", e))?;
+            cut_short::step();
+            Ok(())
+        })
     });
     if let Err(e) = placed {
         for (tmp, _) in &staged {
@@ -2154,12 +2163,171 @@ pub(crate) fn write_beside(
     Ok(tmp)
 }
 
+/// The number of the next write beside a file: each its own, one after another in this run.
+fn next_write() -> u64 {
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A file beside `path` to write what goes there into: a name of its own, so that no other write
 /// of the same file can touch it.
 fn beside(path: &Path) -> PathBuf {
-    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    path.with_extension(format!("{}.tmp", n))
+    path.with_extension(format!("{}.tmp", next_write()))
+}
+
+/// What a save of an artwork writes into `path` written beside it first (removed again if the write
+/// fails), as [`write_beside`] does, under a name that keeps the whole name of the file it goes to
+/// (`<name>.<n>.tmp`, `n` larger for each written later): a save cut short once its document was
+/// written can then be put in place (see [`finish_first_save`]).
+fn stage_beside(path: &Path, write: impl FnOnce(&Path) -> Result<(), MobileError>) -> Result<PathBuf, MobileError> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = path.with_file_name(format!("{name}.{}.tmp", next_write()));
+    if let Err(e) = write(&tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(tmp)
+}
+
+/// Of a file a save wrote beside its place (`<name>.<n>.tmp`), the name it goes to (one with an
+/// extension: earlier versions' names dropped it) and its number.
+fn staged_for(file: &str) -> Option<(&str, u64)> {
+    let (to, n) = file.strip_suffix(".tmp")?.rsplit_once('.')?;
+    let n = n.parse().ok().filter(|_| n.bytes().all(|b| b.is_ascii_digit()))?;
+    (to.contains('.') && !to.starts_with('.')).then_some((to, n))
+}
+
+/// The folders saves are being written into in this run, each as many times as saves into it.
+static SAVING: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// A save being written into a folder, while this is held.
+struct SavingInto(PathBuf);
+
+impl SavingInto {
+    fn begin(dir: &Path) -> SavingInto {
+        SAVING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(dir.to_path_buf());
+        SavingInto(dir.to_path_buf())
+    }
+}
+
+impl Drop for SavingInto {
+    fn drop(&mut self) {
+        let mut saving = SAVING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(at) = saving.iter().position(|d| *d == self.0) {
+            saving.swap_remove(at);
+        }
+    }
+}
+
+/// Whether a save is being written into `dir` in this run (what it has written beside isn't left
+/// from a save cut short).
+fn being_saved(dir: &Path) -> bool {
+    SAVING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|d| d == dir)
+}
+
+/// Whether the file at `path` holds an artwork's document whole.
+fn whole_document(path: &Path) -> bool {
+    fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .is_some_and(|j| j.get("document").is_some())
+}
+
+/// Finishes the first save of an artwork into `dir` that the app being ended cut short once all
+/// of it was written beside its place, before the document was put there: what it wrote put in
+/// place as that save would have, the document last, so the artwork is in the gallery whole. Only
+/// a folder with no document yet and no save being written into it now; the document written
+/// beside must be whole (written last, it means everything before it was). An earlier version's
+/// save, whose names don't tell where each file goes, is finished only when its document is all
+/// it left. True if it was finished.
+pub(crate) fn finish_first_save(dir: &Path) -> bool {
+    let doc = dir.join("artwork.json");
+    if doc.exists() || being_saved(dir) {
+        return false;
+    }
+    let left_in = |at: &Path| -> Vec<(PathBuf, String)> {
+        fs::read_dir(at).map_or_else(
+            |_| Vec::new(),
+            |entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                    .map(|e| (e.path(), e.file_name().to_string_lossy().into_owned()))
+                    .filter(|(_, name)| name.ends_with(".tmp"))
+                    .collect()
+            },
+        )
+    };
+    let mut left = left_in(dir);
+    left.extend(left_in(&dir.join("layers")));
+    let staged: Vec<(&PathBuf, PathBuf, u64)> = left
+        .iter()
+        .filter_map(|(tmp, name)| {
+            let (to, n) = staged_for(name)?;
+            Some((tmp, tmp.with_file_name(to), n))
+        })
+        .collect();
+    let newest_doc =
+        staged.iter().filter(|(tmp, to, _)| *to == doc && whole_document(tmp)).max_by_key(|(_, _, n)| *n).cloned();
+    let Some((doc_tmp, _, last)) = newest_doc else {
+        // an earlier version's: its document alone left, whole
+        return match left.as_slice() {
+            [(tmp, name)] if name.starts_with("artwork.") && staged_for(name).is_none() && whole_document(tmp) => {
+                fs::rename(tmp, &doc).is_ok()
+            }
+            _ => false,
+        };
+    };
+    // the rest of that save (written before its document), the latest for each place
+    let mut rest: Vec<(&PathBuf, &PathBuf, u64)> = Vec::new();
+    for (tmp, to, n) in &staged {
+        if *to == doc || *n > last {
+            continue;
+        }
+        match rest.iter_mut().find(|(_, t, _)| *t == to) {
+            Some(kept) if kept.2 < *n => *kept = (tmp, to, *n),
+            Some(_) => {}
+            None => rest.push((tmp, to, *n)),
+        }
+    }
+    rest.iter().all(|(tmp, to, _)| fs::rename(tmp, to).is_ok()) && fs::rename(doc_tmp, &doc).is_ok()
+}
+
+/// Tests end a save (or a copy in the gallery) part way, as the app being ended would: after so
+/// many of its steps (a file written beside its place, one put in place, an artwork copied),
+/// nothing after it done and nothing tidied away.
+#[cfg(test)]
+pub(crate) mod cut_short {
+    use std::cell::Cell;
+
+    thread_local! {
+        static AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// What a save ended part way unwinds with.
+    pub(crate) struct Ended;
+
+    /// The next save on this thread ends after `steps` more of its steps (none: it isn't ended).
+    pub(crate) fn after(steps: Option<usize>) {
+        AFTER.with(|a| a.set(steps));
+    }
+
+    /// A step of a save: the one it is to end at ends it (unwinding, with no message).
+    pub(crate) fn step() {
+        AFTER.with(|a| match a.get() {
+            Some(0) => {
+                a.set(None);
+                std::panic::resume_unwind(Box::new(Ended));
+            }
+            Some(n) => a.set(Some(n - 1)),
+            None => {}
+        });
+    }
+}
+
+#[cfg(not(test))]
+pub(crate) mod cut_short {
+    pub(crate) fn step() {}
 }
 
 /// A PNG of RGBA8 pixels, carrying the colour profile `icc` (none if empty).

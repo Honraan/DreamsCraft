@@ -1157,6 +1157,8 @@ impl App {
             log::warn!("an artwork of a plugin's that isn't on opened as what it last drew");
         }
         self.ui.artwork_dir = Some(dir.clone());
+        // a new artwork is in the gallery from the start (an opened one is there already)
+        files::keep_new_artwork(&session, &dir);
         // kept saved as it changes, as the tablet's
         Arc::clone(&session).start_autosave(dir.clone());
         self.artwork = Some(dir);

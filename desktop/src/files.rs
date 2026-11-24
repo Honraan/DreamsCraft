@@ -456,6 +456,23 @@ pub fn keep_preset_time_lapse(preset: &CanvasPreset, dir: &str) {
     });
 }
 
+/// A new artwork saved into its gallery folder `dir` at once, on a thread of its own, as the
+/// tablets save one: it is in the gallery from the moment it is made, not only from its first
+/// change (the app may be ended before that is kept). One opened from the gallery is there
+/// already: nothing is done. The thread, if one was started.
+pub fn keep_new_artwork(session: &Arc<CanvasSession>, dir: &str) -> Option<std::thread::JoinHandle<()>> {
+    if Path::new(dir).join("artwork.json").exists() {
+        return None;
+    }
+    let (session, dir) = (Arc::clone(session), dir.to_owned());
+    let started = std::thread::Builder::new().name("first save".into()).spawn(move || {
+        if let Err(e) = session.save(dir) {
+            log::error!("saving a new artwork: {e}");
+        }
+    });
+    started.inspect_err(|e| log::error!("saving a new artwork: {e}")).ok()
+}
+
 /// A colour profile the user picks (an .icc file), added to those a canvas can be in; its name, or
 /// none (said so) if it isn't one.
 pub fn import_profile() -> Option<String> {
@@ -1234,6 +1251,36 @@ mod tests {
         let settings = procraft_core::TimeLapse::new(dir.to_string_lossy().into_owned()).settings();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(settings, procraft_core::TimeLapseSettings { resolution: 2, quality: 3, hevc: true });
+    }
+
+    /// A new artwork is in the gallery from the moment it is made, with nothing painted yet (the
+    /// app ended before a change is kept loses nothing of it); one already saved isn't saved again.
+    #[test]
+    fn a_new_artwork_is_in_the_gallery_from_the_start() {
+        let root = folder("new-artwork");
+        let store = procraft_core::ArtworkStore::open(root.to_string_lossy().into_owned());
+        let mut made = Vec::new();
+        for n in 0..5 {
+            let session = CanvasSession::new(64 + n, 48);
+            let dir = store.new_folder(None);
+            keep_new_artwork(&session, &dir).expect("saved on a thread").join().unwrap();
+            assert!(keep_new_artwork(&session, &dir).is_none(), "saved once");
+            made.push(dir);
+        }
+        let shown: Vec<String> = store
+            .list(None)
+            .into_iter()
+            .filter_map(|e| match e {
+                procraft_core::GalleryEntry::Artwork { artwork } => Some(artwork.dir),
+                procraft_core::GalleryEntry::Stack { .. } => None,
+            })
+            .collect();
+        let _ = std::fs::remove_dir_all(&root);
+        println!("new artworks made: {}, in the gallery: {}", made.len(), shown.len());
+        made.sort();
+        let mut shown = shown;
+        shown.sort();
+        assert_eq!(shown, made);
     }
 
     #[test]

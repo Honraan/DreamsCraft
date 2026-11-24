@@ -43,6 +43,8 @@ mod floating;
 mod frame;
 mod frame_loop;
 mod gallery;
+#[cfg(test)]
+mod gallery_kept_tests;
 mod gestures;
 mod gradients;
 mod grain_store;
