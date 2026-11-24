@@ -57,7 +57,9 @@ struct CanvasScreen: View {
                 }
                 ColorDropBand(drop: model.drop, width: screen.size.width)
                 // the top bar slides up off the screen and the side bar out to its side as they fade
-                if model.barMoved(.topLeft) == nil, model.barMoved(.topRight) == nil {
+                // (each half on glass of its own while moved, or collapsed into its side: Collapse to edge)
+                if model.barMoved(.topLeft) == nil, model.barMoved(.topRight) == nil,
+                   model.barCollapsed(.topLeft) == nil, model.barCollapsed(.topRight) == nil {
                     TopBar(model: model)
                         .offset(y: hidden ? -Pc.barHeight : 0)
                         .opacity(hidden ? 0 : 1)
@@ -65,8 +67,15 @@ struct CanvasScreen: View {
                     // moved by Edit layout: each half on glass of its own where it was left
                     ForEach([LayoutBar.topLeft, .topRight], id: \.self) { bar in
                         if let at = model.barMoved(bar) ?? model.barLayout.shown(bar: bar) {
-                            TopBarHalf(model: model, left: bar == .topLeft, upright: at.vertical, screenWidth: screen.size.width)
+                            let into = collapseOffset(model.barCollapsePlace(bar), model.barCollapsed(bar) != nil)
+                            TopBarHalf(
+                                model: model, left: bar == .topLeft, upright: at.vertical, screenWidth: screen.size.width,
+                                edges: model.barTouching(bar)
+                            )
                                 .offset(x: CGFloat(at.x), y: CGFloat(at.y))
+                                // collapsed: slid into its side
+                                .offset(into)
+                                .animation(collapseSlide, value: into)
                                 .opacity(hidden ? 0 : 1)
                         }
                     }
@@ -76,13 +85,24 @@ struct CanvasScreen: View {
                 if let moved = model.barMoved(.sideBar) {
                     // moved by Edit layout: where it was left, lying down turned a quarter about its
                     // top-left
-                    SideBar(model: model, right: right, windowHeight: screen.size.height)
+                    // (square only on its sides against the window's edges, its own way up)
+                    let edges = model.barTouching(.sideBar).map { moved.vertical ? $0 : turnedSides($0) }
+                    let into = collapseOffset(model.barCollapsePlace(.sideBar), model.barCollapsed(.sideBar) != nil)
+                    // (standing against a side: mirrored to that side)
+                    let standsRight = moved.vertical ? (model.barTouching(.sideBar)?.right ?? right) : right
+                    SideBar(model: model, right: standsRight, windowHeight: screen.size.height, edges: edges)
                         .rotationEffect(.degrees(moved.vertical ? 0 : -90), anchor: .topLeading)
                         .offset(x: CGFloat(moved.x), y: CGFloat(moved.y) + (moved.vertical ? 0 : Pc.sideBarShown))
+                        // collapsed: slid into its side
+                        .offset(into)
+                        .animation(collapseSlide, value: into)
                         .frame(width: screen.size.width, height: screen.size.height, alignment: .topLeading)
                         .opacity(hidden ? 0 : 1)
                 } else {
+                    let into = collapseOffset(model.barCollapsePlace(.sideBar), model.barCollapsed(.sideBar) != nil)
                     SideBar(model: model, right: right, windowHeight: screen.size.height, stretch: sideStretch)
+                        .offset(into)
+                        .animation(collapseSlide, value: into)
                         .frame(maxWidth: .infinity, alignment: right ? .trailing : .leading)
                         // stretched, what is on it moves out with its far side
                         .offset(x: sideBarShift(right) + (right ? -sideStretch : sideStretch), y: CGFloat(sideMoving?.top ?? sideFit.top))
@@ -97,6 +117,8 @@ struct CanvasScreen: View {
                 // the panels a plugin lets float, in windows of their own, under those hanging
                 if !hidden {
                     FloatingPanelWindows(model: model, screen: screen.size)
+                    // Collapse to edge's buttons by the bars and the tabs of what went into a side
+                    CollapseControls(model: model, screen: screen.size)
                 }
                 if model.panel != .none || model.panelFading {
                     // the one view all the way, so a list fading keeps its place
@@ -125,7 +147,8 @@ struct CanvasScreen: View {
                     .frame(width: 0, height: 0)
                     .onChange(
                         of: LayoutRoomKey(
-                            size: screen.size, sideBar: model.showSideBar && model.barMoved(.sideBar) == nil,
+                            size: screen.size,
+                            sideBar: model.showSideBar && model.barMoved(.sideBar) == nil && model.barCollapsed(.sideBar) == nil,
                             rightHanded: AppSettings.shared.rightHanded,
                             sideBarShown: Pc.sideBarShown, barShown: Pc.barShown, floating: Look.shared.scale(.floating)
                         ),
@@ -780,6 +803,7 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
         // kept saved by the core a few seconds after it changes; a failure told
         session.startAutosave(dir: dir)
         canvas.onCommands = { [weak self] in self?.obey($0) }
+        canvas.takesTouches = { [weak self] in !(self?.model.editingLayout ?? false) }
         canvas.beforeTouches = { [weak self] in
             guard let self else { return }
             self.model.prepareTouches()

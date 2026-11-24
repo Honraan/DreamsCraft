@@ -606,8 +606,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         interfacePrefs.edit().putBoolean(LIGHT_INTERFACE, on).apply()
     }
 
-    /** The plugins, their values kept with the interface settings, and what their page draws. */
-    val plugins = keptPlugins(app, interfacePrefs)
+    /** The plugins, their values kept with the interface settings, and what their page draws; the folders picked for them reached through the system's document trees, files made for them in the cache first. */
+    val plugins = keptPlugins(app, interfacePrefs).also { it.useFolderAccess(SystemFolders(app), File(app.cacheDir, "folders").path) }
     var pluginList by mutableStateOf(plugins.plugins())
         private set
 
@@ -943,6 +943,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 is io.github.artcraftandroid.procraft.core.PluginControl.Slider ->
                     if (io.github.artcraftandroid.procraft.core.pluginSliderWhole(c.control)) edit.putInt(c.control.key, c.control.value.roundToInt()) else edit.putFloat(c.control.key, c.control.value)
                 is io.github.artcraftandroid.procraft.core.PluginControl.File -> Unit
+                is io.github.artcraftandroid.procraft.core.PluginControl.Folder -> Unit
                 is io.github.artcraftandroid.procraft.core.PluginControl.Texture -> edit.putInt(c.control.key, c.control.value)
             }
         }
@@ -1016,9 +1017,22 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         return Bitmap.createBitmap(argb, w, h, Bitmap.Config.ARGB_8888).asImageBitmap()
     }
 
-    /** A plugin's file control [key] lets its file go. */
+    /** A plugin's file control [key] lets its file go (a folder control its folder). */
     fun clearPluginFile(key: String) {
         if (plugins.clearFile(key)) pluginsChanged()
+    }
+
+    /** A folder picked with the system's picker at [tree] for a plugin's folder control [key]: its permission kept, then kept with the plugin; told if it can't be used. */
+    fun pickPluginFolder(key: String, tree: android.net.Uri) {
+        viewModelScope.launch {
+            val kept = withContext(Dispatchers.IO) {
+                val app = getApplication<Application>()
+                runCatching { app.contentResolver.takePersistableUriPermission(tree, SystemFolders.KEPT) }
+                    .onFailure { AppLog.e(TAG, "keeping a folder's permission", it) }
+                    .isSuccess && plugins.setFolder(key, tree.toString(), SystemFolders.shownName(app, tree) ?: "Folder")
+            }
+            if (kept) pluginsChanged() else message = "This folder couldn't be used."
+        }
     }
 
     /** The list as it stands: a plugin may have stopped on a stroke since it was read. */
@@ -1456,7 +1470,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         private set
 
     /** How the plugins lay the panels out, as last asked. */
-    var layoutLook by mutableStateOf(io.github.artcraftandroid.procraft.core.PanelLayoutLook(false, 0f, false, false, false))
+    var layoutLook by mutableStateOf(io.github.artcraftandroid.procraft.core.PanelLayoutLook(false, 0f, false, false, false, false, false))
         private set
 
     /** A panel's grabber is being dragged out: the panel stays, unseen, until let go, its window following the finger. */
@@ -1561,13 +1575,18 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** [piece]'s strip or tab (or, [sizing], its corner) pressed: it moves (or is sized) with the finger until let go. */
-    fun holdPiece(piece: io.github.artcraftandroid.procraft.core.LayoutPiece, sizing: Boolean) {
-        panelLayout.hold(piece, sizing, 0f, 0f)
+    fun holdPiece(piece: io.github.artcraftandroid.procraft.core.LayoutPiece, sizing: Boolean, at: androidx.compose.ui.geometry.Offset) {
+        piecePressed = at
+        panelLayout.hold(piece, sizing, at.x, at.y)
     }
+
+    /** Where the piece held was pressed (dp of the interface): the pointer is there plus the drag. */
+    private var piecePressed = androidx.compose.ui.geometry.Offset.Zero
 
     /** The piece held dragged ([dx], [dy]) all told since it was pressed (dp of the interface). */
     fun dragPiece(dx: Float, dy: Float): io.github.artcraftandroid.procraft.core.PieceShown? {
-        val shown = panelLayout.drag(dx, dy)
+        // (the finger's place, as the layout takes it: where it was let go decides a tab or a park)
+        val shown = panelLayout.drag(piecePressed.x + dx, piecePressed.y + dy)
         layoutChanged()
         return shown
     }
@@ -1663,6 +1682,60 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         layoutChanged()
     }
 
+    /** The panels [piece]'s window holds as tabs, the first holding its place; none while it holds it alone. */
+    fun tabsOf(piece: io.github.artcraftandroid.procraft.core.LayoutPiece): List<io.github.artcraftandroid.procraft.core.LayoutPiece> =
+        layoutChanges.let { panelLayout.tabsOf(piece) }
+
+    /** [piece], a tab of its window, shown there. */
+    fun pickTab(piece: io.github.artcraftandroid.procraft.core.LayoutPiece) {
+        panelLayout.setActiveTab(piece)
+        keepLayout()
+        layoutChanged()
+    }
+
+    /** [piece], a tab of its window, torn out with the finger at ([x], [y]) (dp of the interface): it follows the finger. */
+    fun tearTab(piece: io.github.artcraftandroid.procraft.core.LayoutPiece, x: Float, y: Float) {
+        panelLayout.tearTab(piece, x, y, io.github.artcraftandroid.procraft.ui.FloatingGrabY)
+        layoutChanged()
+    }
+
+    /** The tab torn out follows the finger, at ([x], [y]) (dp of the interface). */
+    fun followTorn(x: Float, y: Float) {
+        panelLayout.drag(x, y)
+        layoutChanged()
+    }
+
+    /** The Tool Belt as it shows, while a plugin says so. */
+    fun beltShown(): io.github.artcraftandroid.procraft.core.BeltShown? = layoutChanges.let { panelLayout.beltShown() }
+
+    /**
+     * Where the Tool Belt shows (dp of the interface): moved where Edit layout left it (a bar), else where [belt] says; told
+     * to the layout, which parks what is let go on it.
+     */
+    fun beltPlace(belt: io.github.artcraftandroid.procraft.core.BeltShown): io.github.artcraftandroid.procraft.core.BarPlace {
+        val k = belt.scale
+        val (length, thickness) = belt.width * k to belt.height * k
+        val own = io.github.artcraftandroid.procraft.core.BarPlace(belt.x, belt.y, false)
+        barLayout.setBar(io.github.artcraftandroid.procraft.core.LayoutBar.BELT, own, length, thickness)
+        val place = barChanges.let { barLayout.shown(io.github.artcraftandroid.procraft.core.LayoutBar.BELT) } ?: own
+        val (w, h) = if (place.vertical) thickness to length else length to thickness
+        panelLayout.setBeltPlace(io.github.artcraftandroid.procraft.core.LayoutRect(place.x, place.y, w, h))
+        return place
+    }
+
+    /** [piece], parked on the Tool Belt, taken off: back where it was. */
+    fun unparkPiece(piece: io.github.artcraftandroid.procraft.core.LayoutPiece) {
+        panelLayout.unpark(piece)
+        keepLayout()
+        layoutChanged()
+    }
+
+    /** [piece], parked on the Tool Belt, dragged off with the finger at ([x], [y]) (dp of the interface): it follows the finger. */
+    fun unparkAt(piece: io.github.artcraftandroid.procraft.core.LayoutPiece, x: Float, y: Float) {
+        panelLayout.unparkAt(piece, x, y, io.github.artcraftandroid.procraft.ui.FloatingGrabY)
+        layoutChanged()
+    }
+
     /** The floating windows in the order they are drawn, from the bottom up. */
     fun pieceOrder(): List<io.github.artcraftandroid.procraft.core.LayoutPiece> = layoutChanges.let { panelLayout.order() }
 
@@ -1707,6 +1780,67 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     fun barMoved(bar: io.github.artcraftandroid.procraft.core.LayoutBar): io.github.artcraftandroid.procraft.core.BarPlace? =
         barChanges.let { if (layoutLook.edit && barLayout.isMoved(bar)) barLayout.shown(bar) else null }
 
+    /** Which sides of [bar] lie against the window's edges where it shows now, as it is dragged too: square there, round elsewhere. */
+    fun barTouching(bar: io.github.artcraftandroid.procraft.core.LayoutBar): io.github.artcraftandroid.procraft.core.BarSides? =
+        barChanges.let { barLayout.touching(bar) }
+
+    /** Collapse to edge: [bar] collapsed into its side (the side, its tab there, how far it slid), while it is. */
+    fun barCollapsed(bar: io.github.artcraftandroid.procraft.core.LayoutBar): io.github.artcraftandroid.procraft.core.EdgeCollapse? = barChanges.let { barLayout.collapsed(bar) }
+
+    /** Where [bar] goes when it collapses, collapsed or not (to slide it there and back); none while it can't. */
+    fun barCollapsePlace(bar: io.github.artcraftandroid.procraft.core.LayoutBar): io.github.artcraftandroid.procraft.core.EdgeCollapse? = barChanges.let { barLayout.collapsePlace(bar) }
+
+    /** Where [bar]'s collapse button goes, while it has one (dp of the interface). */
+    fun barCollapseButton(bar: io.github.artcraftandroid.procraft.core.LayoutBar): io.github.artcraftandroid.procraft.core.LayoutRect? = barChanges.let { barLayout.collapseButton(bar) }
+
+    /** [bar] collapsed into its side, or brought back out, kept. */
+    fun collapseBar(bar: io.github.artcraftandroid.procraft.core.LayoutBar, collapsed: Boolean) {
+        if (barLayout.setCollapsed(bar, collapsed)) keepBars()
+        barChanges++
+    }
+
+    /** A drag from collapsed [bar]'s tab, ([dx], [dy]) so far: out of the side far enough, it comes back out. */
+    fun pullBarTab(bar: io.github.artcraftandroid.procraft.core.LayoutBar, dx: Float, dy: Float) {
+        if (barLayout.pullTab(bar, dx, dy)) {
+            keepBars()
+            barChanges++
+        }
+    }
+
+    /** [piece]'s window collapsed into its side, while it is. */
+    fun pieceCollapsed(piece: io.github.artcraftandroid.procraft.core.LayoutPiece): io.github.artcraftandroid.procraft.core.EdgeCollapse? = layoutChanges.let { panelLayout.pieceCollapsed(piece) }
+
+    /** Where [piece]'s window goes when it collapses, collapsed or not; none while it can't. */
+    fun pieceCollapsePlace(piece: io.github.artcraftandroid.procraft.core.LayoutPiece): io.github.artcraftandroid.procraft.core.EdgeCollapse? = layoutChanges.let { panelLayout.pieceCollapsePlace(piece) }
+
+    /** The side [piece]'s window goes into at its collapse button, while it may. */
+    fun pieceCollapseEdge(piece: io.github.artcraftandroid.procraft.core.LayoutPiece): io.github.artcraftandroid.procraft.core.WindowEdge? = layoutChanges.let { panelLayout.pieceCollapseEdge(piece) }
+
+    /** [piece]'s window collapsed into its side, or brought back out, kept. */
+    fun collapsePiece(piece: io.github.artcraftandroid.procraft.core.LayoutPiece, collapsed: Boolean) {
+        if (panelLayout.setPieceCollapsed(piece, collapsed)) keepLayout()
+        layoutChanged()
+    }
+
+    /** A drag from collapsed [piece]'s tab, ([dx], [dy]) so far: out of the side far enough, it comes back out. */
+    fun pullPieceTab(piece: io.github.artcraftandroid.procraft.core.LayoutPiece, dx: Float, dy: Float) {
+        if (panelLayout.pullPieceTab(piece, dx, dy)) {
+            keepLayout()
+            layoutChanged()
+        }
+    }
+
+    /** Whether any bar or window is collapsed into its side. */
+    fun anyCollapsed(): Boolean = barChanges.let { layoutChanges.let { barLayout.anyCollapsed() || panelLayout.anyCollapsed() } }
+
+    /** Collapse All ([collapsed]) or Open All: every bar and window against a side, kept. */
+    fun collapseAll(collapsed: Boolean) {
+        if (barLayout.setAllCollapsed(collapsed)) keepBars()
+        barChanges++
+        if (panelLayout.setAllCollapsed(collapsed)) keepLayout()
+        layoutChanged()
+    }
+
     /** Where [bar] shows now, moved or not (dp of the interface). */
     fun barShown(bar: io.github.artcraftandroid.procraft.core.LayoutBar): io.github.artcraftandroid.procraft.core.BarPlace? =
         barChanges.let { barMoved(bar) ?: barLayout.shown(bar) }
@@ -1715,7 +1849,14 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     fun tellBar(width: Float, height: Float, bar: io.github.artcraftandroid.procraft.core.LayoutBar, own: io.github.artcraftandroid.procraft.core.BarPlace, length: Float, thickness: Float) {
         val landscape = width >= height
         barLayout.setWindow(width, height, layoutLook.snap.coerceAtLeast(EDIT_SNAP))
+        barLayout.setCollapsing(layoutLook.collapse)
         barLayout.setBar(bar, own, length, thickness)
+        // where it always is changed (the side bar laid out again after Reset, say): its handle goes there too
+        val told = Triple(own, length, thickness)
+        if (barsTold[bar] != told) {
+            barsTold[bar] = told
+            barChanges++
+        }
         // turned, the bars moved the other way show
         if (landscape != barsLandscape) {
             barsLandscape = landscape
@@ -1724,6 +1865,9 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private var barsLandscape: Boolean? = null
+
+    /** What each bar was last told as where it always is. */
+    private val barsTold = mutableMapOf<io.github.artcraftandroid.procraft.core.LayoutBar, Triple<io.github.artcraftandroid.procraft.core.BarPlace, Float, Float>>()
 
     /** Edit layout on (from the Canvas tab): the panels close, and the bars show handles. */
     fun startEditLayout() {
@@ -1747,13 +1891,20 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** [bar]'s handle pressed, while editing. */
-    fun holdBar(bar: io.github.artcraftandroid.procraft.core.LayoutBar) {
-        barLayout.hold(bar, 0f, 0f)
+    fun holdBar(bar: io.github.artcraftandroid.procraft.core.LayoutBar, x: Float, y: Float) {
+        barPressed = androidx.compose.ui.geometry.Offset(x, y)
+        barLayout.hold(bar, x, y)
     }
 
-    /** The bar held dragged ([dx], [dy]) all told since it was pressed (dp of the interface). */
+    /** Where the bar held was pressed (dp of the interface). */
+    private var barPressed = androidx.compose.ui.geometry.Offset.Zero
+
+    /**
+     * The bar held dragged ([dx], [dy]) all told since it was pressed (dp of the interface): the finger's place, which
+     * decides whether it stands upright and against which side.
+     */
     fun dragBar(dx: Float, dy: Float) {
-        barLayout.drag(dx, dy)
+        barLayout.drag(barPressed.x + dx, barPressed.y + dy)
         barChanges++
     }
 
@@ -2087,6 +2238,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         refreshGallery()
+        // (nothing is being saved yet as the app starts)
+        viewModelScope.launch { bringIn() }
         // the GPU made while the gallery shows, so the first artwork opens at once
         viewModelScope.launch(Dispatchers.Default) { io.github.artcraftandroid.procraft.core.warmGpu() }
         // and the brushes read (with many imported, reading them took seconds at each open)
@@ -2097,6 +2250,30 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Where new artworks go: the stack open, or the gallery. */
     private val galleryDir get() = openStack?.dir ?: store.root
+
+    /**
+     * The gallery shows: what a plugin brings in from its folder comes in (once what is being saved
+     * is kept, off the main thread), and the gallery is read again if anything came; a folder out of
+     * reach is told once. With no plugin bringing anything in, nothing happens.
+     */
+    fun galleryOpened() {
+        viewModelScope.launch {
+            while (closingSaves.get() > 0) kotlinx.coroutines.delay(100)
+            bringIn()
+        }
+    }
+
+    /** What a plugin brings in from its folder, brought in now (see [galleryOpened]). */
+    private suspend fun bringIn() {
+        val brought = withContext(Dispatchers.IO) {
+            runCatching { store.bringIn(plugins) }.onFailure { AppLog.e(TAG, "bringing artworks in from a folder", it) }.getOrNull()
+        } ?: return
+        if (brought.added + brought.updated + brought.copies > 0u) {
+            galleryVersion++
+            refreshGallery()
+        }
+        brought.notice?.let { message = it }
+    }
 
     fun refreshGallery() {
         viewModelScope.launch {
@@ -3655,6 +3832,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             }
             galleryVersion++
             refreshGallery()
+            galleryOpened()
         }
         then?.invoke()
     }
@@ -5182,6 +5360,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             }
             // frames left in their place, not left out silently
             if (t.unread > 0) showNotice("${t.unread} frames of the time-lapse can't be read on this device: the one before each shows in its place.", warning = true)
+            // a copy for the folder a plugin keeps them in, if one does
+            plugins.videoExported(made.path, s.name())
             // full, then the check drawn in it before the card goes
             exportShown = ExportShown(1f, done = true)
             kotlinx.coroutines.delay(EXPORT_DONE_MS)

@@ -394,6 +394,14 @@ fun <T> PanelPresence(
     }
 }
 
+/**
+ * Takes every touch on it that what is inside doesn't (those go to what is inside first): none reaches the canvas under
+ * it, for all its drag. For what Edit layout moves, whose glass between its buttons would let a press through.
+ */
+fun Modifier.keepsItsTouches(): Modifier = pointerInput(Unit) {
+    awaitEachGesture { awaitFirstDown(requireUnconsumed = false).consume() }
+}
+
 /** Keeps touches from what is inside: a panel fading away takes none (the canvas around it does). */
 fun Modifier.takingNoTouches(): Modifier = pointerInput(Unit) {
     awaitEachGesture {

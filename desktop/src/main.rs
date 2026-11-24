@@ -12,6 +12,7 @@ mod animated_export;
 mod animation;
 mod canvas_info;
 mod chrome;
+mod collapse;
 mod colour_drop;
 mod colours;
 mod compact_colours;
@@ -50,6 +51,7 @@ mod pdf;
 mod pen;
 mod prefs;
 mod projection;
+mod questions;
 mod quick_menu;
 mod recolor;
 mod reference;
@@ -111,6 +113,8 @@ struct Importing {
 /// off the window's thread (a long time-lapse is hundreds of videos, every frame decoded).
 enum ImportStage {
     Reading(std::thread::JoinHandle<Option<(Arc<CanvasSession>, Option<std::path::PathBuf>)>>),
+    /// Read, waiting for the artwork open to be left (whether to leave it unsaved being asked).
+    Read(Arc<CanvasSession>, Option<std::path::PathBuf>),
     TakingTimeLapse(std::thread::JoinHandle<()>, Arc<CanvasSession>, String),
 }
 
@@ -118,6 +122,7 @@ impl ImportStage {
     fn is_finished(&self) -> bool {
         match self {
             ImportStage::Reading(t) => t.is_finished(),
+            ImportStage::Read(..) => true,
             ImportStage::TakingTimeLapse(t, ..) => t.is_finished(),
         }
     }
@@ -199,6 +204,10 @@ fn memory_total() -> Option<u64> {
 
 /// How long an artwork opens before it says so, as the tablet's.
 const SLOW_OPENING: Duration = Duration::from_millis(500);
+
+/// How often the window's title is looked at again while the artwork open has changes no save has
+/// yet (see [`App::follow_title`]).
+const TITLE_CHECK: Duration = Duration::from_secs(1);
 
 /// A window event (a frame among them) that takes longer than this is logged: the window waits on
 /// it.
@@ -315,7 +324,7 @@ fn main() {
         gallery: gallery::Gallery::new(),
         ui: Interface::default(),
         input: input::Input::default(),
-        title: String::new(),
+        title: TitleWatch::default(),
         zoom: None,
         projection: None,
         displays_seen: None,
@@ -327,7 +336,13 @@ fn main() {
         modifiers: winit::keyboard::ModifiersState::empty(),
         maximised_before_full_screen: false,
         closed: false,
+        leave_question: questions::LeaveQuestion::default(),
+        left_unsaved: None,
+        close_asked: false,
+        open_anyway: questions::OpenAnyway::default(),
     };
+    // what a plugin brings in from its folder, as the gallery first shows
+    app.gallery.bring_in(&app.ui.plugins_shared());
     // a panic on the window's thread ends the app: said, rather than the window just vanishing
     // (its message and place are in the log already)
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| event_loop.run_app(&mut app))) {
@@ -386,8 +401,8 @@ struct App {
     gallery: gallery::Gallery,
     ui: Interface,
     input: input::Input,
-    /// The window's title as last set.
-    title: String,
+    /// The window's title.
+    title: TitleWatch,
     /// The gallery zooming into the artwork opening, or out of the one closing.
     zoom: Option<zoom::Zoom>,
     /// Project canvas's window on a second display, and when the displays were last looked at.
@@ -406,7 +421,59 @@ struct App {
     maximised_before_full_screen: bool,
     /// The window was closed (the artwork open kept): the app's end needs nothing more.
     closed: bool,
+    /// Whether to leave the artwork open without saving it, asked once it couldn't be saved; what
+    /// the person chose to leave it unsaved for (done next, the artwork left as it is: that leave
+    /// alone saves nothing); and to close the window (at the loop's next turn).
+    leave_question: questions::LeaveQuestion,
+    left_unsaved: Option<questions::Then>,
+    close_asked: bool,
+    /// Whether to open an artwork whose opening ended the app last time, asked over the gallery:
+    /// its folder, and to share it as what (see [`App::read_artwork`]).
+    open_anyway: questions::OpenAnyway<(String, Option<animated_export::Animated>)>,
 }
+
+/// The window's title as the artwork open is: its name, marked while it has changes no save has
+/// yet, and looked at again a second later until one has them (autosaves come in on their own),
+/// with no frame drawn for it: on OpenGL the swap of a frame drawn after the window had been still
+/// a moment held the window's thread 90 to 450 ms (the driver's), each second until the autosave.
+#[derive(Default)]
+struct TitleWatch {
+    /// The title as last set.
+    shown: String,
+    /// When it is looked at again, if it is.
+    check_at: Option<Instant>,
+}
+
+impl TitleWatch {
+    /// The artwork called `name`, `saved` or not, at `now`: the title to set, if it changed; looked
+    /// at again [`TITLE_CHECK`] later while it isn't saved.
+    fn follow(&mut self, name: &str, saved: bool, now: Instant) -> Option<String> {
+        let unsaved = if saved { "" } else { " •" };
+        let title = format!("{name}{unsaved} — ProCraft");
+        self.check_at = (!saved).then(|| now + TITLE_CHECK);
+        (title != self.shown).then(|| {
+            self.shown.clone_from(&title);
+            title
+        })
+    }
+
+    /// Whether it is time to look at it again.
+    fn due(&self, now: Instant) -> bool {
+        self.check_at.is_some_and(|at| now >= at)
+    }
+
+    /// The gallery's title, set if it isn't already; nothing to look at again.
+    fn gallery(&mut self) -> Option<&'static str> {
+        self.check_at = None;
+        (self.shown != GALLERY_TITLE).then(|| {
+            self.shown = GALLERY_TITLE.to_owned();
+            GALLERY_TITLE
+        })
+    }
+}
+
+/// The window's title over the gallery.
+const GALLERY_TITLE: &str = "ProCraft";
 
 /// The app's icon, for the window's title bar and the task bar.
 fn window_icon() -> Option<winit::window::Icon> {
@@ -595,11 +662,8 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => {
                 // the artwork open is kept in the gallery, and files still being written finish
                 let waits = self.hide_while_opening();
-                if self.leave_artwork() {
-                    files::finish_writing();
-                    files::tell_what_was_told();
-                    self.closed = true;
-                    event_loop.exit();
+                if self.leave_artwork(Some(questions::Then::Close)) {
+                    self.close_window(event_loop);
                 } else if waits && let Some(screen) = &self.screen {
                     screen.window.set_visible(true);
                 }
@@ -638,8 +702,12 @@ impl ApplicationHandler for App {
                 session.set_touch_panel_open(through);
                 let canvas = self.ui.canvas_rect;
                 // asked only of a press (a stroke's moves would wait on the canvas each)
+                // (nor while Edit Layout moves the bars: the canvas takes no press then)
                 let blocked = || {
-                    (self.ui.popover_open && !through) || files::exporting_since().is_some() || session.pour_finishing()
+                    (self.ui.popover_open && !through)
+                        || self.ui.editing_layout()
+                        || files::exporting_since().is_some()
+                        || session.pour_finishing()
                 };
                 let over = |p: (f32, f32)| blocked() || screen.over_interface(p, canvas);
                 if self.input.on_event(&session, &event, response.consumed, over) {
@@ -672,7 +740,8 @@ impl ApplicationHandler for App {
             return;
         }
         self.hide_while_opening();
-        if !self.leave_artwork() {
+        // (nothing can be asked as it ends)
+        if !self.leave_artwork(None) {
             log::error!("the artwork open couldn't be kept as the app ended");
         }
         files::finish_writing();
@@ -692,6 +761,11 @@ impl ApplicationHandler for App {
         }
         if self.screen.as_ref().is_some_and(|s| s.gpu.is_lost()) {
             self.gpu_lost(event_loop);
+            return;
+        }
+        // the window's close went on with once the artwork was left without saving
+        if std::mem::take(&mut self.close_asked) && self.leave_artwork(Some(questions::Then::Close)) {
+            self.close_window(event_loop);
             return;
         }
         // the interface's last frame couldn't go up to the GPU: what is kept is let go of and it is
@@ -722,6 +796,11 @@ impl ApplicationHandler for App {
             self.again = Some(self.again.map_or(soon, |due| due.min(soon)));
         }
         self.sync_projection(event_loop);
+        // the title looked at again, with no frame drawn for it
+        if self.title.due(Instant::now()) {
+            self.follow_title();
+        }
+        let title_at = self.title.check_at;
         let Some(screen) = self.screen.as_ref() else { return };
         let Some(session) = self.session.as_ref() else {
             // the gallery: only the interface's own wants, and input's once a refresh
@@ -738,6 +817,9 @@ impl ApplicationHandler for App {
             return;
         };
         let mut deadline = self.input.next_deadline(session);
+        if let Some(at) = title_at {
+            deadline = Some(deadline.map_or(at, |d| d.min(at)));
+        }
         // the touches' waits (a hold, a repeat) run out
         if self.input.tick(session) || !self.input.commands.is_empty() {
             screen.window.request_redraw();
@@ -838,6 +920,8 @@ impl App {
         }
         self.take_dropped();
         self.imported();
+        // (a leave without saving chosen is done by now, or not at all)
+        self.left_unsaved = None;
         self.artwork_read();
         self.photo_read();
         let Some(screen) = self.screen.as_mut() else { return };
@@ -881,6 +965,7 @@ impl App {
         // the strokes heard while a plugin makes their sound
         self.stroke_sound.follow(Some(&session), self.ui.plugins().makes_stroke_sound());
         let raw = screen.take_input();
+        let mut leave_answer = None;
         let output = screen.egui.egui_ctx().clone().run_ui(raw, |ui| {
             self.ui.show(ui, &session, &mut self.input);
             // opening: the gallery over it, growing from the artwork's picture
@@ -894,6 +979,8 @@ impl App {
             } else if finishing_slowly {
                 veil(ui.ctx(), "Finishing the fill…");
             }
+            // whether to leave the artwork without saving it, over everything
+            leave_answer = leave_answer.or(self.leave_question.show(ui.ctx(), &mut self.ui.look));
         });
         let pad_soon = self.studio_pad(&session);
         let Some(screen) = self.screen.as_mut() else { return };
@@ -907,19 +994,7 @@ impl App {
             let soon = Instant::now() + Duration::from_millis(50);
             self.again = Some(self.again.map_or(soon, |due| due.min(soon)));
         }
-        let edits = session.edits();
-        let saved = edits == self.ui.saved_edits || session.edits_saved() == Some(edits);
-        let unsaved = if saved { "" } else { " •" };
-        let title = format!("{}{unsaved} — ProCraft", session.name());
-        if title != self.title {
-            screen.window.set_title(&title);
-            self.title = title;
-        }
-        // looked at again until a save has it (autosaves come in on their own)
-        if !saved {
-            let soon = Instant::now() + Duration::from_secs(1);
-            self.again = Some(self.again.map_or(soon, |due| due.min(soon)));
-        }
+        self.follow_title();
         self.zoom_on();
         // Project canvas shows the canvas as just drawn
         if let (Some(p), Some(screen)) = (self.projection.as_mut(), &self.screen) {
@@ -934,6 +1009,56 @@ impl App {
         for action in std::mem::take(&mut self.ui.actions) {
             self.act(action, &session);
         }
+        if let Some((then, leave)) = leave_answer {
+            self.leave_answered(then, leave, &session);
+        }
+    }
+
+    /// The leave question answered, asked to do `then`: leaving the artwork without saving it
+    /// (`leave`), its autosave stops and `then` goes on, the artwork left as it is; staying, the
+    /// artwork stays open (an artwork read to come in goes, with any after it).
+    fn leave_answered(&mut self, then: questions::Then, leave: bool, session: &Arc<CanvasSession>) {
+        if !leave {
+            if then == questions::Then::Import {
+                self.importing = None;
+            }
+            return;
+        }
+        session.stop_autosave();
+        self.left_unsaved = Some(then);
+        match then {
+            questions::Then::Gallery => self.act(Action::Gallery, session),
+            questions::Then::New => self.act(Action::New, session),
+            // at the loop's next turn, which has the loop to end; an artwork coming in comes in at
+            // the next frame
+            questions::Then::Close | questions::Then::Import => {
+                self.close_asked = then == questions::Then::Close;
+                if let Some(screen) = &self.screen {
+                    screen.window.request_redraw();
+                }
+            }
+        }
+    }
+
+    /// The window's title as the artwork open is now (see [`TitleWatch`]).
+    fn follow_title(&mut self) {
+        let (Some(screen), Some(session)) = (&self.screen, &self.session) else {
+            self.title.check_at = None;
+            return;
+        };
+        let edits = session.edits();
+        let saved = edits == self.ui.saved_edits || session.edits_saved() == Some(edits);
+        if let Some(title) = self.title.follow(&session.name(), saved, Instant::now()) {
+            screen.window.set_title(&title);
+        }
+    }
+
+    /// The window goes and the app ends, the files still being written finished first.
+    fn close_window(&mut self, event_loop: &ActiveEventLoop) {
+        files::finish_writing();
+        files::tell_what_was_told();
+        self.closed = true;
+        event_loop.exit();
     }
 
     /// The gallery over the whole window, and what a tap in it asked for.
@@ -945,8 +1070,13 @@ impl App {
         screen.size_interface(self.ui.plugins(), None);
         self.stroke_sound.follow(None, false);
         let raw = screen.take_input();
+        // what a plugin brought in from its folder, once it is in
+        if let Some(said) = self.gallery.brought() {
+            files::say(&said);
+        }
         let mut asked = None;
-        let (gallery, interface) = (&mut self.gallery, &mut self.ui);
+        let mut opened_anyway = None;
+        let (gallery, interface, open_anyway) = (&mut self.gallery, &mut self.ui, &mut self.open_anyway);
         let closing = self.zoom.as_ref().filter(|z| !z.opening);
         let reading = match (&self.importing, &self.reading_artwork, &self.reading_photo) {
             (None, None, None) => None,
@@ -989,6 +1119,10 @@ impl App {
             // a share from the gallery shows its card there
             interface.export_card.show(ui.ctx(), &mut interface.look);
             interface.plugin_alert(ui.ctx());
+            // an artwork whose opening ended the app last time opened only when asked to
+            let log = open_anyway.log().map(std::path::Path::to_path_buf).unwrap_or_else(startup::last_run_log);
+            let share_log = || files::reveal(&log);
+            opened_anyway = opened_anyway.take().or(open_anyway.show(ui.ctx(), &mut interface.look, share_log));
             if reading == Some(true) {
                 opening_veil(ui.ctx());
             } else if getting_ready {
@@ -1000,15 +1134,15 @@ impl App {
         // enough to say so (once made, the window is asked to draw again)
         let soon = match waited {
             _ if reading.is_some() => Some(Instant::now() + Duration::from_millis(50)),
+            _ if self.gallery.bringing_in() => Some(Instant::now() + Duration::from_millis(200)),
             Some(waited) if !getting_ready => Some(Instant::now() + CANVASES_SLOW.saturating_sub(waited)),
             _ => None,
         };
         if let Some(soon) = soon {
             self.again = Some(self.again.map_or(soon, |due| due.min(soon)));
         }
-        if self.title != "ProCraft" {
-            screen.window.set_title("ProCraft");
-            self.title = "ProCraft".into();
+        if let Some(title) = self.title.gallery() {
+            screen.window.set_title(title);
         }
         self.zoom_on();
         // Project canvas is black while the gallery shows
@@ -1018,6 +1152,11 @@ impl App {
         // while an artwork, a photo or an import is being read, the first tap stands: another
         // artwork, a new one or a photo isn't opened over it
         let busy = self.reading_artwork.is_some() || self.reading_photo.is_some() || self.importing.is_some();
+        if let Some(Some((dir, shared_as))) = opened_anyway
+            && !busy
+        {
+            self.read_artwork_anyway(dir, shared_as);
+        }
         match asked {
             // read on a thread of its own; one at a time
             Some(gallery::Asked::Open(dir)) => {
@@ -1261,10 +1400,24 @@ impl App {
     /// Starts reading the artwork in gallery folder `dir` on a thread of its own, to open it (to
     /// share it as `shared_as`, if given).
     fn read_artwork(&mut self, dir: String, shared_as: Option<animated_export::Animated>) {
-        // one whose opening ended the app last time is opened again only when asked to
-        if !files::open_anyway(&dir) {
+        // one whose opening ended the app last time is opened again only when asked to (the
+        // gallery stays as it is meanwhile, the artwork in it), so that it can't take the app down
+        // each time it is picked
+        if procraft_core::opening_ended_app(dir.clone()) {
+            log::warn!("the app ended while opening {dir} last time: asking before opening it again");
+            // what is said follows how that run ended, as its log tells (a crash, or not known);
+            // Share Log shows that run's log
+            let run = procraft_core::opening_ended_run(dir.clone());
+            let (said, log) = (startup::opening_ended_said(run), startup::log_of_run(run));
+            self.open_anyway.ask((dir, shared_as), said, log);
             return;
         }
+        self.read_artwork_anyway(dir, shared_as);
+    }
+
+    /// Starts reading the artwork in gallery folder `dir` as [`Self::read_artwork`] does, however
+    /// its opening went last time.
+    fn read_artwork_anyway(&mut self, dir: String, shared_as: Option<animated_export::Animated>) {
         let folder = dir.clone();
         let reading = std::thread::spawn(move || CanvasSession::open(folder).map_err(|e| e.to_string()));
         self.reading_artwork = Some((Instant::now(), dir, shared_as, reading));
@@ -1320,15 +1473,31 @@ impl App {
 
     /// An artwork read meanwhile, opened (the one open before kept), and the next one read.
     fn imported(&mut self) {
+        // (waits while the artwork open is asked whether to be left without saving)
+        if self.leave_question.is_open() {
+            return;
+        }
         let Some(importing) = self.importing.take_if(|i| i.stage.is_finished()) else { return };
         let Importing { since, stage, folder, rest } = importing;
-        let (session, dir) = match stage {
-            ImportStage::Reading(reading) => {
-                let Ok(Some((session, package))) = reading.join() else {
+        // read (now, or before the artwork open was asked whether to be left unsaved), or with its
+        // time-lapse taken in
+        let read = match stage {
+            ImportStage::Reading(reading) => Ok(reading.join().ok().flatten()),
+            ImportStage::Read(session, package) => Ok(Some((session, package))),
+            ImportStage::TakingTimeLapse(taking, session, dir) => Err((taking, session, dir)),
+        };
+        let (session, dir) = match read {
+            Ok(read) => {
+                let Some((session, package)) = read else {
                     self.importing = Importing::next(rest, folder);
                     return;
                 };
-                if self.session.is_some() && !self.leave_artwork() {
+                if self.session.is_some() && !self.leave_artwork(Some(questions::Then::Import)) {
+                    // asked whether to leave the artwork open unsaved: this one waits for the answer
+                    if self.leave_question.is_open() {
+                        let stage = ImportStage::Read(session, package);
+                        self.importing = Some(Importing { since, stage, folder, rest });
+                    }
                     return;
                 }
                 let dir = self.gallery.store.new_folder(folder.clone());
@@ -1342,7 +1511,7 @@ impl App {
                 }
                 (session, dir)
             }
-            ImportStage::TakingTimeLapse(taking, session, dir) => {
+            Err((taking, session, dir)) => {
                 let _ = taking.join();
                 (session, dir)
             }
@@ -1476,16 +1645,21 @@ impl App {
         waits
     }
 
-    /// The artwork open is put away and kept; false while it stays open. One that can't be saved (the
-    /// storage full, say) stays, kept saved again, unless the person chooses to leave it without
-    /// saving (the core's rule, as the tablet's).
-    fn leave_artwork(&mut self) -> bool {
+    /// The artwork open is put away and kept, to do `then`; false while it stays open. One that
+    /// can't be saved (the storage full, say) stays, kept saved again, and the person is asked
+    /// whether to leave it without saving (the core's rule, as the tablet's): chosen, `then` goes on
+    /// ([`Self::leave_answered`]). With no `then` (the app ending) nothing is asked. Nothing is
+    /// left while that is asked.
+    fn leave_artwork(&mut self, then: Option<questions::Then>) -> bool {
+        if self.leave_question.is_open() {
+            return false;
+        }
         if let Some(session) = self.session.clone() {
             // its time counted up to now, saved with it
             session.set_tracking(false);
             self.ui.closing(&session);
         }
-        let left = self.keep_artwork_to_leave();
+        let left = self.keep_artwork_to_leave(then);
         // still open: its time counts again
         if !left && let Some(session) = &self.session {
             session.set_tracking(true);
@@ -1494,9 +1668,14 @@ impl App {
     }
 
     /// Saves the artwork open to leave it (and the brushes as it left them): true once it is kept,
-    /// or once the person chose to leave it without saving when it couldn't be; false to stay.
-    fn keep_artwork_to_leave(&mut self) -> bool {
+    /// or once the person chose to leave it without saving when it couldn't be; false to stay
+    /// (asked whether to leave it unsaved to do `then`, if given).
+    fn keep_artwork_to_leave(&mut self, then: Option<questions::Then>) -> bool {
         let (Some(session), Some(dir)) = (self.session.clone(), self.artwork.clone()) else { return true };
+        // left without saving, as the person chose, for what they chose it for
+        if then.is_some() && self.left_unsaved.take() == then {
+            return true;
+        }
         // its canvas made first (it is being made on a thread of its own), so the save has its picture
         if let Some((_, made)) = self.opening.take() {
             let _ = made.join();
@@ -1511,11 +1690,11 @@ impl App {
                 true
             }
             procraft_core::Leaving::Stays { title, message } => {
-                let leave = files::leave_without_saving(&title, &message);
-                if leave {
-                    session.stop_autosave();
+                match then {
+                    Some(then) => self.leave_question.ask(&title, &message, then),
+                    None => log::warn!("{title}: {message}"),
                 }
-                leave
+                false
             }
         }
     }
@@ -1551,7 +1730,7 @@ impl App {
     fn act(&mut self, action: Action, session: &Arc<CanvasSession>) {
         let opened = match action {
             Action::Gallery => {
-                if self.leave_artwork() {
+                if self.leave_artwork(Some(questions::Then::Gallery)) {
                     // the gallery zooms out of the artwork's picture, as it will show (turned as its
                     // canvas was left)
                     let (info, turns) = (session.info(), session.shown_turns());
@@ -1563,6 +1742,7 @@ impl App {
                     self.session = None;
                     self.artwork = None;
                     self.gallery.refresh();
+                    self.gallery.bring_in(&self.ui.plugins_shared());
                     if let Some(screen) = &self.screen {
                         screen.window.request_redraw();
                     }
@@ -1571,7 +1751,7 @@ impl App {
             }
             // a new artwork the size of this one beside it in the gallery
             Action::New => {
-                if !self.leave_artwork() {
+                if !self.leave_artwork(Some(questions::Then::New)) {
                     return;
                 }
                 let info = session.info();
@@ -1639,6 +1819,30 @@ fn redraw_paced(window: &Window, last_frame: Instant, gap: Duration, later: &mut
 
 #[cfg(test)]
 mod tests {
+    /// The title marks an artwork with changes no save has yet, and is looked at again a second
+    /// later until one has them; then not again. Looking at it again only sets the title if it
+    /// changed, and asks for nothing to be drawn (no frame comes of it: on OpenGL a frame's swap
+    /// after the window had been still held the window's thread 90 to 450 ms each second).
+    #[test]
+    fn the_title_is_looked_at_again_each_second_until_saved_and_sets_only_changes() {
+        let mut title = super::TitleWatch::default();
+        let now = std::time::Instant::now();
+        assert_eq!(title.follow("Untitled", false, now).as_deref(), Some("Untitled \u{2022} \u{2014} ProCraft"));
+        assert!(!title.due(now));
+        assert!(title.due(now + super::TITLE_CHECK));
+        // still unsaved a second later: nothing to set, looked at again
+        let later = now + super::TITLE_CHECK;
+        assert_eq!(title.follow("Untitled", false, later), None);
+        assert_eq!(title.check_at, Some(later + super::TITLE_CHECK));
+        // saved: the mark goes, and it isn't looked at again
+        assert_eq!(title.follow("Untitled", true, later).as_deref(), Some("Untitled \u{2014} ProCraft"));
+        assert_eq!(title.check_at, None);
+        assert!(!title.due(later + super::TITLE_CHECK * 10));
+        // the gallery: its title once, nothing to look at again
+        assert_eq!(title.gallery(), Some("ProCraft"));
+        assert_eq!(title.gallery(), None);
+    }
+
     #[test]
     fn the_computers_memory_is_read() {
         let total = super::memory_total().expect("the system says how much memory there is");

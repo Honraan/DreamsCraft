@@ -108,6 +108,8 @@ struct TopBarHalf: View {
     let left: Bool
     let upright: Bool
     let screenWidth: CGFloat
+    /// Its sides against the window's edges, square; the rest round.
+    var edges: BarSides? = nil
 
     var body: some View {
         let k = Look.shared.scale(.topBar)
@@ -134,7 +136,8 @@ struct TopBarHalf: View {
                     .environment(\.colorScheme, Look.shared.light ? .light : .dark)
                 Pc.bar
             }
-            .clipShape(RoundedRectangle(cornerRadius: Pc.barHeight / 2, style: .circular))
+            .clipShape(UnevenRoundedRectangle(cornerRadii: barCorners(edges, radius: Pc.barHeight / 2), style: .circular))
+            .animation(barCornerEase, value: edges)
         }
         .scaleEffect(k, anchor: .topLeading)
         .frame(width: w * k, height: h * k, alignment: .topLeading)
@@ -247,6 +250,9 @@ struct SideBar: View {
     var right = false
     var windowHeight: CGFloat = 0
     var stretch: CGFloat = 0
+    /// Moved by Edit layout: its sides against the window's edges (its own way up), square; the rest
+    /// round. None: against its edge as it always is.
+    var edges: BarSides? = nil
 
     /// A control's left edge, mirrored on the right.
     private func x(_ left: CGFloat, _ width: CGFloat) -> CGFloat {
@@ -256,9 +262,9 @@ struct SideBar: View {
     var body: some View {
         let fill = Pc.sideBar
         let r = Pc.sideBarCorner
-        let corners = right
+        let corners = edges.map { barCorners($0, radius: r) } ?? (right
             ? RectangleCornerRadii(topLeading: r, bottomLeading: r, bottomTrailing: 0, topTrailing: 0)
-            : RectangleCornerRadii(topLeading: 0, bottomLeading: 0, bottomTrailing: r, topTrailing: r)
+            : RectangleCornerRadii(topLeading: 0, bottomLeading: 0, bottomTrailing: r, topTrailing: r))
         // its glass reaches back to the window's edge however far it is stretched
         let reach = max(stretch, 0)
         let back: CGFloat = right ? 0 : -reach
@@ -274,12 +280,17 @@ struct SideBar: View {
                 .environment(\.colorScheme, Look.shared.light ? .light : .dark)
                 .frame(width: Pc.sideBarWidth + reach, height: Pc.sideBarHeight)
                 .offset(x: back)
+                .animation(barCornerEase, value: edges)
                 .allowsHitTesting(false)
             // translucent, with windows where the slider tracks are: they show what is behind,
             // each with a darker hairline round it
+            SideBarGlass(corners: corners, windows: windows)
+                .fill(fill, style: FillStyle(eoFill: true))
+                .frame(width: Pc.sideBarWidth + reach, height: Pc.sideBarHeight)
+                .offset(x: back)
+                .animation(barCornerEase, value: edges)
+                .allowsHitTesting(false)
             Canvas { context, size in
-                let body = SideBarGlass(corners: corners, windows: windows).path(in: CGRect(origin: .zero, size: size))
-                context.fill(body, with: .color(fill), style: FillStyle(eoFill: true))
                 let edge = Pc.sliderEdgeWidth
                 for w in windows {
                     let r = Pc.sliderCorner
@@ -358,8 +369,14 @@ private struct ScaledSideBar: ViewModifier {
 /// The side bar's glass: its body, square against the screen's edge and round on the far side
 /// (`corners`), with `windows` cut out of it (the slider tracks).
 private struct SideBarGlass: Shape {
-    let corners: RectangleCornerRadii
+    var corners: RectangleCornerRadii
     let windows: [CGRect]
+
+    // (its corners ease between square and round as a moved bar comes to an edge or leaves it)
+    var animatableData: RectangleCornerRadii.AnimatableData {
+        get { corners.animatableData }
+        set { corners.animatableData = newValue }
+    }
 
     func path(in rect: CGRect) -> Path {
         var shape = Path()
@@ -370,6 +387,30 @@ private struct SideBarGlass: Shape {
         return shape
     }
 }
+
+/// A bar's corners as Edit layout leaves it: `radius` round all round, but square on each side of it
+/// against the window's edges (`sides`, the bar's own way up; none: free).
+func barCorners(_ sides: BarSides?, radius r: CGFloat) -> RectangleCornerRadii {
+    guard let s = sides else {
+        return RectangleCornerRadii(topLeading: r, bottomLeading: r, bottomTrailing: r, topTrailing: r)
+    }
+    return RectangleCornerRadii(
+        topLeading: s.left || s.top ? 0 : r,
+        bottomLeading: s.bottom || s.left ? 0 : r,
+        bottomTrailing: s.right || s.bottom ? 0 : r,
+        topTrailing: s.top || s.right ? 0 : r
+    )
+}
+
+/// `sides` of a bar as the window has them, as the bar's own: for one drawn lying down by turning it
+/// a quarter back about its top-left (its own left lies at the window's bottom, its top at the left,
+/// and so on round).
+func turnedSides(_ s: BarSides) -> BarSides {
+    BarSides(left: s.bottom, top: s.left, right: s.top, bottom: s.right)
+}
+
+/// How a moved bar's corners turn square or round as it comes to an edge or leaves it, so none snaps.
+let barCornerEase = Animation.easeOut(duration: 0.15)
 
 /// One touch on the modify button: the core's drag, which says when it moves the side bar instead;
 /// whether the button is still pressed; and where the button stood on the window as it began.

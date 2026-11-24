@@ -184,7 +184,10 @@ private fun Screens(vm: CanvasViewModel, keptClear: Clearance) {
                     vm.tellBar(maxWidth.value, maxHeight.value, io.github.artcraftandroid.procraft.core.LayoutBar.TOP_LEFT, io.github.artcraftandroid.procraft.core.BarPlace(halfEnd.value, 0f, false), leftLength.value, thick.value)
                     vm.tellBar(maxWidth.value, maxHeight.value, io.github.artcraftandroid.procraft.core.LayoutBar.TOP_RIGHT, io.github.artcraftandroid.procraft.core.BarPlace((maxWidth - halfEnd - rightLength).value, 0f, false), rightLength.value, thick.value)
                 }
-                val halvesMoved = vm.barMoved(io.github.artcraftandroid.procraft.core.LayoutBar.TOP_LEFT) != null || vm.barMoved(io.github.artcraftandroid.procraft.core.LayoutBar.TOP_RIGHT) != null
+                // (each half on glass of its own while moved, or sliding into its side or out: Collapse to edge)
+                val halfSlides = listOf(io.github.artcraftandroid.procraft.core.LayoutBar.TOP_LEFT, io.github.artcraftandroid.procraft.core.LayoutBar.TOP_RIGHT).map { collapseSlide(vm.barCollapsed(it) != null) }
+                val halvesMoved = vm.barMoved(io.github.artcraftandroid.procraft.core.LayoutBar.TOP_LEFT) != null || vm.barMoved(io.github.artcraftandroid.procraft.core.LayoutBar.TOP_RIGHT) != null ||
+                    halfSlides.any { it > 0f }
                 val rootDensity = androidx.compose.ui.platform.LocalDensity.current.density
                 PartScaled(io.github.artcraftandroid.procraft.core.InterfacePart.TOP_BAR) {
                     if (!halvesMoved) {
@@ -195,14 +198,21 @@ private fun Screens(vm: CanvasViewModel, keptClear: Clearance) {
                         // moved by Edit layout: each half on glass of its own where it was left
                         for ((bar, left) in listOf(io.github.artcraftandroid.procraft.core.LayoutBar.TOP_LEFT to true, io.github.artcraftandroid.procraft.core.LayoutBar.TOP_RIGHT to false)) {
                             val at = vm.barShown(bar) ?: continue
+                            // gone into its side: its tab shows there instead
+                            val slide = halfSlides[if (left) 0 else 1]
+                            if (slide >= 1f && vm.barCollapsed(bar) != null) continue
                             androidx.compose.runtime.key(bar) {
+                                // square only on its sides against the window's edges
+                                val edges = vm.barTouching(bar)
                                 TopBarHalf(
                                     vm,
                                     left,
                                     at.vertical,
                                     barWidth,
                                     Modifier.offset { androidx.compose.ui.unit.IntOffset((at.x * rootDensity).roundToInt(), (at.y * rootDensity).roundToInt()) }
-                                        .then(rememberFrost(Pc.BarHeight / 2)).then(fade),
+                                        .collapseSlid(vm.barCollapsePlace(bar), slide, rootDensity)
+                                        .then(rememberFrost(Pc.BarHeight / 2, pastEdges(edges, Pc.BarHeight / 2, BarGlass()))).then(fade),
+                                    edges,
                                 )
                             }
                         }
@@ -238,6 +248,10 @@ private fun Screens(vm: CanvasViewModel, keptClear: Clearance) {
                 }
                 // a mode taking the screen slides it off its edge, and back when it ends
                 val sideMoved = vm.barMoved(io.github.artcraftandroid.procraft.core.LayoutBar.SIDE_BAR)
+                // collapsed into its side (Collapse to edge): sliding there, then gone, its tab there instead
+                val sideCollapsed = vm.barCollapsed(io.github.artcraftandroid.procraft.core.LayoutBar.SIDE_BAR) != null
+                val sideSlide = collapseSlide(sideCollapsed)
+                val sideGone = sideCollapsed && sideSlide >= 1f
                 // where it always is, told to Edit layout to move it from
                 vm.sideBarBounds?.takeIf { sideMoved == null }?.let { b ->
                     val d = androidx.compose.ui.platform.LocalDensity.current.density
@@ -246,7 +260,7 @@ private fun Screens(vm: CanvasViewModel, keptClear: Clearance) {
                     }
                 }
                 androidx.compose.animation.AnimatedVisibility(
-                    vm.showSideBar && !vm.transforming && !vm.selecting && !vm.guideEditing && !vm.lightingStudioOpen && vm.cropRect == null && vm.textInfo == null &&
+                    vm.showSideBar && !sideGone && !vm.transforming && !vm.selecting && !vm.guideEditing && !vm.lightingStudioOpen && vm.cropRect == null && vm.textInfo == null &&
                         vm.opacityLayer == null &&
                         (vm.adjustment == null || vm.adjustPencil),
                     if (sideMoved != null) {
@@ -280,11 +294,27 @@ private fun Screens(vm: CanvasViewModel, keptClear: Clearance) {
                         }
                         SideBar(
                             vm,
-                            lying.then(aside).then(fade).onGloballyPositioned { vm.sideBarBounds = it.boundsInRoot().translate(-keptClear.corner) },
-                            right = vm.rightHanded,
+                            // (moved, a press on its glass never the canvas's, wherever it is turned)
+                            Modifier.collapseSlid(vm.barCollapsePlace(io.github.artcraftandroid.procraft.core.LayoutBar.SIDE_BAR), sideSlide, rootDensity)
+                                .then(lying).then(aside).then(fade).then(if (sideMoved != null) Modifier.keepsItsTouches() else Modifier)
+                                .onGloballyPositioned {
+                                    val b = it.boundsInRoot().translate(-keptClear.corner)
+                                    vm.sideBarBounds = b
+                                    // back where it always is (Reset): its handle follows as it lands there
+                                    if (sideMoved == null && sideSlide == 0f && barsShown >= 1f && sideStretch.value == 0f) {
+                                        val d = rootDensity
+                                        vm.tellBar(maxWidth.value, maxHeight.value, io.github.artcraftandroid.procraft.core.LayoutBar.SIDE_BAR, io.github.artcraftandroid.procraft.core.BarPlace(b.left / d, b.top / d, true), b.height / d, b.width / d)
+                                    }
+                                },
+                            // standing against a side Edit layout took it to: mirrored to that side
+                            right = sideMoved?.takeIf { it.vertical }?.let { vm.barTouching(io.github.artcraftandroid.procraft.core.LayoutBar.SIDE_BAR)?.right } ?: vm.rightHanded,
                             trackHeight = sideBar.track.dp,
                             shown = barsShown,
                             stretch = sideStretch.value.dp,
+                            // moved: square only on its sides against the window's edges (its own, lying down)
+                            edges = sideMoved?.let { at ->
+                                vm.barTouching(io.github.artcraftandroid.procraft.core.LayoutBar.SIDE_BAR)?.let { if (at.vertical) it else turnedSides(it) }
+                            },
                         )
                     }
                 }
@@ -311,6 +341,8 @@ private fun Screens(vm: CanvasViewModel, keptClear: Clearance) {
             FloatingColors(vm, maxWidth, maxHeight)
             // the Layers panel and the brush library torn off into windows of their own, likewise
             FloatingPanels(vm, maxWidth, maxHeight)
+            // Collapse to edge's buttons by the bars and the tabs of what went into a side
+            if (!vm.barsHidden) CollapseControls(vm)
             // Edit layout: a handle on each bar, Reset and Done
             if (vm.editingLayout && !vm.barsHidden) EditLayoutHandles(vm)
             // each panel hangs from its button: colour, layers, then the tool that opened the library;

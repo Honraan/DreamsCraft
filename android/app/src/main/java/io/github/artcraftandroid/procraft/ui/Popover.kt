@@ -79,7 +79,7 @@ fun rememberFrost(corner: Dp): Modifier = rememberFrost(corner, BarGlass())
 
 /**
  * How a bar's glass differs from a panel's: it shows as much as [shown], [moved] (window pixels) as
- * the bar slides out of its place, its box goes [pastLeft], [pastRight] and [pastBottom] further (to
+ * the bar slides out of its place, its box goes [pastLeft], [pastRight], [pastBottom] and [pastTop] further (to
  * take the corners of a bar's or a sheet's screen edge off the screen), and as a [window] what is
  * behind only softens.
  */
@@ -90,6 +90,7 @@ data class BarGlass(
     val pastRight: Dp = 0.dp,
     val window: Boolean = false,
     val pastBottom: Dp = 0.dp,
+    val pastTop: Dp = 0.dp,
 )
 
 /** [rememberFrost] for a bar, as [glass] says. */
@@ -119,8 +120,8 @@ fun rememberFrost(corner: Dp, glass: BarGlass): Modifier {
         // by the screen, so that it works from popups too, then on the canvas
         val at = backdrops.onCanvas(c.positionOnScreen())
         val (left, right) = with(density) { glass.pastLeft.toPx() to glass.pastRight.toPx() }
-        val below = with(density) { glass.pastBottom.toPx() }
-        box = frostBox(at, c.size.width, c.size.height, left, right, below, with(density) { corner.toPx() })
+        val (below, above) = with(density) { glass.pastBottom.toPx() to glass.pastTop.toPx() }
+        box = frostBox(at, c.size.width, c.size.height, left, right, below, with(density) { corner.toPx() }, above)
     }
 }
 
@@ -134,11 +135,14 @@ internal fun canvasCorner(contentOnScreen: Offset, clear: Clearance): Offset = c
 
 /**
  * The frosted box (x0, y0, x1, y1 and its corners' radius, canvas pixels) of a node [width] by
- * [height] at [onCanvas], [left], [right] and [below] further out than it.
+ * [height] at [onCanvas], [left], [right], [below] and [above] further out than it.
  */
-internal fun frostBox(onCanvas: Offset, width: Int, height: Int, left: Float, right: Float, below: Float, corner: Float): FloatArray =
-    floatArrayOf(onCanvas.x - left, onCanvas.y, onCanvas.x + width + right, onCanvas.y + height + below, corner)
+internal fun frostBox(onCanvas: Offset, width: Int, height: Int, left: Float, right: Float, below: Float, corner: Float, above: Float = 0f): FloatArray =
+    floatArrayOf(onCanvas.x - left, onCanvas.y - above, onCanvas.x + width + right, onCanvas.y + height + below, corner)
 
+
+/** How solid a floating window's frost is: what is under it (a bar, another window) barely shows. */
+private const val WindowFrostAlpha = 0.96f
 
 /** The side of a popover its arrow sticks out of, pointing at its button; or none. */
 enum class ArrowSide { TOP, BOTTOM, LEFT, RIGHT, NONE }
@@ -185,7 +189,7 @@ fun Popover(
     androidx.compose.runtime.CompositionLocalProvider(LocalHang provides null, LocalFloat provides null) {
         if (float != null) {
             // floating: as big as its window, its strip over it and the room for its corner under it
-            PopoverBody(float.width, 0.dp, modifier.height(float.height), fill, corner, ArrowSide.NONE) {
+            PopoverBody(float.width, 0.dp, modifier.height(float.height), fill, corner, ArrowSide.NONE, window = true) {
                 FloatingTop(float.frame)
                 androidx.compose.foundation.layout.Box(Modifier.weight(1f).fillMaxWidth()) {
                     Column(Modifier.fillMaxSize(), content = content)
@@ -193,7 +197,7 @@ fun Popover(
                 if (float.sizable) FloatingBottom(float.frame)
             }
         } else {
-            PopoverBody(width, hang?.arrow ?: arrowX, modifier, fill, corner, hang?.side ?: side, content)
+            PopoverBody(width, hang?.arrow ?: arrowX, modifier, fill, corner, hang?.side ?: side, content = content)
         }
     }
 }
@@ -206,10 +210,14 @@ private fun PopoverBody(
     fill: Color?,
     corner: Dp,
     side: ArrowSide,
+    window: Boolean = false,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val backdrops = LocalBackdrops.current.takeIf { fill == null && Pc.PopoverFrost.alpha < 1f }
-    val paint = fill ?: if (backdrops != null) Pc.PopoverFrost else Pc.PopoverFill
+    // frosted; a floating window, which may lie over the bars and other windows (only the canvas
+    // blurs behind the frost), nearly solid so what is under it doesn't read through
+    val frosted = if (window) Pc.PopoverFrost.copy(alpha = maxOf(Pc.PopoverFrost.alpha, WindowFrostAlpha)) else Pc.PopoverFrost
+    val paint = fill ?: if (backdrops != null) frosted else Pc.PopoverFill
     val key = remember { Any() }
     val density = LocalDensity.current
     // the blur grows and fades with the panel: its body as drawn (already grown), and how much

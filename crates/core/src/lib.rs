@@ -40,6 +40,7 @@ mod device;
 mod drawn_previews;
 mod filter_layers;
 mod floating;
+mod folders;
 mod frame;
 mod frame_loop;
 mod gallery;
@@ -167,7 +168,7 @@ pub use animation::{
     export_fps_label, frame_rate,
 };
 pub use app_log::process_line;
-pub use bars::{BarHang, BarLayout, BarPlace, HangSide, LayoutBar, bar_layout_key};
+pub use bars::{BarHang, BarLayout, BarPlace, BarSides, EdgeCollapse, HangSide, LayoutBar, WindowEdge, bar_layout_key};
 pub use big_pictures::{big_pictures_left, wait_for_big_pictures};
 pub use blend_wheel::{
     BLEND_TAP_SECONDS, BlendCoast, BlendStep, blend_centred, blend_coast, blend_coast_at, blend_pull_for, blend_pulled,
@@ -204,6 +205,7 @@ pub use floating::{
     FloatingPanel, FloatingRoom, FloatingSizes, FloatingWindow, floating_at, floating_fitted, floating_kept,
     floating_key, floating_moved, floating_read, floating_resized, floating_sizes,
 };
+pub use folders::{FOLDER_UNREACHABLE, FolderAccess, FolderBroughtIn, FolderEntry, FolderError, PlainFolderAccess};
 pub use frame::{configure, screen_profile};
 pub use gallery::{
     ArtworkStore, DragRest, GALLERY_MORE_ALONE, GALLERY_SPRING_MS, GalleryAction, GalleryArtwork, GalleryButton,
@@ -226,7 +228,7 @@ pub use layers::{
     row_hold_seconds, set_layer_budget, set_resident_budget,
 };
 pub use layout::{
-    LayoutDock, LayoutInsets, LayoutPiece, LayoutRect, PanelLayout, PanelLayoutLook, PieceShown, PieceSizes,
+    BeltShown, LayoutDock, LayoutInsets, LayoutPiece, LayoutRect, PanelLayout, PanelLayoutLook, PieceShown, PieceSizes,
     panel_layout_key, piece_sizes,
 };
 pub use liquify::liquify_reach;
@@ -250,10 +252,11 @@ pub use plugin_filter::PluginFilterShown;
 pub use plugin_panel::{PanelBrush, PanelPoint, PanelRow, PluginPanel};
 pub use plugin_run::set_memory_available;
 pub use plugins::{
-    InterfacePart, NoticeKind, PluginAction, PluginChoice, PluginControl, PluginFeature, PluginFileKind, PluginInfo,
-    PluginMenuPlace, PluginOffer, PluginPart, PluginPicture, PluginPlace, PluginPressed, PluginSlider, PluginSource,
-    PluginSwitch, PluginTexture, Plugins, SliderLook, plugin_file_most_bytes, plugin_slider_along, plugin_slider_at,
-    plugin_slider_choice, plugin_slider_choices, plugin_slider_chosen, plugin_slider_shown, plugin_slider_whole,
+    InterfacePart, NoticeKind, PluginAction, PluginChoice, PluginControl, PluginFeature, PluginFileKind, PluginFolder,
+    PluginInfo, PluginMenuPlace, PluginOffer, PluginPart, PluginPicture, PluginPlace, PluginPressed, PluginSlider,
+    PluginSource, PluginSwitch, PluginTexture, Plugins, SliderLook, plugin_file_most_bytes, plugin_slider_along,
+    plugin_slider_at, plugin_slider_choice, plugin_slider_choices, plugin_slider_chosen, plugin_slider_shown,
+    plugin_slider_whole,
 };
 pub use presets::{
     CanvasPreset, P3, SRGB, per_inch, preset_height, preset_label, preset_number, preset_width, presets_from_json,
@@ -592,6 +595,13 @@ impl State {
     }
 }
 
+/// The quarter turns clockwise (0 to 3) nearest a turn of `angle` radians clockwise on screen, as an
+/// artwork is kept turned: halfway (45 degrees off) goes to upright or upside down. None if it is
+/// no angle.
+pub(crate) fn nearest_quarter_turns(angle: f32) -> Option<u8> {
+    angle.is_finite().then(|| ((angle / std::f32::consts::FRAC_PI_2).round_ties_even() as i32).rem_euclid(4) as u8)
+}
+
 pub(crate) struct State {
     pub(crate) doc: Document,
     /// Fitted once the window's size is known.
@@ -795,10 +805,11 @@ pub(crate) struct State {
     pub(crate) plugin_dim: f32,
     /// The paper a plugin on the paper's hook gives, as it said then.
     pub(crate) plugin_paper: Option<procraft_gpu::CanvasPaper>,
-    /// The set of brushes each plugin on holds, by its id, as the session last took them up, and
-    /// the folder the brushes were opened from (none until they are): the library is given each set
-    /// once it is open (see [`CanvasSession::give_plugin_sets`]).
-    pub(crate) plugin_sets: Vec<(String, std::sync::Arc<[u8]>)>,
+    /// The set of brushes each plugin on holds, by its id, as the session last took them up (none
+    /// until it is told the plugins), and the folder the brushes were opened from (none until they
+    /// are): the library is given each set once it is open, and a set given goes again with the
+    /// switch it comes under (see [`CanvasSession::give_plugin_sets`]).
+    pub(crate) plugin_sets: Option<Vec<(String, std::sync::Arc<[u8]>)>>,
     pub(crate) brushes_dir: Option<std::path::PathBuf>,
     /// The tile of the picture a plugin's paper is, made again only as its file changes.
     pub(crate) paper_picture: Option<std::sync::Arc<paper_picture::PaperPicture>>,
@@ -1029,13 +1040,7 @@ impl State {
             Some(v) if self.turns_follow_view => {
                 let m = v.to_screen();
                 // its down axis gives its turn whether or not it is mirrored
-                let angle = (-m.c).atan2(m.d) - self.screen_follow;
-                if angle.is_finite() {
-                    // halfway (45 degrees off) goes to upright or upside down
-                    ((angle / std::f32::consts::FRAC_PI_2).round_ties_even() as i32).rem_euclid(4) as u8
-                } else {
-                    self.turns
-                }
+                nearest_quarter_turns((-m.c).atan2(m.d) - self.screen_follow).unwrap_or(self.turns)
             }
             _ => self.turns,
         }
@@ -1737,6 +1742,9 @@ pub(crate) struct Shared {
     pub(crate) lands_on: pour::LandsOn,
     /// Counts this session among those alive until all of it goes (see [`live_sessions`]).
     _alive: activity::Alive,
+    /// The folders the plugins name, told of each save (interface 22); none until the plugins are
+    /// taken up ([`CanvasSession::use_plugins`]).
+    pub(crate) folders: Mutex<Option<Arc<folders::Folders>>>,
 }
 
 /// Pen input waiting for the canvas (see [`Shared::queued`]): the stroke's samples in order (those
@@ -2278,7 +2286,7 @@ impl CanvasSession {
             plugin_look: None,
             plugin_dim: 0.0,
             plugin_paper: None,
-            plugin_sets: Vec::new(),
+            plugin_sets: None,
             brushes_dir: None,
             paper_picture: None,
             plugin_surround: None,
@@ -2385,6 +2393,7 @@ impl CanvasSession {
                 cursor: cursor_turn::CursorTurns::default(),
                 lands_on: pour::LandsOn::default(),
                 _alive: activity::Alive::new(),
+                folders: Mutex::new(None),
             }),
         })
     }

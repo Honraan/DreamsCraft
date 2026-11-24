@@ -104,7 +104,7 @@ final class CanvasModel {
     /// PanelLayoutModel.swift); how the plugins lay them out, as last asked; and what goes up as the
     /// layout changes, for what shows it to show it again.
     @ObservationIgnored let panelLayout = PanelLayout()
-    var layoutLook = PanelLayoutLook(on: false, snap: 0, fold: false, makeRoom: false, edit: false)
+    var layoutLook = PanelLayoutLook(on: false, snap: 0, fold: false, makeRoom: false, edit: false, belt: false, collapse: false)
     /// The interface's bars as Edit layout moves them (see PanelLayoutModel.swift), whether it is
     /// on, and what goes up as a bar moves.
     @ObservationIgnored let barLayout = BarLayout()
@@ -113,6 +113,10 @@ final class CanvasModel {
     var namedChanges = 0
     var editingLayout = false
     var barChanges = 0
+    /// Where the bar or window piece held was pressed (interface points): the finger is there plus
+    /// the drag, which decides where a bar turns and goes, and where a window is let go (a tab, a
+    /// park on the Tool Belt).
+    @ObservationIgnored var heldAt = CGPoint.zero
     @ObservationIgnored var barsLandscape: Bool?
     var layoutChanges = 0
     /// The colour panel's grabber is being dragged out: the panel stays, unseen, until let go.
