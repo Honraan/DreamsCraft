@@ -183,6 +183,8 @@ impl CanvasSession {
         if let Some(mut old_canvas) = old_canvas {
             // the crop is a new step: what was undone before it can't be redone
             old_canvas.forget_redo();
+            // (kept only for the next stroke, as big as a layer four times over)
+            old_canvas.let_go_of_carried();
             st.crop_undo = Some((old_canvas, old_doc));
         }
         st.crop_redo = None;

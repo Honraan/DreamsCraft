@@ -1097,9 +1097,11 @@ fn rule_tiles(instances: &[StampInstance], first: u32, part: IRect, rule: u32) -
 /// so a stroke's end lays only the rest and comes out bit for bit as laid whole.
 #[derive(Default)]
 struct Carried {
-    /// The full floats, four words a pixel, the canvas's size: made when first wanted in a stroke,
-    /// let go as it ends.
+    /// The full floats, four words a pixel, the canvas's size: made when first wanted, kept for the
+    /// next stroke that carries the part (see [`Canvas::end_carried`]).
     texture: Option<(wgpu::Texture, wgpu::TextureView)>,
+    /// Whether the stroke laid now carries the part.
+    used: bool,
     /// For each of the canvas's [`RULE_TILE`] tiles (`across` a row), the lot its full floats were
     /// last written in: those of an earlier lot (or none since the part was cleared) are left for
     /// its half floats, as the whole stroke laid again rounds a lot's sums as it ends.
@@ -7033,15 +7035,8 @@ impl Canvas {
             if matches!(op, Op::Commit(_) | Op::Cancel) {
                 self.queued_second = None;
                 self.smudge_refused = false;
-                // (its stroke cleared as it goes into its layer, its second as the next begins): what
-                // a dual brush's parts were carried in goes, as big as two layers each (kept, it held
-                // a canvas's GPU past half its budget), made again for the next dual brush's stroke
-                for carried in &mut self.carried {
-                    carried.forget();
-                    carried.texture = None;
-                }
-                self.carry_out = None;
-                self.rule_lists.unbind_carried();
+                // (its stroke cleared as it goes into its layer, its second as the next begins)
+                self.end_carried();
             }
             match op {
                 Op::Stamps { instances, wet, picks, times, style, layer, clear, second: false, .. }
@@ -10329,6 +10324,7 @@ impl Canvas {
             } else if begins {
                 carried.begin_lot();
             }
+            carried.used |= made;
             made.then_some(part)
         });
         let out = match carry {
@@ -10446,8 +10442,14 @@ impl Canvas {
                 })
             });
         }
-        if self.carried.get(part).is_some_and(|c| c.texture.is_none()) {
-            let (width, height) = (self.width, self.height);
+        let (width, height) = (self.width, self.height);
+        // (one of another size, were the canvas's to change, made again)
+        let sized = |c: &Carried| c.texture.as_ref().is_some_and(|(t, _)| (t.width(), t.height()) == (width, height));
+        if self.carried.get(part).is_some_and(|c| !sized(c)) {
+            if let Some(carried) = self.carried.get_mut(part) {
+                carried.texture = None;
+            }
+            self.rule_lists.unbind_carried();
             let made = self.made_or_told(device, |device| {
                 let texture = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("stroke carried"),
@@ -10469,6 +10471,43 @@ impl Canvas {
             }
         }
         self.carry_out.is_some() && self.carried.get(part).is_some_and(|c| c.texture.is_some())
+    }
+
+    /// A stroke ends (into its layer, or cancelled): no full floats are its parts' own any more. What
+    /// a part it carried was carried in is kept for the next stroke that carries it, as big as a
+    /// layer four times over: made again for each, it took 40 to 90 ms at a dual brush's every
+    /// stroke's start on a tablet (made, then cleared whole before the first pass writes a part of
+    /// it). It goes, with where the rule passes write, once a stroke doesn't carry the part (another
+    /// brush), on a device of little memory, and as spares go (see [`Canvas::let_go_of_spares`]).
+    fn end_carried(&mut self) {
+        let keep = !self.low_memory();
+        let mut gone = false;
+        for carried in &mut self.carried {
+            carried.forget();
+            if !std::mem::take(&mut carried.used) || !keep {
+                gone |= carried.texture.take().is_some();
+            }
+        }
+        if self.carried.iter().all(|c| c.texture.is_none()) {
+            self.carry_out = None;
+        }
+        if gone {
+            self.rule_lists.unbind_carried();
+        }
+    }
+
+    /// Lets go of what a dual brush's parts are carried in (see [`Canvas::end_carried`]), unless a
+    /// stroke is open: for a canvas put aside (kept for undoing a crop).
+    pub fn let_go_of_carried(&mut self) {
+        if self.active.is_some() || !self.ops.is_empty() {
+            return;
+        }
+        for carried in &mut self.carried {
+            carried.forget();
+            carried.texture = None;
+        }
+        self.carry_out = None;
+        self.rule_lists.unbind_carried();
     }
 
     /// The bind group for the next part of this render's rule passes (see [`RuleLists`]), its list

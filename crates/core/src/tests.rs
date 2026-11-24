@@ -3771,6 +3771,118 @@ fn a_dual_brush_built_up_by_its_rule_ends_a_long_stroke_laying_only_the_rest_as_
     }
 }
 
+/// A dual brush built up by its rule keeps what its parts are carried in (see the test above) from
+/// stroke to stroke: made again as each stroke began, as big as a layer four times over and cleared
+/// whole before its first pass, it held a tablet's every stroke of such a brush up 40 to 90 ms as
+/// it began. Kept, each stroke still takes nothing of the last's full floats (the strokes cross,
+/// each ending with only the rest, and come out bit for bit as laid whole); it goes once a stroke
+/// of another brush ends, as spares go, and on a device of little memory isn't kept at all.
+#[test]
+fn a_dual_brush_built_up_by_its_rule_keeps_what_its_parts_are_carried_in_from_stroke_to_stroke() {
+    use procraft_gpu::wgpu;
+    use std::time::{Duration, Instant};
+    let side = 384;
+    // stroke `n`'s sample `k`: each crossing the ones before
+    let point = |n: usize, k: usize| PenSample {
+        pressure: 0.4 + 0.5 * (k as f32 * 0.07).sin().abs(),
+        ..sample(
+            30.0 + k as f32 * 1.6,
+            90.0 + n as f32 * 50.0 + (k as f32 * 0.05 + n as f32).sin() * 70.0,
+            k as f64 * 4.17,
+        )
+    };
+    let (samples, strokes) = (200, 3);
+    let carried_in = |s: &CanvasSession| -> Vec<wgpu::Texture> {
+        let st = s.shared.lock();
+        let all = st.canvas.as_ref().map(procraft_gpu::Canvas::textures).unwrap_or_default();
+        all.into_iter().filter(|t| t.format() == wgpu::TextureFormat::Rgba32Uint).collect()
+    };
+    let stroke = |s: &CanvasSession, n: usize| -> Duration {
+        s.stroke_begin(PointerKind::Stylus, vec![point(n, 0)]);
+        s.stroke_add(vec![point(n, 1), point(n, 2)]);
+        let begun = Instant::now();
+        picture(s);
+        let first = begun.elapsed();
+        for k in (3..samples - 1).step_by(2) {
+            s.stroke_add(vec![point(n, k), point(n, k + 1)]);
+            if k % 8 == 3 {
+                picture(s);
+            }
+        }
+        s.stroke_end(vec![point(n, samples - 1)]);
+        picture(s);
+        picture(s);
+        first
+    };
+    // the layer drawn, what it carries in kept and made over its strokes, their first frames
+    struct Drawn {
+        layer: Vec<u8>,
+        kept: usize,
+        made: usize,
+        starts: Vec<Duration>,
+        session: std::sync::Arc<CanvasSession>,
+    }
+    for name in ["Ironwood", "Beluga", "Frost Birch"] {
+        let drawn = |whole: bool| -> Option<Drawn> {
+            let s = session(side, side)?;
+            let (set, index) = library_brush(&s, |b| b.name == name)?;
+            {
+                let mut st = s.shared.lock();
+                let brush = &mut st.library[set as usize].brushes[index as usize];
+                // (an end taper reaching back over what was laid lays the stroke again whole)
+                brush.pen_taper.end = 0.0;
+                if let Some(second) = brush.secondary.as_deref_mut() {
+                    second.pen_taper.end = 0.0;
+                }
+            }
+            assert!(s.select_brush(set, index));
+            s.set_brush_size(0.4);
+            s.set_color(0.2, 0.2, 0.25);
+            s.shared.lock().canvas.as_mut()?.lay_ends_whole(whole);
+            let (mut kept, mut made, mut starts) = (Vec::<wgpu::Texture>::new(), 0, Vec::new());
+            for n in 0..strokes {
+                starts.push(stroke(&s, n));
+                let now = carried_in(&s);
+                made += now.iter().filter(|t| !kept.contains(t)).count();
+                kept = now;
+            }
+            let current = s.layers().iter().find(|l| l.current).map_or(0, |l| l.id);
+            Some(Drawn { layer: layer_rgba(&s, current), kept: kept.len(), made, starts, session: s })
+        };
+        let (Some(Drawn { layer: whole, .. }), Some(Drawn { layer: rest, kept, made, starts, session: s })) =
+            (drawn(true), drawn(false))
+        else {
+            continue;
+        };
+        let ms = |d: &Duration| format!("{:.1}", d.as_secs_f64() * 1e3);
+        println!(
+            "{name}: {kept} kept, {made} made over {strokes} strokes; first frames {} ms",
+            starts.iter().map(ms).collect::<Vec<_>>().join(", ")
+        );
+        assert!(kept > 0, "{name}: its parts carried in nothing");
+        // made at the first stroke only
+        assert_eq!(made, kept, "{name}: {made} made over {strokes} strokes, {kept} kept");
+        assert!(whole.iter().skip(3).step_by(4).any(|&a| a > 0), "{name} drew nothing");
+        assert_eq!(differ(&whole, &rest), (0, 0), "{name}: crossing strokes ended unlike laid whole");
+        // a stroke of a brush that carries nothing lets them go, and so does trimming memory
+        let (set, index) =
+            library_brush(&s, |b| b.secondary.is_none() && !b.mixes_wet() && !b.laid_in_place()).unwrap();
+        assert!(s.select_brush(set, index));
+        stroke(&s, strokes);
+        assert_eq!(carried_in(&s).len(), 0, "{name}: kept past another brush's stroke");
+        let (set, index) = library_brush(&s, |b| b.name == name).unwrap();
+        assert!(s.select_brush(set, index));
+        stroke(&s, strokes + 1);
+        assert_eq!(carried_in(&s).len(), kept, "{name}: made again for its next stroke");
+        s.trim_memory();
+        assert_eq!(carried_in(&s).len(), 0, "{name}: kept past trimming memory");
+        // a device of little memory keeps none
+        s.shared.lock().canvas.as_mut().unwrap().set_resident_budget(1 << 30);
+        stroke(&s, strokes + 2);
+        assert_eq!(carried_in(&s).len(), 0, "{name}: kept on a device of little memory");
+    }
+}
+
 /// A dual brush whose second turns its stamps the way the stroke goes (57 of the library's 140) ends
 /// a long stroke laying only what follows what it laid, as laid whole: its second's first stamps,
 /// laid before the stroke had a way to go, turned with it once it had one, and the stroke's end
