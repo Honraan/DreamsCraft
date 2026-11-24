@@ -1159,6 +1159,7 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
         leave()
         Gallery.closingSaves += 1
         let canvases = CanvasLife.canvases
+        weak var left = model
         DispatchQueue.global(qos: .userInitiated).async {
             // (saved: its autosave ended already; left without saving: it ends now)
             session.stopAutosave()
@@ -1170,7 +1171,7 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
             // its memory free at once, not when the object goes
             session.releaseCanvas()
             // and the rest of it once nothing holds the session: the log says if anything does
-            CanvasLife.lookAfterLeaving(session, canvases: canvases)
+            CanvasLife.lookAfterLeaving(session, model: left, canvases: canvases)
             DispatchQueue.main.async { Gallery.artworkKept(failure: nil) }
         }
         then?()
@@ -1257,6 +1258,24 @@ enum CanvasLife {
     private static var alive = [0, 0, 0]
     /// Canvases made so far (on the main thread): one made since a canvas was left is alive rightly.
     private(set) static var canvases = 0
+    /// Each model made, by its artwork's folder, while it is alive (on the main thread).
+    private static var models: [WeakModel] = []
+
+    private final class WeakModel {
+        weak var model: CanvasModel?
+        let dir: String
+
+        init(_ model: CanvasModel) {
+            self.model = model
+            dir = model.dir
+        }
+    }
+
+    /// `model` was made (on the main thread): followed while it is alive, for the look after leaving.
+    static func follow(_ model: CanvasModel) {
+        models.removeAll { $0.model == nil }
+        models.append(WeakModel(model))
+    }
 
     static func made(_ kind: Kind) {
         lock.lock()
@@ -1274,20 +1293,40 @@ enum CanvasLife {
         lock.unlock()
     }
 
-    /// The canvas of `session` was left (`since` canvases made by then) and its canvas let go: a few
-    /// seconds on, once its zoom out is over, the log says what is still alive of it (and whether
-    /// the app still holds the session itself, or only the core its state); if anything is, and no
+    /// The canvas of `session` and `model` was left (`since` canvases made by then) and its canvas
+    /// let go: a few seconds on, once its zoom out is over, the log says what is still alive of it
+    /// (whether the app still holds the session itself, or only the core its state; what of the
+    /// app's own holds its model, and the artworks whose models are alive); if anything is, and no
     /// canvas was made since, as a problem.
-    static func lookAfterLeaving(_ session: CanvasSession, canvases since: Int) {
+    static func lookAfterLeaving(_ session: CanvasSession, model: CanvasModel?, canvases since: Int) {
         weak var left = session
+        weak var leftModel = model
+        let dir = model?.dir
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
             lock.lock()
             let counts = alive
             lock.unlock()
             let sessions = liveSessions()
-            let line = "\(sessions) sessions, \(counts[0]) canvas models, \(counts[1]) canvas screens, "
+            var line = "\(sessions) sessions, \(counts[0]) canvas models, \(counts[1]) canvas screens, "
                 + "\(counts[2]) canvas views alive; the one left \(left == nil ? "let go" : "still held by the app")"
-            if canvases == since, left != nil || sessions > 0 || counts.contains(where: { $0 > 0 }) {
+            if let leftModel {
+                // the root view's open canvas (which the gallery's open handler reaches, and
+                // nothing else of it), or the gallery's zoom still under way on it
+                var by: [String] = []
+                if OpenCanvas.shared.model === leftModel {
+                    by.append("the open canvas")
+                }
+                if let dir, GalleryZoomer.shared.zoom?.dir == dir {
+                    by.append("the gallery's zoom")
+                }
+                let holders = by.isEmpty ? "none of the open canvas, the gallery or its zoom" : by.joined(separator: " and ")
+                line += "; its model held by " + holders
+            }
+            models.removeAll { $0.model == nil }
+            if !models.isEmpty {
+                line += "; models alive for " + models.map { ($0.dir as NSString).lastPathComponent }.joined(separator: ", ")
+            }
+            if canvases == since, left != nil || leftModel != nil || sessions > 0 || counts.contains(where: { $0 > 0 }) {
                 AppLog.error("memory", "a canvas left 5 s ago is still held: \(line)")
             } else {
                 AppLog.info("memory", "5 s after leaving a canvas: \(line)")

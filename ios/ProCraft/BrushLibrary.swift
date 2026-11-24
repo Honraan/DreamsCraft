@@ -1075,12 +1075,14 @@ private struct SwipeAction: Identifiable {
 
 /// A brush that slides away to the left, showing its `actions` in its place: Share, Duplicate and
 /// Delete; in the Recent set Find, Pin (or Unpin) and Clear. Slid right past half of `pickReach`
-/// it is picked (or no longer), if it can be (`onPick`), and slides back.
+/// it is picked (or no longer), if it can be (`onPick`), and slides back. While it is `held` (its
+/// menu up, or it dragged on from there), it stays where it is.
 private struct SwipeRow<Content: View>: View {
     let open: Bool
     let onOpen: (Bool) -> Void
     let actions: [SwipeAction]
     var onPick: (() -> Void)?
+    var held: () -> Bool = { false }
     @ViewBuilder let content: () -> Content
 
     @State private var width: CGFloat = 0
@@ -1121,6 +1123,10 @@ private struct SwipeRow<Content: View>: View {
                 .simultaneousGesture(
                     DragGesture(minimumDistance: 14)
                         .onChanged { drag in
+                            // a hold has the rest of the touch: no buttons show under a dragged brush
+                            if held() {
+                                return
+                            }
                             if !sliding, abs(drag.translation.width) > abs(drag.translation.height) {
                                 sliding = true
                             }
@@ -1202,7 +1208,10 @@ private struct BrushRow: View {
         let picked = model.pickedBrushes.contains(key)
         // the current brush counts as picked already
         let pick: (() -> Void)? = recent || selected ? nil : { model.togglePickedBrush(brush) }
-        SwipeRow(open: model.swipedBrush == key, onOpen: { model.swipedBrush = $0 ? key : nil }, actions: actions, onPick: pick) {
+        SwipeRow(
+            open: model.swipedBrush == key, onOpen: { model.swipedBrush = $0 ? key : nil }, actions: actions, onPick: pick,
+            held: { ui.holding || ui.dragging }
+        ) {
             ZStack(alignment: .topLeading) {
                 shape.fill(selected ? Pc.rowSelected : picked ? pickedBrush : Color.clear)
                 if let preview {
@@ -1261,7 +1270,10 @@ private struct BrushRow: View {
                 began: { at in
                     // the Recent set's brushes stay where they are
                     guard !recent else { return }
-                    withAnimation(Motion.menuClose) { ui.brushMenu = nil }
+                    // the menu goes at once: closing, it would still show while the brush is dragged
+                    var gone = Transaction()
+                    gone.disablesAnimations = true
+                    withTransaction(gone) { ui.brushMenu = nil }
                     let frame = ui.brushFrames[key] ?? .zero
                     ui.grab = CGPoint(x: at.x - frame.minX, y: at.y - frame.minY)
                     ui.dragWidth = frame.width

@@ -403,6 +403,7 @@ final class CanvasModel {
         CanvasLife.made(.model)
         // the artwork open: where layers held out of another's layers panel land
         HeldLayers.shared.canvas = self
+        CanvasLife.follow(self)
         _ = session.openBrushes(dir: Self.brushesDir)
         // the plugins on first: their brush engines make brushes of the files waiting too
         applyPlugins()
