@@ -245,6 +245,7 @@ impl Canvas {
                         times: times.into_iter().skip(at).collect(),
                         style,
                         clear: false,
+                        again: true,
                         layer,
                         pencil,
                         carry,

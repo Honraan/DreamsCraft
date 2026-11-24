@@ -991,6 +991,10 @@ fn heavy_realtime() {
         st.window_size = (width, height);
         st.view = Some(View::fit((width, height), (width, height)));
         st.gpu = Some(gpu);
+        // (`HEAVY_P3`: the canvas in Display P3, as a Screen Size one is made)
+        if env("HEAVY_P3", "0") == "1" {
+            st.doc.assign_profile(procraft_engine::profile::Profile::DisplayP3, None);
+        }
         st.ensure_canvas();
     }
     let library = s.brush_library();
@@ -1018,6 +1022,7 @@ fn heavy_realtime() {
             let view = texture.create_view(&Default::default());
             let mut taken = Vec::new();
             while !stop.load(Ordering::Relaxed) {
+                let queued = s.shared.lock().canvas.as_ref().map(|c| c.queued_work()).unwrap_or_default();
                 let t = Instant::now();
                 match s.shared.state.try_lock_for(Duration::from_millis(40)) {
                     Some(guard) => drop(guard),
@@ -1035,9 +1040,11 @@ fn heavy_realtime() {
                 let flushed = ms(f);
                 let at = t.duration_since(started).as_secs_f64() * 1e3;
                 if ms(t) > 50.0 {
-                    println!("  slow frame at {at:.0} ms: lock {locked:.1}, draw {drew:.1}, GPU {flushed:.1}");
+                    println!(
+                        "  slow frame at {at:.0} ms: lock {locked:.1}, draw {drew:.1}, GPU {flushed:.1} | queued: {queued}"
+                    );
                 }
-                taken.push((at, ms(t)));
+                taken.push((at, ms(t), flushed));
                 std::thread::sleep(Duration::from_millis(8).saturating_sub(t.elapsed()));
             }
             taken
@@ -1059,18 +1066,51 @@ fn heavy_realtime() {
         println!("kept saved in {}", dir.display());
     }
     let samples = (stroke_ms / 1000.0 * rate) as usize;
+    // (`HEAVY_POINTER` mouse or finger: at full pressure; `HEAVY_PATH` desk: strokes as the desktop pass posted
+    // them, a wave, a line or a zigzag between random points, the window's pixels a sixth smaller)
+    let pointer = match env("HEAVY_POINTER", "stylus").as_str() {
+        "mouse" => PointerKind::Mouse,
+        "finger" => PointerKind::Finger,
+        _ => PointerKind::Stylus,
+    };
+    let mouse = pointer != PointerKind::Stylus;
+    let desk = env("HEAVY_PATH", "bands") == "desk";
+    let mut seed: u64 = 7;
+    let mut random = |from: f32, to: f32| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        from + (to - from) * ((seed >> 33) as f32 / (1u64 << 31) as f32)
+    };
     let mut spans = Vec::new();
     for n in 0..strokes {
         let y0 = height as f32 * (0.15 + 0.1 * (n % 8) as f32);
+        let k_window = width as f32 / 2160.0;
+        let (dx0, dy0, dx1, dy1) =
+            (random(150.0, 900.0), random(200.0, 1250.0), random(1200.0, 2080.0), random(200.0, 1250.0));
+        let kind = (random(0.0, 3.0) as usize).min(2);
         let begun = Instant::now();
         let t0 = begun.duration_since(started).as_secs_f64() * 1e3;
         let point = |k: usize| {
             let along = k as f32 / samples.max(1) as f32;
-            let x = width as f32 * if n.is_multiple_of(2) { 0.1 + 0.8 * along } else { 0.9 - 0.8 * along };
+            let (x, y) = if desk {
+                let (x, mut y) = (dx0 + (dx1 - dx0) * along, dy0 + (dy1 - dy0) * along);
+                let reach = (dy1 - dy0).abs().max(0.0) + 200.0;
+                match kind {
+                    0 => y += (along * std::f32::consts::PI * 4.0).sin() * 0.35 * reach.max(80.0),
+                    2 => {
+                        let side = if ((along * 8.0) as usize).is_multiple_of(2) { -1.0 } else { 1.0 };
+                        y += side * 0.25 * reach.max(80.0) * (along * 8.0).fract();
+                    }
+                    _ => {}
+                }
+                (x * k_window, y * k_window)
+            } else {
+                let x = width as f32 * if n.is_multiple_of(2) { 0.1 + 0.8 * along } else { 0.9 - 0.8 * along };
+                (x, y0 + (along * 9.0).sin() * height as f32 * 0.05)
+            };
             PenSample {
                 x,
-                y: y0 + (along * 9.0).sin() * height as f32 * 0.05,
-                pressure: 0.5 + 0.45 * (along * 7.0).sin().abs(),
+                y,
+                pressure: if mouse { 1.0 } else { 0.5 + 0.45 * (along * 7.0).sin().abs() },
                 tilt: 0.0,
                 orientation: 0.0,
                 time_ms: t0 + k as f64 * 1000.0 / rate,
@@ -1078,7 +1118,7 @@ fn heavy_realtime() {
             }
         };
         println!("  stroke {} begins at {t0:.0} ms", n + 1);
-        s.stroke_begin(PointerKind::Stylus, vec![point(0)]);
+        s.stroke_begin(pointer, vec![point(0)]);
         for k in 1..samples {
             let due = Duration::from_secs_f64(k as f64 / rate);
             std::thread::sleep(due.saturating_sub(begun.elapsed()));
@@ -1098,11 +1138,12 @@ fn heavy_realtime() {
     stop.store(true, Ordering::Relaxed);
     let taken = frames.join().unwrap_or_default();
     for (n, (from, to)) in spans.iter().enumerate() {
-        let mut these: Vec<f64> = taken.iter().filter(|(at, _)| at >= from && at < to).map(|(_, t)| *t).collect();
+        let mut these: Vec<f64> = taken.iter().filter(|(at, ..)| at >= from && at < to).map(|(_, t, _)| *t).collect();
         these.sort_by(f64::total_cmp);
         let slow = these.iter().filter(|&&t| t > 100.0).count();
+        let gpu_most = taken.iter().filter(|(at, ..)| at >= from && at < to).map(|(.., g)| *g).fold(0.0, f64::max);
         println!(
-            "stroke {:2}: {} frames, med {:5.1} p95 {:6.1} max {:6.1} ms, over 100 ms {slow}",
+            "stroke {:2}: {} frames, med {:5.1} p95 {:6.1} max {:6.1} ms, GPU at most {gpu_most:6.1} ms, over 100 ms {slow}",
             n + 1,
             these.len(),
             these.get(these.len() / 2).copied().unwrap_or(0.0),

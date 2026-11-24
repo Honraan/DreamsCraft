@@ -150,6 +150,16 @@ const IN_PLACE_FRAME_MS: f64 = 33.0;
 /// [`WORK_AT_ONCE`]): a few stamps of a big wet brush (a GPU's speed seen late, or with other work,
 /// can seem slower than it is).
 const IN_PLACE_LEAST: u64 = WORK_AT_ONCE;
+/// How much GPU time a render that shows the canvas gives the stamps it lays in a stroke's
+/// textures (a dual brush's second among them), ms, by how fast the GPU got through such work
+/// before: the rest waits for the renders after, the stroke shown as far as it is laid (and, laid
+/// again from scratch, as it was until all of it is). Laid all at once, a big dual brush's second
+/// laid again as its start turned, or coming while its paint laid in place caught up, took a
+/// laptop's GPU 0.5 to 2 s a frame, and one past two seconds took the device with it.
+const DRY_FRAME_MS: f64 = 20.0;
+/// The least work of a stroke's textures a render lays however slow the GPU seems: a few big
+/// stamps (see [`stamp_work`]).
+const DRY_LEAST: u64 = 16 << 20;
 /// What a stamp counts for besides the pixels it covers; and a stamp painted in place, a compute
 /// pass for each, for each pixel and for itself.
 const STAMP_WORK: u64 = 1 << 10;
@@ -2501,6 +2511,9 @@ enum Op {
         layer: LayerId,
         /// Into the adjustment's mask instead of the stroke.
         pencil: bool,
+        /// A piece of a stroke laid again from scratch after its first (or from where it went back
+        /// to): the stroke isn't shown until all of it is laid.
+        again: bool,
         /// Laid on a part carried from lot to lot (see [`Carried`]).
         carry: bool,
     },
@@ -3445,6 +3458,13 @@ pub struct Canvas {
     in_place_sent: Option<(wgpu::SubmissionIndex, std::time::Instant, u64)>,
     in_place_rate: Option<f64>,
     in_place_paced: bool,
+    /// As those for paint laid in place, for the stamps laid in a stroke's textures (see
+    /// [`DRY_FRAME_MS`]); and the most such work a render that shows the canvas has laid: for tests.
+    dry_sent: Option<(wgpu::SubmissionIndex, std::time::Instant, u64)>,
+    dry_rate: Option<f64>,
+    dry_rate_set: Option<f64>,
+    dry_paced: bool,
+    dry_laid_most: u64,
     /// How the last plugin filter's draw went, not yet asked for.
     filter_run: Option<plugin_filter::FilterRun>,
     /// How many times the composite has been redrawn.
@@ -3891,6 +3911,11 @@ impl Canvas {
             in_place_sent: None,
             in_place_rate: None,
             in_place_paced: true,
+            dry_sent: None,
+            dry_rate: None,
+            dry_rate_set: None,
+            dry_paced: true,
+            dry_laid_most: 0,
             filter_run: None,
             composites: 0,
             active: None,
@@ -4728,6 +4753,7 @@ impl Canvas {
                 times,
                 style,
                 clear: clear && !pencil,
+                again: false,
                 layer: active.layer,
                 pencil,
                 second,
@@ -5067,6 +5093,49 @@ impl Canvas {
         (self.marks_made, self.rewound, bytes)
     }
 
+    /// The work queued for the next render, counted by kind with its stamps, and whether a stroke
+    /// is being laid again or caught up with: for benches.
+    #[doc(hidden)]
+    pub fn queued_work(&self) -> String {
+        let mut kinds: Vec<(String, usize, usize)> = Vec::new();
+        for op in &self.ops {
+            let (name, stamps) = match op {
+                Op::Stamps { instances, clear, second, style, .. } => (
+                    format!(
+                        "stamps{}{}{}",
+                        if *second { " second" } else { "" },
+                        if *clear { " from scratch" } else { "" },
+                        if style.in_place() { " in place" } else { "" }
+                    ),
+                    instances.len(),
+                ),
+                Op::Commit(_) => ("commit".to_owned(), 0),
+                Op::Cancel => ("cancel".to_owned(), 0),
+                Op::RewindInPlace(_) => ("rewind".to_owned(), 0),
+                Op::RewindSecond(_) => ("rewind second".to_owned(), 0),
+                Op::ClearSecond(_) => ("clear second".to_owned(), 0),
+                Op::SecondReached(_) => ("second reached".to_owned(), 0),
+                Op::DropSecond => ("drop second".to_owned(), 0),
+                _ => ("other".to_owned(), 0),
+            };
+            match kinds.iter_mut().find(|k| k.0 == name) {
+                Some(k) => {
+                    k.1 += 1;
+                    k.2 += stamps;
+                }
+                None => kinds.push((name, 1, stamps)),
+            }
+        }
+        let mut said: Vec<String> = kinds.iter().map(|(n, c, s)| format!("{n} x{c} ({s} stamps)")).collect();
+        if self.relaying {
+            said.push("relaying".to_owned());
+        }
+        if self.catching_up {
+            said.push("catching up".to_owned());
+        }
+        said.join(", ")
+    }
+
     /// Lays a stroke laid again as it ends for at most this long in a render that shows the canvas,
     /// in place of [`RELAY_AT_ONCE`]: for tests (none, a piece of its work a render).
     #[doc(hidden)]
@@ -5122,6 +5191,59 @@ impl Canvas {
             Some(rate) if shown && self.in_place_paced => ((rate * IN_PLACE_FRAME_MS) as u64).max(IN_PLACE_LEAST),
             _ => u64::MAX,
         }
+    }
+
+    /// The most work of stamps in a stroke's textures a render lays (see [`DRY_FRAME_MS`]): as
+    /// much as the GPU gets through in that while, by the fastest it was seen to (each sighting
+    /// counting a little less as more come), [`DRY_LEAST`] at least; all of it before that is known,
+    /// or in a render that doesn't show the canvas (as [`Canvas::in_place_most`] does).
+    fn dry_most(&mut self, gpu: &Gpu, shown: bool) -> u64 {
+        if let Some((index, sent, work)) = self.dry_sent.take() {
+            let now = wgpu::PollType::Wait {
+                submission_index: Some(index.clone()),
+                timeout: Some(std::time::Duration::ZERO),
+            };
+            if crate::poll(&gpu.device, now).is_ok() {
+                let rate = work as f64 / (sent.elapsed().as_secs_f64() * 1000.0).max(0.5);
+                self.dry_rate = Some(self.dry_rate.map_or(rate, |r| (r * 0.9).max(rate)));
+            } else {
+                self.dry_sent = Some((index, sent, work));
+            }
+        }
+        match self.dry_rate_set.or(self.dry_rate) {
+            Some(rate) if shown && self.dry_paced => ((rate * DRY_FRAME_MS) as u64).max(DRY_LEAST),
+            _ => u64::MAX,
+        }
+    }
+
+    /// Work left for the renders after (`rest`, `relaying` an ended stroke laid again): the picture
+    /// held as it was meanwhile where a stroke is being laid again (its end, the rest of it from
+    /// scratch or from where it went back to, of which some is laid), else the stroke shown as far
+    /// as it is laid.
+    fn hold_or_catch_up(&mut self, rest: &[Op], relaying: bool) {
+        let again = rest.first().is_some_and(|op| matches!(op, Op::Stamps { again: true, .. }));
+        let ends = rest.iter().any(|op| matches!(op, Op::Commit(_) | Op::Cancel));
+        if again || (relaying && ends) {
+            self.relaying = true;
+        } else {
+            self.catching_up = true;
+        }
+    }
+
+    /// Whether the stamps laid in a stroke's textures are laid only as fast as the GPU gets through
+    /// them (see [`DRY_FRAME_MS`]), and how fast it is taken to (work a millisecond; none: as seen):
+    /// for tests comparing it with all of it laid in each render.
+    #[doc(hidden)]
+    pub fn set_dry_paced(&mut self, on: bool, rate: Option<f64>) {
+        self.dry_paced = on;
+        self.dry_rate_set = rate;
+    }
+
+    /// The most work of stamps in a stroke's textures a render that showed the canvas laid (see
+    /// [`stamp_work`]), and the least it may (see [`DRY_LEAST`]): for tests.
+    #[doc(hidden)]
+    pub fn dry_laid_most(&self) -> (u64, u64) {
+        (self.dry_laid_most, DRY_LEAST)
     }
 
     /// The most work of a stroke laid again a render that shows the canvas lays (see
@@ -6873,7 +6995,14 @@ impl Canvas {
         let rewinds = ops.iter().any(|op| matches!(op, Op::RewindInPlace(_) | Op::RewindSecond(_)));
         let relays = target.is_some() && (self.relaying || rewinds || lays_ended_stroke_again(&ops));
         let relay_most = if relays { self.relay_most(gpu) } else { u64::MAX };
-        let ops = in_pieces(ops, self.full(), (self.work_at_once, self.work_at_once.min(relay_most)), most_stamps);
+        // stamps in a stroke's textures, in a render that shows the canvas: a frame's share of the
+        // GPU's time (see `DRY_FRAME_MS`), in pieces no bigger where cutting them changes nothing (a
+        // part laid by its rule and not carried from lot to lot rounds each piece's sums: cut only
+        // as it always is)
+        let target_shown = target.is_some();
+        let dry_most = self.dry_most(gpu, target_shown);
+        let most = self.work_at_once.min(relay_most);
+        let ops = in_pieces(ops, self.full(), (self.work_at_once, most, most.min(dry_most)), most_stamps);
         let (ops, held_back) = {
             let (mut taken, mut count) = (Vec::with_capacity(ops.len()), 0u64);
             let mut ops = ops.into_iter();
@@ -6979,6 +7108,14 @@ impl Canvas {
         // a little while (see `IN_PLACE_FRAME_MS`), the rest left to the renders after
         let in_place_most = self.in_place_most(gpu, target.is_some());
         let mut in_place_laid = 0u64;
+        // and stamps in a stroke's textures, so too (see `DRY_FRAME_MS`); the two together in no
+        // more of the GPU's time than paint laid in place alone takes (as fast as each was seen to
+        // go), past the least of each: laid apart, a big dual brush's paint and second came to
+        // twice that, its second's coming while its paint caught up
+        let mut dry_laid = 0u64;
+        let in_place_rate = self.in_place_rate.filter(|_| target_shown && self.in_place_paced);
+        let dry_rate = self.dry_rate_set.or(self.dry_rate).filter(|_| target_shown && self.dry_paced);
+        let mut spent_ms = 0.0f64;
         self.catching_up = false;
         let full = self.full();
         let mut ops = ops.into_iter();
@@ -6995,8 +7132,8 @@ impl Canvas {
                 let work = if dry { stamps_work(instances, full, false) } else { 0 };
                 if relaid && (std::time::Instant::now() >= until || relay_laid.saturating_add(work) > relay_most) {
                     let rest: Vec<Op> = std::iter::once(op).chain(ops.by_ref()).collect();
+                    self.hold_or_catch_up(&rest, true);
                     self.ops.splice(0..0, rest);
-                    self.relaying = true;
                     break;
                 }
                 relay_laid = relay_laid.saturating_add(work);
@@ -7005,17 +7142,36 @@ impl Canvas {
                 && style.in_place()
             {
                 let work = stamps_work(instances, full, true);
-                if in_place_laid > 0 && in_place_laid.saturating_add(work) > in_place_most {
+                let ms = in_place_rate.map_or(0.0, |rate| work as f64 / rate);
+                let past_own = in_place_laid > 0 && in_place_laid.saturating_add(work) > in_place_most;
+                let past_both = spent_ms > 0.0
+                    && spent_ms + ms > IN_PLACE_FRAME_MS
+                    && in_place_laid.saturating_add(work) > IN_PLACE_LEAST;
+                if past_own || past_both {
                     let rest: Vec<Op> = std::iter::once(op).chain(ops.by_ref()).collect();
+                    self.hold_or_catch_up(&rest, relay_until.is_some());
                     self.ops.splice(0..0, rest);
-                    // (a stroke being laid again holds the picture as it was meanwhile)
-                    match relay_until {
-                        Some(_) => self.relaying = true,
-                        None => self.catching_up = true,
-                    }
                     break;
                 }
                 in_place_laid = in_place_laid.saturating_add(work);
+                spent_ms += ms;
+            }
+            if let Op::Stamps { instances, style, second, .. } = &op
+                && (!style.in_place() || *second)
+            {
+                let work = stamps_work(instances, full, false);
+                let ms = dry_rate.map_or(0.0, |rate| work as f64 / rate);
+                let past_own = dry_laid > 0 && dry_laid.saturating_add(work) > dry_most;
+                let past_both =
+                    spent_ms > 0.0 && spent_ms + ms > IN_PLACE_FRAME_MS && dry_laid.saturating_add(work) > DRY_LEAST;
+                if past_own || past_both {
+                    let rest: Vec<Op> = std::iter::once(op).chain(ops.by_ref()).collect();
+                    self.hold_or_catch_up(&rest, relay_until.is_some());
+                    self.ops.splice(0..0, rest);
+                    break;
+                }
+                dry_laid = dry_laid.saturating_add(work);
+                spent_ms += ms;
             }
             match &op {
                 Op::Stamps { .. } => relaid = true,
@@ -8181,6 +8337,12 @@ impl Canvas {
         // this began, as OpenGL does much of the work as it is sent)
         if in_place_laid > 0 && self.in_place_sent.is_none() {
             self.in_place_sent = Some((sent.clone(), started, in_place_laid));
+        }
+        if dry_laid > 0 && self.dry_sent.is_none() {
+            self.dry_sent = Some((sent.clone(), started, dry_laid));
+        }
+        if target_shown {
+            self.dry_laid_most = self.dry_laid_most.max(dry_laid);
         }
         if relay_laid > 0 && self.relay_sent.is_none() {
             self.relay_sent = Some((sent.clone(), std::time::Instant::now(), relay_laid));
@@ -13664,17 +13826,24 @@ fn stamps_work(stamps: &[StampInstance], full: IRect, in_place: bool) -> u64 {
 }
 
 /// `ops` with stamps of more work than `most` (the first for paint laid in place, the second for
-/// the rest), or more than `most_stamps` of them, as several in a row of no more (a stamp is never
-/// cut in two): a stroke redrawn whole would otherwise reach the GPU as one piece.
-fn in_pieces(ops: Vec<Op>, full: IRect, (in_place_most, most): (u64, u64), most_stamps: u64) -> Vec<Op> {
+/// the rest, the third for those whose pieces come out the same however they are cut: drawn over
+/// each other or kept strongest, or carried from lot to lot), or more than `most_stamps` of them,
+/// as several in a row of no more (a stamp is never cut in two): a stroke redrawn whole would
+/// otherwise reach the GPU as one piece.
+fn in_pieces(ops: Vec<Op>, full: IRect, (in_place_most, most, cut_most): (u64, u64, u64), most_stamps: u64) -> Vec<Op> {
     let mut pieces = Vec::with_capacity(ops.len());
     for op in ops {
-        let Op::Stamps { second, instances, wet, picks, times, style, clear, layer, pencil, carry } = op else {
+        let Op::Stamps { second, instances, wet, picks, times, style, clear, again, layer, pencil, carry } = op else {
             pieces.push(op);
             continue;
         };
         let in_place = style.in_place() && !second;
-        let most = if in_place { in_place_most } else { most };
+        let cut_alike = by_rule(style.rendering).is_none() || carry;
+        let most = match (in_place, cut_alike) {
+            (true, _) => in_place_most,
+            (false, true) => cut_most,
+            (false, false) => most,
+        };
         // how many stamps go in each
         let mut counts = Vec::new();
         let (mut count, mut work) = (0usize, 0u64);
@@ -13688,7 +13857,7 @@ fn in_pieces(ops: Vec<Op>, full: IRect, (in_place_most, most): (u64, u64), most_
             work = work.saturating_add(more);
         }
         if counts.is_empty() {
-            pieces.push(Op::Stamps { second, instances, wet, picks, times, style, clear, layer, pencil, carry });
+            pieces.push(Op::Stamps { second, instances, wet, picks, times, style, clear, again, layer, pencil, carry });
             continue;
         }
         counts.push(count);
@@ -13702,8 +13871,9 @@ fn in_pieces(ops: Vec<Op>, full: IRect, (in_place_most, most): (u64, u64), most_
                 picks: picks.by_ref().take(count).collect(),
                 times: times.by_ref().take(count).collect(),
                 style,
-                // from scratch the first time only
+                // from scratch the first time only, the rest of it after
                 clear: clear && i == 0,
+                again: again || (clear && i > 0),
                 layer,
                 pencil,
                 carry,
@@ -16517,13 +16687,14 @@ mod tests {
                 times: Vec::new(),
                 style,
                 clear: true,
+                again: false,
                 layer: LayerId(1),
                 pencil: false,
                 carry: true,
             };
             let mut cuts = Vec::new();
             let mut at = 0;
-            for op in in_pieces(vec![whole], full, (most, most), most_stamps) {
+            for op in in_pieces(vec![whole], full, (most, most, most), most_stamps) {
                 let Op::Stamps { instances, .. } = op else { continue };
                 cuts.push(at);
                 at += instances.len();

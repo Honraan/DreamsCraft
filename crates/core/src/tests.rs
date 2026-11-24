@@ -21411,6 +21411,145 @@ fn kept_selections_delete_by_place_and_the_rest_close_up() {
 }
 
 /// The library's first brush (set, place) `wanted` says yes to.
+/// Stamps laid in a stroke's textures in a frame that shows the canvas go no faster than the GPU
+/// gets through them in a frame's share (see `DRY_FRAME_MS`), the rest left to the frames after:
+/// a heavy dual brush's second at full size from a mouse at full pressure (Quicksilver's laid while
+/// its paint laid in place caught up, Verbena's laid again as its start turned) came all at once,
+/// a laptop's GPU taking 0.5 to 2 s a frame, and one past two seconds took the device with it
+/// (Quicksilver's frames took up to 54 ms of a PC's GPU here, laid at once). Taken to get through
+/// little (each frame then laying the least share), no frame lays more than a piece of the work at
+/// once; at the GPU's own pace no frame's GPU work takes over 50 ms on a PC (35 ms here); and the
+/// strokes come out bit for bit as with all of it laid in each frame.
+#[test]
+fn a_heavy_brushs_stamps_are_laid_a_frames_share_at_a_time_and_come_out_the_same() {
+    use std::time::{Duration, Instant};
+    let (width, height) = (2560u32, 1600u32);
+    // (`paced`: none, at a crawl taken as the GPU's pace, or at its own; the layer, the most work
+    // a frame laid, and the slowest frame's GPU work)
+    #[derive(Clone, Copy, PartialEq)]
+    enum Pace {
+        Off,
+        Crawl,
+        Own,
+    }
+    let drawn = |name: &str, pace: Pace| -> Option<(Vec<u8>, u64, u64, Duration)> {
+        let gpu = Gpu::headless().ok()?;
+        let s = CanvasSession::new(width, height);
+        {
+            let mut st = s.shared.lock();
+            st.window_size = (width, height);
+            st.view = Some(View::fit((width, height), (width, height)));
+            st.gpu = Some(gpu);
+            st.ensure_canvas();
+            let canvas = st.canvas.as_mut()?;
+            match pace {
+                Pace::Off => canvas.set_dry_paced(false, None),
+                Pace::Crawl => canvas.set_dry_paced(true, Some(1.0)),
+                Pace::Own => canvas.set_dry_paced(true, None),
+            }
+        }
+        let (set, index) = library_brush(&s, |b| b.name == name)?;
+        assert!(s.select_brush(set, index));
+        crate::big_pictures::wait_for_big_pictures(Duration::from_secs(60));
+        s.set_brush_size(1.0);
+        s.set_color(0.6, 0.2, 0.4);
+        let gpu = s.shared.lock().gpu.clone()?;
+        let format = procraft_gpu::wgpu::TextureFormat::Rgba8Unorm;
+        let target = gpu.device.create_texture(&procraft_gpu::wgpu::TextureDescriptor {
+            label: Some("window"),
+            size: procraft_gpu::wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: procraft_gpu::wgpu::TextureDimension::D2,
+            format,
+            usage: procraft_gpu::wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = target.create_view(&Default::default());
+        let started = Instant::now();
+        let mut slowest = Duration::ZERO;
+        let mut frame = |s: &CanvasSession| -> bool {
+            let more = {
+                let mut st = s.shared.lock();
+                st.draw_frame(&view, format, (width, height), procraft_engine::profile::Profile::Srgb, started);
+                st.needs_frame || st.canvas.as_ref().is_some_and(|c| c.lays_over_frames())
+            };
+            let t = Instant::now();
+            gpu.flush();
+            slowest = slowest.max(t.elapsed());
+            more
+        };
+        frame(&s);
+        // three waves across the canvas from a mouse, 120 samples a second, coming faster than the
+        // frames (as they do where a frame takes a while): six a frame, two at a time
+        for n in 0..3 {
+            let y0 = height as f32 * (0.3 + 0.2 * n as f32);
+            let at = |k: usize| PenSample {
+                pressure: 1.0,
+                ..sample(
+                    200.0 + k as f32 * 18.0,
+                    y0 + (k as f32 * 0.12).sin() * 300.0,
+                    f64::from(n) * 5000.0 + k as f64 * 8.33,
+                )
+            };
+            s.stroke_begin(PointerKind::Mouse, vec![at(0)]);
+            for k in (1..110).step_by(6) {
+                for j in [0, 2, 4] {
+                    s.stroke_add(vec![at(k + j), at(k + j + 1)]);
+                }
+                frame(&s);
+            }
+            s.stroke_end(vec![at(111)]);
+            for _ in 0..2000 {
+                if !frame(&s) {
+                    break;
+                }
+            }
+        }
+        let (most, _) = s.shared.lock().canvas.as_ref()?.dry_laid_most();
+        let current = s.layers().iter().find(|l| l.current).map_or(0, |l| l.id);
+        Some((layer_rgba(&s, current), most, 0, slowest))
+    };
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    for name in ["Quicksilver", "Verbena"] {
+        let (Some((at_once, most_at_once, _, slowest_at_once)), Some((crawl, most_crawl, ..))) =
+            (drawn(name, Pace::Off), drawn(name, Pace::Crawl))
+        else {
+            continue;
+        };
+        // the GPU's own pace: the quietest of up to three runs (other tests' GPU work beside it can
+        // hold a frame up)
+        let mut own = drawn(name, Pace::Own);
+        for _ in 0..2 {
+            if own.as_ref().is_some_and(|o| o.3 <= Duration::from_millis(50)) {
+                break;
+            }
+            let again = drawn(name, Pace::Own);
+            if again.as_ref().map(|a| a.3) < own.as_ref().map(|o| o.3) {
+                own = again;
+            }
+        }
+        let Some((paced, most_paced, _, slowest)) = own else { continue };
+        println!(
+            "{name}: the most work a frame laid {most_at_once} at once, {most_crawl} at a crawl, {most_paced} at the GPU's pace; \
+             the slowest frame's GPU work {:.1} ms at once, {:.1} ms at the GPU's pace",
+            ms(slowest_at_once),
+            ms(slowest)
+        );
+        assert!(at_once.iter().skip(3).step_by(4).any(|&a| a > 0), "{name} drew nothing");
+        // at a crawl, the least share a frame (a part laid by its rule and not carried in pieces as
+        // it always is, of at most `WORK_AT_ONCE`): less than all
+        assert!(most_crawl <= 64 << 20, "{name}: a frame laid {most_crawl} at a crawl");
+        assert!(most_at_once > most_crawl, "{name}: laid {most_at_once} at once, {most_crawl} at a crawl");
+        // within 50 ms, or (other tests' GPU work beside it slowing every frame) well under the
+        // slowest laid all at once
+        let bound = Duration::from_millis(50).max(slowest_at_once.mul_f64(0.8));
+        assert!(slowest <= bound, "{name}: a frame's GPU work took {slowest:?}, {slowest_at_once:?} at once");
+        assert_eq!(differ(&at_once, &crawl), (0, 0), "{name}: laid at a crawl unlike all at once");
+        assert_eq!(differ(&at_once, &paced), (0, 0), "{name}: laid at the GPU's pace unlike all at once");
+    }
+}
+
 /// A stroke begun just after its brush was chosen, while its pictures are still being drawn, draws
 /// them before it holds the canvas: drawn under its lock, they held the frames up meanwhile (35 to
 /// 140 ms for a dual brush's four). Here a picture takes 400 ms to draw: the stroke waits for it,
