@@ -29,7 +29,7 @@ struct ProCraftApp: App {
         // the GPU device and the canvases' pipelines made ahead of the first artwork
         DispatchQueue.global(qos: .userInitiated).async { warmGpu() }
         // and the brushes read: with many brought in, reading them as an artwork opened took seconds
-        DispatchQueue.global(qos: .utility).async { prepareBrushes(dir: CanvasModel.brushesDir) }
+        DispatchQueue.global(qos: .utility).async { onBigStack(qos: .utility) { prepareBrushes(dir: CanvasModel.brushesDir) } }
         // the home screen's widget shows the artwork worked on last
         RecentArtwork.start()
     }
