@@ -4947,8 +4947,20 @@ mod tests {
         let prefs = crate::prefs::Prefs { plugins, ..Default::default() };
         let Some(mut w) = Window::open_canvas(vec2(1000.0, 750.0), (2000, 1500), prefs) else { return };
         let paper = w.paper();
-        // the tools half moved down into the middle
+        // the bars where they always are: their glass between their buttons (the side bar's ends, the
+        // top bar's middle between its two groups) is theirs
         let bars = Arc::clone(&w.ui.bars);
+        let side = bars.rect(LayoutBar::SideBar).unwrap();
+        for at in [
+            pos2(side.x + side.width / 2.0, side.y + 3.0),
+            pos2(side.x + side.width / 2.0, side.y + side.height - 3.0),
+            pos2(500.0, 20.0),
+        ] {
+            w.click(at);
+            w.pen_tap(at);
+        }
+        untouched(&w, "the bars where they always are");
+        // the tools half moved down into the middle
         let r = bars.rect(LayoutBar::TopRight).unwrap();
         bars.set_editing(true);
         assert!(bars.hold(LayoutBar::TopRight, r.x + 10.0, r.y + 10.0));

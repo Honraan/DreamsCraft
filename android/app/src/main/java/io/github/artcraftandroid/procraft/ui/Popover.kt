@@ -29,7 +29,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Paint
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.layout.positionOnScreen
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Dp
@@ -117,11 +119,14 @@ fun rememberFrost(corner: Dp, glass: BarGlass): Modifier {
         }
     }
     return Modifier.onGloballyPositioned { c ->
-        // by the screen, so that it works from popups too, then on the canvas
-        val at = backdrops.onCanvas(c.positionOnScreen())
+        // by the screen, so that it works from popups too, then on the canvas; by its bounds as drawn
+        // (turned, a bar lying down has them across)
+        val drawn = c.boundsInWindow()
+        val at = backdrops.onCanvas(c.positionOnScreen() - c.positionInWindow() + drawn.topLeft)
         val (left, right) = with(density) { glass.pastLeft.toPx() to glass.pastRight.toPx() }
         val (below, above) = with(density) { glass.pastBottom.toPx() to glass.pastTop.toPx() }
-        box = frostBox(at, c.size.width, c.size.height, left, right, below, with(density) { corner.toPx() }, above)
+        val (w, h) = drawn.width.toInt() to drawn.height.toInt()
+        box = frostBox(at, w, h, left, right, below, with(density) { corner.toPx() }, above)
     }
 }
 
@@ -141,8 +146,14 @@ internal fun frostBox(onCanvas: Offset, width: Int, height: Int, left: Float, ri
     floatArrayOf(onCanvas.x - left, onCanvas.y - above, onCanvas.x + width + right, onCanvas.y + height + below, corner)
 
 
-/** How solid a floating window's frost is: what is under it (a bar, another window) barely shows. */
-private const val WindowFrostAlpha = 0.96f
+/** How solid a floating window's frost is: what is under it (a bar, another window) doesn't show. */
+private const val WindowFrostAlpha = 0.98f
+
+/**
+ * Whether every panel is drawn nearly solid: while the panels float (a plugin lays them out), a window lies over the
+ * bars and other windows and a panel over a window, and only the canvas blurs behind the frost.
+ */
+val LocalSolidPanels = androidx.compose.runtime.staticCompositionLocalOf { false }
 
 /** The side of a popover its arrow sticks out of, pointing at its button; or none. */
 enum class ArrowSide { TOP, BOTTOM, LEFT, RIGHT, NONE }
@@ -216,7 +227,8 @@ private fun PopoverBody(
     val backdrops = LocalBackdrops.current.takeIf { fill == null && Pc.PopoverFrost.alpha < 1f }
     // frosted; a floating window, which may lie over the bars and other windows (only the canvas
     // blurs behind the frost), nearly solid so what is under it doesn't read through
-    val frosted = if (window) Pc.PopoverFrost.copy(alpha = maxOf(Pc.PopoverFrost.alpha, WindowFrostAlpha)) else Pc.PopoverFrost
+    val solid = window || LocalSolidPanels.current
+    val frosted = if (solid) Pc.PopoverFrost.copy(alpha = maxOf(Pc.PopoverFrost.alpha, WindowFrostAlpha)) else Pc.PopoverFrost
     val paint = fill ?: if (backdrops != null) frosted else Pc.PopoverFill
     val key = remember { Any() }
     val density = LocalDensity.current

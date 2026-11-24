@@ -1540,6 +1540,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     private fun followLayout() {
         panelLayout.follow(plugins)
         layoutLook = panelLayout.look()
+        // (Collapse to edge turned on or off: the bars know at once, not only once they are told again)
+        barLayout.setCollapsing(layoutLook.collapse)
         // the bars back where they always are as no plugin lets them move: no handles
         if (!layoutLook.edit && editingLayout) doneEditLayout()
         barChanges++

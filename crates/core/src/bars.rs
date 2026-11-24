@@ -4,8 +4,9 @@
 //! has it; moved, it goes where it was let go, snapping to the window's edges and to the other bars
 //! with no gap. Brought within [`TURN_IN`] of the window's left or right edge (and not of its top or
 //! bottom) it stands upright against that edge, and it lies down again only once taken farther than
-//! [`TURN_OUT`] from it, or within [`TURN_IN`] of the top or the bottom: so it doesn't flicker
-//! between the two as it passes. Each way the window is turned keeps its own; Reset puts them all
+//! [`TURN_OUT`] from it, or with the pointer within half [`TURN_IN`] of the top or the bottom: so it
+//! doesn't flicker between the two as it passes, however tall it is. It turns about the finger, the
+//! place held staying under it. Each way the window is turned keeps its own; Reset puts them all
 //! back.
 //!
 //! The app tells it each bar's place as it always has it and its size laid down (its length and its
@@ -712,30 +713,36 @@ impl Bars {
         if self.fixed.get(bar.at()).copied().unwrap_or(false) {
             return placed(start.vertical, x, y);
         }
-        let (length, thickness) = self.sizes.get(bar.at()).copied().unwrap_or((0.0, 0.0));
-        // the pointer, and where the bar would lie under it (held where it was held along it, or by
-        // its middle when it was held standing)
-        let pointer = held.from.0 + dx;
-        let along = if start.vertical { length / 2.0 } else { held.from.0 - start.x };
-        let lying_x = pointer - along;
-        let lying = self.rect(bar, self.inside(bar, BarPlace { x: lying_x, y, vertical: false }));
+        let thickness = self.sizes.get(bar.at()).map_or(0.0, |s| s.1);
+        // the pointer, and where it holds the bar: along its length from its start, and across it
+        // (turning, the bar turns about the finger, the place held staying under it)
+        let pointer = (held.from.0 + dx, held.from.1 + dy);
+        let (along, across) = if start.vertical {
+            (held.from.1 - start.y, held.from.0 - start.x)
+        } else {
+            (held.from.0 - start.x, held.from.1 - start.y)
+        };
+        let (lying_x, lying_y) = (pointer.0 - along, pointer.1 - across);
+        let lying = self.rect(bar, self.inside(bar, BarPlace { x: lying_x, y: lying_y, vertical: false }));
         let near_side = |r: &LayoutRect| (r.x - room.left).min(room.right - r.right());
         let near_end = |r: &LayoutRect| (r.y - room.top).min(room.bottom - r.bottom());
-        let standing = self.rect(bar, self.inside(bar, BarPlace { x, y, vertical: true }));
-        // lying, it stands up once its end comes within TURN_IN of a side (and not of the top or the
-        // bottom); standing, it lies down only once the pointer is taken past TURN_OUT from the sides
-        let side_of_pointer = (pointer - room.left).min(room.right - pointer);
+        // lying, it stands up once its end comes within TURN_IN of a side (and it is not within
+        // TURN_IN of the top or the bottom); standing, it lies down only once it would lie with its
+        // end past TURN_OUT from the sides, or with the pointer within half TURN_IN of the top or the
+        // bottom (the pointer's, not the bar's: a bar taller than the window leaves room for is never
+        // far from both). Both by where it would lie, so one never undoes the other on the next move.
+        let end_of_pointer = (pointer.1 - room.top).min(room.bottom - pointer.1);
         let upright = if held.upright {
-            side_of_pointer <= TURN_OUT && near_end(&standing) > TURN_IN
+            near_side(&lying) <= TURN_OUT && end_of_pointer > TURN_IN / 2.0
         } else {
             near_side(&lying) <= TURN_IN && near_end(&lying) > TURN_IN
         };
         if upright {
             // against the side it is nearest, whatever the drag's x
-            let x = if pointer - room.left <= room.right - pointer { room.left } else { room.right - thickness };
-            placed(true, x, y)
+            let x = if pointer.0 - room.left <= room.right - pointer.0 { room.left } else { room.right - thickness };
+            placed(true, x, pointer.1 - along)
         } else {
-            placed(false, lying_x, y)
+            placed(false, lying_x, lying_y)
         }
     }
 }
@@ -830,8 +837,8 @@ mod tests {
         // the side bar dragged near the bottom: lying down along it, 519 long and 51 thick
         bars.hold(LayoutBar::SideBar, 20.0, 300.0);
         let down = bars.drag(620.0, 300.0 + 1000.0).unwrap();
-        // (lying under the pointer, held by its middle)
-        assert_eq!(down, at(620.0 - 259.5, 1000.0 - 51.0, false));
+        // (lying under the pointer, held where it was held: 60 down its length, 20 across it)
+        assert_eq!(down, at(620.0 - 60.0, 1000.0 - 51.0, false));
         // into the bottom left corner: near a side and an end both, it stays as it lies
         let corner = bars.drag(20.0, 300.0 + 1000.0).unwrap();
         assert_eq!(corner, at(0.0, 949.0, false));
@@ -911,9 +918,10 @@ mod tests {
     #[test]
     fn a_panel_beside_an_upright_bar_keeps_under_a_bar_lying_across_its_way() {
         let bars = bars();
-        // the tools half upright against the right edge (1552..1600 by 110..410)...
+        // the tools half upright against the right edge (1552..1600 by 110..410: held 100 along it,
+        // standing, its top 100 over the finger)...
         bars.hold(LayoutBar::TopRight, 1400.0, 10.0);
-        assert_eq!(bars.drag(1560.0, 10.0 + 110.0).unwrap(), at(1552.0, 110.0, true));
+        assert_eq!(bars.drag(1560.0, 10.0 + 200.0).unwrap(), at(1552.0, 110.0, true));
         bars.let_go();
         // ...and the left half along the top right over its panels' way (1100..1520 by 0..48)
         bars.hold(LayoutBar::TopLeft, 10.0, 10.0);
@@ -929,6 +937,46 @@ mod tests {
         bars.drag(10.0, 10.0);
         bars.let_go();
         assert_eq!(bars.hang(LayoutBar::TopRight, 30.0, 384.0, 2.0, 12.0, 12.0).unwrap().y, 42.0);
+    }
+
+    #[test]
+    fn a_bar_turns_about_the_finger_and_stands_in_a_window_too_short_to_leave_it_room() {
+        // a window 1024 by 640 (a tablet's, wider than tall), the side bar 518 long: it can't stand
+        // 96 clear of both the top and the bottom
+        let bars = BarLayout::new();
+        bars.set_window(1024.0, 640.0, 16.0);
+        bars.set_bar(LayoutBar::TopLeft, at(0.0, 0.0, false), 420.0, 48.0);
+        bars.set_bar(LayoutBar::TopRight, at(724.0, 0.0, false), 300.0, 48.0);
+        bars.set_bar(LayoutBar::SideBar, at(0.0, 61.0, true), 518.0, 51.0);
+        bars.set_editing(true);
+        // held at its middle (25, 320) and taken across to the right edge at the same height, step by
+        // step: lying down once out of the left side, the finger on it; upright against the right side,
+        // the finger still at its middle; never flicking between the two on the way
+        assert!(bars.hold(LayoutBar::SideBar, 25.0, 320.0));
+        let mut turns = 0;
+        let mut was = true;
+        for step in 1..=40 {
+            let x = 25.0 + step as f32 * 25.0;
+            let place = bars.drag(x, 320.0).unwrap();
+            let r = bars.rect(LayoutBar::SideBar).unwrap();
+            if place.vertical != was {
+                turns += 1;
+                was = place.vertical;
+            }
+            if !place.vertical {
+                assert!(r.x <= x && x <= r.right() && r.y <= 320.0 && 320.0 <= r.bottom(), "{x}: {r:?}");
+            }
+        }
+        assert_eq!(turns, 2, "out of the left side lying down, then standing at the right");
+        let right = bars.shown(LayoutBar::SideBar).unwrap();
+        assert!(right.vertical);
+        assert_eq!(right.x, 1024.0 - 51.0);
+        // and down along it: standing all the way, its middle under the finger as far as the window lets
+        for y in [360.0, 400.0, 440.0, 380.0, 320.0, 280.0] {
+            let place = bars.drag(1010.0, y).unwrap();
+            assert!(place.vertical, "{y}");
+        }
+        bars.let_go();
     }
 
     #[test]

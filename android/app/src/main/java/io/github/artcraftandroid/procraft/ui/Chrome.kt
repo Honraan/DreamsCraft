@@ -97,7 +97,8 @@ private fun Modifier.tap(enabled: Boolean = true, onClick: () -> Unit): Modifier
 /** The bar across the top of the canvas: artwork actions on the left, painting tools on the right. */
 @Composable
 fun TopBar(vm: CanvasViewModel, modifier: Modifier = Modifier) {
-    BoxWithConstraints(modifier.fillMaxWidth().height(Pc.BarHeight).background(Pc.Bar)) {
+    // (a press on the bar between its buttons is the bar's: never a dot on the canvas, nor a colour picked)
+    BoxWithConstraints(modifier.fillMaxWidth().height(Pc.BarHeight).background(Pc.Bar).keepsItsTouches()) {
         val fit = Pc.barFit(maxWidth)
         Row(
             Modifier.align(Alignment.CenterStart).padding(start = fit.margin),
@@ -315,7 +316,16 @@ internal fun sideBarBody(width: Float, stretch: Float, right: Boolean): Pair<Flo
  * window's edges ([edges], its own way up), and round all round away from them.
  */
 @Composable
-fun SideBar(vm: CanvasViewModel, modifier: Modifier = Modifier, right: Boolean = false, trackHeight: Dp = Pc.SliderHeight, shown: Float = 1f, stretch: Dp = 0.dp, edges: io.github.artcraftandroid.procraft.core.BarSides? = null) {
+fun SideBar(
+    vm: CanvasViewModel,
+    modifier: Modifier = Modifier,
+    right: Boolean = false,
+    trackHeight: Dp = Pc.SliderHeight,
+    shown: Float = 1f,
+    stretch: Dp = 0.dp,
+    edges: io.github.artcraftandroid.procraft.core.BarSides? = null,
+    glassEdges: io.github.artcraftandroid.procraft.core.BarSides? = edges,
+) {
     // a control's left edge, mirrored on the right
     fun x(left: Dp, width: Dp) = if (right) Pc.SideBarWidth - left - width else left
     // shorter tracks bring what is under each up with them
@@ -327,7 +337,8 @@ fun SideBar(vm: CanvasViewModel, modifier: Modifier = Modifier, right: Boolean =
     // its glass goes past the screen's edge (to take that side's corners off the screen), the
     // further for its stretch
     val past = Pc.SideBarCorner + stretch.coerceAtLeast(0.dp)
-    val body = pastEdges(edges, past, BarGlass(shown, moved, pastLeft = if (right) 0.dp else past, pastRight = if (right) past else 0.dp))
+    // (its frost by the window's sides it touches: lying down, its own are turned)
+    val body = pastEdges(glassEdges, past, BarGlass(shown, moved, pastLeft = if (right) 0.dp else past, pastRight = if (right) past else 0.dp))
     val corners = edges?.let { barCorners(it, Pc.SideBarCorner) }
     // the tracks' own thin glass, unless a plugin has them frosted as the bar is (which the bar's
     // glass under them is already)

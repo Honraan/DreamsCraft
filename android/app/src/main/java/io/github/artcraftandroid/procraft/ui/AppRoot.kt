@@ -66,6 +66,12 @@ fun AppRoot(vm: CanvasViewModel) {
 /** The gallery, or the open artwork's canvas with the bars and panels over it. */
 @Composable
 private fun Screens(vm: CanvasViewModel, keptClear: Clearance) {
+    // (while a plugin lays the panels out, windows lie over the bars and each other: the panels nearly solid)
+    androidx.compose.runtime.CompositionLocalProvider(LocalSolidPanels provides vm.layoutLook.on) { ScreensShown(vm, keptClear) }
+}
+
+@Composable
+private fun ScreensShown(vm: CanvasViewModel, keptClear: Clearance) {
     if (vm.screen == Screen.GALLERY) {
         ZoomingGallery(vm, overlay = false)
         // a share from the gallery shows its card there, and a file brought in its own
@@ -294,9 +300,9 @@ private fun Screens(vm: CanvasViewModel, keptClear: Clearance) {
                         }
                         SideBar(
                             vm,
-                            // (moved, a press on its glass never the canvas's, wherever it is turned)
+                            // (a press on its glass never the canvas's, wherever it is and however it is turned)
                             Modifier.collapseSlid(vm.barCollapsePlace(io.github.artcraftandroid.procraft.core.LayoutBar.SIDE_BAR), sideSlide, rootDensity)
-                                .then(lying).then(aside).then(fade).then(if (sideMoved != null) Modifier.keepsItsTouches() else Modifier)
+                                .then(lying).then(aside).then(fade).keepsItsTouches()
                                 .onGloballyPositioned {
                                     val b = it.boundsInRoot().translate(-keptClear.corner)
                                     vm.sideBarBounds = b
@@ -315,6 +321,7 @@ private fun Screens(vm: CanvasViewModel, keptClear: Clearance) {
                             edges = sideMoved?.let { at ->
                                 vm.barTouching(io.github.artcraftandroid.procraft.core.LayoutBar.SIDE_BAR)?.let { if (at.vertical) it else turnedSides(it) }
                             },
+                            glassEdges = sideMoved?.let { vm.barTouching(io.github.artcraftandroid.procraft.core.LayoutBar.SIDE_BAR) },
                         )
                     }
                 }

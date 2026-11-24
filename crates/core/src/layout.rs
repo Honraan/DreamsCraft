@@ -424,6 +424,10 @@ struct Inner {
     /// go the strips go on showing those tabs, so that what drags it (the tab pressed, in an app
     /// that lays the strip out anew) is still there to the end of the drag.
     tearing: Option<(LayoutPiece, Vec<LayoutPiece>)>,
+    /// A chip dragged off the Tool Belt, still held: it, and where it was among the chips. Until it is
+    /// let go the belt goes on showing it there, so that what drags it (the chip pressed, in an app
+    /// that lays the belt out anew) is still there to the end of the drag.
+    unparking: Option<(LayoutPiece, usize)>,
 }
 
 impl Default for Inner {
@@ -452,6 +456,7 @@ impl Default for Inner {
             reference: None,
             held: None,
             tearing: None,
+            unparking: None,
         }
     }
 }
@@ -683,16 +688,18 @@ impl PanelLayout {
 
     /// The Tool Belt as it shows, while a plugin says so: at the bottom left of the room, a chip for
     /// each panel parked on it (as wide as one while none is).
+    /// (Where it always is, in the room as it is now, however the app moved it as a bar: the app
+    /// shows it moved, and tells where with [`PanelLayout::set_belt_place`].)
     pub fn belt_shown(&self) -> Option<BeltShown> {
         let inner = self.lock();
-        let r = inner.belt_rect()?;
+        let r = inner.belt_home()?;
         Some(BeltShown {
             x: r.x,
             y: r.y,
             width: r.width / inner.scale,
             height: r.height / inner.scale,
             scale: inner.scale,
-            pieces: inner.belt.clone(),
+            pieces: inner.belt_chips(),
         })
     }
 
@@ -717,8 +724,11 @@ impl PanelLayout {
     /// the pointer, following it as one torn off does (see [`PanelLayout::open_at`]).
     pub fn unpark_at(&self, piece: LayoutPiece, x: f32, y: f32, grab: f32) -> Option<PieceShown> {
         let mut inner = self.lock();
+        let at = inner.belt.iter().position(|&p| p == piece);
         inner.belt.retain(|&p| p != piece);
-        inner.opened_at(piece, x, y, grab)
+        let shown = inner.opened_at(piece, x, y, grab);
+        inner.unparking = at.filter(|_| shown.is_some()).map(|at| (piece, at));
+        shown
     }
 
     /// `piece`, a tab of its window, shown there (the others' tabs hide).
@@ -769,7 +779,10 @@ impl Inner {
         }
         inner.raise(piece);
         let shown = inner.shown_spot(piece, spot);
-        inner.held = Some(Held { piece, sizing: false, from: (x, y), start: shown, moved: true, at: (x, y) });
+        // (dragged from where it was meant to be: kept inside the room at first, it comes back under
+        // the finger as the finger moves on)
+        let meant = PieceShown { x: rect.x, y: rect.y, ..shown };
+        inner.held = Some(Held { piece, sizing: false, from: (x, y), start: meant, moved: true, at: (x, y) });
         Some(shown)
     }
 
@@ -778,12 +791,31 @@ impl Inner {
         if !self.look.belt {
             return None;
         }
-        if let Some(place) = self.belt_place {
-            return Some(place);
+        self.belt_place.or_else(|| self.belt_home())
+    }
+
+    /// Where the Tool Belt always is (window points): the room's bottom left as it is now (turned,
+    /// the new one's), as long as its chips (one while none is).
+    fn belt_home(&self) -> Option<LayoutRect> {
+        if !self.look.belt {
+            return None;
         }
         let k = self.scale;
-        let (width, height) = (self.belt.len().max(1) as f32 * BELT_CHIP * k, BELT_HEIGHT * k);
+        let chips = self.belt_chips().len().max(1) as f32;
+        let (width, height) = (chips * BELT_CHIP * k, BELT_HEIGHT * k);
         Some(LayoutRect { x: self.room.left + BELT_GAP, y: self.room.bottom - BELT_GAP - height, width, height })
+    }
+
+    /// The chips on the Tool Belt: those parked, and one dragged off still held, where it was.
+    fn belt_chips(&self) -> Vec<LayoutPiece> {
+        let mut chips = self.belt.clone();
+        if let Some((piece, at)) = self.unparking
+            && self.held.is_some_and(|h| h.piece == piece)
+            && !chips.contains(&piece)
+        {
+            chips.insert(at.min(chips.len()), piece);
+        }
+        chips
     }
 
     /// `piece`, just let go with the pointer at `at`, parked on the Tool Belt if the pointer was on
@@ -802,10 +834,17 @@ impl Inner {
         if !on {
             return false;
         }
-        self.untab(piece);
-        let spot = self.place(piece, start.rect(), start.folded);
-        self.set_spot(piece, spot);
-        self.belt.push(piece);
+        // a window of tabs parks whole, each of its tabs a chip (in its order), each kept where the
+        // window was for when it is taken off
+        let pieces = self.group_of(piece).map_or_else(|| vec![piece], |g| g.pieces.clone());
+        self.groups.retain(|g| !g.pieces.contains(&piece));
+        for p in pieces {
+            let spot = self.place(p, start.rect(), start.folded);
+            self.set_spot(p, spot);
+            if !self.belt.contains(&p) {
+                self.belt.push(p);
+            }
+        }
         true
     }
 
@@ -947,6 +986,7 @@ impl PanelLayout {
     pub fn let_go(&self) -> bool {
         let mut inner = self.lock();
         inner.tearing = None;
+        inner.unparking = None;
         let Some(held) = inner.held.take() else { return false };
         if held.piece.kept_at().is_none() {
             return false;
@@ -1347,6 +1387,17 @@ impl Inner {
             LayoutRect { width: width * k, height: height * k, ..snapped }
         } else {
             let moved = LayoutRect { x: rect.x + dx, y: rect.y + dy, ..rect };
+            // a tall window (over half the room) taken down past the room's bottom gets shorter, so it
+            // goes on under the finger (no shorter than it may be)
+            let sizes = self.sizes_of(held.piece);
+            let tall = rect.height > (self.room.bottom - self.room.top) / 2.0;
+            let moved =
+                if held.piece != LayoutPiece::Reference && sizes.sizable && tall && moved.bottom() > self.room.bottom {
+                    let height = (self.room.bottom - moved.y).max(sizes.least_height * k).min(rect.height);
+                    LayoutRect { height, ..moved }
+                } else {
+                    moved
+                };
             let inside = inside_room(moved, self.room);
             let snapped = snap_moved(inside, &others, self.room, self.bar, reach);
             inside_room(snapped, self.room)
@@ -2452,34 +2503,33 @@ mod tests {
 
     #[test]
     fn a_tall_window_joins_a_strip_low_in_the_window_where_the_pointer_lets_it_go() {
-        // the Adjustments menu (480 tall) at the bottom on the left, its strip at 1000 - 480 = 520
-        let low_menu = |layout: &PanelLayout| {
-            dropped(layout, LayoutPiece::Adjustments, 400.0, 520.0);
-            layout.shown(LayoutPiece::Adjustments).unwrap().rect()
+        // the Layers panel (520 tall) at the bottom on the left, its strip at 1000 - 520 = 480
+        let low_panel = |layout: &PanelLayout| {
+            dropped(layout, LayoutPiece::Layers, 400.0, 480.0);
+            layout.shown(LayoutPiece::Layers).unwrap().rect()
         };
         let layout = laid_out(SNAPPING);
-        let low = low_menu(&layout);
-        assert_eq!(low.y, 520.0);
-        // the Actions panel, 600 tall, held by its strip and brought down onto that strip: kept
-        // inside the window, its top goes no lower than 1000 - 600 = 400, 120 short of it
-        let actions = opened(&layout, LayoutPiece::Actions);
-        let grip = (actions.x + 100.0, actions.y + 10.0);
-        assert!(layout.hold(LayoutPiece::Actions, false, grip.0, grip.1));
+        let low = low_panel(&layout);
+        assert_eq!(low.y, 480.0);
+        // the Adjustments menu held low on it, 400 under its strip, and brought so that the finger is
+        // on that strip: its own strip 400 higher, nowhere near it
+        let menu = opened(&layout, LayoutPiece::Adjustments);
+        let grip = (menu.x + 100.0, menu.y + 400.0);
+        assert!(layout.hold(LayoutPiece::Adjustments, false, grip.0, grip.1));
         let pointer = (low.x + low.width / 2.0, low.y + 10.0);
         let held = layout.drag(pointer.0, pointer.1).unwrap();
-        assert_eq!(held.y, 400.0);
-        assert!(low.y - held.y > TAB_ZONE);
+        assert!(low.y - held.y > TAB_ZONE, "{held:?}");
         // let go with the pointer on that strip: a tab of it all the same
         layout.let_go();
-        assert_eq!(layout.tabs_of(LayoutPiece::Actions), [LayoutPiece::Adjustments, LayoutPiece::Actions]);
+        assert_eq!(layout.tabs_of(LayoutPiece::Adjustments), [LayoutPiece::Layers, LayoutPiece::Adjustments]);
         // let go with the pointer well under that strip (and the window's own away from it): no tab
         let apart = laid_out(SNAPPING);
-        low_menu(&apart);
-        opened(&apart, LayoutPiece::Actions);
-        assert!(apart.hold(LayoutPiece::Actions, false, grip.0, grip.1));
+        low_panel(&apart);
+        opened(&apart, LayoutPiece::Adjustments);
+        assert!(apart.hold(LayoutPiece::Adjustments, false, grip.0, grip.1));
         apart.drag(pointer.0, pointer.1 + 200.0);
         apart.let_go();
-        assert!(apart.tabs_of(LayoutPiece::Actions).is_empty());
+        assert!(apart.tabs_of(LayoutPiece::Adjustments).is_empty());
     }
 
     #[test]
@@ -2611,6 +2661,85 @@ mod tests {
         layout.lock().look.belt = false;
         assert_eq!(layout.belt_shown(), None);
         assert_eq!(layout.shown(LayoutPiece::Layers), Some(layers));
+    }
+
+    #[test]
+    fn the_tool_belt_keeps_to_the_room_s_bottom_left_and_a_chip_dragged_off_stays_until_let_go() {
+        let layout = laid_out(SNAPPING);
+        layout.lock().look.belt = true;
+        // the app shows it where it always is and says so (a bar it may move)
+        let shown = layout.belt_shown().unwrap();
+        let tell = |b: &BeltShown| {
+            let place = LayoutRect { x: b.x, y: b.y, width: b.width * b.scale, height: b.height * b.scale };
+            layout.set_belt_place(Some(place));
+        };
+        tell(&shown);
+        // two parked: two chips wide, though the place told was one chip wide
+        let park = |piece: LayoutPiece, from: (f32, f32), to: (f32, f32)| {
+            assert!(layout.hold(piece, false, from.0, from.1));
+            layout.drag(to.0, to.1);
+            assert!(layout.let_go());
+        };
+        opened(&layout, LayoutPiece::Layers);
+        park(LayoutPiece::Layers, (1300.0, 60.0), (60.0, 970.0));
+        tell(&layout.belt_shown().unwrap());
+        opened(&layout, LayoutPiece::Actions);
+        park(LayoutPiece::Actions, (100.0, 60.0), (150.0, 960.0));
+        let two = layout.belt_shown().unwrap();
+        assert_eq!((two.width, two.pieces.len()), (240.0, 2), "a second park grows the belt");
+        tell(&two);
+        // a chip dragged off: a window under the finger, following it, the chip staying on the belt
+        // (where it was) until let go, then gone, the window where it was let go
+        // (low on the window, kept inside the room: its top 1000 - 520 up, not 888 under the finger)
+        let off = layout.unpark_at(LayoutPiece::Layers, 300.0, 900.0, 12.0).unwrap();
+        assert_eq!((off.x + off.width / 2.0, off.y), (300.0, 1000.0 - 520.0));
+        assert_eq!(layout.belt_shown().unwrap().pieces, [LayoutPiece::Layers, LayoutPiece::Actions]);
+        let under = layout.drag(800.0, 300.0).unwrap();
+        layout.let_go();
+        assert_eq!(layout.belt_shown().unwrap().pieces, [LayoutPiece::Actions]);
+        assert_eq!(layout.shown(LayoutPiece::Layers), Some(under));
+        // (under the finger as it was meant to be, its grabber 12 under it: not 408 higher, as it
+        // would be moved from where the room kept it at first)
+        assert_eq!((under.x + under.width / 2.0, under.y), (800.0, 300.0 - 12.0));
+        // turned the other way: at the new bottom left, the place told for the old way notwithstanding
+        layout.set_room(FloatingRoom { left: 0.0, top: 0.0, right: 1000.0, bottom: 1600.0 }, 1000.0, 1600.0, BAR, 1.0);
+        let portrait = layout.belt_shown().unwrap();
+        assert_eq!((portrait.x, portrait.y), (12.0, 1600.0 - 12.0 - 36.0));
+    }
+
+    #[test]
+    fn a_window_of_tabs_parks_whole_and_a_tall_window_goes_down_under_the_finger() {
+        let layout = laid_out(SNAPPING);
+        layout.lock().look.belt = true;
+        // the library a tab of the Layers panel's window: let go on the belt, both park
+        opened(&layout, LayoutPiece::Layers);
+        dropped(&layout, LayoutPiece::Brushes, 1408.0, 53.0);
+        assert_eq!(layout.tabs_of(LayoutPiece::Layers).len(), 2);
+        assert!(layout.hold(LayoutPiece::Brushes, false, 1408.0, 60.0));
+        layout.drag(60.0, 970.0);
+        assert!(layout.let_go());
+        assert_eq!(layout.belt_shown().unwrap().pieces, [LayoutPiece::Layers, LayoutPiece::Brushes]);
+        assert!(layout.shown(LayoutPiece::Layers).is_none() && layout.shown(LayoutPiece::Brushes).is_none());
+        assert!(layout.tabs_of(LayoutPiece::Layers).is_empty());
+        // each taken off on its own
+        layout.unpark(LayoutPiece::Brushes);
+        assert!(layout.shown(LayoutPiece::Brushes).is_some());
+        assert_eq!(layout.belt_shown().unwrap().pieces, [LayoutPiece::Layers]);
+        // the library (as tall as its window was, over half the room) held by its strip and taken down
+        // 500: 500 lower, its strip still under the finger, shorter to stay in the room; a short one
+        // (the Adjustments menu) stops at the bottom
+        let tall = layout.shown(LayoutPiece::Brushes).unwrap();
+        assert!(tall.height > 500.0, "{tall:?}");
+        assert!(layout.hold(LayoutPiece::Brushes, false, tall.x + 100.0, tall.y + 10.0));
+        let down = layout.drag(tall.x + 100.0, tall.y + 10.0 + 500.0).unwrap();
+        layout.let_go();
+        assert_eq!((down.y, down.y + down.height), (tall.y + 500.0, 1000.0));
+        assert!(down.height < tall.height);
+        let short = opened(&layout, LayoutPiece::Adjustments);
+        assert!(layout.hold(LayoutPiece::Adjustments, false, short.x + 100.0, short.y + 10.0));
+        let stopped = layout.drag(short.x + 100.0, short.y + 10.0 + 900.0).unwrap();
+        layout.let_go();
+        assert_eq!((stopped.y + stopped.height, stopped.height), (1000.0, short.height));
     }
 
     #[test]

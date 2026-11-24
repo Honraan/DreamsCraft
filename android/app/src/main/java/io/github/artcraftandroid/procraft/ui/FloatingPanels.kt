@@ -39,6 +39,7 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -492,28 +493,38 @@ fun FloatingPanels(vm: CanvasViewModel, maxWidth: Dp, maxHeight: Dp) {
     val bar = Pc.barShown.value
     SideEffect { vm.layoutRoom(room, maxWidth.value, maxHeight.value, bar, k) }
     // the Tool Belt, under the windows
-    vm.beltShown()?.let { ToolBelt(vm, it) }
-    // drawn as they were last pressed, those pinned over the rest
-    for (piece in vm.pieceOrder()) {
-        val panel = when (piece) {
-            LayoutPiece.LAYERS -> FloatingPanel.LAYERS
-            LayoutPiece.BRUSHES -> FloatingPanel.BRUSHES
-            else -> null
-        }
-        val popover = piece == LayoutPiece.ACTIONS || piece == LayoutPiece.ADJUSTMENTS
-        if (panel == null && !popover) continue
-        val window = vm.shownPiece(piece) ?: continue
-        key(piece) {
-            // collapsed into its side (Collapse to edge): sliding there, then gone, its tab there instead
-            val collapsed = vm.pieceCollapsed(piece) != null
-            val slide = collapseSlide(collapsed)
-            if (!(collapsed && slide >= 1f)) {
-                val px = LocalDensity.current.density
-                Box(Modifier.size(maxWidth, maxHeight).collapseSlid(vm.pieceCollapsePlace(piece), slide, px)) {
-                    when {
-                        window.folded -> FloatingTab(vm, piece, window, pieceTitle(piece))
-                        panel != null -> FloatingPanelWindow(vm, panel, window)
-                        else -> FloatingPopoverWindow(vm, piece, window)
+    // (not while a panel hangs open from its button: it would lie over the panel)
+    if (vm.panel == io.github.artcraftandroid.procraft.canvas.Panel.NONE) vm.beltShown()?.let { ToolBelt(vm, it) }
+    // over one another as they were last pressed, those pinned over the rest: each always in the same
+    // place among them, stacked by its order (raised, none moves, so a drag on one goes on)
+    // (in a box of their own, stacked among themselves: under the panels hanging from the bar)
+    val order = vm.pieceOrder()
+    val drawn = LayoutPiece.entries.filter {
+        it in order && it in listOf(LayoutPiece.LAYERS, LayoutPiece.BRUSHES, LayoutPiece.ACTIONS, LayoutPiece.ADJUSTMENTS)
+    }
+    Box(Modifier.size(maxWidth, maxHeight)) {
+        for (piece in drawn) {
+            val panel = when (piece) {
+                LayoutPiece.LAYERS -> FloatingPanel.LAYERS
+                LayoutPiece.BRUSHES -> FloatingPanel.BRUSHES
+                else -> null
+            }
+            val window = vm.shownPiece(piece)
+            if (window != null) key(piece) {
+                // collapsed into its side (Collapse to edge): sliding there, then gone, its tab there instead
+                val collapsed = vm.pieceCollapsed(piece) != null
+                val slide = collapseSlide(collapsed)
+                if (!(collapsed && slide >= 1f)) {
+                    val px = LocalDensity.current.density
+                    Box(
+                        Modifier.zIndex(order.indexOf(piece).toFloat()).size(maxWidth, maxHeight)
+                            .collapseSlid(vm.pieceCollapsePlace(piece), slide, px),
+                    ) {
+                        when {
+                            window.folded -> FloatingTab(vm, piece, window, pieceTitle(piece))
+                            panel != null -> FloatingPanelWindow(vm, panel, window)
+                            else -> FloatingPopoverWindow(vm, piece, window)
+                        }
                     }
                 }
             }

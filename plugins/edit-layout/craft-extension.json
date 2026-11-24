@@ -2,7 +2,7 @@
   "schema": 1,
   "id": "io.github.artcraftandroid.edit-layout",
   "name": "Edit layout",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "holds": ["hooks"],
   "publisher": {"name": "ProCraft"},
   "description": "Panels that float, snap to the edges and to each other, fold to a tab and make room for the canvas, and bars you move anywhere, kept for each way the screen turns.",

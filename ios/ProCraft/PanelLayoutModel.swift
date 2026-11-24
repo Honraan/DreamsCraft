@@ -56,6 +56,8 @@ extension CanvasModel {
     func followLayout() {
         panelLayout.follow(plugins: PluginsModel.shared.store)
         layoutLook = panelLayout.look()
+        // (Collapse to edge turned on or off: the bars know at once, not only once they are told again)
+        barLayout.setCollapsing(on: layoutLook.collapse)
         // the bars back where they always are as no plugin lets them move: no handles
         if !layoutLook.edit, editingLayout {
             doneEditLayout()

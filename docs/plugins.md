@@ -2304,7 +2304,10 @@ other, with the same card, Turn on and Remove.
 - The app writes down in its plugin folder (`added`) each one it added, so one that's removed stays
   removed, through restarts and updates. Importing its file brings it back, as any import.
 - A later version of the app adds any it never added before, and puts a newer file in place of an
-  older one that's there, keeping what was set, as an import of it would.
+  older one that's there, keeping what was set, as an import of it would. Newer goes by the version
+  alone, so a plugin packed again with anything changed gets a newer version:
+  `python tools/check_bundled_versions.py` fails for one packed anew since the last release (or
+  `--since` another commit) whose version isn't newer.
 - One imported before the app came with it is left as it is, but for a newer file.
 - A setting the app used to have and a plugin now `keeps` (Colour tools' ColorDrop gap, Interface
   look's size, Layer tools' eyedropper and paste switches) starts the plugin the app added on with it,
