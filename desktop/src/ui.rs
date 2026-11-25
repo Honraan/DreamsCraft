@@ -570,6 +570,8 @@ impl Interface {
         let typing = self.typing;
         self.gallery_button = None;
         self.show_frame(ui, session, input);
+        // the colour as it now is kept (written only as it changes)
+        self.colours.keep();
         // the library closed this frame lets go of what draws its strokes
         self.library.after_frame(session);
         let ctx = ui.ctx();

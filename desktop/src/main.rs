@@ -1721,8 +1721,6 @@ impl App {
             let _ = made.join();
         }
         files::keep_brushes(&session);
-        let (brush, mask) = self.ui.colours.brush_and_mask();
-        files::keep_colours(brush, mask);
         let edits = session.edits();
         match Arc::clone(&session).save_to_leave(dir) {
             procraft_core::Leaving::Left => {
@@ -1748,8 +1746,6 @@ impl App {
             let _ = made.join();
         }
         files::keep_brushes(&session);
-        let (brush, mask) = self.ui.colours.brush_and_mask();
-        files::keep_colours(brush, mask);
         let edits = session.edits();
         match session.save(dir) {
             Ok(()) => {
