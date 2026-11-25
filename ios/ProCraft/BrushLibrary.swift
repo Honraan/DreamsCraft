@@ -1144,8 +1144,10 @@ private struct SwipeAction: Identifiable {
 
 /// A brush that slides away to the left, showing its `actions` in its place: Share, Duplicate and
 /// Delete; in the Recent set Find, Pin (or Unpin) and Clear. Slid right past half of `pickReach`
-/// it is picked (or no longer), if it can be (`onPick`), and slides back. While it is `held` (its
-/// menu up, or it dragged on from there), it stays where it is.
+/// it is picked (or no longer), if it can be (`onPick`), and slides back. Open, any slide right
+/// closes it, quick or slow and let go wherever (the slide is read on the whole row: open, the
+/// brush itself is out of it, the buttons filling it). While it is `held` (its menu up, or it
+/// dragged on from there), it stays where it is.
 private struct SwipeRow<Content: View>: View {
     let open: Bool
     let onOpen: (Bool) -> Void
@@ -1189,36 +1191,38 @@ private struct SwipeRow<Content: View>: View {
             }
             content()
                 .offset(x: offset)
-                .simultaneousGesture(
-                    DragGesture(minimumDistance: 14)
-                        .onChanged { drag in
-                            // a hold has the rest of the touch: no buttons show under a dragged brush
-                            if held() {
-                                return
-                            }
-                            if !sliding, abs(drag.translation.width) > abs(drag.translation.height) {
-                                sliding = true
-                            }
-                            if sliding {
-                                let right: CGFloat = open || onPick == nil ? 0 : pickReach
-                                offset = min(max(rest + drag.translation.width, -width), right)
-                            }
-                        }
-                        .onEnded { _ in
-                            guard sliding else { return }
-                            sliding = false
-                            if offset > pickReach / 2, let onPick {
-                                onPick()
-                            }
-                            let opened = offset < -width / 3
-                            if opened == open {
-                                withAnimation(Motion.swipeSettle) { offset = rest }
-                            } else {
-                                onOpen(opened)
-                            }
-                        }
-                )
         }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 14)
+                .onChanged { drag in
+                    // a hold has the rest of the touch: no buttons show under a dragged brush
+                    if held() {
+                        return
+                    }
+                    if !sliding, abs(drag.translation.width) > abs(drag.translation.height) {
+                        sliding = true
+                    }
+                    if sliding {
+                        let right: CGFloat = open || onPick == nil ? 0 : pickReach
+                        offset = min(max(rest + drag.translation.width, -width), right)
+                    }
+                }
+                .onEnded { drag in
+                    guard sliding else { return }
+                    sliding = false
+                    if !open, offset > pickReach / 2, let onPick {
+                        onPick()
+                    }
+                    // open, a slide right closes it however far it went; closed, a slide left past a
+                    // third of the way opens it
+                    let opened = open ? drag.translation.width <= 0 : offset < -width / 3
+                    if opened == open {
+                        withAnimation(Motion.swipeSettle) { offset = rest }
+                    } else {
+                        onOpen(opened)
+                    }
+                }
+        )
         .background(GeometryReader { g in
             Color.clear
                 .onAppear { width = g.size.width }

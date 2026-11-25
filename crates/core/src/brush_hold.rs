@@ -11,9 +11,11 @@
 pub const BRUSH_MENU_HOLD: f64 = 0.33;
 
 /// How long after its menu shows a held brush still lifts to follow the finger moving on, seconds:
-/// a press of 0.4 to 0.55 s then moved on lifted the brush (moved 0.07 to 0.22 s after the menu
-/// showed); one of 0.7 s or 1 s (0.37 s and more after) scrolled the list under the menu instead.
-pub const BRUSH_DRAG_WINDOW: f64 = 0.25;
+/// presses of 0.4 and 0.55 s then moved on lifted the brush, their moves taking hold 0.51 and
+/// 0.67 s after the touch came down (0.18 and 0.34 s after the menu showed); presses of 0.7 s and
+/// 1 s scrolled the list under the menu instead. So the window ends 0.65 to 0.75 s after the touch
+/// came down: here in the middle of that.
+pub const BRUSH_DRAG_WINDOW: f64 = 0.37;
 
 /// What the finger holding a brush does as it moves (see [`brush_hold_move`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -56,18 +58,21 @@ pub fn brush_hold_move(moved: f32, slop: f32, since_menu: f64, movable: bool) ->
 mod tests {
     use super::*;
 
-    /// The press times measured on the original, from the touch coming down, and what a move then
-    /// did: the drag window has to keep each where it was seen.
+    /// The presses measured on the original, and when their moves took hold (from the touch coming
+    /// down: where the menu began to fade as the brush lifted), and what each move then did: the
+    /// drag window has to keep each where it was seen.
     #[test]
     fn the_measured_presses_move_on_as_the_original_did() {
         // still holds: the menu showed 0.32 to 0.35 s in, and a hold of 0.3 s let go was a tap
         let hold = brush_menu_hold_seconds();
         assert!((0.32..=0.35).contains(&hold) && hold > 0.3, "{hold}");
-        for (press, lifts) in [(0.4, true), (0.55, true), (0.7, false), (1.0, false)] {
-            let since_menu = press - BRUSH_MENU_HOLD;
-            let moved = brush_hold_move(30.0, 8.0, since_menu, true);
+        // a 0.4 s press (its move taking hold at 0.508 s) and a 0.55 s one (0.668 s) lifted the
+        // brush; a 0.7 s press, its move no sooner than 0.75 s, and a 1 s one scrolled the list
+        for (press, moved_at, lifts) in [(0.4, 0.508, true), (0.55, 0.668, true), (0.7, 0.75, false), (1.0, 1.0, false)]
+        {
+            let moved = brush_hold_move(30.0, 8.0, moved_at - BRUSH_MENU_HOLD, true);
             let want = if lifts { BrushHoldMove::Drags } else { BrushHoldMove::Leaves };
-            assert_eq!(moved, want, "a press of {press} s then moved 30 points");
+            assert_eq!(moved, want, "a press of {press} s, moved on at {moved_at} s");
         }
     }
 
