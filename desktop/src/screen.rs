@@ -373,10 +373,9 @@ impl Screen {
             .filter(|d| *d < Duration::from_secs(60 * 60));
         // textures change even when nothing is shown, so none is missed (the device keeps one
         // let go of until what drew with it is done)
-        let (device, queue) = (&self.gpu.device, &self.gpu.queue);
         for (id, deltas) in std::mem::take(&mut textures_delta.set) {
             for delta in &deltas {
-                self.renderer.update_texture(device, queue, id, delta);
+                crate::interface_pass::upload(&mut self.renderer, &self.gpu, id, delta);
             }
         }
         for id in std::mem::take(&mut textures_delta.free) {

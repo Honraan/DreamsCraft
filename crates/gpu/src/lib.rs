@@ -15,6 +15,7 @@ mod lighting;
 mod placed;
 mod scene;
 mod sphere;
+mod stale;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -38,6 +39,7 @@ pub use scene::{
     GrainLook, Light, MOST_LIGHTS, MaterialLook, MeshView, Orbit, ShownSelection, SurfaceMap, material_source,
 };
 pub use sphere::{SphereLook, SpherePreview, preview_environment};
+pub use stale::{STALE, StaleTextures, starts_stale};
 pub use wgpu;
 
 #[cfg(windows)]
@@ -310,6 +312,8 @@ pub struct Gpu {
     /// Whether its copies are made as Direct3D 12 without unrestricted copy pitches makes them
     /// (see [`Gpu::emulate_placed_copies`]).
     placed: Arc<placed::Placed>,
+    /// Whether its new textures start stale, so each is cleared as it is made (see `stale.rs`).
+    stale: Arc<stale::Stale>,
 }
 
 /// Elsewhere there's no Direct3D 12 to choose a shader compiler for.
@@ -579,6 +583,10 @@ impl Gpu {
         if weak_gpu(&info.name, info.device_type) {
             log::info!("a weak GPU: the frosted glass is blurred from a smaller picture");
         }
+        let stale = starts_stale(&info);
+        if stale {
+            log::info!("new textures start stale on this GPU: each is cleared as it is made");
+        }
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("procraft"),
             // where the GPU has it: the pipelines' compiled form to keep between runs
@@ -637,6 +645,7 @@ impl Gpu {
             readbacks: Arc::default(),
             old,
             placed: Arc::default(),
+            stale: Arc::new(stale::Stale::new(stale)),
         };
         // what an old GPU can't do, and what the canvas does without it (in the shared log)
         for lack in gpu.lacks() {
