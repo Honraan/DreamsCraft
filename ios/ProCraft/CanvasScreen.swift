@@ -434,6 +434,10 @@ struct CanvasScreen: View {
                     onAction: { model.rasterizeCurrent() }
                 )
             }
+            // while a plugin lays the panels out, a panel may lie over a window, or a window over
+            // another or a bar: they hide what is under them whole (only the canvas blurs behind
+            // the frost)
+            .environment(\.panelsSolid, model.layoutLook.on)
             .animation(Motion.bars, value: hidden)
             .animation(model.sideBarShown ? Motion.sideBarIn : Motion.sideBarOut, value: model.sideBarShown)
             .sized(screen)
