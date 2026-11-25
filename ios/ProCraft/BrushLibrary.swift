@@ -379,7 +379,15 @@ struct BrushLibrary: View {
                     .clipped()
                     .contentShape(Rectangle())
                 if searching || !ui.query.isEmpty {
-                    SearchResults(model: model, query: ui.query)
+                    SearchResults(model: model, query: ui.query) { b in
+                        // as the original: the search ends, the field goes, and the brush shows in
+                        // its own set, chosen there and scrolled to (the set column too, as it
+                        // comes back)
+                        ui.query = ""
+                        searching = false
+                        ui.searchAway = searchBlock
+                        model.findBrush(b)
+                    }
                 } else {
                     HStack(spacing: 0) {
                         SetColumn(model: model, ui: ui)
@@ -525,10 +533,12 @@ private struct LibrarySearch: View {
     }
 }
 
-/// The brushes of every set whose name holds the search, two to a row; tapping one chooses it.
+/// The brushes of every set whose name holds the search, two to a row; tapping one (`onPick`) ends
+/// the search and shows it in its own set, chosen there.
 private struct SearchResults: View {
     let model: CanvasModel
     let query: String
+    let onPick: (BrushInfo) -> Void
 
     var body: some View {
         let wanted = query.trimmingCharacters(in: .whitespaces)
@@ -544,7 +554,7 @@ private struct SearchResults: View {
                 let tints = model.previewTints()
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 2), spacing: 6) {
                     ForEach(found, id: \.self) { b in
-                        ResultCell(model: model, brush: b, tints: tints)
+                        ResultCell(model: model, brush: b, tints: tints, onPick: onPick)
                     }
                 }
                 .padding(.horizontal, 12)
@@ -561,6 +571,7 @@ private struct ResultCell: View {
     let model: CanvasModel
     let brush: BrushInfo
     let tints: PreviewTints
+    let onPick: (BrushInfo) -> Void
 
     var body: some View {
         let key = CanvasModel.brushKey(brush)
@@ -580,7 +591,7 @@ private struct ResultCell: View {
         .frame(height: 81)
         .clipShape(shape)
         .contentShape(Rectangle())
-        .onTapGesture { model.chooseBrush(brush) }
+        .onTapGesture { onPick(brush) }
         .task(id: preview == nil) {
             if preview == nil {
                 model.loadPreview(brush)

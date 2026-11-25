@@ -12310,7 +12310,9 @@ fn a_size_saved_from_the_panel_is_gone_back_to_from_its_mark_and_taken_away_on_i
 }
 
 /// A set opened in the library brings back the brush last chosen in it as the one in use, so the
-/// brush it shows highlighted is the one that paints; a set never chosen in brings back none.
+/// brush it shows highlighted is the one that paints; a set never chosen in brings back its first
+/// brush (the original keeps one brush per set, the first until one is chosen), and a set with no
+/// brushes none.
 #[test]
 fn a_set_opened_takes_the_brush_last_chosen_in_it_and_follows_it_when_moved() {
     let s = CanvasSession::new(64, 64);
@@ -12321,7 +12323,13 @@ fn a_set_opened_takes_the_brush_last_chosen_in_it_and_follows_it_when_moved() {
     assert_eq!(at(s.brush_set_choice(1)), Some((1, 2)));
     assert_eq!(at(s.brush_set_choice(0)), Some((0, 3)));
     let untouched = (2..s.brush_library().len() as u32).find(|&i| i != start).unwrap();
-    assert_eq!(s.brush_set_choice(untouched), None);
+    assert_eq!(at(s.brush_set_choice(untouched)), Some((untouched, 0)));
+    // opened (tapped, or rested on by a dragged brush), its first brush is the brush and stays its
+    // choice
+    let b = s.brush_set_choice(untouched).unwrap();
+    assert!(s.select_brush(b.set, b.index));
+    assert_eq!((s.current_brush().set, s.current_brush().index), (untouched, 0));
+    assert_eq!(at(s.brush_set_choice(untouched)), Some((untouched, 0)));
     // opened, set 1's choice is the brush; back in set 0, set 0's
     let b = s.brush_set_choice(1).unwrap();
     assert!(s.select_brush(b.set, b.index));
@@ -12332,10 +12340,33 @@ fn a_set_opened_takes_the_brush_last_chosen_in_it_and_follows_it_when_moved() {
     // the choice moved to the top of its set is still that set's choice
     assert!(s.move_brush(1, 2, 1, 0));
     assert_eq!(at(s.brush_set_choice(1)), Some((1, 0)));
-    // moved into another set, its old set has none and the other keeps its later choice
+    // moved into another set, its old set falls back on its first brush and the other keeps its
+    // later choice
+    let left = s.brush_library()[1].brushes.len();
     assert!(s.move_brush(1, 0, 0, 0));
-    assert_eq!(s.brush_set_choice(1), None);
+    assert_eq!(s.brush_library()[1].brushes.len(), left - 1);
+    assert_eq!(at(s.brush_set_choice(1)), Some((1, 0)));
     assert_eq!(at(s.brush_set_choice(0)), Some((0, 4)));
+    // a set with no brushes has none to bring back
+    let empty = s.new_brush_set();
+    assert!(s.brush_library()[empty as usize].brushes.is_empty());
+    assert_eq!(s.brush_set_choice(empty), None);
+}
+
+/// A brush picked from a search, wherever the library stood, is the brush and its set's choice: so
+/// its own set, shown with it, lights it (the original ends the search on the pick and shows the
+/// brush's set, the brush lit), and showing that set again keeps it.
+#[test]
+fn a_brush_picked_from_a_search_is_its_sets_choice() {
+    let s = CanvasSession::new(64, 64);
+    let at = |b: Option<crate::BrushInfo>| b.map(|b| (b.set, b.index));
+    // set 1 shown with its brush 2 the brush; brush 4 of set 3 picked from the search
+    assert!(s.select_brush(1, 2));
+    assert!(s.select_brush(3, 4));
+    assert_eq!((s.current_brush().set, s.current_brush().index), (3, 4));
+    assert_eq!(at(s.brush_set_choice(3)), Some((3, 4)));
+    // set 1 keeps its own choice for when it is shown again
+    assert_eq!(at(s.brush_set_choice(1)), Some((1, 2)));
 }
 
 #[test]

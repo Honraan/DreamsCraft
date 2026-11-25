@@ -4,7 +4,8 @@
 //! [`BRUSH_DRAG_WINDOW`] of the menu showing lifts the brush to follow it, the menu going; moving on
 //! later, the hold is over and the list under the menu has the touch (it scrolls), the menu staying.
 //! Let go without moving on, the menu stays and nothing is chosen. The apps follow the touch; what
-//! a move does is [`brush_hold_move`]'s to say.
+//! a move does is [`brush_hold_move`]'s to say, and how long the hold still has to go when an app
+//! first sees the touch, [`brush_menu_wait`]'s.
 
 /// How long a brush is held still before its menu shows, seconds from the touch coming down: the
 /// menu started showing 0.32 to 0.35 s into each hold measured.
@@ -17,6 +18,13 @@ pub const BRUSH_MENU_HOLD: f64 = 0.33;
 /// came down: here in the middle of that.
 pub const BRUSH_DRAG_WINDOW: f64 = 0.37;
 
+/// How far back the touch's own clock may put its coming down when an app first sees it, seconds,
+/// for the hold to count from then: further back (or ahead), that clock isn't one to go by (a
+/// touch screen just made gives its first touch a time most of a second early), and the hold
+/// counts from when the app saw it. A touch reaches an app some milliseconds after it came down,
+/// a busy frame or two more; well inside the hold, so the press is never taken as held at once.
+pub const BRUSH_TOUCH_CLOCK_TRUST: f64 = 0.25;
+
 /// What the finger holding a brush does as it moves (see [`brush_hold_move`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum BrushHoldMove {
@@ -25,7 +33,8 @@ pub enum BrushHoldMove {
     /// The brush lifts and follows the finger; its menu goes.
     Drags,
     /// The hold is over without lifting the brush: the list under the menu has the touch (it
-    /// scrolls), and the menu stays.
+    /// scrolls up and down), and the menu stays. Nothing else has it: moved sideways, the brush's
+    /// row doesn't slide open to its buttons (see [`brush_row_slides`]).
     Leaves,
 }
 
@@ -33,6 +42,28 @@ pub enum BrushHoldMove {
 #[uniffi::export]
 pub fn brush_menu_hold_seconds() -> f64 {
     BRUSH_MENU_HOLD
+}
+
+/// How much longer a brush held still waits before its menu shows, seconds, when the app first
+/// sees the touch `since_down` seconds after it came down by the touch's own clock: the menu shows
+/// [`BRUSH_MENU_HOLD`] after the finger landed, not after the app saw it. A time that isn't a number,
+/// one ahead of the app's clock or further back than [`BRUSH_TOUCH_CLOCK_TRUST`] is a clock not to go
+/// by: the hold then counts from now.
+#[uniffi::export]
+pub fn brush_menu_wait(since_down: f64) -> f64 {
+    if !(0.0..=BRUSH_TOUCH_CLOCK_TRUST).contains(&since_down) {
+        return BRUSH_MENU_HOLD;
+    }
+    (BRUSH_MENU_HOLD - since_down).max(0.0)
+}
+
+/// Whether a press on a brush's row may slide the row sideways to show its buttons: not once the
+/// brush's menu has shown under it (`menu_shown`). From then on the press is the hold's until let go:
+/// moved on in time it lifts the brush, later the list under the menu has it, which only scrolls up
+/// and down, the menu staying (as the original: a sideways move late in a hold opens no buttons).
+#[uniffi::export]
+pub fn brush_row_slides(menu_shown: bool) -> bool {
+    !menu_shown
 }
 
 /// What the finger holding a brush does, moved `moved` from where it came down (the app's points
@@ -97,6 +128,49 @@ mod tests {
         // a time that isn't a number is late
         assert_eq!(brush_hold_move(40.0, 8.0, f64::NAN, true), BrushHoldMove::Leaves);
         assert_eq!(brush_hold_move(40.0, 8.0, f64::INFINITY, true), BrushHoldMove::Leaves);
+    }
+
+    /// The menu shows the hold after the finger landed: an app seeing the touch late waits only the
+    /// rest of it, and one that saw it after the whole hold shows it at once.
+    #[test]
+    fn the_menu_counts_from_when_the_finger_landed() {
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // seen at once: the whole 0.33 s; seen 40 ms or 90 ms late (the 0.37 to 0.42 s the menu
+        // showed at, timed from when the app saw the touch): 0.29 and 0.24 s more
+        assert!(close(brush_menu_wait(0.0), 0.33), "{}", brush_menu_wait(0.0));
+        assert!(close(brush_menu_wait(0.040), 0.29), "{}", brush_menu_wait(0.040));
+        assert!(close(brush_menu_wait(0.090), 0.24), "{}", brush_menu_wait(0.090));
+        // so the menu shows at 0.33 s from the touch however late (up to a quarter second) the app
+        // saw it, and always some time after the app saw it (never held at once)
+        for late in [0.0, 0.004, 0.016, 0.040, 0.090, 0.2, 0.25] {
+            assert!(close(late + brush_menu_wait(late), BRUSH_MENU_HOLD), "seen {late} s late");
+            assert!(brush_menu_wait(late) >= 0.08, "seen {late} s late");
+        }
+        // a clock not to go by, the hold counted from now: a virtual touch screen's first touch
+        // (0.9 s early, which made a press moved at once lift and drag its brush), one ahead of
+        // the app's clock, one far off, or not a number
+        for odd in [0.26, 0.5, 0.9, -0.004, -3.0, 4_000_000.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(brush_menu_wait(odd), BRUSH_MENU_HOLD, "{odd}");
+        }
+    }
+
+    /// Moved sideways late in a hold (after the drag window), the list has the press, and only to
+    /// scroll: the brush's row doesn't slide open to its buttons, as it does for a press whose menu
+    /// hasn't shown.
+    #[test]
+    fn a_late_sideways_move_opens_no_buttons() {
+        // 30 sideways, 2 down, with an 8 slop: 0.5 s and 1 s after the menu showed (past the 0.37 s
+        // window), the hold leaves to the list, and the row stays shut
+        for since_menu in [0.5, 1.0] {
+            assert_eq!(brush_hold_move(30.0, 8.0, since_menu, true), BrushHoldMove::Leaves);
+            assert!(!brush_row_slides(true));
+        }
+        // in time, the same move lifts the brush instead (no buttons either)
+        assert_eq!(brush_hold_move(30.0, 8.0, 0.2, true), BrushHoldMove::Drags);
+        // a Recent brush held, moved sideways at once: the list's, no buttons
+        assert_eq!(brush_hold_move(30.0, 8.0, 0.0, false), BrushHoldMove::Leaves);
+        // a press whose menu hasn't shown (moved before 0.33 s) slides its row
+        assert!(brush_row_slides(false));
     }
 
     #[test]

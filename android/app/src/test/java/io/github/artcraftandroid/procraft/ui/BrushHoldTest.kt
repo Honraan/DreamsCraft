@@ -18,7 +18,8 @@ class BrushHoldTest {
 
     private fun over(x: Float, y: Float) = brushDropOver(Offset(x, y), sets, 1, 5, list, rows)
 
-    // (what a held brush's move does, a drag or the list's, is the core's: brush_hold.rs tests it)
+    // (what a held brush's move does, a drag or the list's, and when its menu shows, is the core's:
+    // brush_hold.rs tests it)
     @Test
     fun aDraggedBrushLetGoIsOverTheHalfOfTheBrushUnderIt() {
         // over the fourth brush (300 to 390): its upper half, its lower half (the core puts it just
@@ -77,6 +78,34 @@ class BrushHoldTest {
         assertEquals(BrushDropOver.OnBrush(2u, 1u, false), brushDropOver(Offset(400f, 125f), sets, 2, 3, list, opened))
         // it opens only after a hold as long as the original's (1.76 s measured)
         assertTrue(SPRING_LOAD_MS in 1600L..2000L)
+    }
+
+    /**
+     * A row whose brush was held to its menu doesn't slide open: a sideways move late in the hold is
+     * the list's (the core's hold rule), so let go it is as it was, its buttons shut and nothing
+     * picked; a press that never showed the menu slides it as ever.
+     */
+    @Test
+    fun aRowHeldToItsMenuLetGoSlidSidewaysStaysAsItWas() {
+        // buttons 400 wide, the pick 60 to the right: slid 200 left (past a third, 133), let go
+        assertEquals(false to true, brushSlideEnd(-200f, 400f, 60f, open = false, slides = true))
+        assertEquals(false to false, brushSlideEnd(-200f, 400f, 60f, open = false, slides = false))
+        // slid 40 right (past half the reach, 30): picked, unless held to the menu
+        assertEquals(true to false, brushSlideEnd(40f, 400f, 60f, open = false, slides = true))
+        assertEquals(false to false, brushSlideEnd(40f, 400f, 60f, open = false, slides = false))
+        // open already and held: still open
+        assertEquals(false to true, brushSlideEnd(-400f, 400f, 60f, open = true, slides = false))
+        // a short slide (under a third) shuts again
+        assertEquals(false to false, brushSlideEnd(-100f, 400f, 60f, open = false, slides = true))
+    }
+
+    @Test
+    fun aRowSlidesNoFurtherThanItsButtonsOrThePick() {
+        assertEquals(-400f, brushSlide(-390f, -30f, 400f, 60f, open = false), 0f)
+        assertEquals(60f, brushSlide(50f, 30f, 400f, 60f, open = false), 0f)
+        assertEquals(-150f, brushSlide(-120f, -30f, 400f, 60f, open = false), 0f)
+        // open, it goes no further right than shut
+        assertEquals(0f, brushSlide(-10f, 30f, 400f, 60f, open = true), 0f)
     }
 
     @Test

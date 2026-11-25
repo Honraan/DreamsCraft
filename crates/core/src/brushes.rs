@@ -520,13 +520,15 @@ impl CanvasSession {
         true
     }
 
-    /// The brush last chosen in `set`, if one has been and it is still there. A set opened in the
-    /// library makes it the current tool's brush at once, so the brush shown highlighted is always
-    /// the one in use.
+    /// The brush last chosen in `set`, or its first brush if none has been or that one is gone;
+    /// none for a set with no brushes. A set opened in the library, tapped or rested on by a dragged
+    /// brush, makes it the current tool's brush at once, so the brush shown highlighted is always
+    /// the one in use (as the original keeps one brush per set, the first until one is chosen).
     pub fn brush_set_choice(&self, set: u32) -> Option<BrushInfo> {
         let st = self.shared.lock();
-        let index = st.set_choice(set as usize)?;
-        let brush = st.library.get(set as usize)?.brushes.get(index)?;
+        let brushes = &st.library.get(set as usize)?.brushes;
+        let index = st.set_choice(set as usize).filter(|&i| i < brushes.len()).unwrap_or(0);
+        let brush = brushes.get(index)?;
         Some(BrushInfo { set, index: index as u32, name: brush.name.clone() })
     }
 

@@ -101,10 +101,12 @@ import io.github.artcraftandroid.procraft.canvas.RECENT_SET
 import io.github.artcraftandroid.procraft.core.BrushHoldMove
 import io.github.artcraftandroid.procraft.core.BrushInfo
 import io.github.artcraftandroid.procraft.core.brushHoldMove
-import io.github.artcraftandroid.procraft.core.brushMenuHoldSeconds
+import io.github.artcraftandroid.procraft.core.brushMenuWait
+import io.github.artcraftandroid.procraft.core.brushRowSlides
 import io.github.artcraftandroid.procraft.core.ToolKind
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
+import kotlin.math.roundToLong
 
 private val LibraryWidth = 440.dp
 private val SetsWidth = 168.dp
@@ -216,9 +218,12 @@ private fun LibrarySearch(query: String, onQuery: (String) -> Unit, onFocus: (Bo
     }
 }
 
-/** The brushes of every set whose name holds the search, two to a row; tapping one chooses it. */
+/**
+ * The brushes of every set whose name holds the search, two to a row; tapping one ([onPick]) ends
+ * the search and shows it in its own set, chosen there.
+ */
 @Composable
-private fun SearchResults(vm: CanvasViewModel, query: String) {
+private fun SearchResults(vm: CanvasViewModel, query: String, onPick: (BrushInfo) -> Unit) {
     val found = if (query.isBlank()) emptyList() else vm.brushSets.flatMap { it.brushes }.filter { it.name.contains(query.trim(), ignoreCase = true) }
     val tints = remember(vm.colorRgb(), vm.pluginLooks) { vm.previewTints() }
     if (found.isEmpty()) {
@@ -242,7 +247,7 @@ private fun SearchResults(vm: CanvasViewModel, query: String) {
             Box(
                 Modifier.fillMaxWidth().height(81.dp).clip(RoundedCornerShape(12.dp))
                     .background(if (selected) Pc.RowSelected else ResultFill)
-                    .clickable { vm.chooseBrush(b) },
+                    .clickable { onPick(b) },
             ) {
                 preview?.let {
                     val tint = pluginFilter(if (selected) tints.second else tints.first)
@@ -519,11 +524,30 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
                 },
         ) {
         if (searching || query.isNotEmpty()) {
-            SearchResults(vm, query)
+            SearchResults(vm, query) { b ->
+                // as the original: the search ends, the field goes, and the brush shows in its own
+                // set, chosen there and scrolled to, the set too
+                query = ""
+                focus.clearFocus()
+                searching = false
+                searchAway = searchBlock
+                vm.findBrush(b)
+            }
         } else {
         Row(Modifier.fillMaxSize()) {
+            // a brush found (from the search, or the Recent set) shows its set (the Recent row first)
+            val setsState = rememberLazyListState()
+            val found = vm.foundBrush
+            LaunchedEffect(found) {
+                if (found == null) return@LaunchedEffect
+                val item = vm.shownSet + 1
+                if (setsState.layoutInfo.visibleItemsInfo.none { it.index == item && it.offset >= 0 && it.offset + it.size <= setsState.layoutInfo.viewportEndOffset }) {
+                    setsState.scrollToItem(item)
+                }
+            }
             LazyColumn(
                 Modifier.width(SetsWidth).fillMaxHeight().background(Pc.SetColumn),
+                state = setsState,
                 contentPadding = PaddingValues(12.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
@@ -711,6 +735,8 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
                             SwipeBrush(
                                 open = vm.swipedBrush == key,
                                 onOpen = { vm.swipedBrush = if (it) key else null },
+                                // held to its menu, the press is the hold's: a late move is the list's
+                                slides = brushRowSlides(brushMenu == key),
                                 // the current brush counts as picked already
                                 onPick = if (recent || selected) null else ({ vm.togglePickedBrush(b) }),
                                 actions = if (recent) {
@@ -744,8 +770,11 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
                                             // press from the drag
                                             awaitEachGesture {
                                                 val down = awaitFirstDown(requireUnconsumed = false)
-                                                val long = awaitBrushHold(down) ?: return@awaitEachGesture
-                                                val menuAt = down.uptimeMillis + brushMenuHoldMillis()
+                                                // the menu shows the hold after the finger landed (the
+                                                // touch's own time), not after the press reached here
+                                                val wait = brushMenuWaitMillis(android.os.SystemClock.uptimeMillis() - down.uptimeMillis)
+                                                val menuAt = android.os.SystemClock.uptimeMillis() + wait
+                                                val long = awaitBrushHold(down, wait) ?: return@awaitEachGesture
                                                 vm.swipedBrush = null
                                                 focus.clearFocus()
                                                 brushMenu = key
@@ -956,12 +985,15 @@ private fun SwipeBrush(
     onOpen: (Boolean) -> Unit,
     actions: List<SwipeAction>,
     onPick: (() -> Unit)? = null,
+    slides: Boolean = true,
     content: @Composable () -> Unit,
 ) {
     var width by remember { mutableIntStateOf(0) }
     val reach = if (onPick == null) 0f else with(LocalDensity.current) { PickReach.toPx() }
     val offset = remember { Animatable(0f) }
     val scope = rememberCoroutineScope()
+    // read as the drag goes (the press may have shown the brush's menu since it began)
+    val slidesNow by androidx.compose.runtime.rememberUpdatedState(slides)
     LaunchedEffect(open, width) { offset.animateTo(if (open) -width.toFloat() else 0f, Motion.swipeSettle()) }
     Box(Modifier.fillMaxWidth().onSizeChanged { width = it.width }.clipToBounds()) {
         if (offset.value < 0f) {
@@ -975,15 +1007,19 @@ private fun SwipeBrush(
             }
         }
         Box(
-            Modifier.offset { IntOffset(offset.value.roundToInt(), 0) }.pointerInput(open, width, reach) {
+            Modifier.offset { IntOffset(offset.value.roundToInt(), 0) }.pointerInput(open, width, reach, slides) {
+                // a press held to the brush's menu isn't followed from then on (nor taken from the
+                // list, which scrolls with it)
+                if (!slides) return@pointerInput
                 detectHorizontalDragGestures(
                     onHorizontalDrag = { change, amount ->
+                        if (!slidesNow) return@detectHorizontalDragGestures
                         change.consume()
-                        scope.launch { offset.snapTo((offset.value + amount).coerceIn(-width.toFloat(), if (open) 0f else reach)) }
+                        scope.launch { offset.snapTo(brushSlide(offset.value, amount, width.toFloat(), reach, open)) }
                     },
                     onDragEnd = {
-                        if (offset.value > reach / 2f && reach > 0f) onPick?.invoke()
-                        val opened = offset.value < -width / 3f
+                        val (pick, opened) = brushSlideEnd(offset.value, width.toFloat(), reach, open, slidesNow)
+                        if (pick) onPick?.invoke()
                         if (opened == open) scope.launch { offset.animateTo(if (open) -width.toFloat() else 0f, Motion.swipeSettle()) } else onOpen(opened)
                     },
                     onDragCancel = { scope.launch { offset.animateTo(if (open) -width.toFloat() else 0f, Motion.swipeSettle()) } },
@@ -1349,16 +1385,21 @@ private fun LibraryCard(vm: CanvasViewModel, i: Int, library: io.github.artcraft
     }
 }
 
-/** How long a brush is held still before its menu shows, milliseconds (the core's, as measured). */
-private fun brushMenuHoldMillis(): Long = (brushMenuHoldSeconds() * 1000).toLong()
+/**
+ * How much longer, milliseconds, a brush held still waits before its menu shows, the press seen
+ * [sinceDown] milliseconds after the touch came down by its own clock (the core's rule: the menu
+ * shows its measured hold after the finger landed).
+ */
+private fun brushMenuWaitMillis(sinceDown: Long): Long = (brushMenuWait(sinceDown / 1000.0) * 1000).roundToLong()
 
 /**
- * The press [down] on a brush held still for the core's menu time: not lifted, not taken (the list
- * scrolling), not moved past the touch slop. Its last change then (where it took hold), else null.
+ * The press [down] on a brush held still for [wait] milliseconds more: not lifted, not taken (the
+ * list scrolling), not moved past the touch slop. Its last change then (where it took hold), else
+ * null.
  */
-private suspend fun AwaitPointerEventScope.awaitBrushHold(down: PointerInputChange): PointerInputChange? {
+private suspend fun AwaitPointerEventScope.awaitBrushHold(down: PointerInputChange, wait: Long): PointerInputChange? {
     var last = down
-    val cut = withTimeoutOrNull(brushMenuHoldMillis()) {
+    val cut = withTimeoutOrNull(wait.coerceAtLeast(1L)) {
         var still = true
         while (still) {
             val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id }
@@ -1398,6 +1439,23 @@ internal fun draggedTogether(held: BrushInfo, picked: List<String>, selected: Bo
     if (picked.isEmpty() || (key !in picked && !selected)) return listOf(held)
     val going = brushes.filter { b -> b.set == held.set && ("${b.set}-${b.index}" in picked || b.index == held.index) }
     return going.ifEmpty { listOf(held) }
+}
+
+/**
+ * Where a brush's row slid sideways by [amount] comes to from [at] (pixels, left negative): open as
+ * far as its buttons' [width], shut as far as the pick's [reach] to the right (none while [open]).
+ */
+internal fun brushSlide(at: Float, amount: Float, width: Float, reach: Float, open: Boolean): Float =
+    (at + amount).coerceIn(-width, if (open) 0f else reach)
+
+/**
+ * A brush's row let go slid to [at]: whether it is picked (past half the [reach] to the right),
+ * and whether it is open (past a third of its buttons' [width] to the left). A press that may not
+ * slide it ([slides] false: its brush's menu showed) leaves it as it was ([open]), unpicked.
+ */
+internal fun brushSlideEnd(at: Float, width: Float, reach: Float, open: Boolean, slides: Boolean): Pair<Boolean, Boolean> {
+    if (!slides) return false to open
+    return (reach > 0f && at > reach / 2f) to (at < -width / 3f)
 }
 
 /**
