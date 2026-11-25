@@ -400,6 +400,28 @@ impl Fragments {
         self.rule_lists.truncate(RULE_LISTS_KEPT);
         self.rule_next = 0;
     }
+
+    /// Lets go of the rule's lists that take more than `most` bytes (see
+    /// `Canvas::let_go_of_work_past`), and the bind groups of those kept, which hold what they
+    /// bind.
+    pub(super) fn let_go_of_lists_past(&mut self, most: u64) {
+        self.rule_lists.retain(|list| list.bytes() <= most);
+        for list in &mut self.rule_lists {
+            list.bind = None;
+        }
+    }
+
+    /// What the rule's lists take, bytes.
+    pub(super) fn list_bytes(&self) -> u64 {
+        self.rule_lists.iter().map(RuleList::bytes).sum()
+    }
+}
+
+impl RuleList {
+    /// What it takes, bytes: its words' texture and its stamps' buffer.
+    fn bytes(&self) -> u64 {
+        super::textures_bytes(std::slice::from_ref(&self.tiles.texture)) + self.stamps.size()
+    }
 }
 
 impl Canvas {

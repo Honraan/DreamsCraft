@@ -430,7 +430,10 @@ struct BrushLibrary: View {
                 model.importBrushes(from: url)
             }
         }
-        .onDisappear { model.renamingBrush = nil }
+        .onDisappear {
+            model.renamingBrush = nil
+            model.libraryClosed()
+        }
         #if DEBUG
         .onAppear {
             switch ScreenCapture.libraryShows {

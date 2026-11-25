@@ -387,6 +387,9 @@ pub struct Library {
     /// What the sample strokes are tinted with as a plugin colours them (each brush's, then the
     /// brush in use's), as this frame began; none, as the interface draws them.
     tints: [Option<Color32>; 2],
+    /// Whether it was shown this frame and the last (see [`Library::after_frame`]).
+    shown_now: bool,
+    shown_last: bool,
 }
 
 /// A colour (0xRRGGBB) to draw.
@@ -419,6 +422,17 @@ impl Library {
         if !self.recent {
             self.shown_set = None;
         }
+    }
+
+    /// A frame ends: the library shown last frame and not in this one has closed (hanging from its
+    /// button or floating alike), and the core lets go of the canvas its sample strokes are drawn
+    /// on. Its strokes stay, so it opens again at once.
+    pub fn after_frame(&mut self, session: &CanvasSession) {
+        let shown = std::mem::take(&mut self.shown_now);
+        if self.shown_last && !shown {
+            session.let_go_of_previews();
+        }
+        self.shown_last = shown;
     }
 
     /// A menu or question of the library's is up: a press elsewhere only closes it.
@@ -637,6 +651,7 @@ impl Library {
                 panel::floating_area(ctx, egui::Id::unique("floating brush library"), window),
             ),
         };
+        self.shown_now = true;
         // the cards' strokes forgotten last frame are drawn no more
         self.card_retired.clear();
         // nor the sample strokes out of sight past those kept (before any is drawn this frame)

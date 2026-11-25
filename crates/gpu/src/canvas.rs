@@ -981,6 +981,13 @@ struct RuleBinds {
 /// The most lists of the rule's tiles kept between renders (see [`RuleLists`]).
 const RULE_LISTS_KEPT: usize = 8;
 
+/// How many stamps, uniform slots, smudge stamps' slots and wet passes a canvas's buffers for them
+/// hold as it is made: each grows as a render wants more (see [`Canvas::let_go_of_work_past`]).
+const STAMPS_MADE: u64 = 4096;
+const UNIFORM_SLOTS_MADE: u64 = 64;
+const SMUDGE_SLOTS_MADE: u64 = 64;
+const WET_PASSES_MADE: u64 = 4;
+
 /// The most words a list of the rule's tiles holds (8 MB): a part of the canvas whose list would
 /// hold more is laid in smaller parts (see [`rule_lists`]). A sample stroke of thousands of big
 /// stamps took hundreds of MB in one, past what a phone could make.
@@ -3805,9 +3812,9 @@ impl Canvas {
         // two points on a side: each corner its own colour
         let corners: Vec<u8> = (0..8u8).flat_map(|i| [(i >> 2) & 1, (i >> 1) & 1, i & 1, 1].map(|c| c * 255)).collect();
         let identity_lut = lut_bind(gpu, &pipelines.lut_layout, 2, &corners);
-        let uniform_slots = 64;
+        let uniform_slots = UNIFORM_SLOTS_MADE;
         let (uniform_buffer, uniform_bind) = uniforms(device, &pipelines.uniform_layout, uniform_slots);
-        let stamp_capacity = 4096;
+        let stamp_capacity = STAMPS_MADE;
         let stamp_buffer = stamp_buffer(device, stamp_capacity);
         let canvas = Canvas {
             id: NEXT_CANVAS.fetch_add(1, Ordering::Relaxed),
@@ -3936,13 +3943,13 @@ impl Canvas {
             scaled: None,
             sharp: None,
             surround_picture: None,
-            smudge_params: smudge_params(device, 64),
+            smudge_params: smudge_params(device, SMUDGE_SLOTS_MADE),
             smudge_spare: [spare_buffer(device), spare_buffer(device)],
-            smudge_capacity: 64,
+            smudge_capacity: SMUDGE_SLOTS_MADE,
             smudge_most,
             smudge_room,
-            wet_params: wet_params(device, 4),
-            wet_capacity: 4,
+            wet_params: wet_params(device, WET_PASSES_MADE),
+            wet_capacity: WET_PASSES_MADE,
             prediction: Vec::new(),
             laid: None,
             laid_second: None,
@@ -4068,6 +4075,66 @@ impl Canvas {
         self.filter_keep.let_go();
         // what the screen shows while traced: drawn whole again at the next render
         self.trace = None;
+    }
+
+    /// Lets go of what its strokes' work grew past `most` bytes a buffer (the lists of tiles the
+    /// stamps laid by their rule read, the stamps' upload, the uniforms of a render's passes and of
+    /// paint laid in place), with what [`Canvas::let_go_of_spares`] lets go: for a canvas kept
+    /// between short strokes of its own (the brushes' sample strokes), which one heavy stroke left
+    /// holding the most it had ever taken (eight lists of 8 MB, after a wet brush's). Each is made
+    /// again, as small as when the canvas was made, when next wanted. Nothing while a stroke is
+    /// open or work waits.
+    pub fn let_go_of_work_past(&mut self, gpu: &Gpu, most: u64) {
+        if self.active.is_some() || self.smudge.is_some() || !self.ops.is_empty() {
+            return;
+        }
+        self.let_go_of_spares();
+        // (a list's bind group holds what it binds: the stamps' and uniforms' buffers let go below)
+        self.rule_lists.kept.retain(|list| list.buffer.size() <= most);
+        for list in &mut self.rule_lists.kept {
+            list.bind = None;
+        }
+        self.fragments.let_go_of_lists_past(most);
+        let device = &gpu.device;
+        if self.stamp_buffer.size() > most {
+            self.stamp_capacity = STAMPS_MADE;
+            self.stamp_buffer = stamp_buffer(device, self.stamp_capacity);
+        }
+        if self.uniform_buffer.size() > most {
+            self.uniform_slots = UNIFORM_SLOTS_MADE;
+            let (buffer, bind) = uniforms(device, &self.pipelines.uniform_layout, self.uniform_slots);
+            self.uniform_buffer = buffer;
+            self.uniform_bind = bind;
+        }
+        if self.smudge_params.size() > most {
+            self.smudge_capacity = SMUDGE_SLOTS_MADE;
+            self.smudge_params = smudge_params(device, self.smudge_capacity);
+        }
+        if self.wet_params.size() > most {
+            self.wet_capacity = WET_PASSES_MADE;
+            self.wet_params = wet_params(device, self.wet_capacity);
+        }
+    }
+
+    /// What the buffers made for its strokes' work take, bytes: the lists of tiles the stamps laid
+    /// by their rule read (see [`Canvas::rule_list_bytes`]), the stamps' upload, the uniforms,
+    /// where the rule's passes write, and the upload buffers kept. For tests.
+    #[doc(hidden)]
+    pub fn work_buffer_bytes(&self) -> u64 {
+        let buffers = [&self.stamp_buffer, &self.uniform_buffer, &self.smudge_params, &self.wet_params];
+        let outs = [self.rule_out.as_ref(), self.carry_out.as_ref()];
+        let uploads: u64 =
+            self.uploads.kept.lock().unwrap_or_else(PoisonError::into_inner).iter().map(|(b, _)| b.size()).sum();
+        self.rule_list_bytes()
+            + buffers.into_iter().chain(outs.into_iter().flatten()).map(wgpu::Buffer::size).sum::<u64>()
+            + uploads
+    }
+
+    /// What the lists of tiles the stamps laid by their rule read take, bytes (in fragment passes,
+    /// their textures and the stamps beside them). For tests.
+    #[doc(hidden)]
+    pub fn rule_list_bytes(&self) -> u64 {
+        self.rule_lists.kept.iter().map(|l| l.buffer.size()).sum::<u64>() + self.fragments.list_bytes()
     }
 
     /// Lets go of the shape and grain images until something wants them again (a canvas left

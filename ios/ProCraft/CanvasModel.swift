@@ -1134,6 +1134,14 @@ final class CanvasModel {
         }
     }
 
+    /// The library closed: the core lets go of the canvas its sample strokes are drawn on (100 MB
+    /// and more of the GPU's memory after a heavy set), made again for the next. The pictures stay,
+    /// so it opens again at once.
+    func libraryClosed() {
+        let session = session
+        DispatchQueue.global(qos: .utility).async { session.letGoOfPreviews() }
+    }
+
     /// `image` kept as brush `key`'s sample stroke, the oldest let go past the most kept.
     private func keepPreview(_ key: String, _ image: UIImage, shaded: Bool) {
         previews[key] = image

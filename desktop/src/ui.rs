@@ -570,6 +570,8 @@ impl Interface {
         let typing = self.typing;
         self.gallery_button = None;
         self.show_frame(ui, session, input);
+        // the library closed this frame lets go of what draws its strokes
+        self.library.after_frame(session);
         let ctx = ui.ctx();
         self.follow_held(ctx, session);
         if !typing && escape_untaken(ctx) && self.canvas_shown() && input.idle() {

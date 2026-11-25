@@ -263,6 +263,8 @@ private fun SearchResults(vm: CanvasViewModel, query: String) {
  */
 @Composable
 fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier, floating: FloatingFrame? = null) {
+    // closed, hanging from its button or floating: the core lets go of what its strokes are drawn on
+    androidx.compose.runtime.DisposableEffect(vm) { onDispose { vm.libraryClosed() } }
     val sets = vm.brushSets
     val tints = remember(vm.colorRgb(), vm.pluginLooks) { vm.previewTints() }
     // the Recent set, or one of the library's

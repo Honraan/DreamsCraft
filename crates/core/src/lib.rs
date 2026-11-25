@@ -1726,6 +1726,14 @@ pub(crate) struct Shared {
     /// How many times the brush studio has asked for its brush's sample stroke: the newest ask
     /// is the one drawn (see [`CanvasSession::studio_preview`]).
     pub(crate) studio_previews: std::sync::atomic::AtomicU64,
+    /// The brushes' sample strokes ended or kept so far, when the last ended (milliseconds into
+    /// the run), how many are waiting for their turn or being drawn, and whether a thread waits to
+    /// let go of the canvas they are drawn on once none has been asked for a while (see
+    /// `brushes.rs`).
+    pub(crate) previews_drawn: std::sync::atomic::AtomicU64,
+    pub(crate) preview_drawn_at: std::sync::atomic::AtomicU64,
+    pub(crate) previews_pending: std::sync::atomic::AtomicU64,
+    pub(crate) previews_watched: std::sync::atomic::AtomicBool,
     /// Where `state` was last taken, for the log when a wait on it is long.
     holder: held::Holder,
     /// What the session's own threads have done (see [`CanvasSession::activity`]).
@@ -2387,6 +2395,10 @@ impl CanvasSession {
                 touches: Mutex::new(touch::Touches::default()),
                 pad_sync: Mutex::new(studio::PadSync::default()),
                 studio_previews: std::sync::atomic::AtomicU64::new(0),
+                previews_drawn: std::sync::atomic::AtomicU64::new(0),
+                preview_drawn_at: std::sync::atomic::AtomicU64::new(0),
+                previews_pending: std::sync::atomic::AtomicU64::new(0),
+                previews_watched: std::sync::atomic::AtomicBool::new(false),
                 holder: held::Holder::default(),
                 counts: activity::Counts::default(),
                 nudge: Arc::new(activity::Nudge::default()),
@@ -3272,6 +3284,8 @@ impl CanvasSession {
         st.canvas = None;
         st.pending_pixels.clear();
         st.scene = None;
+        // and the canvas the brushes' sample strokes are drawn on
+        st.preview = None;
     }
 
     /// Canvas Orientation Memory: on, the quarter turn the artwork is kept at (which it opens

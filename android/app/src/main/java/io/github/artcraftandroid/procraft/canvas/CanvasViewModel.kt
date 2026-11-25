@@ -2044,14 +2044,16 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * The sample strokes in [previews], the last drawn last: past [previewsMost] (by the device's
-     * memory, the core's brushPreviewsKept) the first go, a row showing one drawing it again from
-     * the core's packed copy. Kept all, every set looked through held some 100 MB of pictures.
+     * memory and what it has available as each is kept, see [previewBitmapsKept]) the first go, a row
+     * showing one drawing it again from the core's packed copy. Kept all, every set looked through
+     * held some 100 MB of pictures.
      */
     private val previewOrder = ArrayDeque<String>()
-    private val previewsMost by lazy {
+
+    private fun previewsMost(): Int {
         val memory = android.app.ActivityManager.MemoryInfo()
         getApplication<Application>().getSystemService(android.app.ActivityManager::class.java)?.getMemoryInfo(memory)
-        io.github.artcraftandroid.procraft.core.brushPreviewsKept(memory.totalMem.coerceAtLeast(0).toULong(), 530u, 162u).toInt()
+        return previewBitmapsKept(memory.totalMem, memory.availMem)
     }
 
     /** [bitmap] kept as brush [key]'s sample stroke, the oldest let go past the most kept. */
@@ -2060,7 +2062,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         previews[key] = bitmap
         previewOrder.remove(key)
         previewOrder.addLast(key)
-        while (previewOrder.size > previewsMost) {
+        val most = previewsMost()
+        while (previewOrder.size > most) {
             val old = previewOrder.removeFirst()
             previews.remove(old)
             shadedNames.remove(old)
@@ -2072,6 +2075,16 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         previews.clear()
         shadedNames.clear()
         previewOrder.clear()
+    }
+
+    /**
+     * The library closed: the core lets go of the canvas its sample strokes are drawn on (100 MB and
+     * more of the GPU's memory after a heavy set), made again for the next. The pictures stay, so it
+     * opens again at once.
+     */
+    fun libraryClosed() {
+        val s = session ?: return
+        viewModelScope.launch(Dispatchers.Default) { s.letGoOfPreviews() }
     }
 
     /** Counts the library's changes: a sample stroke asked for before the last one isn't kept. */
