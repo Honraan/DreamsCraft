@@ -18,6 +18,7 @@ use procraft_engine::textures::{self, GrayImage, TEXTURE_SIZE};
 
 use crate::{Gpu, GpuError};
 
+mod carry_check;
 pub(crate) mod filter_layers;
 mod fragments;
 pub(crate) mod plugin_filter;
@@ -27,6 +28,8 @@ mod second_marks;
 mod smudge;
 mod store;
 
+pub(crate) use carry_check::CarryCheck;
+pub use carry_check::CarryFault;
 pub use store::{LayerStore, STORE_LIT};
 
 const LAYER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -3114,6 +3117,8 @@ pub(crate) struct Abilities {
     /// Whether the compute passes run (see [`Gpu::computes`]): without them nothing smudges, wet
     /// paint and paint laid in place are laid dry, and no stroke is laid by its rule.
     pub(crate) computes: bool,
+    /// The carried rule pass laid wrong, as a test asks (see [`CarryFault::Miscompiled`]).
+    pub(crate) miscompiled_carry: bool,
 }
 
 impl Abilities {
@@ -3123,6 +3128,7 @@ impl Abilities {
             stroke_format: if floats { STROKE_FORMAT } else { LAYER_FORMAT },
             liquify_format: floats.then(|| liquify_format(&gpu.adapter)),
             computes: gpu.computes(),
+            miscompiled_carry: gpu.carry_fault() == CarryFault::Miscompiled,
         }
     }
 }
@@ -3279,6 +3285,11 @@ pub struct Canvas {
     /// What a part is carried with couldn't be made here: a dual brush's stroke laid by its rule
     /// is laid whole again as it ends, as it was before.
     carry_refused: bool,
+    /// The device it was made on, for whether parts are carried there, checked the first time a
+    /// stroke would carry one (see `carry_check.rs`).
+    gpu: Gpu,
+    /// It is the check's own canvas, and lays a part carried or not as told.
+    checking_carry: bool,
     /// The lists of tiles the rule's passes read (see [`RuleLists`]), and the most words one may
     /// hold (see [`RULE_LIST_MOST`]).
     rule_lists: RuleLists,
@@ -3831,6 +3842,8 @@ impl Canvas {
             carried: Default::default(),
             carry_out: None,
             carry_refused: false,
+            gpu: gpu.clone(),
+            checking_carry: false,
             rule_lists: RuleLists::default(),
             rule_list_most: RULE_LIST_MOST,
             work_left_out: false,
@@ -4535,7 +4548,8 @@ impl Canvas {
 
     /// Whether the open stroke's part (`second`: its second) is carried from lot to lot (see
     /// [`Carried`]): a dual brush's laid by its rule in the stroke's textures (neither part laid in
-    /// place, nor its stroke onto an adjustment's mask), where the GPU's compute passes lay it.
+    /// place, nor its stroke onto an adjustment's mask), where the GPU's compute passes lay it as
+    /// the plain pass does (checked the first time, see `carry_check.rs`).
     fn carries(&self, second: bool) -> bool {
         let Some(active) = self.active else { return false };
         let Some(dual) = active.second else { return false };
@@ -4547,6 +4561,7 @@ impl Canvas {
             && self.pipelines.compute.is_some()
             && self.pipelines.fragments.is_none()
             && !self.carry_refused
+            && (self.checking_carry || self.gpu.carries_rule())
     }
 
     /// The open stroke goes on without its second (it was made into a shape).
@@ -13418,15 +13433,16 @@ impl Pipelines {
                 label: Some("stamp rule carried"),
                 entries: &[rule_entries.as_slice(), &[carried]].concat(),
             });
-            let rule_module = module(
-                "stamp rule",
-                concat!(
-                    include_str!("shaders/blend.wgsl"),
-                    include_str!("shaders/stamp.wgsl"),
-                    include_str!("shaders/stamp_rule.wgsl"),
-                    include_str!("shaders/stamp_rule_compute.wgsl")
-                ),
+            let rule_source = concat!(
+                include_str!("shaders/blend.wgsl"),
+                include_str!("shaders/stamp.wgsl"),
+                include_str!("shaders/stamp_rule.wgsl"),
+                include_str!("shaders/stamp_rule_compute.wgsl")
             );
+            let rule_module = match abilities.miscompiled_carry {
+                true => module("stamp rule", &carry_check::miscompiled(rule_source)),
+                false => module("stamp rule", rule_source),
+            };
             let stamp_rule = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("stamp rule"),
                 layout: Some(&layout("stamp rule", &[Some(&rule_layout), Some(&brush_layout)])),

@@ -3699,7 +3699,7 @@ fn a_dual_brush_built_up_by_its_rule_ends_a_long_stroke_laying_only_the_rest_as_
     let samples = 900;
     let names = ["Ironwood", "Beluga", "Frost Birch"];
     for (name, lot) in names.iter().flat_map(|n| [(*n, None), (*n, Some(60_000))]) {
-        let ended = |whole: bool| -> Option<(Vec<u8>, u64, Duration, Duration, bool)> {
+        let ended = |whole: bool| -> Option<(Vec<u8>, u64, Duration, Duration, bool, bool)> {
             let s = session(side, side)?;
             let (set, index) = library_brush(&s, |b| b.name == name)?;
             let carried = {
@@ -3744,11 +3744,13 @@ fn a_dual_brush_built_up_by_its_rule_ends_a_long_stroke_laying_only_the_rest_as_
             let laid = lifted.elapsed();
             let sent = s.shared.lock().canvas.as_ref()?.stamps_queued() - before;
             let current = s.layers().iter().find(|l| l.current).map_or(0, |l| l.id);
-            Some((layer_rgba(&s, current), sent, lift, laid, carried))
+            // (where the GPU lays the carried pass wrong, the check finds it and nothing is carried)
+            let here = s.shared.lock().gpu.as_ref()?.carry_checked() != Some(false);
+            Some((layer_rgba(&s, current), sent, lift, laid, carried, here))
         };
         let (
-            Some((whole, sent_whole, lift_whole, laid_whole, carried)),
-            Some((rest, sent_rest, lift_rest, laid_rest, _)),
+            Some((whole, sent_whole, lift_whole, laid_whole, carried, _)),
+            Some((rest, sent_rest, lift_rest, laid_rest, _, here)),
         ) = (ended(true), ended(false))
         else {
             continue;
@@ -3766,7 +3768,11 @@ fn a_dual_brush_built_up_by_its_rule_ends_a_long_stroke_laying_only_the_rest_as_
         );
         assert!(whole.iter().skip(3).step_by(4).any(|&a| a > 0), "{name} drew nothing");
         assert_eq!((most, count), (0, 0), "{name} (lots of {lot:?}): ended unlike laid whole");
-        // the end lays a few stamps, not the stroke again
+        // the end lays a few stamps, not the stroke again (where this GPU carries its parts)
+        if !here {
+            println!("{name}: not carried on this GPU (its check found the carried pass wrong): laid whole again");
+            continue;
+        }
         assert!(sent_rest * 10 < sent_whole, "{name}: {sent_rest} stamps laid at its end, against {sent_whole} whole");
     }
 }
@@ -3859,11 +3865,15 @@ fn a_dual_brush_built_up_by_its_rule_keeps_what_its_parts_are_carried_in_from_st
             "{name}: {kept} kept, {made} made over {strokes} strokes; first frames {} ms",
             starts.iter().map(ms).collect::<Vec<_>>().join(", ")
         );
+        assert!(whole.iter().skip(3).step_by(4).any(|&a| a > 0), "{name} drew nothing");
+        assert_eq!(differ(&whole, &rest), (0, 0), "{name}: crossing strokes ended unlike laid whole");
+        if s.shared.lock().gpu.as_ref().unwrap().carry_checked() == Some(false) {
+            println!("{name}: not carried on this GPU (its check found the carried pass wrong)");
+            continue;
+        }
         assert!(kept > 0, "{name}: its parts carried in nothing");
         // made at the first stroke only
         assert_eq!(made, kept, "{name}: {made} made over {strokes} strokes, {kept} kept");
-        assert!(whole.iter().skip(3).step_by(4).any(|&a| a > 0), "{name} drew nothing");
-        assert_eq!(differ(&whole, &rest), (0, 0), "{name}: crossing strokes ended unlike laid whole");
         // a stroke of a brush that carries nothing lets them go, and so does trimming memory
         let (set, index) =
             library_brush(&s, |b| b.secondary.is_none() && !b.mixes_wet() && !b.laid_in_place()).unwrap();
@@ -3881,6 +3891,61 @@ fn a_dual_brush_built_up_by_its_rule_keeps_what_its_parts_are_carried_in_from_st
         stroke(&s, strokes + 2);
         assert_eq!(carried_in(&s).len(), 0, "{name}: kept on a device of little memory");
     }
+}
+
+/// A dual brush built up by its rule draws on a GPU whose compiler lays the carried rule pass wrong
+/// (emulated: see `procraft_gpu::CarryFault`) as on one laying such brushes by the plain pass: the
+/// check made before its first stroke would carry a part turns the carry off there. Carried as it
+/// is, the stroke came out fainter (on the Adreno 750 a dual brush cut by its second's strength drew
+/// next to nothing).
+#[test]
+fn a_dual_brush_built_up_by_its_rule_draws_whole_on_a_gpu_that_carries_it_wrong() {
+    use procraft_gpu::CarryFault;
+    let side = 256;
+    let point = |k: usize| PenSample {
+        pressure: 0.4 + 0.5 * (k as f32 * 0.05).sin().abs(),
+        ..sample(24.0 + k as f32 * 1.4, 128.0 + (k as f32 * 0.04).sin() * 60.0, k as f64 * 4.17)
+    };
+    // on a device of its own made as `make` says: the layer once a stroke drawn over frames ends,
+    // its ink, and what the check found
+    let drawn = |make: &dyn Fn(&Gpu)| -> Option<(Vec<u8>, u64, Option<bool>)> {
+        let gpu = Gpu::headless().ok()?;
+        make(&gpu);
+        let s = session_on(gpu.clone(), side, side);
+        let (set, index) = library_brush(&s, |b| b.name == "Ironwood")?;
+        assert!(s.select_brush(set, index));
+        s.set_brush_size(0.4);
+        s.set_color(0.2, 0.2, 0.25);
+        s.stroke_begin(PointerKind::Stylus, vec![point(0)]);
+        for e in 1..75 {
+            s.stroke_add(vec![point(2 * e - 1), point(2 * e)]);
+            if e % 2 == 0 {
+                picture(&s);
+            }
+        }
+        s.stroke_end(vec![point(150)]);
+        picture(&s);
+        let current = s.layers().iter().find(|l| l.current).map_or(0, |l| l.id);
+        let layer = layer_rgba(&s, current);
+        let ink = layer.iter().skip(3).step_by(4).map(|&a| u64::from(a)).sum();
+        Some((layer, ink, gpu.carry_checked()))
+    };
+    let Some((plain, plain_ink, _)) = drawn(&|g| g.settle_carry(false)) else { return };
+    let (wrong, wrong_ink, _) = drawn(&|g| {
+        g.emulate_carry_fault(CarryFault::Miscompiled);
+        g.settle_carry(true);
+    })
+    .unwrap();
+    let (checked, checked_ink, found) = drawn(&|g| g.emulate_carry_fault(CarryFault::Miscompiled)).unwrap();
+    println!(
+        "Ironwood: ink {plain_ink} by the plain pass; carried wrong {wrong_ink}, {} channels apart; checked first {checked_ink} ({found:?}), {:?} apart",
+        differ(&wrong, &plain).1,
+        differ(&checked, &plain)
+    );
+    assert!(plain_ink > 0, "Ironwood drew nothing");
+    assert!(wrong_ink * 10 < plain_ink * 9, "the emulated fault shows");
+    assert_eq!(found, Some(false), "the check found nothing wrong");
+    assert_eq!(differ(&checked, &plain), (0, 0), "unlike the plain pass");
 }
 
 /// A dual brush whose second turns its stamps the way the stroke goes (57 of the library's 140) ends

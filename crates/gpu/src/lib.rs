@@ -32,7 +32,7 @@ pub use canvas::{
     Thumbnail, TipKind, VEIL_GRID, VeilCell, VeilCells, grey_levels, most_resident, read_texture, start_reading,
     textures_bytes,
 };
-pub use canvas::{CanvasPaper, GREY_LOOK, ViewLook};
+pub use canvas::{CanvasPaper, CarryFault, GREY_LOOK, ViewLook};
 pub use kept::keep_pipelines_in;
 pub use lighting::Lighting;
 pub use scene::{
@@ -314,6 +314,9 @@ pub struct Gpu {
     placed: Arc<placed::Placed>,
     /// Whether its new textures start stale, so each is cleared as it is made (see `stale.rs`).
     stale: Arc<stale::Stale>,
+    /// Whether a dual brush's parts laid by their rule are carried from lot to lot here: checked
+    /// before the first stroke that would carry one (see `canvas/carry_check.rs`).
+    carry: Arc<canvas::CarryCheck>,
 }
 
 /// Elsewhere there's no Direct3D 12 to choose a shader compiler for.
@@ -646,6 +649,7 @@ impl Gpu {
             old,
             placed: Arc::default(),
             stale: Arc::new(stale::Stale::new(stale)),
+            carry: Arc::default(),
         };
         // what an old GPU can't do, and what the canvas does without it (in the shared log)
         for lack in gpu.lacks() {
