@@ -336,3 +336,36 @@ fn library_shows_every_stock_brush_first_then_kept() {
     drawn_previews::forget_listing(&dir);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The library opens with its lists as they stood when it closed only on the same set of the same
+/// library: on another set (the brush in use moved there meanwhile), the Recent set, or in another
+/// library, none, and the shown set and the brush in use are brought into sight instead.
+#[test]
+fn the_library_opens_as_it_closed_only_on_the_same_set_of_the_same_library() {
+    use crate::LibraryScroll;
+    let dir = folder("scroll");
+    let s = CanvasSession::new(64, 64);
+    s.open_brushes(dir.to_string_lossy().into_owned());
+    assert_eq!(s.library_opens(3), None, "never closed");
+    let spot =
+        LibraryScroll { shown_set: 3, sets_first: 2, sets_offset: 14.5, brushes_first: 20, brushes_offset: 31.0 };
+    s.library_closed(spot);
+    assert_eq!(s.library_opens(3), Some(spot));
+    assert_eq!(s.library_opens(3), Some(spot), "as often as it opens");
+    assert_eq!(s.library_opens(2), None, "another set");
+    assert_eq!(s.library_opens(-1), None, "the Recent set");
+    s.library_closed(LibraryScroll { shown_set: -1, ..spot });
+    assert_eq!(s.library_opens(-1).map(|o| o.brushes_first), Some(20));
+    // a measure that isn't one is taken as the top
+    s.library_closed(LibraryScroll { sets_offset: f32::NAN, brushes_offset: -4.0, ..spot });
+    assert_eq!(s.library_opens(3).map(|o| (o.sets_offset, o.brushes_offset)), Some((0.0, 0.0)));
+    // another library in use: none, and none back in the first either (it closed on the other)
+    s.library_closed(spot);
+    let other = s.new_brush_library().expect("a new library");
+    assert!(s.open_brush_library(other));
+    assert_eq!(s.library_opens(3), None);
+    s.library_closed(LibraryScroll { shown_set: 0, ..spot });
+    assert!(s.open_brush_library(0));
+    assert_eq!(s.library_opens(0), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}

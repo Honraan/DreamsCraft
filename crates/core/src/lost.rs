@@ -302,6 +302,7 @@ fn carry_over(st: &mut State, old: &mut State) {
     swap(&mut st.sliders, &mut old.sliders);
     swap(&mut st.strokes, &mut old.strokes);
     swap(&mut st.drawn_previews, &mut old.drawn_previews);
+    swap(&mut st.library_scroll, &mut old.library_scroll);
     swap(&mut st.grain_store, &mut old.grain_store);
     swap(&mut st.library_kept, &mut old.library_kept);
     swap(&mut st.engine_studio, &mut old.engine_studio);

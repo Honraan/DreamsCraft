@@ -200,7 +200,7 @@ pub use brush_hold::{
 };
 pub use brush_libraries::BrushLibraryInfo;
 pub use brush_library::{BrushDrop, BrushDropOver, brush_drop_copies, brush_drop_place, prepare_brushes};
-pub use brushes::{BrushInfo, BrushSetInfo, HoverFill, RecentBrush, brush_previews_kept};
+pub use brushes::{BrushInfo, BrushSetInfo, HoverFill, LibraryScroll, RecentBrush, brush_previews_kept};
 pub use clipboard::{COPY_PIXELS_A_METRE, copy_straight, picture_png, write_copy_png};
 pub use colour::{
     cmyk_profiles, color_profiles, colours_in_p3, convert_color, import_profile, is_cmyk_profile, set_profile_folder,
@@ -734,6 +734,9 @@ pub(crate) struct State {
     preview_pictures: Vec<(procraft_engine::brush::Pixels, procraft_engine::brush::Pixels)>,
     /// Sample strokes drawn already, kept by what they were drawn from.
     drawn_previews: drawn_previews::DrawnPreviews,
+    /// Where the brush library's lists stood as it last closed, and the library it showed (see
+    /// [`CanvasSession::library_opens`]).
+    library_scroll: Option<(String, brushes::LibraryScroll)>,
     color: [f32; 3],
     /// The secondary colour, for secondary colour dynamics.
     secondary: [f32; 3],
@@ -2513,6 +2516,7 @@ impl CanvasSession {
             preview: None,
             preview_pictures: Vec::new(),
             drawn_previews: Default::default(),
+            library_scroll: None,
             color: [0.0, 0.0, 0.0],
             secondary: [1.0, 1.0, 1.0],
             colour_history: None,

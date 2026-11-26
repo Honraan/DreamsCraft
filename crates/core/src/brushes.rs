@@ -338,6 +338,18 @@ pub fn brush_previews_kept(memory: u64, width: u32, height: u32) -> u32 {
     u32::try_from(memory / 64 / each).unwrap_or(u32::MAX).clamp(48, 400)
 }
 
+/// Where the brush library's two lists stood as it closed, in the interface's own measures: the
+/// set it showed (-1 for the Recent set), and for the sets' column and the brushes' list each, the
+/// first row in sight and how far the list was scrolled past that row's top.
+#[derive(Clone, Copy, Debug, PartialEq, uniffi::Record)]
+pub struct LibraryScroll {
+    pub shown_set: i32,
+    pub sets_first: u32,
+    pub sets_offset: f32,
+    pub brushes_first: u32,
+    pub brushes_offset: f32,
+}
+
 /// How near a slider value pulls onto a notch, and how many notches a slider holds.
 pub const NOTCH_NEAR: f32 = 0.04;
 pub const NOTCH_MOST: usize = 4;
@@ -368,6 +380,31 @@ impl CanvasSession {
         let st = self.shared.lock();
         let (set, index) = st.brush_ref(st.tool);
         BrushInfo { set: set as u32, index: index as u32, name: st.brush(st.tool).name.clone() }
+    }
+
+    /// The brush library closed with its lists as `scroll` says: they stand so again when it next
+    /// opens on the same set of the same library (see [`CanvasSession::library_opens`]).
+    pub fn library_closed(&self, scroll: LibraryScroll) {
+        let mut st = self.shared.lock();
+        let held = st.libraries.held().to_owned();
+        let offset = |o: f32| if o.is_finite() { o.max(0.0) } else { 0.0 };
+        let scroll = LibraryScroll {
+            sets_offset: offset(scroll.sets_offset),
+            brushes_offset: offset(scroll.brushes_offset),
+            ..scroll
+        };
+        st.library_scroll = Some((held, scroll));
+    }
+
+    /// Where the brush library's lists stand as it opens showing set `shown_set` (-1: the Recent
+    /// set): as they stood when it last closed, if it closed showing the same set of the library
+    /// in use, as the reference brings back the panel it left; else none, and the shown set and
+    /// the brush in use in it are scrolled into sight, as little as it takes (as the reference
+    /// opens the first time).
+    pub fn library_opens(&self, shown_set: i32) -> Option<LibraryScroll> {
+        let st = self.shared.lock();
+        let (library, scroll) = st.library_scroll.as_ref()?;
+        (library == st.libraries.held() && scroll.shown_set == shown_set).then_some(*scroll)
     }
 
     /// The current tool's brush's own outline, for a brush cursor in its shape: loops of x, y

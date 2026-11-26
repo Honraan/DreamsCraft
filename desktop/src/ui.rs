@@ -2792,7 +2792,7 @@ impl Interface {
         }
         self.open = if self.open == Some(popover) { None } else { Some(popover) };
         if self.open == Some(Popover::Brushes) {
-            self.library.opens();
+            self.library.opens(session);
         }
     }
 
