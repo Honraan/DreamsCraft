@@ -1652,10 +1652,14 @@ impl CanvasSession {
 impl crate::State {
     /// Takes the time-lapse frame asked for (see [`CanvasSession::record_time_lapse`]), if there
     /// is one: in a frame (`at_once` false) once the frames have laid what they lay a share at a
-    /// time and the caches are whole (else a frame after this one does, more asked for until
-    /// then); otherwise now, laying that at once. Its picture (private layers left out, so a
-    /// private insert never shows in the replay or its video) is only started on the GPU here and
-    /// handed to the keeper, never waited for.
+    /// time, an open shape's stroke among it (not the stroke the pen is drawing), and the caches are
+    /// whole (else a frame after this one does, more asked for until then); otherwise now, laying
+    /// that at once. Its picture
+    /// (private layers left out, so a private insert never shows in the replay or its video) is
+    /// only started on the GPU here and handed to the keeper, never waited for. (Taken while a big
+    /// shape's stroke was still being laid a share a frame, the render it is read with laid all
+    /// that was left at once: the app asks for a frame as the pen lifts, and the frame after a big
+    /// shape of a heavy brush was dragged about held the canvas for a minute and more.)
     pub(crate) fn take_lapse_picture(&mut self, at_once: bool) {
         if self.lapse_wanted.is_none() {
             return;
@@ -1666,7 +1670,10 @@ impl crate::State {
             return;
         }
         let (Some(canvas), Some(gpu)) = (self.canvas.as_mut(), self.gpu.as_ref()) else { return };
-        if !at_once && (canvas.busy() || canvas.lays_over_frames()) {
+        // (and an open shape's stroke still being laid: not the pen's own stroke, whose work comes as
+        // it moves)
+        let laying_shape = self.shape.is_some() && (canvas.catching_up() || canvas.relaying());
+        if !at_once && (canvas.busy() || canvas.lays_over_frames() || laying_shape) {
             self.needs_frame = true;
             return;
         }

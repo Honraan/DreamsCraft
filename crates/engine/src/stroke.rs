@@ -1672,6 +1672,15 @@ impl StrokeBuilder {
         out
     }
 
+    /// [`StrokeBuilder::add`] for a stroke whose stamps are all taken as it ends
+    /// ([`StrokeBuilder::finish`]), as a shape's are: none is made to be handed out meanwhile, only
+    /// to be made again at the end (a big shape dragged about lays its stroke again at each frame).
+    pub fn add_quietly(&mut self, samples: &[Sample]) {
+        let quiet = std::mem::replace(&mut self.quiet, true);
+        self.add(samples);
+        self.quiet = quiet;
+    }
+
     /// Its stamps are laid for good as they come (paint laid in place, which changes its layer as it
     /// goes, so that what changes in it is laid again from there): those its start taper changes,
     /// whose reach is known only once the stroke is under way, are handed out once they no longer
@@ -3808,6 +3817,99 @@ mod tests {
 
     fn line(n: usize, len: f32) -> Vec<Sample> {
         (0..=n).map(|i| Sample::at(Vec2::new(len * i as f32 / n as f32, 50.0), 1.0, i as f64 * 4.0)).collect()
+    }
+
+    /// A stroke built quietly (as a shape dragged about is, its stamps all taken as it ends) ends
+    /// with exactly the stamps it ends with built as a drawn stroke is: tapers, jitter, wet paint,
+    /// a grain and a shape that follows the way, pressure and lean, along an exact path.
+    #[test]
+    fn a_stroke_built_quietly_ends_with_the_same_stamps() {
+        let stock = |name: &str| crate::library::library().into_iter().flat_map(|s| s.brushes).find(|b| b.name == name);
+        let jittery = Brush {
+            shape: Shape {
+                follow: 1.0,
+                scatter: 0.4,
+                throw: 0.3,
+                size_jitter: 0.3,
+                opacity_jitter: 0.2,
+                count: 3,
+                ..Shape::default()
+            },
+            ..Brush::round_pen()
+        };
+        let brushes: Vec<Brush> =
+            [Some(Brush::round_pen()), Some(jittery), stock("Soft Pastel"), stock("Oil Paint"), stock("Filbert")]
+                .into_iter()
+                .flatten()
+                .collect();
+        assert!(brushes.len() >= 4, "{} brushes", brushes.len());
+        let samples: Vec<Sample> = (0..=1500)
+            .map(|i| {
+                let t = i as f32 / 1500.0 * std::f32::consts::TAU * 1.05;
+                let mut s = Sample::at(
+                    Vec2::new(900.0 + 700.0 * t.cos(), 800.0 + 450.0 * t.sin()),
+                    0.3 + 0.6 * (t * 3.0).sin().abs(),
+                    f64::from(i) * 1.7,
+                );
+                s.tilt = 0.4 + 0.3 * t.sin();
+                s.azimuth = t;
+                s
+            })
+            .collect();
+        for brush in brushes {
+            for pointer in [Pointer::Stylus, Pointer::Finger] {
+                let name = brush.name.clone();
+                let fresh = || StrokeBuilder::with_seed(brush.clone(), 30.0, pointer, 0x5eed).exact_path();
+                let mut drawn = fresh();
+                drawn.add(&samples);
+                let mut quiet = fresh();
+                quiet.add_quietly(&samples);
+                let (a, b) = (drawn.finish(), quiet.finish());
+                assert!(a.len() > 100, "{name}: {} stamps", a.len());
+                assert_eq!(a, b, "{name} ({pointer:?})");
+            }
+        }
+    }
+
+    /// What making a big shape's stamps costs, by part: a circle of radius 1792 drawn along an exact
+    /// path with samples `step` apart (ms a round, the best of five), the pen's spacing `spacing`.
+    /// `cargo test -p procraft-engine --release big_shape_stamps -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn big_shape_stamps_cost() {
+        for (step, spacing) in [(2.0f32, 0.03f32), (8.0, 0.03), (2.0, 0.12), (2.0, 0.5)] {
+            let n = (std::f32::consts::TAU * 1792.0 / step) as usize;
+            let samples: Vec<Sample> = (0..=n)
+                .map(|i| {
+                    let t = i as f32 / n as f32 * std::f32::consts::TAU;
+                    Sample::at(
+                        Vec2::new(2048.0 + 1792.0 * t.cos(), 2048.0 + 1792.0 * t.sin()),
+                        1.0,
+                        f64::from(i as u32) * 1.3,
+                    )
+                })
+                .collect();
+            let brush = Brush { spacing, pen_taper: Taper::NONE, ..Brush::round_pen() };
+            let (mut add, mut quiet, mut finish, mut stamps) = (f64::MAX, f64::MAX, f64::MAX, 0);
+            for _ in 0..5 {
+                let fresh = || StrokeBuilder::with_seed(brush.clone(), 8.0, Pointer::Stylus, 0x5eed).exact_path();
+                let mut b = fresh();
+                let t = std::time::Instant::now();
+                b.add(&samples);
+                add = add.min(t.elapsed().as_secs_f64() * 1000.0);
+                let mut b = fresh();
+                let t = std::time::Instant::now();
+                b.add_quietly(&samples);
+                quiet = quiet.min(t.elapsed().as_secs_f64() * 1000.0);
+                let t = std::time::Instant::now();
+                stamps = b.finish().len();
+                finish = finish.min(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            println!(
+                "step {step}, spacing {spacing}: {} samples, {stamps} stamps; add {add:.2} ms, quietly {quiet:.2}, finish {finish:.2}",
+                samples.len()
+            );
+        }
     }
 
     #[test]

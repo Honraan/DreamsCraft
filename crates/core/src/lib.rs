@@ -1005,10 +1005,16 @@ impl State {
     }
 
     /// Whether the frames, being drawn, have work to lay a share at a time (see
-    /// [`procraft_gpu::Canvas::lays_over_frames`]).
+    /// [`procraft_gpu::Canvas::lays_over_frames`]), an open shape's stroke they are still laying among
+    /// it (laid again as it is let go, which a read beside the frames laid at once: a heavy brush's,
+    /// seconds of a tablet's GPU with the canvas held), not the stroke the pen is drawing.
     pub(crate) fn frames_laying(&self) -> bool {
+        let shape = self.shape.is_some();
         self.frame_drawn_at.is_some_and(|at| at.elapsed() < FRAMES_GONE)
-            && self.canvas.as_deref().is_some_and(procraft_gpu::Canvas::lays_over_frames)
+            && self
+                .canvas
+                .as_deref()
+                .is_some_and(|c| c.lays_over_frames() || (shape && (c.catching_up() || c.relaying())))
     }
 
     /// Window pixels per point of what the interface draws, its handles over the canvas too.
@@ -1095,7 +1101,7 @@ impl State {
             return;
         }
         // a shape kept as it shows, moved since the last frame or not
-        self.draw_moved_shape();
+        self.draw_shape_now();
         let shape = self.shape.take();
         // a stroke on a model ends there, as the pen lifting would end it
         if self.scene_shown() && self.scene.as_ref().is_some_and(|s| s.stroking) {

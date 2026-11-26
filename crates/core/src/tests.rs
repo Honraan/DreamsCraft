@@ -457,7 +457,7 @@ fn quickshape_edit_cost() {
                 let mut st = s.shared.lock();
                 // the stroke laid along the shape, then the frame recorded
                 let t = Instant::now();
-                st.draw_moved_shape();
+                st.draw_shape_now();
                 alone_lay.push(t.elapsed());
                 let t = Instant::now();
                 st.draw_frame(&view, format, (width, height), procraft_engine::profile::Profile::Srgb, Instant::now());
@@ -7941,7 +7941,7 @@ fn a_long_wet_stroke_made_a_shape_is_laid_quickly_and_never_breaks() {
         for k in 0..6 {
             let t = std::time::Instant::now();
             s.quickshape_move(400.0, 400.0, 400.0 + k as f32 * 3.0, 400.0 + k as f32 * 2.0);
-            s.shared.lock().draw_moved_shape();
+            s.shared.lock().draw_shape_now();
             finish(&s);
             moves.push(t.elapsed().as_secs_f64() * 1000.0);
         }
@@ -7949,7 +7949,7 @@ fn a_long_wet_stroke_made_a_shape_is_laid_quickly_and_never_breaks() {
         let (hx, hy) = (info.handles[0], info.handles[1]);
         for k in 1..info.handles.len() / 2 {
             s.quickshape_move_handle(k as u32, hx, hy);
-            s.shared.lock().draw_moved_shape();
+            s.shared.lock().draw_shape_now();
             finish(&s);
         }
         s.quickshape_done();
@@ -22066,6 +22066,10 @@ fn a_heavy_brushs_stamps_are_laid_a_frames_share_at_a_time_and_come_out_the_same
             let canvas = st.canvas.as_mut()?;
             // (paint laid in place and a stroke laid again too, but at the GPU's own pace)
             let all = Duration::from_secs(3600);
+            // (the set shares alone: recorded for however long they take, a debug build's too)
+            if pace != Pace::Own {
+                canvas.set_record_most(all);
+            }
             match pace {
                 Pace::Off => {
                     canvas.set_dry_paced(false, None);
@@ -22311,7 +22315,10 @@ fn a_fast_stroke_on_a_slow_gpu_stays_under_the_pen() {
             st.view = Some(View::fit((width, height), (width, height)));
             st.gpu = Some(gpu.clone());
             st.ensure_canvas();
-            st.canvas.as_mut()?.set_dry_paced(rate.is_some(), rate);
+            let canvas = st.canvas.as_mut()?;
+            canvas.set_dry_paced(rate.is_some(), rate);
+            // (the GPU's share alone: recorded for however long it takes, a debug build's too)
+            canvas.set_record_most(Duration::from_secs(3600));
         }
         let (set, index) = library_brush(&s, |b| b.name == "Easterly")?;
         assert!(s.select_brush(set, index));

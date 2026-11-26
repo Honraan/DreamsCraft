@@ -6758,3 +6758,160 @@ fn a_device_of_little_memory_lays_dual_brushes_without_carrying_them() {
     assert!(low_more + 8 * layer <= carried_more, "little memory: +{low_more} bytes, carried +{carried_more}");
     assert_eq!(apart(&low, &plain), 0, "little memory lays the stroke as the plain pass does");
 }
+
+/// A ring of `count` round stamps of `size` about (128, 128), `r` out.
+fn ring(r: f32, size: f32, count: usize) -> Vec<Stamp> {
+    (0..count)
+        .map(|i| {
+            let a = i as f32 / count as f32 * std::f32::consts::TAU;
+            let mut s = Stamp::round(Vec2::new(128.0 + r * a.cos(), 128.0 + r * a.sin()), size, 0.8);
+            s.time_ms = f64::from(i as u32) * 4.0;
+            s
+        })
+        .collect()
+}
+
+/// Wet paint laid in place, and a second, for a dual brush's stroke.
+fn wet_dual() -> (StrokeStyle, procraft_gpu::SecondStroke) {
+    let first = StrokeStyle {
+        hardness: 0.3,
+        wet_pull: Some(0.5),
+        dilution: 0.3,
+        ..StrokeStyle::new(StrokeTool::Paint, [0.8, 0.1, 0.1], 1.0)
+    };
+    let second = procraft_gpu::SecondStroke {
+        style: StrokeStyle::new(StrokeTool::Paint, [0.0, 0.0, 1.0], 1.0),
+        mode: 0,
+        threshold: -1.0,
+        classic: false,
+    };
+    (first, second)
+}
+
+/// A dual brush's stroke drawn again from scratch over and over before a render (a shape dragged
+/// about faster than the frames lay it) keeps only its last drawing of each part queued: the second
+/// is drawn again first, so the first's stamps never came last and neither was let go, and every
+/// move was laid whole one after another long after the drag (28 moves of a big brush's shape a
+/// minute and a half on a tablet). Laid, it comes out as its last drawing alone does.
+#[test]
+fn a_dual_stroke_drawn_again_from_scratch_over_and_over_queues_only_its_last() {
+    let Some(gpu) = gpu() else { return };
+    let _check = NoErrors(&gpu);
+    let (first, second) = wet_dual();
+    let laid = |moves: &[f32]| -> (Vec<u8>, (usize, usize)) {
+        let mut doc = Document::new(256, 256);
+        let mut canvas = Canvas::new(&gpu, &doc).unwrap();
+        canvas.begin_dual_stroke(doc.current(), first, second);
+        canvas.add_second_stamps(&ring(40.0, 20.0, 40));
+        canvas.add_stamps(&ring(40.0, 8.0, 40));
+        canvas.render(&gpu, &mut doc, None);
+        for &r in moves {
+            canvas.replace_second_stamps(&ring(r, 20.0, 40));
+            canvas.replace_stamps(&ring(r, 8.0, 40));
+        }
+        let queued = canvas.queued_stamps();
+        canvas.end_stroke();
+        canvas.render(&gpu, &mut doc, None);
+        (canvas.read_layer(&gpu, doc.current()).unwrap(), queued)
+    };
+    let moves: Vec<f32> = (0..30).map(|k| 42.0 + k as f32 * 2.0).collect();
+    let (dragged, queued) = laid(&moves);
+    println!("30 moves queued {queued:?} stamps (first, second)");
+    assert_eq!(queued, (40, 40), "every move queued");
+    let (last, _) = laid(&moves[moves.len() - 1..]);
+    let differ = dragged.iter().zip(&last).filter(|(a, b)| a != b).count();
+    assert_eq!(differ, 0, "laid otherwise than its last drawing alone");
+}
+
+/// A render that shows the canvas, laying a long stroke a share at a time (a slow GPU's, set),
+/// uploads only about that share of its stamps: it took them all (up to a million), uploading and
+/// sizing for all of them each frame and putting them back after, however little it laid, a big
+/// shape's queued moves keeping a tablet's frames at a minute's work. However short a while it is
+/// given to record them in, a render lays some, and the stroke comes out as laid at once.
+#[test]
+fn a_render_that_shows_the_canvas_takes_only_its_share_of_a_long_stroke() {
+    let Some(gpu) = gpu() else { return };
+    let _check = NoErrors(&gpu);
+    let size = (512, 512);
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let (_screen, view) = window_target(&gpu, size, format);
+    let target = || shown_on(&view, format, size, procraft_engine::geom::Affine::IDENTITY, None);
+    // a long stroke of big stamps kept strongest (cut anywhere, it comes out the same)
+    let stamps: Vec<Stamp> = (0..20_000)
+        .map(|i| {
+            let t = i as f32 * 0.01;
+            dot(Vec2::new(256.0 + 200.0 * t.cos(), 256.0 + 200.0 * (1.3 * t).sin()), 30.0)
+        })
+        .collect();
+    // (`slow`: a slow GPU's pace, set; `record`: how long a render records stamps for)
+    let laid = |slow: bool, record: std::time::Duration| -> (Vec<u8>, u64, usize) {
+        let mut doc = Document::new(size.0, size.1);
+        let mut canvas = Canvas::new(&gpu, &doc).unwrap();
+        canvas.set_dry_paced(slow, slow.then_some(1.0));
+        canvas.set_record_most(record);
+        canvas.render(&gpu, &mut doc, Some(target()));
+        let mut paint = style(StrokeTool::Paint, 1.0);
+        paint.rendering = Rendering::Strongest;
+        canvas.begin_stroke(doc.current(), paint);
+        canvas.add_stamps(&stamps);
+        canvas.render(&gpu, &mut doc, Some(target()));
+        let (_, uploaded) = canvas.paced_spent();
+        let mut renders = 1;
+        while canvas.catching_up() && renders < 1000 {
+            canvas.render(&gpu, &mut doc, Some(target()));
+            renders += 1;
+        }
+        canvas.end_stroke();
+        canvas.render_finished(&gpu, &mut doc);
+        (canvas.read_layer(&gpu, doc.current()).unwrap(), uploaded, renders)
+    };
+    let long = std::time::Duration::from_secs(3600);
+    let (at_once, all, _) = laid(false, long);
+    let (slow, uploaded, renders) = laid(true, long);
+    let (quick, _, quick_renders) = laid(false, std::time::Duration::ZERO);
+    println!(
+        "20000 stamps: {all} uploaded at once; paced, {uploaded} uploaded by the first render, laid in {renders}; \
+         recorded for no while, laid in {quick_renders}"
+    );
+    assert_eq!(all, 20_000);
+    assert!(renders > 2, "paced, laid in {renders} renders");
+    assert!(uploaded * 4 <= all, "a paced render uploaded {uploaded} of {all} stamps");
+    assert!(quick_renders > 1, "recorded for no while, laid in {quick_renders} renders");
+    assert_eq!(at_once, slow, "laid a share at a time otherwise than at once");
+    assert_eq!(at_once, quick, "laid a lot a render otherwise than at once");
+}
+
+/// A dual brush's stroke laid again from scratch is shown as it was until all of it is laid: also
+/// while the part laid again first is laid and the other hasn't begun (its second laid again, its
+/// paint still as it was), which showed the one with the other as it was, a frame at a time.
+#[test]
+fn a_dual_stroke_laid_again_holds_its_picture_until_both_parts_are_laid() {
+    let Some(gpu) = gpu() else { return };
+    let _check = NoErrors(&gpu);
+    let size = (256, 256);
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let (_screen, view) = window_target(&gpu, size, format);
+    let target = || shown_on(&view, format, size, procraft_engine::geom::Affine::IDENTITY, None);
+    let (first, second) = wet_dual();
+    let mut doc = Document::new(size.0, size.1);
+    let mut canvas = Canvas::new(&gpu, &doc).unwrap();
+    canvas.begin_dual_stroke(doc.current(), first, second);
+    canvas.add_second_stamps(&ring(40.0, 20.0, 40));
+    canvas.add_stamps(&ring(40.0, 8.0, 40));
+    canvas.render(&gpu, &mut doc, Some(target()));
+    let before = canvas.read_composite(&gpu).unwrap();
+    // each render records the stamps of one lot alone
+    canvas.set_record_most(std::time::Duration::ZERO);
+    canvas.replace_second_stamps(&ring(80.0, 20.0, 40));
+    canvas.replace_stamps(&ring(80.0, 8.0, 40));
+    canvas.render(&gpu, &mut doc, Some(target()));
+    assert!(canvas.relaying(), "the picture let go with the second laid again alone");
+    assert_eq!(canvas.read_composite(&gpu).unwrap(), before, "shown half laid again");
+    let mut renders = 1;
+    while (canvas.relaying() || canvas.catching_up()) && renders < 100 {
+        canvas.render(&gpu, &mut doc, Some(target()));
+        renders += 1;
+    }
+    assert!(renders < 100);
+    assert_ne!(canvas.read_composite(&gpu).unwrap(), before, "never shown laid again");
+}

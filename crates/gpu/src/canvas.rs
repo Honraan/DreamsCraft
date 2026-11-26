@@ -141,6 +141,14 @@ const RELAY_LEAST: u64 = 16 << 20;
 /// A render laying a stroke again sends what it has recorded each time this long has gone into
 /// recording it, so the GPU works on it while the rest is recorded (rather than after it all).
 const RELAY_SEND_EVERY: std::time::Duration = std::time::Duration::from_micros(1500);
+/// How long a render that shows the canvas goes on recording a stroke's stamps, past the first lot
+/// it lays, before leaving the rest to the renders after, however fast the GPU seems to get through
+/// them: as long as the GPU's share of a render may take (see [`PACED_MOST_MS`]). The canvas, and
+/// every touch waiting on it, is held while they are recorded, and a big brush's stamps painted in
+/// place take a while each (a tile of the layer copied in and out for each, their marks kept).
+/// Paced by the GPU's time alone, a frame after a shape of such a brush was dragged about went on
+/// recording them for a minute on a tablet.
+const RECORD_MOST: std::time::Duration = std::time::Duration::from_millis(PACED_MOST_MS as u64);
 /// The most GPU time a render that shows the canvas gives the stamps it lays of a stroke (paint
 /// laid in place, and stamps in a stroke's textures, a dual brush's second among them, the two
 /// together), ms, by how fast the GPU was seen to get through such work: within it a render lays
@@ -2639,6 +2647,12 @@ enum Op {
     },
     /// What its tip laid in place wrote comes back as it was, and what it carried.
     UntipInPlace(IRect),
+    /// The open stroke painting in place into `layer` in `style` lays the stamps it holds for the
+    /// rest of their display frame (see [`Canvas::lay_held`]).
+    LayHeld {
+        layer: LayerId,
+        style: StrokeStyle,
+    },
     Undo,
     Redo,
     /// A layer cleared, as one undo step keeping what was painted (all of it, or the box given
@@ -3582,6 +3596,8 @@ pub struct Canvas {
     /// [`RELAY_AT_ONCE`]), and whether one is being laid over several (the picture held meanwhile).
     relay_at_once: std::time::Duration,
     relaying: bool,
+    /// How long a render that shows the canvas records a stroke's stamps (see [`RECORD_MOST`]).
+    record_most: std::time::Duration,
     /// The last render that laid a stroke laid again, as sent (its submission, when it was sent, and
     /// how much work), until it is seen done; the most work the next such render lays (see
     /// [`RELAY_GPU_MS`]); and whether it is held to that, its work sent as it is recorded.
@@ -3606,6 +3622,14 @@ pub struct Canvas {
     dry_paced: bool,
     dry_held: u64,
     dry_laid_most: u64,
+    /// The most GPU time (ms, by the rates it went by) a render that showed the canvas gave a
+    /// stroke's stamps, and the stamps the last render uploaded: for tests.
+    paced_spent_most: f64,
+    uploaded_last: u64,
+    /// The stamps renders that showed nothing have laid, and the pixels of fill strokes' regions
+    /// laid: for tests.
+    unshown_laid: u64,
+    region_laid: u64,
     /// How the last plugin filter's draw went, not yet asked for.
     filter_run: Option<plugin_filter::FilterRun>,
     /// How many times the composite has been redrawn.
@@ -4058,6 +4082,7 @@ impl Canvas {
             joins_synthesis: true,
             relay_at_once: RELAY_AT_ONCE,
             relaying: false,
+            record_most: RECORD_MOST,
             relay_sent: None,
             relay_budget: u64::MAX,
             relay_paced: false,
@@ -4073,6 +4098,10 @@ impl Canvas {
             dry_paced: true,
             dry_held: 0,
             dry_laid_most: 0,
+            paced_spent_most: 0.0,
+            uploaded_last: 0,
+            unshown_laid: 0,
+            region_laid: 0,
             filter_run: None,
             composites: 0,
             active: None,
@@ -4941,6 +4970,16 @@ impl Canvas {
         }
     }
 
+    /// The open stroke's stamps given so far are all it has (a shape's, made whole): painting in
+    /// place, those of its last display frame are laid now, with the rest, rather than held for more
+    /// of that frame to come. A shape's never came, so it showed short of its end (a big circle with
+    /// a gap at its seam) until it was kept, which lays them.
+    pub fn lay_held(&mut self) {
+        if let Some(active) = self.active.filter(|a| a.style.paints_in_place() && !a.pencil && !self.measuring) {
+            self.ops.push(Op::LayHeld { layer: active.layer, style: active.style });
+        }
+    }
+
     /// Takes the tip off the open stroke (one laid in place first, then its second's: see
     /// [`without_passing_tips`]).
     fn untip(&mut self) {
@@ -5096,6 +5135,12 @@ impl Canvas {
             // shape dragged about draws its stroke again at each move, faster than frames come)
             if clear && !pencil && !second {
                 drop_superseded_stamps(&mut self.ops, active.layer);
+            }
+            // and of a dual brush's part, whatever of its other part is queued after (the second is
+            // drawn again first, so the first's stamps were never last): a big shape's every move
+            // was laid whole, one after another, long after the drag
+            if clear && !pencil && !tip {
+                drop_superseded_part(&mut self.ops, active.layer, second);
             }
             self.ops.push(Op::Stamps {
                 instances,
@@ -5430,6 +5475,11 @@ impl Canvas {
         self.brush_across = diameter.is_finite().then_some(diameter);
     }
 
+    /// How wide the open stroke's brush was told to be (see [`Canvas::brush_across`]), if it was.
+    pub fn told_brush_across(&self) -> Option<f32> {
+        self.brush_across
+    }
+
     /// The side of the tiles strokes painting in place keep (none: sized to their brush): for tests
     /// comparing the two.
     #[doc(hidden)]
@@ -5531,6 +5581,14 @@ impl Canvas {
         self.relay_at_once = most;
     }
 
+    /// Records a stroke's stamps for at most this long in a render that shows the canvas, in place
+    /// of [`RECORD_MOST`]: for tests (a long while: as much as the GPU's pace allows, however long
+    /// that takes to record).
+    #[doc(hidden)]
+    pub fn set_record_most(&mut self, most: std::time::Duration) {
+        self.record_most = most;
+    }
+
     /// Whether a stroke laid again as it ends is still being laid, a share at each render that shows
     /// the canvas (the picture held as it was until it is all laid).
     pub fn relaying(&self) -> bool {
@@ -5595,9 +5653,7 @@ impl Canvas {
     /// scratch or from where it went back to, of which some is laid), else the stroke shown as far
     /// as it is laid.
     fn hold_or_catch_up(&mut self, rest: &[Op], relaying: bool) {
-        let again = rest.first().is_some_and(|op| matches!(op, Op::Stamps { again: true, .. }));
-        let ends = rest.iter().any(|op| matches!(op, Op::Commit(_) | Op::Cancel));
-        if again || (relaying && ends) {
+        if holds_picture(rest, relaying) {
             self.relaying = true;
         } else {
             self.catching_up = true;
@@ -5625,6 +5681,38 @@ impl Canvas {
     #[doc(hidden)]
     pub fn dry_laid_most(&self) -> (u64, u64) {
         (self.dry_laid_most, DRY_LEAST)
+    }
+
+    /// The most GPU time (ms) a render that showed the canvas gave a stroke's stamps, as the rates
+    /// it went by take them (see [`PACED_MOST_MS`]; none counted where no rate is known), and the
+    /// stamps the last render uploaded: for tests.
+    #[doc(hidden)]
+    pub fn paced_spent(&self) -> (f64, u64) {
+        (self.paced_spent_most, self.uploaded_last)
+    }
+
+    /// The stamps renders that showed nothing have laid, all told: for tests.
+    #[doc(hidden)]
+    pub fn laid_unshown(&self) -> u64 {
+        self.unshown_laid
+    }
+
+    /// The pixels of fill strokes' regions laid, all told (see [`Canvas::fill_stroke`],
+    /// [`Canvas::fill_stroke_parts`]): for tests.
+    #[doc(hidden)]
+    pub fn region_pixels_laid(&self) -> u64 {
+        self.region_laid
+    }
+
+    /// The stamps queued for the next render of the open stroke's first and of its second (tips'
+    /// among them): for tests.
+    #[doc(hidden)]
+    pub fn queued_stamps(&self) -> (usize, usize) {
+        self.ops.iter().fold((0, 0), |(first, second), op| match op {
+            Op::Stamps { instances, second: true, .. } => (first, second + instances.len()),
+            Op::Stamps { instances, .. } => (first + instances.len(), second),
+            _ => (first, second),
+        })
     }
 
     /// The most work of a stroke laid again a render that shows the canvas lays (see
@@ -5933,6 +6021,10 @@ impl Canvas {
         if let Some(active) = self.active.take()
             && !self.measuring
         {
+            // (what is still queued of it would be laid only to be taken back: a big shape's stroke,
+            // shown by a preview as it is dragged, was laid to its end first)
+            drop_superseded_part(&mut self.ops, active.layer, false);
+            drop_superseded_part(&mut self.ops, active.layer, true);
             self.dirty = self.dirty.union(active.bounds);
             self.ops.push(Op::Cancel);
         }
@@ -7392,13 +7484,38 @@ impl Canvas {
             self.keep_tips_to_the_gpu(gpu);
         }
         let ops = self.tips_within(ops, target_shown);
+        // paint laid in place, in a render that shows the canvas: what came since the last and some
+        // of what waits, within what the GPU gets through in a while (see `PACED_MOST_MS`), the rest
+        // left to the renders after
+        let in_place_most = self.in_place_most(gpu, target_shown, queued_in_place);
+        let full = self.full();
+        // what this render may lay: no more stamps than one upload takes, nor (showing the canvas)
+        // more of either kind than its share of the GPU (see `in_place_most`, `dry_most`), the
+        // rest left as it is. Taken whole, a big shape's every move queued up was uploaded, sized
+        // for and put back again by every frame, however little of it the frame laid
         let (ops, held_back) = {
             let (mut taken, mut count) = (Vec::with_capacity(ops.len()), 0u64);
+            let (mut in_place_taken, mut dry_taken) = (0u64, 0u64);
             let mut ops = ops.into_iter();
             let mut held_back = false;
             while let Some(op) = ops.next() {
                 let n = if let Op::Stamps { instances, .. } = &op { instances.len() as u64 } else { 0 };
-                if count > 0 && count.saturating_add(n) > most_stamps {
+                let past_share = match &op {
+                    Op::Stamps { instances, style, second: false, pencil: false, .. } if style.in_place() => {
+                        let work = stamps_work(instances, full, true);
+                        let past = in_place_taken > 0 && in_place_taken.saturating_add(work) > in_place_most;
+                        in_place_taken = in_place_taken.saturating_add(work);
+                        past
+                    }
+                    Op::Stamps { instances, style, second, .. } if !style.in_place() || *second => {
+                        let work = stamps_work(instances, full, false);
+                        let past = dry_taken > 0 && dry_taken.saturating_add(work) > dry_most;
+                        dry_taken = dry_taken.saturating_add(work);
+                        past
+                    }
+                    _ => false,
+                };
+                if past_share || (count > 0 && count.saturating_add(n) > most_stamps) {
                     let rest: Vec<Op> = std::iter::once(op).chain(ops.by_ref()).collect();
                     self.ops.splice(0..0, rest);
                     held_back = true;
@@ -7424,6 +7541,7 @@ impl Canvas {
         }
         let predicted = predicted_first..u32::try_from(instances.len()).unwrap_or(u32::MAX);
         let needed = instances.len() as u64;
+        self.uploaded_last = needed;
         if needed > self.stamp_capacity {
             // doubled for the strokes to come, as far as a buffer goes
             self.stamp_capacity = needed.next_power_of_two().min(Self::stamps_in_a_buffer(device)).max(needed);
@@ -7493,10 +7611,6 @@ impl Canvas {
         // when what was recorded was last sent, laying a stroke again (see `RELAY_SEND_EVERY`)
         let mut relay_sent_at = started;
         self.relaying = false;
-        // paint laid in place, in a render that shows the canvas: what came since the last and some
-        // of what waits, within what the GPU gets through in a while (see `PACED_MOST_MS`), the rest
-        // left to the renders after
-        let in_place_most = self.in_place_most(gpu, target.is_some(), queued_in_place);
         let mut in_place_laid = 0u64;
         // and stamps in a stroke's textures, so too; the two together in no more of the GPU's time
         // than that (as fast as each was seen to go), past the least of each: laid apart, a big
@@ -7507,8 +7621,9 @@ impl Canvas {
             self.in_place_rate_set.or(self.in_place_rate).filter(|_| target_shown && self.in_place_paced);
         let dry_rate = self.dry_rate_set.or(self.dry_rate).filter(|_| target_shown && self.dry_paced);
         let mut spent_ms = 0.0f64;
+        // whether a stroke's stamps (not a tip's) have been recorded yet (see `RECORD_MOST`)
+        let mut recorded_stamps = false;
         self.catching_up = false;
-        let full = self.full();
         let mut ops = ops.into_iter();
         while let Some(op) = ops.next() {
             // (what the paint's next stamps don't take with them is put together before other work)
@@ -7528,6 +7643,16 @@ impl Canvas {
                     break;
                 }
                 relay_laid = relay_laid.saturating_add(work);
+            }
+            if target_shown
+                && recorded_stamps
+                && matches!(&op, Op::Stamps { tip: false, .. })
+                && started.elapsed() >= self.record_most
+            {
+                let rest: Vec<Op> = std::iter::once(op).chain(ops.by_ref()).collect();
+                self.hold_or_catch_up(&rest, relay_until.is_some());
+                self.ops.splice(0..0, rest);
+                break;
             }
             if let Op::Stamps { instances, style, second: false, pencil: false, .. } = &op
                 && style.in_place()
@@ -7565,7 +7690,13 @@ impl Canvas {
                 spent_ms += ms;
             }
             match &op {
-                Op::Stamps { .. } => relaid = true,
+                Op::Stamps { tip, instances, .. } => {
+                    relaid = true;
+                    recorded_stamps |= !tip;
+                    if !target_shown {
+                        self.unshown_laid += instances.len() as u64;
+                    }
+                }
                 Op::Commit(_) | Op::Cancel => relay_until = None,
                 _ => {}
             }
@@ -7627,7 +7758,7 @@ impl Canvas {
                     next_instance = next_instance.saturating_add(u32::try_from(instances.len()).unwrap_or(u32::MAX));
                     let stamps = (instances.as_slice(), wet.as_slice(), times.as_slice(), picks.as_slice());
                     let uniforms = (&mut smudge_uniforms, &mut wet_uniforms);
-                    self.smudge_stamps(gpu, &mut encoder, uniforms, stamps, &style, layer, (clear, tip));
+                    self.smudge_stamps(gpu, &mut encoder, uniforms, stamps, &style, layer, (clear, tip, false));
                 }
                 // (not `on`: its tip isn't laid, nor its second's put together)
                 Op::SaveInPlaceTip { on: false, .. } => self.tip_synthesis = IRect::EMPTY,
@@ -7648,6 +7779,13 @@ impl Canvas {
                     }
                 }
                 Op::UntipInPlace(_) => self.untip_in_place_now(gpu, &mut encoder),
+                Op::LayHeld { layer, style } => {
+                    if self.smudge.as_ref().is_some_and(|s| s.layer == layer && !s.pending.is_empty()) {
+                        let uniforms = (&mut smudge_uniforms, &mut wet_uniforms);
+                        let none = (&[][..], &[][..], &[][..], &[][..]);
+                        self.smudge_stamps(gpu, &mut encoder, uniforms, none, &style, layer, (false, false, true));
+                    }
+                }
                 Op::RewindInPlace(at) => self.rewind_in_place(gpu, &mut encoder, at),
                 Op::RewindSecond(at) => self.rewind_second(gpu, &mut encoder, at),
                 Op::SecondReached(rect) => match self.smudge.as_mut().filter(|s| s.apart.is_some()) {
@@ -7830,11 +7968,14 @@ impl Canvas {
                 }
                 Op::RegionParts { parts, colour } => {
                     self.carried[0].forget();
+                    self.region_laid +=
+                        parts.iter().map(|(r, _)| u64::from(r.width()) * u64::from(r.height())).sum::<u64>();
                     let format = self.pipelines.stroke_format;
                     uploaded.extend(self.upload_region_parts(gpu, &mut encoder, format, colour, &parts));
                 }
                 Op::Region { rect, coverage, colour } => {
                     self.carried[0].forget();
+                    self.region_laid += u64::from(rect.width()) * u64::from(rect.height());
                     drop(render_pass(
                         &mut encoder,
                         "region clear",
@@ -8701,6 +8842,17 @@ impl Canvas {
                 self.stroke_step = Some((number, self.steps_made));
             }
         }
+        // work held back before it was gone through (past one upload, or this render's share) or in
+        // it (OpenGL's stroke waiting for its own render), in a render that shows the canvas, waits
+        // for the renders after as the work it holds back does: the picture held as it was while a
+        // stroke is laid again (see `hold_or_catch_up`)
+        if deferred && target_shown && !self.relaying && !self.catching_up {
+            if holds_picture(&self.ops, relay_until.is_some()) {
+                self.relaying = true;
+            } else {
+                self.catching_up = true;
+            }
+        }
         // (and what the work left to put together, before its uniforms are written)
         self.synthesize_due(gpu, &mut encoder, &mut smudge_uniforms);
         if history_changed {
@@ -8799,6 +8951,7 @@ impl Canvas {
         }
         if target_shown {
             self.dry_laid_most = self.dry_laid_most.max(dry_laid);
+            self.paced_spent_most = self.paced_spent_most.max(spent_ms);
         }
         // what is left for the renders after: what comes before the next is what came since
         (self.in_place_held, self.dry_held) = paced_work(&self.ops, full);
@@ -8813,7 +8966,8 @@ impl Canvas {
         self.park_extra(gpu, doc);
         self.pack_history(gpu);
         // the work held back, in a submission after this one's (a stroke being laid again goes on in
-        // the next render that shows the canvas)
+        // the next render that shows the canvas, as do the renders after one that shows the canvas:
+        // see above)
         if deferred && !self.relaying && !self.catching_up {
             self.render(gpu, doc, None);
         }
@@ -8916,7 +9070,8 @@ impl Canvas {
     /// Smudges `instances` into the stroke's layer: per stamp, the brush picks up colour and lays
     /// down what it carries, a window at a time (see `smudge.rs`), the changed pixels going back
     /// into the layer texture. Wet paint is laid a pass at a time (a display frame's input, see
-    /// [`Canvas::lay_wet`]), the newest pass's stamps held back until the rest of it comes.
+    /// [`Canvas::lay_wet`]), the newest pass's stamps held back until the rest of it comes (unless
+    /// `whole`: all that is given has come, see [`Canvas::lay_held`]).
     fn smudge_stamps(
         &mut self,
         gpu: &Gpu,
@@ -8925,7 +9080,7 @@ impl Canvas {
         (instances, wet, times, picks): SmudgedStamps<'_>,
         style: &StrokeStyle,
         target: LayerId,
-        (restart, tip): (bool, bool),
+        (restart, tip, whole): (bool, bool, bool),
     ) {
         let device = &gpu.device;
         // a tip laid in place, only over the stroke under way where what it writes is kept (see
@@ -8967,7 +9122,7 @@ impl Canvas {
             let key = |s: &(StampInstance, [f32; 8], Paced)| wet_pass(s.2.time_ms, style.preview);
             let newest = smudge.pending.last().map(key);
             // a tip laid with the stamps waiting for the rest of their display frame, all of it
-            let ready = if tip {
+            let ready = if tip || whole {
                 smudge.pending.len()
             } else {
                 smudge.pending.iter().take_while(|s| Some(key(s)) != newest).count()
@@ -11648,6 +11803,7 @@ impl Canvas {
             | Op::UntipSecond(_)
             | Op::SaveInPlaceTip { .. }
             | Op::UntipInPlace(_)
+            | Op::LayHeld { .. }
             | Op::RewindInPlace(_)
             | Op::RewindSecond(_)
             | Op::SecondReached(_)
@@ -14620,7 +14776,7 @@ fn laid_before(laid: Option<&[Stamp]>, stamps: &[Stamp], whole: bool) -> Option<
 fn drop_superseded_stamps(ops: &mut Vec<Op>, layer: LayerId) {
     while let Some(op) = ops.last() {
         let superseded = match op {
-            Op::Stamps { second: false, pencil: false, layer: on, .. } => *on == layer,
+            Op::Stamps { second: false, pencil: false, layer: on, .. } | Op::LayHeld { layer: on, .. } => *on == layer,
             Op::SaveTip(_) | Op::Untip(_) => true,
             _ => false,
         };
@@ -14628,6 +14784,46 @@ fn drop_superseded_stamps(ops: &mut Vec<Op>, layer: LayerId) {
             break;
         }
         ops.pop();
+    }
+}
+
+/// Whether work left for the renders after (`rest`, `relaying` an ended stroke laid again) holds the
+/// picture as it was until it is laid (see [`Canvas::hold_or_catch_up`]): a stroke being laid again
+/// from scratch, begun or not (begun, its next stamps are laid again; not begun, a dual brush's part
+/// laid again so far showed with its other part as it was, a frame at a time), or an ended one's end
+/// laid again.
+fn holds_picture(rest: &[Op], relaying: bool) -> bool {
+    let again = rest.first().is_some_and(|op| {
+        matches!(op, Op::Stamps { again: true, .. } | Op::Stamps { clear: true, pencil: false, tip: false, .. })
+    });
+    again || (relaying && rest.iter().any(|op| matches!(op, Op::Commit(_) | Op::Cancel)))
+}
+
+/// `ops` without the open stroke's stamps of one part (`second`: its second's) not laid yet, back to
+/// the last work that isn't the open stroke's own (its end, its second cleared or let go, any other
+/// change): that part drawn again from scratch after them clears what they would lay. Its other
+/// part's stamps and its tips stay as and where they are.
+fn drop_superseded_part(ops: &mut Vec<Op>, layer: LayerId, second: bool) {
+    let own = |op: &Op| match op {
+        Op::Stamps { layer: on, pencil: false, .. } | Op::LayHeld { layer: on, .. } => *on == layer,
+        Op::SaveTip(_)
+        | Op::Untip(_)
+        | Op::SaveSecondTip(_)
+        | Op::UntipSecond(_)
+        | Op::SaveInPlaceTip { .. }
+        | Op::UntipInPlace(_)
+        | Op::SecondReached(_) => true,
+        _ => false,
+    };
+    let from = ops.iter().rposition(|op| !own(op)).map_or(0, |at| at + 1);
+    let superseded = |op: &Op| match op {
+        Op::Stamps { second: s, tip: false, .. } => *s == second,
+        Op::LayHeld { .. } => !second,
+        _ => false,
+    };
+    if ops.get(from..).is_some_and(|tail| tail.iter().any(superseded)) {
+        let tail = ops.split_off(from);
+        ops.extend(tail.into_iter().filter(|op| !superseded(op)));
     }
 }
 
