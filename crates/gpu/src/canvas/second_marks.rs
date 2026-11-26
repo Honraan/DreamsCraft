@@ -220,7 +220,8 @@ impl Canvas {
         }
         let paced = |op: &Op| -> Vec<PacedStamp> {
             match op {
-                Op::Stamps { second: true, instances, wet, times, .. } => {
+                // (not a dual brush's tip: taken off again, it lays nothing for good)
+                Op::Stamps { second: true, tip: false, instances, wet, times, .. } => {
                     instances.iter().zip(wet).zip(times).map(|((s, w), t)| (*s, *w, *t)).collect()
                 }
                 _ => Vec::new(),
@@ -251,6 +252,7 @@ impl Canvas {
                         layer,
                         pencil,
                         carry,
+                        tip: false,
                     });
                 }
                 op => out.push(op),

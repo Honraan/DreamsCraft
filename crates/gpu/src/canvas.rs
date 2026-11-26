@@ -161,6 +161,21 @@ const DRY_FRAME_MS: f64 = 20.0;
 /// The least work of a stroke's textures a render lays however slow the GPU seems: a few big
 /// stamps (see [`stamp_work`]).
 const DRY_LEAST: u64 = 16 << 20;
+/// The work (see [`stamp_work`]) a render that shows the canvas gives what runs ahead of a stroke
+/// (a dual brush's tip, one laid in place: see [`Canvas::set_dual_tip`], [`Canvas::set_in_place_tip`])
+/// at first, and the least and most it gives it. Where the GPU hadn't done the render before by the
+/// time this one began (it fell behind the screen), half, and no more than three quarters of that
+/// again from then on, a 500th more each render; where it had, a sixteenth more up to that. Each tip's
+/// stamps are laid from its start as far as that goes, the rest not at all. Laid whole, a wet brush's
+/// tip held back 162 ms by the app's motion filtering took a laptop's built-in GPU 30 to 75 ms a
+/// frame; given a quarter more a render, half on falling behind, a frame in four was late.
+const TIP_WORK_FIRST: u64 = 16 << 20;
+const TIP_WORK_LEAST: u64 = 1 << 20;
+const TIP_WORK_MOST: u64 = 4 << 30;
+/// What laying again the stamps waiting for the rest of their display frame is taken to cost a tip
+/// laid in place, against what the stroke's own stamps laid in place this render take: a tip laid in
+/// place is laid only where the work it is given covers that.
+const TIP_PENDING_SHARE: f64 = 1.5;
 /// What a stamp counts for besides the pixels it covers; and a stamp painted in place, a compute
 /// pass for each, for each pixel and for itself.
 const STAMP_WORK: u64 = 1 << 10;
@@ -929,6 +944,17 @@ fn by_rule(rendering: Rendering) -> Option<u32> {
         Rendering::Capped => Some(2),
         Rendering::BuildUp | Rendering::Strongest => None,
     }
+}
+
+/// Where laying `instances` in place may write within `full`: each stamp's box as
+/// [`Canvas::lay_wet`] lays it (a pixel past its quad), which holds where a dual brush's second's
+/// stamps put the paint together with it too.
+fn in_place_writes(instances: &[StampInstance], full: IRect) -> IRect {
+    instances.iter().filter(|s| s.radius > 0.0).fold(IRect::EMPTY, |r, s| {
+        let at = procraft_engine::geom::Vec2::new(s.center[0], s.center[1]);
+        let reach = (s.radius + QUAD_REACH) * s.roundness.max(1.0) * std::f32::consts::SQRT_2;
+        r.union(IRect::around(at, reach).intersect(full))
+    })
 }
 
 /// How far a stamp's quad reaches on the canvas: a pixel past the stamp, turned any way.
@@ -2533,6 +2559,9 @@ enum Op {
         again: bool,
         /// Laid on a part carried from lot to lot (see [`Carried`]).
         carry: bool,
+        /// Part of a dual brush's tip (see [`Canvas::set_dual_tip`]): laid on no part carried from
+        /// lot to lot, nor kept for its second to go back over, and taken off before more is laid.
+        tip: bool,
     },
     /// The open stroke's paint is cleared and becomes its colour over `coverage` (a byte a pixel,
     /// `rect`'s rows, 255 all of it): a fill stroke's region (see [`Canvas::fill_stroke`]).
@@ -2550,6 +2579,23 @@ enum Op {
     SaveTip(IRect),
     /// What was put aside under this rectangle comes back (the tip drawn over it goes).
     Untip(IRect),
+    /// What the stroke's second has under this rectangle is put aside, for a dual brush's tip
+    /// drawn over it (see [`Canvas::set_dual_tip`]).
+    SaveSecondTip(IRect),
+    /// What was put aside of the second under this rectangle comes back.
+    UntipSecond(IRect),
+    /// The open stroke painting in place into `layer` in `style` keeps what its tip will write
+    /// within `writes` as it is, and what it carries, for its tip laid in place over it (see
+    /// [`Canvas::set_in_place_tip`]); begun first if it hasn't laid anything yet. Not `on`, the tip
+    /// isn't laid (see [`TIP_WORK_FIRST`]).
+    SaveInPlaceTip {
+        writes: IRect,
+        layer: LayerId,
+        style: StrokeStyle,
+        on: bool,
+    },
+    /// What its tip laid in place wrote comes back as it was, and what it carried.
+    UntipInPlace(IRect),
     Undo,
     Redo,
     /// A layer cleared, as one undo step keeping what was painted (all of it, or the box given
@@ -3282,6 +3328,21 @@ pub struct Canvas {
     /// Where the open stroke's tip is drawn (see [`Canvas::set_tip`]), and what it covered.
     tip: Option<IRect>,
     tip_backup: Option<wgpu::Texture>,
+    /// The same in a dual brush's second (see [`Canvas::set_dual_tip`]); where a stroke painting
+    /// in place keeps what its tip writes (see [`Canvas::set_in_place_tip`]), and where its tip's
+    /// second is to be put together with its paint; and whether a dual brush's stroke and one
+    /// painting in place show their tips (for tests comparing them with none).
+    second_tip: Option<IRect>,
+    second_tip_backup: Option<wgpu::Texture>,
+    in_place_tip: Option<IRect>,
+    tip_synthesis: IRect,
+    tips_ahead: bool,
+    /// The work a render that shows the canvas gives the tips (see [`TIP_WORK_FIRST`]), and the last
+    /// such render's work sent, to see whether it was done as the next began.
+    tip_work: u64,
+    tip_ceiling: u64,
+    tip_sent: Option<wgpu::SubmissionIndex>,
+    tip_stamps: (u64, u64),
     /// Where stamps laid by their stroke's rule go before their part of the stroke takes them
     /// (see [`Canvas::lay_by_rule`]), made when first wanted.
     rule_out: Option<wgpu::Buffer>,
@@ -3847,6 +3908,15 @@ impl Canvas {
             stroke_view,
             tip: None,
             tip_backup: None,
+            second_tip: None,
+            second_tip_backup: None,
+            in_place_tip: None,
+            tip_synthesis: IRect::EMPTY,
+            tips_ahead: true,
+            tip_work: TIP_WORK_FIRST,
+            tip_ceiling: TIP_WORK_MOST,
+            tip_sent: None,
+            tip_stamps: (0, 0),
             rule_out: None,
             carried: Default::default(),
             carry_out: None,
@@ -4338,7 +4408,12 @@ impl Canvas {
             return true;
         }
         let fits = (stroke.texture.width(), stroke.texture.height()) == (self.width, self.height);
-        let busy = self.active.is_some() || self.smudge.is_some() || self.tip.is_some() || !self.ops.is_empty();
+        let busy = self.active.is_some()
+            || self.smudge.is_some()
+            || self.tip.is_some()
+            || self.second_tip.is_some()
+            || self.in_place_tip.is_some()
+            || !self.ops.is_empty();
         if !fits || busy {
             return false;
         }
@@ -4462,6 +4537,8 @@ impl Canvas {
         self.end_stroke();
         self.may_lay_again = true;
         self.second_may_lay_again = true;
+        // (another brush may take more or less: its tips find how much the GPU keeps up with anew)
+        self.tip_ceiling = TIP_WORK_MOST;
         self.brush_across = None;
         self.prediction.clear();
         self.laid = Some(Vec::new());
@@ -4500,6 +4577,7 @@ impl Canvas {
 
     /// Draws more of the open stroke's second.
     pub fn add_second_stamps(&mut self, stamps: &[Stamp]) {
+        self.untip();
         self.push_stamps_to(stamps, false, true);
         keep_laid(&mut self.laid_second, stamps);
         self.laid_second_count += stamps.len();
@@ -4508,6 +4586,7 @@ impl Canvas {
     /// Redraws the open stroke's second from scratch with `stamps` (its final form): only those
     /// after the stamps it has laid, if they are still at its start (as [`Canvas::replace_stamps`]).
     pub fn replace_second_stamps(&mut self, stamps: &[Stamp]) {
+        self.untip();
         if let Some(from) = laid_before(self.laid_second.as_deref(), stamps, !self.ends_with_rest(true)) {
             self.add_second_stamps(stamps.get(from..).unwrap_or_default());
             return;
@@ -4579,6 +4658,7 @@ impl Canvas {
 
     /// The open stroke goes on without its second (it was made into a shape).
     pub fn drop_second(&mut self) {
+        self.untip();
         self.laid_second = None;
         if let Some(active) = self.active.as_mut()
             && active.second.take().is_some()
@@ -4657,6 +4737,8 @@ impl Canvas {
             self.add_stamps(stamps.get(from..).unwrap_or_default());
             return;
         }
+        self.untip_in_place();
+        self.untip_second();
         self.tip = None;
         self.push_stamps(stamps, true);
         if self.laid.is_some() {
@@ -4709,11 +4791,121 @@ impl Canvas {
         self.tip = Some(bounds);
     }
 
-    /// Takes the tip off the open stroke.
+    /// Whether the open stroke can show a dual brush's tip (see [`Canvas::set_dual_tip`]): one with
+    /// a second, built up in the stroke's textures (not painted in place, nor onto an adjustment).
+    pub fn shows_dual_tip(&self) -> bool {
+        self.tips_ahead && self.active.is_some_and(|a| !a.pencil && !a.style.in_place() && a.second.is_some())
+    }
+
+    /// Whether a dual brush's stroke and one painting in place show their tips (see
+    /// [`Canvas::set_dual_tip`], [`Canvas::set_in_place_tip`]): for tests comparing them with none.
+    #[doc(hidden)]
+    pub fn set_tips_ahead(&mut self, on: bool) {
+        self.tips_ahead = on;
+    }
+
+    /// Whether the open stroke can show its tip laid in place (see [`Canvas::set_in_place_tip`]): a
+    /// stroke painting its layer as it goes (wet or dry, a dual brush's too), where it can go back
+    /// over what it laid (compute passes, not into a layer's store).
+    pub fn shows_in_place_tip(&self) -> bool {
+        self.tips_ahead
+            && self.rewinds
+            && self.pipelines.compute.is_some()
+            && self.pipelines.fragments.is_none()
+            && self.active.is_some_and(|a| !a.pencil && a.style.paints_in_place() && a.style.store == 0)
+    }
+
+    /// The open stroke's tip, one painting in place: its stamps as they'd be laid were it to end
+    /// now (`stamps`), and its second's (`second`, a dual brush's), laid in place as its stamps are,
+    /// what they write kept as it was and put back before anything more is laid. Without it the
+    /// stroke showed only what its smoothing had settled, as far behind the pen as that holds the
+    /// input back (motion filtering's 30%, 162 ms). Not where what it writes can't be kept (past
+    /// the memory marks may take, or with a symmetry's copies): it shows as far as it is laid.
+    pub fn set_in_place_tip(&mut self, stamps: &[Stamp], second: &[Stamp]) {
+        self.untip();
+        if !self.shows_in_place_tip() {
+            return;
+        }
+        let full = self.full();
+        // where the stamps just queued may write, laid in place or put together with the paint
+        let queued_writes = |ops: &[Op], at: usize| match ops.get(at..) {
+            Some([Op::Stamps { instances, .. }]) => in_place_writes(instances, full),
+            _ => IRect::EMPTY,
+        };
+        let mut writes = IRect::EMPTY;
+        // its second's first, then what it writes kept, then its own (see `without_passing_tips`)
+        if !second.is_empty() && self.active.is_some_and(|a| a.second.is_some()) {
+            let at = self.ops.len();
+            let bounds = self.push_stamps_as(second, false, true, true);
+            writes = writes.union(queued_writes(&self.ops, at));
+            if !bounds.is_empty() && !self.measuring {
+                self.ops.insert(at, Op::SaveSecondTip(bounds));
+                self.second_tip = Some(bounds);
+            }
+        }
+        let at = self.ops.len();
+        self.push_stamps_as(stamps, false, false, true);
+        let writes = writes.union(queued_writes(&self.ops, at));
+        if writes.is_empty() || self.measuring {
+            return;
+        }
+        let Some(active) = self.active else { return };
+        self.ops.insert(at, Op::SaveInPlaceTip { writes, layer: active.layer, style: active.style, on: true });
+        self.in_place_tip = Some(writes);
+    }
+
+    /// The open stroke's tip, a dual brush's: its last stamps as they'd be drawn were it to end
+    /// now (`stamps`), and its second's (`second`), each drawn over its part until the next stamps
+    /// or tip. Without it the stroke showed only what its smoothing had settled, as far behind the
+    /// pen as that holds the input back (motion filtering's 30%, 162 ms).
+    pub fn set_dual_tip(&mut self, stamps: &[Stamp], second: &[Stamp]) {
+        self.untip();
+        if !self.shows_dual_tip() {
+            return;
+        }
+        for (stamps, second) in [(stamps, false), (second, true)] {
+            if stamps.is_empty() {
+                continue;
+            }
+            let at = self.ops.len();
+            let bounds = self.push_stamps_as(stamps, false, second, true);
+            if bounds.is_empty() || self.measuring {
+                continue;
+            }
+            if second {
+                self.ops.insert(at, Op::SaveSecondTip(bounds));
+                self.second_tip = Some(bounds);
+            } else {
+                self.ops.insert(at, Op::SaveTip(bounds));
+                self.tip = Some(bounds);
+            }
+        }
+    }
+
+    /// Takes the tip off the open stroke (one laid in place first, then its second's: see
+    /// [`without_passing_tips`]).
     fn untip(&mut self) {
+        self.untip_in_place();
+        self.untip_second();
         if let Some(rect) = self.tip.take() {
             self.dirty = self.dirty.union(rect);
             self.ops.push(Op::Untip(rect));
+        }
+    }
+
+    /// Takes the tip laid in place off the open stroke painting in place.
+    fn untip_in_place(&mut self) {
+        if let Some(rect) = self.in_place_tip.take() {
+            self.dirty = self.dirty.union(rect);
+            self.ops.push(Op::UntipInPlace(rect));
+        }
+    }
+
+    /// Takes a dual brush's tip off its second.
+    fn untip_second(&mut self) {
+        if let Some(rect) = self.second_tip.take() {
+            self.dirty = self.dirty.union(rect);
+            self.ops.push(Op::UntipSecond(rect));
         }
     }
 
@@ -4724,6 +4916,12 @@ impl Canvas {
 
     /// As [`Canvas::push_stamps`], into the open stroke's second if `second` (none without one).
     fn push_stamps_to(&mut self, stamps: &[Stamp], clear: bool, second: bool) -> IRect {
+        self.push_stamps_as(stamps, clear, second, false)
+    }
+
+    /// As [`Canvas::push_stamps_to`], as part of a dual brush's tip if `tip` (see
+    /// [`Canvas::set_dual_tip`]).
+    fn push_stamps_as(&mut self, stamps: &[Stamp], clear: bool, second: bool, tip: bool) -> IRect {
         // given in another canvas's pixels: drawn here as much bigger
         let mapped: Vec<Stamp>;
         let stamps = match self.scaled {
@@ -4737,7 +4935,7 @@ impl Canvas {
         // where the GPU runs the rule's pass (see `Canvas::lay_by_rule`), or lays every stroke by
         // its rule in fragment passes
         let by_rule_here = self.pipelines.compute.is_some() || self.pipelines.fragments.is_some();
-        let carry = self.carries(second);
+        let carry = self.carries(second) && !tip;
         let Some(active) = self.active.as_mut() else { return IRect::EMPTY };
         let style = match (second, active.second) {
             (false, _) => active.style,
@@ -4852,6 +5050,7 @@ impl Canvas {
                 pencil,
                 second,
                 carry,
+                tip,
             });
         }
         bounds
@@ -5637,6 +5836,8 @@ impl Canvas {
         self.laid = None;
         self.laid_second = None;
         self.tip = None;
+        self.second_tip = None;
+        self.in_place_tip = None;
         if let Some(active) = self.active.take()
             && !self.measuring
         {
@@ -7094,6 +7295,10 @@ impl Canvas {
         let dry_most = self.dry_most(gpu, target_shown);
         let most = self.work_at_once.min(relay_most);
         let ops = in_pieces(ops, self.full(), (self.work_at_once, most, most.min(dry_most)), most_stamps);
+        if target_shown {
+            self.keep_tips_to_the_gpu(gpu);
+        }
+        let ops = self.tips_within(ops, target_shown);
         let (ops, held_back) = {
             let (mut taken, mut count) = (Vec::with_capacity(ops.len()), 0u64);
             let mut ops = ops.into_iter();
@@ -7321,14 +7526,33 @@ impl Canvas {
                 self.second_marks = None;
             }
             match op {
-                Op::Stamps { instances, wet, picks, times, style, layer, clear, second: false, .. }
+                Op::Stamps { instances, wet, picks, times, style, layer, clear, second: false, tip, .. }
                     if style.in_place() =>
                 {
                     next_instance = next_instance.saturating_add(u32::try_from(instances.len()).unwrap_or(u32::MAX));
                     let stamps = (instances.as_slice(), wet.as_slice(), times.as_slice(), picks.as_slice());
                     let uniforms = (&mut smudge_uniforms, &mut wet_uniforms);
-                    self.smudge_stamps(gpu, &mut encoder, uniforms, stamps, &style, layer, clear);
+                    self.smudge_stamps(gpu, &mut encoder, uniforms, stamps, &style, layer, (clear, tip));
                 }
+                // (not `on`: its tip isn't laid, nor its second's put together)
+                Op::SaveInPlaceTip { on: false, .. } => self.tip_synthesis = IRect::EMPTY,
+                Op::SaveInPlaceTip { writes: rect, layer, style, .. } => {
+                    // (the stroke begun by its tip while its smoothing has settled none of it yet,
+                    // as its first stamps would begin it)
+                    if self.smudge.is_none() {
+                        self.begin_smudge(gpu, &mut encoder, &style, layer);
+                    }
+                    // a dual brush's second still to be put together put together first, so that
+                    // what is kept holds the layer with it (as a mark does)
+                    self.synthesize_due(gpu, &mut encoder, &mut smudge_uniforms);
+                    let due = std::mem::replace(&mut self.tip_synthesis, IRect::EMPTY);
+                    // (and the tip's second put together with the paint as laid, the tip's own
+                    // stamps then put together where they go)
+                    if self.save_in_place_tip(gpu, &mut encoder, rect) && !due.is_empty() {
+                        self.synthesize(gpu, &mut encoder, &mut smudge_uniforms, due);
+                    }
+                }
+                Op::UntipInPlace(_) => self.untip_in_place_now(gpu, &mut encoder),
                 Op::RewindInPlace(at) => self.rewind_in_place(gpu, &mut encoder, at),
                 Op::RewindSecond(at) => self.rewind_second(gpu, &mut encoder, at),
                 Op::SecondReached(rect) => match self.smudge.as_mut().filter(|s| s.apart.is_some()) {
@@ -7361,7 +7585,7 @@ impl Canvas {
                     ));
                     self.clear_built_up(&mut encoder, texture);
                 }
-                Op::Stamps { instances, wet, times, style, clear, pencil, second, carry, .. } => {
+                Op::Stamps { instances, wet, times, style, clear, pencil, second, carry, tip, .. } => {
                     let count = u32::try_from(instances.len()).unwrap_or(u32::MAX);
                     let first = next_instance;
                     next_instance = next_instance.saturating_add(count);
@@ -7419,7 +7643,9 @@ impl Canvas {
                     let part = usize::from(second);
                     let onto_part = second || !(pencil && self.pencil.is_some());
                     let carry = carry && onto_part && rule.is_some() && !in_fragments;
-                    if let Some(carried) = self.carried.get_mut(part).filter(|_| onto_part && (clear || !carry)) {
+                    // (a dual brush's tip, taken off again, leaves what is carried as it was)
+                    if let Some(carried) = self.carried.get_mut(part).filter(|_| onto_part && (clear || !carry) && !tip)
+                    {
                         carried.forget();
                     }
                     // a dual brush's second laid from scratch keeps marks from here, else marks
@@ -7427,7 +7653,7 @@ impl Canvas {
                     if second && clear {
                         self.second_cleared();
                     }
-                    if second {
+                    if second && !tip {
                         self.mark_second(
                             gpu,
                             &mut encoder,
@@ -7496,10 +7722,16 @@ impl Canvas {
                     // both, it comes out the same, nothing reading what it puts together), or where
                     // it went before the paint began as the stroke ends
                     if second {
-                        let rect = reach;
+                        let rect = instances.iter().fold(IRect::EMPTY, |r, s| {
+                            let at = procraft_engine::geom::Vec2::new(s.center[0], s.center[1]);
+                            r.union(IRect::around(at, s.radius * s.roundness.max(1.0) * std::f32::consts::SQRT_2))
+                        });
                         match self.smudge.as_ref().filter(|s| s.apart.is_some()) {
+                            // a tip's, put together as its paint's tip is laid (see `SaveInPlaceTip`)
+                            Some(_) if tip => self.tip_synthesis = self.tip_synthesis.union(rect),
                             Some(_) if self.joins_synthesis => self.synthesis_due = self.synthesis_due.union(rect),
                             Some(_) => self.synthesize(gpu, &mut encoder, &mut smudge_uniforms, rect),
+                            None if tip => {}
                             None => self.second_unsynthesized = self.second_unsynthesized.union(rect),
                         }
                     }
@@ -7601,6 +7833,41 @@ impl Canvas {
                         );
                     }
                     self.untip_built_up(gpu, &mut encoder, rect);
+                }
+                Op::SaveSecondTip(rect) => {
+                    let (width, height) = (rect.width(), rect.height());
+                    let second = self.second_stroke.get(gpu).0.clone();
+                    let roomy =
+                        self.second_tip_backup.as_ref().is_some_and(|b| b.width() >= width && b.height() >= height);
+                    if !roomy {
+                        // grown in steps, as the stroke's own
+                        let room = |n: u32, most: u32| n.max(1).next_multiple_of(256).min(most);
+                        let (w, h) = self.second_tip_backup.as_ref().map_or((0, 0), |b| (b.width(), b.height()));
+                        let size = (room(width.max(w), self.width), room(height.max(h), self.height));
+                        self.second_tip_backup =
+                            Some(texture(gpu, "second tip backup", size.0, size.1, second.format()));
+                    }
+                    if let Some(backup) = &self.second_tip_backup {
+                        gpu.copy_texture_to_texture(
+                            &mut encoder,
+                            copy_at(&second, rect.x0, rect.y0),
+                            copy_at(backup, 0, 0),
+                            extent(width, height),
+                        );
+                    }
+                    self.save_second_tip_built_up(gpu, &mut encoder, &second, rect);
+                }
+                Op::UntipSecond(rect) => {
+                    let second = self.second_stroke.get(gpu).0.clone();
+                    if let Some(backup) = &self.second_tip_backup {
+                        gpu.copy_texture_to_texture(
+                            &mut encoder,
+                            copy_at(backup, 0, 0),
+                            copy_at(&second, rect.x0, rect.y0),
+                            extent(rect.width(), rect.height()),
+                        );
+                    }
+                    self.untip_second_built_up(gpu, &mut encoder, &second, rect);
                 }
                 Op::Undo => {
                     if let Some(step) = self.undo.pop() {
@@ -8424,6 +8691,9 @@ impl Canvas {
             self.dry_sent = Some((sent.clone(), started, dry_laid));
         }
         if target_shown {
+            self.tip_sent = Some(sent.clone());
+        }
+        if target_shown {
             self.dry_laid_most = self.dry_laid_most.max(dry_laid);
         }
         if relay_laid > 0 && self.relay_sent.is_none() {
@@ -8440,6 +8710,100 @@ impl Canvas {
         }
     }
 
+    /// Begins the stroke painting in place into `target` in `style`: what it carries and keeps,
+    /// its tiles' side, and what it keeps to go back to (see `rewind.rs`). False if it can't be
+    /// begun (past the GPU's memory, its layer gone).
+    fn begin_smudge(
+        &mut self,
+        gpu: &Gpu,
+        encoder: &mut wgpu::CommandEncoder,
+        style: &StrokeStyle,
+        target: LayerId,
+    ) -> bool {
+        let device = &gpu.device;
+        if self.smudge_refused || !self.layers.contains_key(&target) {
+            return false;
+        }
+        let wet_paint = style.paints_in_place();
+        // paint laid in place with a second, a texturized grain, wet or burnt edges, or a
+        // glaze of its own over its wet paint is laid apart, and put together with them
+        let second = self.queued_second.map(|d| (d.uniform_mode(), d.threshold));
+        let alone = grain_once(style) || style.wet_edges > 0.0 || style.burnt_edges > 0.0 || wet_rule(style) != 0;
+        let apart = second
+            .or(alone.then_some((0, -1.0)))
+            .filter(|_| wet_paint)
+            .map(|(mode, threshold)| (*style, mode, threshold));
+        // and keeps the colour its stamps mixed (with how much of its paint shows, the stroke as
+        // laid, which wet paint goes on mixing with); wet paint in the modulated mode or a
+        // glaze of its own keeps how much each pixel has taken, or how far its glaze shows
+        let keeps = smudge::Keeps {
+            grained: apart.is_some(),
+            amount: wet_paint && (style.rendering == Rendering::Gradual || wet_rule(style) != 0),
+            shown: apart.is_some(),
+        };
+        // what it carries made first, and the stroke not begun if it can't be (past the GPU's
+        // memory): begun, each frame it is in would go undrawn (the screen flashing)
+        let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let invalid = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let in_fragments = self.pipelines.compute.is_none();
+        let carry = (!in_fragments).then(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("smudge carry"),
+                // the carry, and the blur's two passes over it (see the shader's cs_blur_down);
+                // or wet paint's two carried-over plots and a pass's plots (see cs_wet_plots)
+                size: if wet_paint {
+                    (2 * u64::from(WET_PLOT_MOST * WET_PLOT_MOST) + WET_PLOTS_TEXELS) * 16
+                } else {
+                    u64::from(SMUDGE_GRID * SMUDGE_GRID) * 16 * 3
+                },
+                // (copied aside and back where a symmetry's copies take turns in it)
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        let held = in_fragments.then(|| fragments::Held::new(gpu, wet_paint));
+        if let Some(why) = pollster::block_on(invalid.pop()).or(pollster::block_on(memory.pop())) {
+            log::error!("smudging: {why}");
+            self.smudge_refused = true;
+            self.smudge_untold = true;
+            return false;
+        }
+        // painting into the layer's store: what it works in is the store's paint
+        let store = (style.store != 0).then(|| self.store_for_stroke(gpu, encoder, target, style.store)).flatten();
+        // its tiles sized to its brush
+        let tile = self.smudge_tiles.unwrap_or_else(|| smudge::tile_for(self.brush_across, gpu.is_gl()));
+        // (and to take off its tip laid in place, see `Canvas::set_in_place_tip`)
+        let relays = self.may_lay_again;
+        let rewind = (wet_paint && self.rewinds && (relays || self.tips_ahead) && !in_fragments && store.is_none())
+            .then(|| rewind::Rewind::new(self.low_memory(), self.rewind_most, tile, relays));
+        self.smudge = Some(Smudge {
+            layer: target,
+            into: store.as_ref().map_or(target, |s| s.planes[0]),
+            store,
+            carry,
+            held,
+            carries: vec![Carry::new()],
+            resident: None,
+            wet: wet_paint,
+            keeps,
+            apart,
+            pending: Vec::new(),
+            pass: None,
+            passed: None,
+            tiles: smudge::Tiles::new(),
+            tile,
+            window: None,
+            frag_window: None,
+            laid: false,
+            stalled: false,
+            synthesized: IRect::EMPTY,
+            rewind,
+            stale: IRect::EMPTY,
+            stale_whole: false,
+        });
+        true
+    }
+
     /// Smudges `instances` into the stroke's layer: per stamp, the brush picks up colour and lays
     /// down what it carries, a window at a time (see `smudge.rs`), the changed pixels going back
     /// into the layer texture. Wet paint is laid a pass at a time (a display frame's input, see
@@ -8452,9 +8816,14 @@ impl Canvas {
         (instances, wet, times, picks): SmudgedStamps<'_>,
         style: &StrokeStyle,
         target: LayerId,
-        restart: bool,
+        (restart, tip): (bool, bool),
     ) {
         let device = &gpu.device;
+        // a tip laid in place, only over the stroke under way where what it writes is kept (see
+        // `Canvas::save_in_place_tip`)
+        if tip && !self.keeps_in_place_tip(target) {
+            return;
+        }
         // redrawn from scratch: the stroke starts again on the layer as it was before it
         if restart && self.smudge.as_ref().is_some_and(|s| s.layer == target) {
             self.smudge_put_back(gpu, encoder);
@@ -8475,97 +8844,30 @@ impl Canvas {
             }
             self.dirty = self.full();
         }
-        if self.smudge.as_ref().is_none_or(|s| s.layer != target) {
-            if self.smudge_refused || !self.layers.contains_key(&target) {
-                return;
-            }
-            let wet_paint = style.paints_in_place();
-            // paint laid in place with a second, a texturized grain, wet or burnt edges, or a
-            // glaze of its own over its wet paint is laid apart, and put together with them
-            let second = self.queued_second.map(|d| (d.uniform_mode(), d.threshold));
-            let alone = grain_once(style) || style.wet_edges > 0.0 || style.burnt_edges > 0.0 || wet_rule(style) != 0;
-            let apart = second
-                .or(alone.then_some((0, -1.0)))
-                .filter(|_| wet_paint)
-                .map(|(mode, threshold)| (*style, mode, threshold));
-            // and keeps the colour its stamps mixed (with how much of its paint shows, the stroke as
-            // laid, which wet paint goes on mixing with); wet paint in the modulated mode or a
-            // glaze of its own keeps how much each pixel has taken, or how far its glaze shows
-            let keeps = smudge::Keeps {
-                grained: apart.is_some(),
-                amount: wet_paint && (style.rendering == Rendering::Gradual || wet_rule(style) != 0),
-                shown: apart.is_some(),
-            };
-            // what it carries made first, and the stroke not begun if it can't be (past the GPU's
-            // memory): begun, each frame it is in would go undrawn (the screen flashing)
-            let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-            let invalid = device.push_error_scope(wgpu::ErrorFilter::Validation);
-            let in_fragments = self.pipelines.compute.is_none();
-            let carry = (!in_fragments).then(|| {
-                device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("smudge carry"),
-                    // the carry, and the blur's two passes over it (see the shader's cs_blur_down);
-                    // or wet paint's two carried-over plots and a pass's plots (see cs_wet_plots)
-                    size: if wet_paint {
-                        (2 * u64::from(WET_PLOT_MOST * WET_PLOT_MOST) + WET_PLOTS_TEXELS) * 16
-                    } else {
-                        u64::from(SMUDGE_GRID * SMUDGE_GRID) * 16 * 3
-                    },
-                    // (copied aside and back where a symmetry's copies take turns in it)
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                })
-            });
-            let held = in_fragments.then(|| fragments::Held::new(gpu, wet_paint));
-            if let Some(why) = pollster::block_on(invalid.pop()).or(pollster::block_on(memory.pop())) {
-                log::error!("smudging: {why}");
-                self.smudge_refused = true;
-                self.smudge_untold = true;
-                return;
-            }
-            // painting into the layer's store: what it works in is the store's paint
-            let store = (style.store != 0).then(|| self.store_for_stroke(gpu, encoder, target, style.store)).flatten();
-            // its tiles sized to its brush
-            let tile = self.smudge_tiles.unwrap_or_else(|| smudge::tile_for(self.brush_across, gpu.is_gl()));
-            let rewind = (wet_paint && self.rewinds && self.may_lay_again && !in_fragments && store.is_none())
-                .then(|| rewind::Rewind::new(self.low_memory(), self.rewind_most, tile));
-            self.smudge = Some(Smudge {
-                layer: target,
-                into: store.as_ref().map_or(target, |s| s.planes[0]),
-                store,
-                carry,
-                held,
-                carries: vec![Carry::new()],
-                resident: None,
-                wet: wet_paint,
-                keeps,
-                apart,
-                pending: Vec::new(),
-                pass: None,
-                passed: None,
-                tiles: smudge::Tiles::new(),
-                tile,
-                window: None,
-                frag_window: None,
-                laid: false,
-                stalled: false,
-                synthesized: IRect::EMPTY,
-                rewind,
-                stale: IRect::EMPTY,
-                stale_whole: false,
-            });
+        if self.smudge.as_ref().is_none_or(|s| s.layer != target) && !self.begin_smudge(gpu, encoder, style, target) {
+            return;
         }
         if style.paints_in_place() {
             let Some(smudge) = self.smudge.as_mut() else { return };
             let given = instances.iter().zip(wet).zip(times).map(|((s, w), t)| (*s, *w, *t));
-            if let Some(rewind) = smudge.rewind.as_mut() {
+            // (a tip's stamps are no part of the stroke: they come off again)
+            if let Some(rewind) = smudge.rewind.as_mut().filter(|_| !tip) {
                 rewind.give(given.clone());
             }
             smudge.pending.extend(given);
             let key = |s: &(StampInstance, [f32; 8], Paced)| wet_pass(s.2.time_ms, style.preview);
             let newest = smudge.pending.last().map(key);
-            let ready = smudge.pending.iter().take_while(|s| Some(key(s)) != newest).count();
+            // a tip laid with the stamps waiting for the rest of their display frame, all of it
+            let ready = if tip {
+                smudge.pending.len()
+            } else {
+                smudge.pending.iter().take_while(|s| Some(key(s)) != newest).count()
+            };
             let ready: Vec<_> = smudge.pending.drain(..ready).collect();
+            if tip {
+                self.lay_wet(gpu, encoder, (params, passes), &ready, style);
+                return;
+            }
             // a mark to go back to before them (see `rewind.rs`), a dual brush's second still to be
             // put together put together first, so that the mark holds the layer with it (see
             // `synthesis_due`): gone back to, the stroke would lay again without it
@@ -11152,6 +11454,10 @@ impl Canvas {
             Op::Cancel
             | Op::SaveTip(_)
             | Op::Untip(_)
+            | Op::SaveSecondTip(_)
+            | Op::UntipSecond(_)
+            | Op::SaveInPlaceTip { .. }
+            | Op::UntipInPlace(_)
             | Op::RewindInPlace(_)
             | Op::RewindSecond(_)
             | Op::SecondReached(_)
@@ -12941,6 +13247,7 @@ impl Canvas {
         let mut all: Vec<&wgpu::Texture> = vec![&self.stroke, &self.composite, &self.shapes, &self.grains, &self.table];
         all.extend(self.layers.values().map(|l| &l.texture));
         all.extend(self.tip_backup.as_ref());
+        all.extend(self.second_tip_backup.as_ref());
         all.extend(self.fragments.textures());
         all.extend(self.composite_second.made());
         all.extend(self.trace.as_ref().map(|t| &t.texture));
@@ -13845,17 +14152,178 @@ impl UniformData {
     }
 }
 
+impl Canvas {
+    /// A render that shows the canvas begins: the work the tips get grows if the GPU had done the
+    /// last such render by now, and halves if it hadn't (see [`TIP_WORK_FIRST`]).
+    fn keep_tips_to_the_gpu(&mut self, gpu: &Gpu) {
+        let Some(index) = self.tip_sent.take() else { return };
+        let now = wgpu::PollType::Wait { submission_index: Some(index), timeout: Some(std::time::Duration::ZERO) };
+        if crate::poll(&gpu.device, now).is_ok() {
+            self.tip_ceiling = self.tip_ceiling.saturating_add(self.tip_ceiling / 500).min(TIP_WORK_MOST);
+            let most = self.tip_ceiling / 4 * 3;
+            self.tip_work = self.tip_work.saturating_add(self.tip_work / 16).min(most).max(TIP_WORK_LEAST);
+        } else {
+            self.tip_ceiling = self.tip_work.max(TIP_WORK_LEAST);
+            self.tip_work = (self.tip_work / 2).max(TIP_WORK_LEAST);
+        }
+    }
+
+    /// `ops` with what runs ahead of a stroke (a dual brush's tip, one laid in place) laid only as
+    /// far as the work given it goes in a render that shows the canvas (`shown`, see
+    /// [`TIP_WORK_FIRST`]): each tip's stamps from its start, as the stroke would lay them, the rest
+    /// left out (a tip isn't kept: the next is drawn anew). A tip laid in place lays the stamps
+    /// waiting for the rest of their display frame too, about as many as the stroke lays a render:
+    /// none of the tips of a stroke painting in place is laid where the work doesn't cover that.
+    /// What a tip laid in place keeps is then kept only where what is left of it writes.
+    fn tips_within(&mut self, ops: Vec<Op>, shown: bool) -> Vec<Op> {
+        if !shown {
+            return ops;
+        }
+        let (mut given, mut laid) = (0u64, 0u64);
+        let full = self.full();
+        let laid_in_place = ops.iter().any(|op| matches!(op, Op::SaveInPlaceTip { .. }));
+        let pending: u64 = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Stamps { tip: false, instances, style, second: false, .. } if style.in_place() => {
+                    Some(stamps_work(instances, full, true))
+                }
+                _ => None,
+            })
+            .sum();
+        let pending = (pending as f64 * TIP_PENDING_SHARE) as u64;
+        let mut room = self.tip_work;
+        let in_place_on = !laid_in_place || room > pending;
+        if laid_in_place {
+            room = room.saturating_sub(pending);
+        }
+        let mut cut = false;
+        let mut ops: Vec<Op> = ops
+            .into_iter()
+            .map(|op| {
+                let Op::Stamps {
+                    tip: true,
+                    mut instances,
+                    mut wet,
+                    mut picks,
+                    mut times,
+                    style,
+                    second,
+                    clear,
+                    again,
+                    layer,
+                    pencil,
+                    carry,
+                } = op
+                else {
+                    return op;
+                };
+                let in_place = style.in_place() && !second;
+                let mut count = 0;
+                if in_place_on && !cut {
+                    // (a second's tip of a stroke painting in place is put together with its paint
+                    // wherever it goes, as paint laid in place is laid)
+                    let together = laid_in_place && !in_place;
+                    for s in &instances {
+                        let work = stamp_work(s, full, in_place).saturating_add(if together {
+                            stamp_work(s, full, true)
+                        } else {
+                            0
+                        });
+                        if work > room {
+                            // (none after it: a tip is laid from its start)
+                            cut = true;
+                            break;
+                        }
+                        room -= work;
+                        count += 1;
+                    }
+                }
+                given += instances.len() as u64;
+                laid += count as u64;
+                instances.truncate(count);
+                wet.truncate(count);
+                picks.truncate(count);
+                times.truncate(count);
+                Op::Stamps {
+                    tip: true,
+                    instances,
+                    wet,
+                    picks,
+                    times,
+                    style,
+                    second,
+                    clear,
+                    again,
+                    layer,
+                    pencil,
+                    carry,
+                }
+            })
+            .map(|op| match op {
+                Op::SaveInPlaceTip { writes, layer, style, .. } => {
+                    Op::SaveInPlaceTip { writes, layer, style, on: in_place_on }
+                }
+                op => op,
+            })
+            .collect();
+        // a tip laid in place keeps what is left of it writes: its second's stamps just before it,
+        // its own just after
+        for k in 0..ops.len() {
+            if !matches!(ops.get(k), Some(Op::SaveInPlaceTip { .. })) {
+                continue;
+            }
+            let tip_writes = |op: &Op| match op {
+                Op::Stamps { tip: true, instances, .. } => Some(in_place_writes(instances, full)),
+                _ => None,
+            };
+            let before = ops.get(..k).unwrap_or_default().iter().rev().map_while(tip_writes);
+            let after = ops.get(k + 1..).unwrap_or_default().iter().map_while(tip_writes);
+            let kept = before.chain(after).fold(IRect::EMPTY, IRect::union);
+            if let Some(Op::SaveInPlaceTip { writes, .. }) = ops.get_mut(k) {
+                *writes = writes.intersect(kept);
+            }
+        }
+        self.tip_stamps = (self.tip_stamps.0 + given, self.tip_stamps.1 + laid);
+        ops
+    }
+
+    /// The work the tips are given a render (see [`TIP_WORK_FIRST`]), and the tips' stamps given and
+    /// laid in renders that showed the canvas so far: for benches.
+    #[doc(hidden)]
+    pub fn tip_work(&self) -> (u64, (u64, u64)) {
+        (self.tip_work, self.tip_stamps)
+    }
+}
+
 /// `ops` without the tips taken off again among them: what a tip covered comes back as it was, so
 /// one that never reached the screen is work for nothing. Behind with a fast stroke, a frame has
-/// a tip for every input event since the last, and drawing them all left it further behind.
+/// a tip for every input event since the last, and drawing them all left it further behind. A
+/// dual brush's tip puts its second's after its own and takes it off first, so each comes off
+/// where it was just put.
 fn without_passing_tips(ops: Vec<Op>) -> Vec<Op> {
     let mut kept: Vec<Op> = Vec::with_capacity(ops.len());
     for op in ops {
-        if let Op::Untip(rect) = op
-            && let [.., Op::SaveTip(saved), Op::Stamps { .. }] = kept.as_slice()
-            && *saved == rect
-        {
+        let passing = match (&op, kept.as_slice()) {
+            (Op::Untip(rect), [.., Op::SaveTip(saved), Op::Stamps { second: false, .. }]) => saved == rect,
+            (Op::UntipSecond(rect), [.., Op::SaveSecondTip(saved), Op::Stamps { second: true, tip: true, .. }]) => {
+                saved == rect
+            }
+            (
+                Op::UntipInPlace(rect),
+                [.., Op::SaveInPlaceTip { writes: saved, .. }, Op::Stamps { second: false, tip: true, .. }],
+            ) => saved == rect,
+            _ => false,
+        };
+        if passing {
             kept.truncate(kept.len() - 2);
+            continue;
+        }
+        // (a tip laid in place of only its second's)
+        if let (Op::UntipInPlace(rect), [.., Op::SaveInPlaceTip { writes: saved, .. }]) = (&op, kept.as_slice())
+            && saved == rect
+        {
+            kept.truncate(kept.len() - 1);
             continue;
         }
         kept.push(op);
@@ -13927,7 +14395,8 @@ fn stamps_work(stamps: &[StampInstance], full: IRect, in_place: bool) -> u64 {
 fn in_pieces(ops: Vec<Op>, full: IRect, (in_place_most, most, cut_most): (u64, u64, u64), most_stamps: u64) -> Vec<Op> {
     let mut pieces = Vec::with_capacity(ops.len());
     for op in ops {
-        let Op::Stamps { second, instances, wet, picks, times, style, clear, again, layer, pencil, carry } = op else {
+        let Op::Stamps { second, instances, wet, picks, times, style, clear, again, layer, pencil, carry, tip } = op
+        else {
             pieces.push(op);
             continue;
         };
@@ -13951,7 +14420,20 @@ fn in_pieces(ops: Vec<Op>, full: IRect, (in_place_most, most, cut_most): (u64, u
             work = work.saturating_add(more);
         }
         if counts.is_empty() {
-            pieces.push(Op::Stamps { second, instances, wet, picks, times, style, clear, again, layer, pencil, carry });
+            pieces.push(Op::Stamps {
+                second,
+                instances,
+                wet,
+                picks,
+                times,
+                style,
+                clear,
+                again,
+                layer,
+                pencil,
+                carry,
+                tip,
+            });
             continue;
         }
         counts.push(count);
@@ -13971,6 +14453,7 @@ fn in_pieces(ops: Vec<Op>, full: IRect, (in_place_most, most, cut_most): (u64, u
                 layer,
                 pencil,
                 carry,
+                tip,
             });
         }
     }
@@ -16778,6 +17261,7 @@ mod tests {
                 layer: LayerId(1),
                 pencil: false,
                 carry: true,
+                tip: false,
             };
             let mut cuts = Vec::new();
             let mut at = 0;

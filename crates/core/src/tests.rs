@@ -4656,6 +4656,31 @@ fn stroke_end_cost() {
 }
 
 #[test]
+fn a_stabilised_stock_brush_requests_a_frame_while_only_its_tip_moves() {
+    let Some(s) = session(140, 140) else { return };
+    let (set, index) = library_brush(&s, |b| b.name == "Hard Brush").expect("stock Hard Brush");
+    assert!(s.select_brush(set, index));
+    s.set_brush_size(0.15);
+    s.set_color(0.0, 0.0, 0.0);
+    s.set_input_settings(1.0, 0.0, 0.0, 0.0, true, vec![]);
+
+    s.stroke_begin(PointerKind::Stylus, vec![sample(20.5, 70.5, 0.0)]);
+    assert_eq!(pixel(&s, 95, 70), [255, 255, 255, 255]);
+    {
+        let mut st = s.shared.lock();
+        assert!(st.canvas.as_ref().unwrap().shows_tip());
+        assert!(!st.stroke.as_ref().unwrap().shows_tip());
+        // The first frame has been requested. Further input must request another one.
+        st.needs_frame = false;
+    }
+    s.stroke_add(vec![sample(60.5, 70.5, 25.0), sample(100.5, 70.5, 50.0)]);
+    assert_eq!(s.shared.lock().stroke.as_ref().unwrap().stamp_count(), 0);
+    assert!(s.wants_frame());
+    assert!(pixel(&s, 95, 70)[0] < 240, "the preview follows the pen while the stroke settles");
+    s.stroke_end(vec![]);
+}
+
+#[test]
 fn a_finger_strokes_head_is_drawn_in_its_layer_under_those_above() {
     let Some(s) = session(100, 100) else { return };
     let below = s.layers()[0].id;
@@ -25550,4 +25575,107 @@ fn time_lapse_hold_back_to_back() {
     assert!(run.in_order, "frames out of order");
     assert!(run.last_all, "a stroke missing from the last frame");
     assert!(run.kept as usize >= run.strokes, "{} frames for {} strokes", run.kept, run.strokes);
+}
+
+/// A stroke drawn by `name` with the app's motion filtering at 30% (which holds the input back
+/// 162 ms), a pen at 240 Hz moving 2000 px/s, a frame drawn every 4 samples as the app draws them
+/// (what runs ahead of the stroke laid then): how far its ink is behind the pen at the most past
+/// its first 100 ms (screen pixels), and the composite once it has ended. `tips` off, it shows only
+/// what its smoothing has settled. And whether the canvas shows such a stroke's tip (not one
+/// painting in place where the GPU runs no compute passes).
+fn tip_drawn(name: &str, tips: bool) -> Option<(f32, Vec<u8>, bool)> {
+    let side = 900u32;
+    let (speed, rate, samples) = (2000.0f32, 240.0f64, 90usize);
+    let s = session(side, side)?;
+    let (set, index) = library_brush(&s, |b| b.name == name)?;
+    assert!(s.select_brush(set, index));
+    s.set_brush_size(0.15);
+    s.set_input_settings(0.0, 0.3, 0.0, 0.0, true, Vec::new());
+    let zoom = s.shared.lock().view.map_or(1.0, |v| v.zoom());
+    let frame = |s: &CanvasSession| {
+        let mut guard = s.shared.lock();
+        let st = &mut *guard;
+        st.canvas.as_mut().unwrap().set_tips_ahead(tips);
+        st.draw_ahead();
+        let (canvas, gpu) = (st.canvas.as_mut().unwrap(), st.gpu.as_ref().unwrap());
+        canvas.render(gpu, &mut st.doc, None);
+        assert_eq!(gpu.errors(), 0, "GPU validation errors");
+        canvas.read_composite(gpu).unwrap()
+    };
+    let blank = frame(&s);
+    let at = |k: usize| {
+        let t = k as f64 * 1000.0 / rate;
+        PenSample {
+            x: 40.0 + speed * (t / 1000.0) as f32,
+            y: side as f32 / 2.0 + (k as f32 * 0.12).sin() * 30.0,
+            pressure: 0.6,
+            tilt: 0.0,
+            orientation: 0.0,
+            time_ms: t,
+            roll: 0.0,
+        }
+    };
+    s.stroke_begin(PointerKind::Stylus, vec![at(0)]);
+    let shows = s.shared.lock().canvas.as_ref().is_some_and(|c| c.shows_dual_tip() || c.shows_in_place_tip());
+    let mut gap = 0.0f32;
+    for k in 1..samples {
+        s.stroke_add(vec![at(k)]);
+        if k % 4 != 0 {
+            continue;
+        }
+        let shown = frame(&s);
+        // the furthest column inked
+        let reach = (0..side as usize)
+            .rev()
+            .find(|&x| {
+                (0..side as usize).any(|y| {
+                    let i = (y * side as usize + x) * 4;
+                    shown.get(i..i + 4) != blank.get(i..i + 4)
+                })
+            })
+            .unwrap_or(0);
+        if k as f64 * 1000.0 / rate > 100.0 {
+            gap = gap.max(at(k).x - reach as f32 * zoom);
+        }
+    }
+    s.stroke_end(vec![at(samples)]);
+    Some((gap, frame(&s), shows))
+}
+
+/// `names`' strokes reach the pen with their tips, and come out pixel for pixel as drawn without
+/// them (see [`tip_drawn`]).
+fn tips_reach_the_pen(names: &[&str]) {
+    for name in names {
+        let (Some((with, a, shows)), Some((without, b, _))) = (tip_drawn(name, true), tip_drawn(name, false)) else {
+            return;
+        };
+        assert!(without > 200.0, "{name}: {without} px behind without its tip (motion filtering holds 162 ms)");
+        if shows {
+            assert!(with < 40.0, "{name}: {with} px behind with its tip, {without} without");
+        }
+        let differ = a.iter().zip(&b).filter(|(x, y)| x != y).count();
+        assert_eq!(differ, 0, "{name}: {differ} bytes of the stroke differ with its tip shown as it was drawn");
+    }
+}
+
+/// A dual brush's stroke laid in its textures (not painted in place) shows its tip as it is drawn,
+/// its second's with it: it showed only what its smoothing had settled, 330 px behind the pen at
+/// 2000 px/s with the app's motion filtering at 30% (discord, a desktop video: the stroke 165 ms
+/// behind the cursor). The tip taken off again, the stroke comes out as without it. Gradual in both
+/// parts, carried from lot to lot; gradual and carried, and built up; built up and capped;
+/// strongest in both; built up in both.
+#[test]
+fn a_dual_brushs_stroke_shows_its_tip_and_comes_out_as_without_it() {
+    tips_reach_the_pen(&["Hamilton", "Pierrot", "Wavecrest", "Griffin", "Garnet Rose"]);
+}
+
+/// A stroke painting its layer as it goes shows its tip laid in place, and taken off again before
+/// more is laid (what it wrote kept, and what it carried): it showed only what its smoothing had
+/// settled (Ibis, the report's pencil, 174 ms behind the pen). It comes out as without it. Dry
+/// (Pangolin), a dual brush's dry (Ibis), wet (Highmoor), wet with an end taper going back over what
+/// it laid as it ends (Olympus), a wet dual brush's with its own stabilisation (Copperwing), dry
+/// with an end taper (Lundy).
+#[test]
+fn a_stroke_painting_in_place_shows_its_tip_and_comes_out_as_without_it() {
+    tips_reach_the_pen(&["Pangolin", "Ibis", "Highmoor", "Olympus", "Copperwing", "Lundy"]);
 }

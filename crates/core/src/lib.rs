@@ -1522,11 +1522,12 @@ fn draw_samples(
     guide: &procraft_engine::guide::Guide,
     ahead_later: bool,
 ) -> bool {
-    // a dual brush's second, as its stamps come (no tip of its own); laid again once its first
-    // stamps turn to the way it goes, or (holding its start) once that is known, as the stroke's
-    // own are: else its end found them changed and laid all of it again, a second or more after
-    // a long stroke's lift on a tablet
-    if let Some(second) = second {
+    let mut second = second;
+    // a dual brush's second, as its stamps come (what runs ahead of them shown with the stroke's,
+    // see `show_ahead`); laid again once its first stamps turn to the way it goes, or (holding its
+    // start) once that is known, as the stroke's own are: else its end found them changed and laid
+    // all of it again, a second or more after a long stroke's lift on a tablet
+    if let Some(second) = second.as_deref_mut() {
         let added = second.add(samples);
         if second.take_turned() {
             canvas.replace_second_stamps(&guide::mirrored(guide, &second.placed_stamps()));
@@ -1565,9 +1566,10 @@ fn draw_samples(
     if ahead_later {
         return true;
     }
-    show_ahead(canvas, builder, &[], guide);
-    // (holding its start, what it holds back shows in the tip)
-    !stamps.is_empty() || builder.holds_start()
+    let tip_shown = show_ahead(canvas, builder, second, &[], guide);
+    // (holding its start, what it holds back shows in the tip; and a tip moving on while the
+    // stroke's smoothing settles none of it asks for a frame too)
+    !stamps.is_empty() || builder.holds_start() || tip_shown
 }
 
 /// Whether the open stroke is a smudge whose end taper reaches back over what it lays as it goes
@@ -1598,22 +1600,42 @@ fn lift_samples(
 
 /// Shows what is ahead of the open stroke (`samples` being predicted input) until the next input:
 /// as its tip where the canvas takes one, on to the input itself, so it looks as the stroke will
-/// (its grain, build-up and colour, under the layers above it and in its layer's blend); else
-/// drawn over the canvas, and only as far as the path has got.
+/// (its grain, build-up and colour, under the layers above it and in its layer's blend), a dual
+/// brush's with its second's (`second`) cutting it as it will; else drawn over the canvas, and only
+/// as far as the path has got. Whether it showed a tip.
 fn show_ahead(
     canvas: &mut Canvas,
     builder: &mut StrokeBuilder,
+    second: Option<&mut StrokeBuilder>,
     samples: &[Sample],
     guide: &procraft_engine::guide::Guide,
-) {
-    if canvas.shows_tip() {
-        // (with the stamps it holds back until they no longer change, see `hold_start`)
+) -> bool {
+    // (with the stamps it holds back until they no longer change, see `hold_start`)
+    let ahead = |builder: &mut StrokeBuilder| {
         let mut tip = builder.held_back();
         tip.extend(builder.preview_to_input(samples));
+        tip
+    };
+    if canvas.shows_tip() {
+        let tip = ahead(builder);
         canvas.set_tip(&guide::mirrored(guide, &tip));
+        return !tip.is_empty();
+    } else if canvas.shows_dual_tip() || canvas.shows_in_place_tip() {
+        // without it a dual brush's stroke, or one painting in place, showed only what its
+        // smoothing had settled: as far behind the pen as motion filtering or stabilisation hold
+        // the input back
+        let (tip, second) = (ahead(builder), second.map(ahead).unwrap_or_default());
+        let (tip, second) = (guide::mirrored(guide, &tip), guide::mirrored(guide, &second));
+        if canvas.shows_dual_tip() {
+            canvas.set_dual_tip(&tip, &second);
+        } else {
+            canvas.set_in_place_tip(&tip, &second);
+        }
+        return !tip.is_empty() || !second.is_empty();
     } else {
         canvas.set_prediction(&guide::mirrored(guide, &builder.preview(samples)));
     }
+    false
 }
 
 impl State {
@@ -1632,7 +1654,7 @@ impl State {
             let tip = if predicted.is_empty() { builder.tip_now() } else { builder.preview_tip(&predicted) };
             canvas.set_tip(&guide::mirrored(&guide, &tip));
         } else {
-            show_ahead(canvas, builder, &predicted, &guide);
+            show_ahead(canvas, builder, self.second.as_deref_mut(), &predicted, &guide);
         }
     }
 }
@@ -2832,8 +2854,9 @@ impl Shared {
         }
         let (Some(builder), Some(canvas)) = (st.stroke.as_mut(), st.canvas.as_mut()) else { return };
         // while the platform predicts input, what runs ahead waits for the frame (its prediction
-        // follows these samples): on to the input, until a prediction comes
-        let later = st.predicting;
+        // follows these samples): on to the input, until a prediction comes; and a dual brush's
+        // tip, or one laid in place, is laid once a frame however many pen events came
+        let later = st.predicting || canvas.shows_dual_tip() || canvas.shows_in_place_tip();
         if draw_samples(canvas, builder, st.second.as_deref_mut(), &canvas_samples, &st.doc.stroke_guide(), later) {
             st.ahead = later;
             // (a prediction made before these samples no longer runs ahead of them)

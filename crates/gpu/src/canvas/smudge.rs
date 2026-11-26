@@ -752,7 +752,9 @@ impl Canvas {
         writes: &[IRect],
     ) -> bool {
         let device = &gpu.device;
-        // what the passes write, as it is before them, for the stroke's mark to go back to
+        // what the passes write, as it is before them, for the stroke's mark to go back to, and for
+        // its tip laid in place to be taken off
+        self.keep_for_tip(gpu, encoder, writes);
         self.keep_for_mark(gpu, encoder, writes);
         let full = self.full();
         let also = self.smudge_also();

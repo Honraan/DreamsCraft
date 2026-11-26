@@ -364,6 +364,8 @@ pub(super) struct Fragments {
     pub(super) rule_lists: Vec<RuleList>,
     rule_next: usize,
     tip_backup: Option<wgpu::Texture>,
+    /// The build-up under a dual brush's tip in its second.
+    second_tip_backup: Option<wgpu::Texture>,
     spares: Option<Spares>,
 }
 
@@ -392,7 +394,14 @@ impl Fragments {
     pub(super) fn textures(&self) -> Vec<&wgpu::Texture> {
         let outs = self.rule_out.iter().flat_map(|pair| pair.iter().map(|(t, _)| t));
         let lists = self.rule_lists.iter().map(|l| &l.tiles.texture);
-        self.built.iter().map(|b| &b.texture).chain(outs).chain(lists).chain(self.tip_backup.as_ref()).collect()
+        self.built
+            .iter()
+            .map(|b| &b.texture)
+            .chain(outs)
+            .chain(lists)
+            .chain(self.tip_backup.as_ref())
+            .chain(self.second_tip_backup.as_ref())
+            .collect()
     }
 
     /// A render begins: the rule's lists free for its work again, as many kept as are to be.
@@ -475,6 +484,59 @@ impl Canvas {
                 copy_at(&built.texture, rect.x0, rect.y0),
                 copy_at(backup, 0, 0),
                 extent(width, height),
+            );
+        }
+    }
+
+    /// Keeps the build-up of a dual brush's second (`of`) under `rect`, as the second is kept under
+    /// its tip (see [`Canvas::set_dual_tip`]). Made first where the second has none yet (as cleared,
+    /// as the second is before its first stamps), so that the tip's comes off with it.
+    pub(super) fn save_second_tip_built_up(
+        &mut self,
+        gpu: &Gpu,
+        encoder: &mut wgpu::CommandEncoder,
+        of: &wgpu::Texture,
+        rect: IRect,
+    ) {
+        if self.pipelines.fragments.is_none() {
+            return;
+        }
+        let (width, height) = (rect.width(), rect.height());
+        let roomy =
+            self.fragments.second_tip_backup.as_ref().is_some_and(|b| b.width() >= width && b.height() >= height);
+        if !roomy {
+            let room = |n: u32, most: u32| n.max(1).next_multiple_of(256).min(most);
+            let (w, h) = self.fragments.second_tip_backup.as_ref().map_or((0, 0), |b| (b.width(), b.height()));
+            let size = (room(width.max(w), self.width), room(height.max(h), self.height));
+            self.fragments.second_tip_backup = Some(texture(gpu, "second tip built up", size.0, size.1, BUILT_FORMAT));
+        }
+        let Some(built) = self.built_up(gpu, of).map(|b| b.texture.clone()) else { return };
+        if let Some(backup) = &self.fragments.second_tip_backup {
+            gpu.copy_texture_to_texture(
+                encoder,
+                copy_at(&built, rect.x0, rect.y0),
+                copy_at(backup, 0, 0),
+                extent(width, height),
+            );
+        }
+    }
+
+    /// Puts the build-up of a dual brush's second (`of`) under `rect` back as it was kept (see
+    /// [`Canvas::save_second_tip_built_up`]).
+    pub(super) fn untip_second_built_up(
+        &self,
+        gpu: &Gpu,
+        encoder: &mut wgpu::CommandEncoder,
+        of: &wgpu::Texture,
+        rect: IRect,
+    ) {
+        let Some(built) = self.fragments.built.iter().find(|b| b.of == *of) else { return };
+        if let Some(backup) = &self.fragments.second_tip_backup {
+            gpu.copy_texture_to_texture(
+                encoder,
+                copy_at(backup, 0, 0),
+                copy_at(&built.texture, rect.x0, rect.y0),
+                extent(rect.width(), rect.height()),
             );
         }
     }
