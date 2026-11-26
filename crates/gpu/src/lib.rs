@@ -5,6 +5,7 @@
 //! nothing relies on reading the render target in the shader (Android GPUs have no portable way).
 
 mod canvas;
+mod choice;
 #[cfg(windows)]
 mod compiler;
 // (naga's GLSL writer comes with the OpenGL backend, which Apple's systems go without)
@@ -33,6 +34,10 @@ pub use canvas::{
     textures_bytes,
 };
 pub use canvas::{CanvasPaper, CarryFault, GREY_LOOK, PYRAMID_LEVELS, ViewLook, pyramid_levels};
+pub use choice::{
+    GpuMemory, best_gpu, choose_gpu, gpu_memory, gpus_to_choose, know_gpu_memory, passed_over, prefer_gpu,
+    preferred_gpu,
+};
 pub use kept::{forget_kept_pipelines, keep_pipelines_for, keep_pipelines_in};
 pub use lighting::Lighting;
 pub use scene::{
@@ -163,6 +168,32 @@ fn weak_gpu(name: &str, device_type: wgpu::DeviceType) -> bool {
         return n < 630 || (700..710).contains(&n);
     }
     false
+}
+
+/// Whether the GPU `info` is a weak one: a phone's or tablet's (see [`weak_gpu`]), or an old or
+/// entry-level graphics card (see [`choice::weak_card`]), drawn with as there was nothing better or
+/// as the person picked it.
+fn weak(info: &wgpu::AdapterInfo) -> bool {
+    weak_gpu(&info.name, info.device_type)
+        || (info.device_type == wgpu::DeviceType::DiscreteGpu
+            && choice::weak_card(&info.name, gpu_memory(info.vendor, info.device)))
+}
+
+/// Of the GPUs `seen` (one backend's), the one to draw with: as [`choose_gpu`] finds best of those
+/// that can show on `surface` (all, without one); none if none can. Where it isn't the graphics
+/// card wgpu takes, why is logged.
+fn pick(seen: Vec<wgpu::Adapter>, surface: Option<&wgpu::Surface<'_>>) -> Option<wgpu::Adapter> {
+    let mut usable: Vec<wgpu::Adapter> =
+        seen.into_iter().filter(|a| surface.is_none_or(|s| a.is_surface_supported(s))).collect();
+    let infos: Vec<wgpu::AdapterInfo> = usable.iter().map(wgpu::Adapter::get_info).collect();
+    if surface.is_some() {
+        choice::keep_to_choose(&infos);
+    }
+    let at = choose_gpu(&infos)?;
+    if let Some(why) = passed_over(&infos, at) {
+        log::info!("the GPU to draw with: {why}");
+    }
+    (at < usable.len()).then(|| usable.swap_remove(at))
 }
 
 /// Every GPU taken for a weak one (see [`weak_gpu`]): for measuring what that saves on others.
@@ -559,28 +590,37 @@ impl Gpu {
         // each stage timed in the log: on a slow driver, where a start stopped shows
         let started = std::time::Instant::now();
         // every GPU the backend sees, for the log (a laptop's two, a driver's own name and version)
-        for adapter in pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all())) {
+        let seen = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+        for adapter in &seen {
             let info = adapter.get_info();
+            let memory = gpu_memory(info.vendor, info.device).map(|m| format!(", {} MB of its own", m >> 20));
             log::info!(
-                "GPU seen: {} ({:?}, {:?}, driver {} {})",
+                "GPU seen: {} ({:?}, {:?}, driver {} {}{})",
                 info.name,
                 info.backend,
                 info.device_type,
                 info.driver,
-                one_line(&info.driver_info)
+                one_line(&info.driver_info),
+                memory.unwrap_or_default()
             );
         }
         log::info!("the GPUs listed in {} ms", started.elapsed().as_millis());
         let chosen = std::time::Instant::now();
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            // the faster GPU of a laptop's two, unless `WGPU_POWER_PREF` says (`low`: to try the
-            // other when one fails or lags)
-            power_preference: wgpu::PowerPreference::from_env().unwrap_or(wgpu::PowerPreference::HighPerformance),
-            force_fallback_adapter: software,
-            compatible_surface: surface,
-            apply_limit_buckets: false,
-        }))
-        .map_err(|e| GpuError::NoAdapter(e.to_string()))?;
+        // as `choice` finds best of those that can show on the window (not where `WGPU_POWER_PREF`
+        // says which, to try the other when one fails or lags, nor for the software GPU)
+        let picked = if software || wgpu::PowerPreference::from_env().is_some() { None } else { pick(seen, surface) };
+        let adapter = match picked {
+            Some(adapter) => adapter,
+            None => pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                // the faster GPU of a laptop's two, unless `WGPU_POWER_PREF` says (`low`: to try the
+                // other when one fails or lags)
+                power_preference: wgpu::PowerPreference::from_env().unwrap_or(wgpu::PowerPreference::HighPerformance),
+                force_fallback_adapter: software,
+                compatible_surface: surface,
+                apply_limit_buckets: false,
+            }))
+            .map_err(|e| GpuError::NoAdapter(e.to_string()))?,
+        };
         let info = adapter.get_info();
         log::info!(
             "GPU: {} ({:?}, driver {}), chosen in {} ms",
@@ -594,7 +634,7 @@ impl Gpu {
             UNCOMPRESSED.store(true, Ordering::Relaxed);
             log::info!("the canvas's textures kept uncompressed on this GPU");
         }
-        if weak_gpu(&info.name, info.device_type) {
+        if weak(&info) {
             log::info!("a weak GPU: the frosted glass is blurred from a smaller picture");
         }
         let stale = starts_stale(&info);
@@ -878,10 +918,16 @@ impl Gpu {
         if self.is_gl() { gl_array_layers(n) } else { n.max(1) }
     }
 
-    /// Whether the GPU is a weak one (see [`weak_gpu`]).
+    /// Whether the GPU is a weak one (see [`weak`]).
     pub fn is_weak(&self) -> bool {
+        WEAK.load(Ordering::Relaxed) || weak(&self.adapter.get_info())
+    }
+
+    /// The memory of its own the GPU has (a graphics card's), bytes, as the system told it (see
+    /// [`know_gpu_memory`]); none where it didn't.
+    pub fn dedicated_memory(&self) -> Option<u64> {
         let info = self.adapter.get_info();
-        WEAK.load(Ordering::Relaxed) || weak_gpu(&info.name, info.device_type)
+        gpu_memory(info.vendor, info.device)
     }
 
     /// Whether the GPU's memory is the computer's own: an integrated GPU's (a laptop's Intel or
@@ -1274,6 +1320,24 @@ mod tests {
         }
         assert!(!weak_gpu("NVIDIA GeForce RTX 5060 Laptop GPU", DiscreteGpu));
         assert!(weak_gpu("Microsoft Basic Render Driver", Cpu));
+    }
+
+    /// An old or entry-level graphics card drawn with (nothing better beside it, or picked in the
+    /// settings) is a weak GPU too: the frosted glass is blurred from a smaller picture there.
+    /// Others aren't, and an integrated GPU is told by its name alone.
+    #[test]
+    fn an_entry_level_card_is_a_weak_gpu() {
+        use wgpu::DeviceType::{DiscreteGpu, IntegratedGpu};
+        let gpu = |name: &str, device_type| wgpu::AdapterInfo {
+            name: name.to_owned(),
+            ..wgpu::AdapterInfo::new(device_type, wgpu::Backend::Vulkan)
+        };
+        assert!(super::weak(&gpu("GeForce GT 710", DiscreteGpu)));
+        assert!(super::weak(&gpu("AMD Radeon R7 240", DiscreteGpu)));
+        assert!(!super::weak(&gpu("NVIDIA GeForce GTX 1650", DiscreteGpu)));
+        assert!(!super::weak(&gpu("NVIDIA GeForce RTX 5060 Laptop GPU", DiscreteGpu)));
+        assert!(!super::weak(&gpu("Intel(R) UHD Graphics 630", IntegratedGpu)));
+        assert!(super::weak(&gpu("Mali-T830 MP1", IntegratedGpu)));
     }
 
     #[test]
