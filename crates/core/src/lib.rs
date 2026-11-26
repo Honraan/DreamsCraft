@@ -70,6 +70,8 @@ mod layer_store;
 mod layers;
 mod layout;
 #[cfg(test)]
+mod library_preview_tests;
+#[cfg(test)]
 mod limited_gpu_tests;
 mod liquify;
 mod liquify_steps;

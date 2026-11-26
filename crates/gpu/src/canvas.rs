@@ -4388,6 +4388,25 @@ impl Canvas {
         (self.full_shapes.held.len(), self.full_grains.held.len())
     }
 
+    /// What the shape and grain images at their own size it holds take on the GPU, bytes (each
+    /// with its smaller levels).
+    pub fn full_image_bytes(&self) -> u64 {
+        self.full_shapes.bytes() + self.full_grains.bytes()
+    }
+
+    /// Lets go of the shape and grain images at their own size it holds (brush files' own, big
+    /// pictures, a brush engine's set of shapes): for a canvas whose next stroke is another
+    /// brush's (the brushes' sample strokes, each brush with its own), where the last few kept
+    /// held a set's worth of the GPU's memory for nothing (a brush engine's set of shapes can be
+    /// hundreds of MB). Not while a stroke is open or work waits.
+    pub fn let_go_of_full_images(&mut self) {
+        if self.active.is_some() || self.smudge.is_some() || !self.ops.is_empty() {
+            return;
+        }
+        self.full_shapes.held.clear();
+        self.full_grains.held.clear();
+    }
+
     /// [`Canvas::use_full_shape`] for an image given with its smaller levels (see [`grey_levels`]),
     /// so that only copying them is left to do here.
     pub fn use_full_shape_levels(&mut self, gpu: &Gpu, style: &mut StrokeStyle, id: u64, side: u32, levels: &[u8]) {
@@ -15743,11 +15762,17 @@ impl TipKind {
 /// layer: only the last few used, so that their memory doesn't grow with the brushes.
 #[derive(Default)]
 struct FullGrains {
-    held: Vec<(u64, wgpu::TextureView, u64)>,
+    /// Each image's id, its view, when it was last used and what it takes on the GPU (bytes).
+    held: Vec<(u64, wgpu::TextureView, u64, u64)>,
     clock: u64,
 }
 
 impl FullGrains {
+    /// What the images held take on the GPU, bytes.
+    fn bytes(&self) -> u64 {
+        self.held.iter().map(|slot| slot.3).sum()
+    }
+
     /// Has the image `id` ready; false if `pixels` aren't `side` square.
     fn hold(&mut self, gpu: &Gpu, id: u64, side: u32, pixels: &[u8]) -> bool {
         self.hold_set(gpu, id, side, &[pixels], 1)
@@ -15806,7 +15831,8 @@ impl FullGrains {
         {
             self.held.swap_remove(oldest);
         }
-        self.held.push((id, array_view(&texture), clock));
+        let bytes = levels_bytes(side) as u64 * u64::from(channels) * u64::from(layers);
+        self.held.push((id, array_view(&texture), clock, bytes));
         true
     }
 
@@ -15855,7 +15881,8 @@ impl FullGrains {
         {
             self.held.swap_remove(oldest);
         }
-        self.held.push((id, array_view(&texture), clock));
+        let bytes = levels_bytes(side) as u64 * u64::from(gpu.array_layers_least());
+        self.held.push((id, array_view(&texture), clock, bytes));
         true
     }
 
