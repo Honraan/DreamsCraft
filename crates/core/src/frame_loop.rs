@@ -98,6 +98,10 @@ const RETRY_MOST: Duration = Duration::from_millis(250);
 /// A frame that holds the canvas longer than this is logged: touches wait on it.
 const SLOW_FRAME: Duration = Duration::from_millis(200);
 
+/// How often an image kept while frames are held looks whether they still are (their end wakes
+/// it sooner).
+const HOLD_LOOK_EVERY: Duration = Duration::from_millis(50);
+
 /// Why the render loop ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Ended {
@@ -252,17 +256,30 @@ pub(crate) fn draw_loop<S: Screen>(shared: &Shared, screen: &mut S, mut presente
         let view = screen.view(&image);
         {
             let mut guard = shared.lock();
+            // frames held since the image was asked for (the brush studio's pad being drawn again
+            // as its brush changes): the image is kept until they are let go, then drawn and shown,
+            // so the canvas never shows half redrawn. (It went unshown: a Vulkan swapchain never
+            // gets such an image back, wgpu's discard doing nothing, and a pad out of images showed
+            // nothing more, its strokes nor its clearing, until it was opened again: #404.)
+            if guard.holding_frames {
+                guard.frame_held = true;
+                while guard.holding_frames && !guard.stop {
+                    // (looked at again now and then, should its end come unannounced)
+                    _ = shared.wake.wait_for(&mut guard, HOLD_LOOK_EVERY);
+                }
+                if guard.stop {
+                    return Ended::Stopped;
+                }
+                // drawn when the hold ends, not to the plan made before it
+                planned = None;
+            }
             let st = &mut *guard;
             let held = Instant::now();
             // the window changed size while the image was awaited (the device turned): the view is
             // already for the new size, so this image is let go and the surface configured again
+            // (which alone gives a Vulkan swapchain the image back)
             if st.window_size != size {
-                continue;
-            }
-            // frames held since the image was asked for (the brush studio's pad being drawn again
-            // as its brush changes): the image goes unshown, and the canvas half redrawn with it
-            if st.holding_frames {
-                st.frame_held = true;
+                st.reconfigure = true;
                 continue;
             }
             // the pen input that came while the canvas was held goes in this frame

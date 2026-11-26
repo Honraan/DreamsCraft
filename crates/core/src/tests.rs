@@ -24210,6 +24210,315 @@ fn a_pad_being_drawn_again_shows_no_frame_until_it_is_done() {
     assert_eq!(pixel(&pad, 100, 60)[..3], [255, 0, 0]);
 }
 
+/// A stand-in for a window's Vulkan swapchain, as an Android tablet's pad has: `free` images may be
+/// held at once (given and not yet shown). One let go unshown never comes back, as there, where
+/// wgpu's discard does nothing and the image stays taken until the surface is made again; asked for
+/// with none free, it gives none (a timeout). Configured again, it is made anew with all `images`
+/// free. `on_acquire` runs as each image is given, the canvas not held by the loop meanwhile (as
+/// while it waits for one).
+struct Swapchain {
+    texture: procraft_gpu::wgpu::Texture,
+    images: u32,
+    free: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    lost: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    shown: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    on_acquire: Box<dyn FnMut() + Send>,
+}
+
+/// An image of a [`Swapchain`]: lost to it if dropped unshown.
+struct SwapImage {
+    texture: procraft_gpu::wgpu::Texture,
+    shown: bool,
+    lost: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl Drop for SwapImage {
+    fn drop(&mut self) {
+        if !self.shown {
+            self.lost.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+impl crate::frame_loop::Screen for Swapchain {
+    type Image = SwapImage;
+
+    fn configure(
+        &mut self,
+        _gpu: &Gpu,
+        _size: (u32, u32),
+        _wide: bool,
+    ) -> Option<(procraft_gpu::wgpu::TextureFormat, procraft_engine::profile::Profile)> {
+        self.free.store(self.images, std::sync::atomic::Ordering::SeqCst);
+        Some((procraft_gpu::wgpu::TextureFormat::Rgba8Unorm, procraft_engine::profile::Profile::Srgb))
+    }
+
+    fn acquire(&mut self) -> crate::frame_loop::Acquired<SwapImage> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut free = self.free.load(SeqCst);
+        loop {
+            if free == 0 {
+                return crate::frame_loop::Acquired::Unavailable;
+            }
+            match self.free.compare_exchange(free, free - 1, SeqCst, SeqCst) {
+                Ok(_) => break,
+                Err(now) => free = now,
+            }
+        }
+        (self.on_acquire)();
+        crate::frame_loop::Acquired::Ready(SwapImage {
+            texture: self.texture.clone(),
+            shown: false,
+            lost: std::sync::Arc::clone(&self.lost),
+        })
+    }
+
+    fn view(&self, image: &SwapImage) -> procraft_gpu::wgpu::TextureView {
+        image.texture.create_view(&Default::default())
+    }
+
+    fn present(&mut self, mut image: SwapImage) {
+        use std::sync::atomic::Ordering::SeqCst;
+        image.shown = true;
+        self.free.fetch_add(1, SeqCst);
+        self.shown.fetch_add(1, SeqCst);
+    }
+}
+
+/// The render loop running into a [`Swapchain`] on a thread of its own; stopped when dropped.
+struct SwapchainRunning {
+    shared: std::sync::Arc<crate::Shared>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    lost: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    shown: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl SwapchainRunning {
+    fn lost(&self) -> u32 {
+        self.lost.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn shown(&self) -> u32 {
+        self.shown.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Waits up to five seconds for a frame shown after `before` of them; whether one came.
+    fn shows_after(&self, before: u32) -> bool {
+        (0..2500).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            self.shown() > before
+        })
+    }
+}
+
+impl Drop for SwapchainRunning {
+    fn drop(&mut self) {
+        {
+            let mut st = self.shared.lock();
+            st.stop = true;
+            self.shared.wake.notify_all();
+        }
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+        self.shared.lock().stop = false;
+    }
+}
+
+/// `s`'s render loop started into a [`Swapchain`] of `images` free at once, `on_acquire` run as
+/// each is given.
+fn run_swapchain(s: &CanvasSession, images: u32, on_acquire: impl FnMut() + Send + 'static) -> SwapchainRunning {
+    let size = s.shared.lock().window_size;
+    let gpu = s.shared.lock().gpu.clone().unwrap();
+    let texture = gpu.device.create_texture(&procraft_gpu::wgpu::TextureDescriptor {
+        label: Some("swapchain image"),
+        size: procraft_gpu::wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: procraft_gpu::wgpu::TextureDimension::D2,
+        format: procraft_gpu::wgpu::TextureFormat::Rgba8Unorm,
+        usage: procraft_gpu::wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let lost = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let shown = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let mut screen = Swapchain {
+        texture,
+        images,
+        free: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(images)),
+        lost: std::sync::Arc::clone(&lost),
+        shown: std::sync::Arc::clone(&shown),
+        on_acquire: Box::new(on_acquire),
+    };
+    let shared = std::sync::Arc::clone(&s.shared);
+    {
+        let mut st = shared.lock();
+        st.reconfigure = true;
+        st.needs_frame = true;
+    }
+    let running = std::sync::Arc::clone(&shared);
+    let thread = std::thread::spawn(move || {
+        crate::frame_loop::draw_loop(&running, &mut screen, || {});
+    });
+    SwapchainRunning { shared, thread: Some(thread), lost, shown }
+}
+
+/// A pad with a stroke across it at y 60, keeping its strokes, as the brush studio's.
+fn pad_with_a_stroke() -> Option<std::sync::Arc<CanvasSession>> {
+    let pad = session(200, 200)?;
+    pad.keep_strokes();
+    pad.begin_own_stroke();
+    pad.stroke_begin(PointerKind::Finger, vec![sample(10.0, 60.0, 0.0)]);
+    pad.stroke_end(vec![sample(190.0, 60.0, 32.0)]);
+    Some(pad)
+}
+
+/// The pad's frames held (its strokes drawn again as a studio setting changes) while its window's
+/// image was being waited for: the image is kept until they are let go, then drawn and shown, so
+/// the pad goes on showing its strokes, a new stroke and its clearing. (It was let go unshown: on
+/// a Vulkan swapchain, which never got it back, the pad showed nothing more until the studio was
+/// opened again: #404, on a Mali tablet.)
+#[test]
+fn a_pad_held_as_its_window_gives_an_image_keeps_the_image_and_shows_it_when_let_go() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    let Some(pad) = pad_with_a_stroke() else { return };
+    // the next image given comes as the pad's redraw begins, which ends 30 ms later
+    let arm = std::sync::Arc::new(AtomicBool::new(false));
+    let hook = {
+        let (pad, arm) = (std::sync::Arc::clone(&pad), std::sync::Arc::clone(&arm));
+        move || {
+            if !arm.swap(false, SeqCst) {
+                return;
+            }
+            pad.shared.lock().holding_frames = true;
+            let pad = std::sync::Arc::clone(&pad);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                pad.replay_strokes();
+                let mut guard = pad.shared.lock();
+                let st = &mut *guard;
+                st.holding_frames = false;
+                st.frame_held = false;
+                pad.shared.frame(st);
+            });
+        }
+    };
+    // one image free at a time, as an Android window's swapchain gives at one frame in flight
+    let chain = run_swapchain(&pad, 1, hook);
+    settled(&pad);
+    assert!(chain.shown() >= 1, "the first frame shown");
+    // a frame asked for, its image given as the redraw begins
+    let before = chain.shown();
+    arm.store(true, SeqCst);
+    {
+        let mut guard = pad.shared.lock();
+        pad.shared.frame(&mut guard);
+    }
+    let asked = std::time::Instant::now();
+    let after_hold = chain.shows_after(before);
+    let took = asked.elapsed();
+    assert!(after_hold, "the image kept through the hold is shown when it ends (images lost: {})", chain.lost());
+    settled(&pad);
+    // a new stroke shows, and so does the pad's clearing
+    let before_stroke = chain.shown();
+    pad.stroke_begin(PointerKind::Finger, vec![sample(100.0, 10.0, 0.0)]);
+    pad.stroke_end(vec![sample(100.0, 190.0, 32.0)]);
+    let stroke = chain.shows_after(before_stroke);
+    settled(&pad);
+    let before_clear = chain.shown();
+    pad.forget_strokes();
+    pad.clear_layer();
+    let cleared = chain.shows_after(before_clear);
+    settled(&pad);
+    let lost = chain.lost();
+    let shown = chain.shown();
+    drop(chain);
+    eprintln!(
+        "held as its image came: shown {} ms after the ask (30 ms held); images lost {lost}; \
+         frames shown {shown}; a stroke shown {stroke}, the clearing {cleared}",
+        took.as_millis()
+    );
+    assert_eq!(lost, 0, "no image let go unshown");
+    assert!(stroke, "a stroke after it shows");
+    assert!(cleared, "the pad's clearing shows");
+    // both strokes gone: the pad as where neither went
+    let bare = pixel(&pad, 180, 180);
+    assert_eq!(pixel(&pad, 50, 60), bare, "cleared");
+    assert_eq!(pixel(&pad, 100, 150), bare, "cleared");
+}
+
+/// A studio slider dragged as the pad shows: drawn again at each step (60 steps, 3 ms apart), each
+/// image waited for 8 ms as for the screen's refresh, one free at a time. No image is lost, frames
+/// go on, and a stroke after the drag shows at once. (Images were let go unshown whenever a redraw
+/// began while one was awaited, and the pad stopped showing anything: #404.)
+#[test]
+fn a_studio_slider_dragged_never_leaves_the_pad_out_of_images() {
+    let Some(pad) = pad_with_a_stroke() else { return };
+    let studio = CanvasSession::new(64, 64);
+    let chain = run_swapchain(&pad, 1, || std::thread::sleep(std::time::Duration::from_millis(8)));
+    settled(&pad);
+    let before = chain.shown();
+    for k in 0..60 {
+        std::sync::Arc::clone(&pad).sync_pad(std::sync::Arc::clone(&studio), (k % 10) as f32 / 9.0, 1.0, 1.0);
+        std::thread::sleep(std::time::Duration::from_millis(3));
+    }
+    for _ in 0..500 {
+        if !pad.pad_syncing() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    settled(&pad);
+    let during = chain.shown() - before;
+    let lost_in_drag = chain.lost();
+    eprintln!("60 slider steps: {during} frames shown, {lost_in_drag} images lost");
+    assert_eq!(lost_in_drag, 0, "no image let go unshown as the slider moved");
+    let before_stroke = chain.shown();
+    let drawn = std::time::Instant::now();
+    pad.stroke_begin(PointerKind::Finger, vec![sample(100.0, 10.0, 0.0)]);
+    pad.stroke_end(vec![sample(100.0, 190.0, 32.0)]);
+    let stroke = chain.shows_after(before_stroke);
+    let took = drawn.elapsed();
+    settled(&pad);
+    let lost = chain.lost();
+    drop(chain);
+    eprintln!("a stroke after: shown {stroke} within {} ms; images lost in all {lost}", took.as_millis());
+    assert!(!pad.pad_syncing());
+    assert_eq!(lost, 0, "no image let go unshown");
+    assert!(during >= 1, "frames shown as the slider moved");
+    assert!(stroke, "a stroke after the drag shows");
+}
+
+/// The other image the render loop lets go unshown, on any canvas: one given as the window changed
+/// size (the tablet turned). The surface is configured again, which alone gives a Vulkan swapchain
+/// that image back, and frames go on.
+#[test]
+fn a_window_turned_as_its_image_came_is_configured_again_and_goes_on_showing() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    let Some(s) = session(200, 200) else { return };
+    let arm = std::sync::Arc::new(AtomicBool::new(false));
+    let hook = {
+        let (s, arm) = (std::sync::Arc::clone(&s), std::sync::Arc::clone(&arm));
+        move || {
+            if arm.swap(false, SeqCst) {
+                s.resize_window(160, 160);
+            }
+        }
+    };
+    let chain = run_swapchain(&s, 1, hook);
+    settled(&s);
+    let before = chain.shown();
+    arm.store(true, SeqCst);
+    s.view_gesture(100.0, 100.0, 1.0, 0.0, 1.0, 0.0);
+    let shown = chain.shows_after(before);
+    settled(&s);
+    let (lost, frames) = (chain.lost(), chain.shown());
+    drop(chain);
+    eprintln!("turned as its image came: a frame after {shown}; images let go {lost}; frames shown {frames}");
+    assert!(shown, "frames go on after the window turned");
+    assert_eq!(s.shared.lock().window_size, (160, 160));
+}
+
 /// A window that gives no image (or a surface that must be configured again and again) is asked
 /// ever less often, down to four times a second, instead of every 4 ms as before (250 a second);
 /// one whose images keep saying they'd do better configured again is configured once, not every
