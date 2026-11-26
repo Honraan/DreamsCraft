@@ -1434,7 +1434,9 @@ private fun versionName(context: Context): String =
 private fun licences(context: Context): String {
     fun asset(name: String) = runCatching { context.assets.open(name).bufferedReader().use { it.readText() } }.getOrDefault("")
     return "The interface font is Inter, by The Inter Project Authors.\n\n${asset("fonts/Inter-OFL.txt")}\n\n" +
-        "The app keeps Lucide icons (lucide.dev), by Lucide Icons and Contributors.\n\n${asset("icons/LICENSE-lucide.txt")}"
+        "The app keeps Lucide icons (lucide.dev), by Lucide Icons and Contributors.\n\n${asset("icons/LICENSE-lucide.txt")}\n\n" +
+        "The undo and redo icons are Google's Material Symbols (fonts.google.com/icons), under the Apache License 2.0.\n\n" +
+        asset("icons/LICENSE-material-symbols.txt")
 }
 
 /** Offers [files] to other apps through the share sheet. */
