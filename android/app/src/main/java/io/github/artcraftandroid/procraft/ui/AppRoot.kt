@@ -107,7 +107,9 @@ private fun ScreensShown(vm: CanvasViewModel, keptClear: Clearance) {
         }
         onDispose { vm.backdrops.canvasOnScreen = { androidx.compose.ui.geometry.Offset.Zero } }
     }
-    CompositionLocalProvider(LocalBackdrops provides vm.backdrops) {
+    // the menus panels draw in this window, over everything (see MenuLayer)
+    val menuLayer = androidx.compose.runtime.remember { MenuLayer() }
+    CompositionLocalProvider(LocalBackdrops provides vm.backdrops, LocalMenuLayer provides menuLayer) {
         // files dragged in from another app: pictures as layers, brushes into the library
         val activity = androidx.compose.ui.platform.LocalContext.current.activity()
         val dropped = androidx.compose.runtime.remember(vm) {
@@ -612,6 +614,8 @@ private fun ScreensShown(vm: CanvasViewModel, keptClear: Clearance) {
             PadMenu(vm, maxWidth)
             // a colour dragged out goes over everything
             DropDot(vm)
+            // and the panels' menus drawn in the window, as popups would be
+            MenuLayerHost(menuLayer)
         }
     }
 }

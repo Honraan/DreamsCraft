@@ -303,8 +303,18 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
     var query by remember { mutableStateOf("") }
     var searching by remember { mutableStateOf(false) }
     var deleting by remember { mutableStateOf<Pair<String, () -> Unit>?>(null) }
-    // a brush held: its menu (by place, "set-index")
+    // a brush held: its menu (by place, "set-index"); and one held nearly long enough, whose menu is
+    // composed ahead of its time, unseen until then
     var brushMenu by remember { mutableStateOf<String?>(null) }
+    var brushMenuAhead by remember { mutableStateOf<String?>(null) }
+    // when the menu opening now was asked for (uptime ms: a brush's, the touch's time it took hold;
+    // a set's, its tap), for it to open from then; and what the menus hang from (the brushes' rows,
+    // the sets' and the Recent set's, while each is in its list)
+    val menuAsked = remember { longArrayOf(0L) }
+    val frameLag = rememberFrameLag()
+    val brushAnchors = remember { mutableStateMapOf<String, MenuAnchor>() }
+    val setAnchors = remember { mutableStateMapOf<Int, MenuAnchor>() }
+    var recentAnchor by remember { mutableStateOf<MenuAnchor?>(null) }
     // two fingers pinching on the lists: how far (their spread, a part of what it was); the lists
     // follow, as far as the pinch can take them, and spring back when it isn't taken
     var pinched by remember { mutableStateOf<Float?>(null) }
@@ -553,27 +563,28 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
             ) {
                 // the brushes last painted with, and those pinned there, above the sets
                 item {
-                    Box {
+                    val anchor = remember { MenuAnchor() }
+                    androidx.compose.runtime.DisposableEffect(anchor) {
+                        recentAnchor = anchor
+                        onDispose { if (recentAnchor === anchor) recentAnchor = null }
+                    }
+                    Box(Modifier.menuAnchor(anchor)) {
                         Row(
                             Modifier.fillMaxWidth().height(50.dp).clip(RoundedCornerShape(12.dp))
                                 .background(if (recent) Pc.RowSelected else Pc.SetCell)
-                                .clickable { if (recent) recentMenu = true else vm.showSet(RECENT_SET) },
+                                .clickable {
+                                    if (recent) {
+                                        menuAsked[0] = android.os.SystemClock.uptimeMillis()
+                                        recentMenu = true
+                                    } else {
+                                        vm.showSet(RECENT_SET)
+                                    }
+                                },
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             val ink = if (recent) Color.White else Pc.PanelTitle
                             Icon(PcIcons.RecentSet, contentDescription = null, tint = ink, modifier = Modifier.padding(start = 4.dp).requiredSize(40.dp))
                             Text("Recent", color = ink, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, modifier = Modifier.padding(start = 1.dp, end = 8.dp))
-                        }
-                        // as a set's menu, of one item and 65 tall, as measured
-                        val left = with(density) { 6.dp.roundToPx() }
-                        val below = with(density) { MenuTop.roundToPx() }
-                        LibraryMenu(recentMenu, androidx.compose.ui.graphics.TransformOrigin(1f, 0.5f), MenuPlace(below) { a, size -> IntOffset(a.left - size.width - left, a.center.y - size.height / 2) }, onDismiss = { recentMenu = false }) {
-                            Box(Modifier.padding(vertical = 5.5.dp)) {
-                                MenuItem(PcIcons.MenuClear, "Clear") {
-                                    recentMenu = false
-                                    vm.clearRecentBrushes()
-                                }
-                            }
                         }
                     }
                 }
@@ -581,7 +592,12 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
                     val selected = i == vm.shownSet
                     // gone from the list, it is nowhere: where it last was may be under another row
                     androidx.compose.runtime.DisposableEffect(i) { onDispose { setBounds.remove(i) } }
-                    Box {
+                    val anchor = remember { MenuAnchor() }
+                    androidx.compose.runtime.DisposableEffect(i, anchor) {
+                        setAnchors[i] = anchor
+                        onDispose { if (setAnchors[i] === anchor) setAnchors.remove(i) }
+                    }
+                    Box(Modifier.menuAnchor(anchor)) {
                         Row(
                             Modifier.fillMaxWidth().height(50.dp).onGloballyPositioned {
                                 setBounds[i] = it.boundsInWindow()
@@ -608,7 +624,14 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
                                 }
                                 .clip(RoundedCornerShape(12.dp))
                                 .background(if (overSet == i) Pc.Accent else if (selected) Pc.RowSelected else Pc.SetCell)
-                                .clickable { if (selected) setMenu = i else vm.showSet(i) },
+                                .clickable {
+                                    if (selected) {
+                                        menuAsked[0] = android.os.SystemClock.uptimeMillis()
+                                        setMenu = i
+                                    } else {
+                                        vm.showSet(i)
+                                    }
+                                },
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             val ink = if (selected) Color.White else Pc.PanelTitle
@@ -630,8 +653,6 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
                                 )
                             }
                         }
-                        // centred on the set, a little left of it
-                        val left = with(density) { 6.dp.roundToPx() }
                         val below = with(density) { MenuTop.roundToPx() }
                         // the icons to choose from, right of the menu over the library: under the Customize icon
                         // row, or over it when there is no room below; scrolled to the set's own icon
@@ -674,33 +695,6 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
                                 }
                             }
                         }
-                        // left of the set, 6 clear of it, centred on it
-                        LibraryMenu(setMenu == i, androidx.compose.ui.graphics.TransformOrigin(1f, 0.5f), MenuPlace(below) { a, size -> IntOffset(a.left - size.width - left, a.center.y - size.height / 2) }, onDismiss = { setMenu = null }) {
-                            MenuItem(PcIcons.MenuRename, "Rename") {
-                                setMenu = null
-                                vm.renamingSet = i
-                            }
-                            MenuItem(PcIcons.MenuDuplicate, "Duplicate") {
-                                setMenu = null
-                                vm.duplicateBrushSet(i)
-                            }
-                            Box(Modifier.onGloballyPositioned { c -> c.positionOnScreen().y.let { customizeRow = it to it + c.size.height } }) {
-                                MenuItem(PcIcons.SetIcons.getOrElse(set.icon.toInt()) { PcIcons.BrushSet }, "Customize icon", trailing = PcIcons.MenuChevron) {
-                                    iconPicker = !iconPicker
-                                }
-                            }
-                            MenuDivider()
-                            MenuItem(PcIcons.MenuShare, "Share") {
-                                setMenu = null
-                                share(null)
-                            }
-                            // the only set too: the library is then left with none
-                            MenuDivider()
-                            MenuItem(PcIcons.MenuTrash, "Delete", Pc.MenuDanger) {
-                                setMenu = null
-                                deleting = "Delete this set and its brushes?" to { vm.deleteBrushSet(i) }
-                            }
-                        }
                     }
                 }
             }
@@ -731,7 +725,13 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
                         androidx.compose.runtime.DisposableEffect(key) { onDispose { brushBounds.remove(key) } }
                         // the brush in this place now, for a hold that began before it moved here
                         val brushNow by androidx.compose.runtime.rememberUpdatedState(b)
-                        Box(Modifier.animateItem(Motion.rowFade(), Motion.rowMove(), Motion.rowFade())) {
+                        // what its menu hangs from
+                        val anchor = remember { MenuAnchor() }
+                        androidx.compose.runtime.DisposableEffect(key, anchor) {
+                            brushAnchors[key] = anchor
+                            onDispose { if (brushAnchors[key] === anchor) brushAnchors.remove(key) }
+                        }
+                        Box(Modifier.animateItem(Motion.rowFade(), Motion.rowMove(), Motion.rowFade()).menuAnchor(anchor)) {
                             SwipeBrush(
                                 open = vm.swipedBrush == key,
                                 onOpen = { vm.swipedBrush = if (it) key else null },
@@ -774,7 +774,17 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
                                                 // touch's own time), not after the press reached here
                                                 val wait = brushMenuWaitMillis(android.os.SystemClock.uptimeMillis() - down.uptimeMillis)
                                                 val menuAt = android.os.SystemClock.uptimeMillis() + wait
-                                                val long = awaitBrushHold(down, wait) ?: return@awaitEachGesture
+                                                // its menu composed a moment ahead, unseen till then: opening from
+                                                // when it takes hold by the touch's clock, less the time a frame takes
+                                                // to reach the screen, its first frame is seen as it takes hold
+                                                val long = try {
+                                                    awaitBrushHold(down, wait, MENU_AHEAD_MS) {
+                                                        menuAsked[0] = menuAt - frameLag
+                                                        brushMenuAhead = key
+                                                    }
+                                                } finally {
+                                                    if (brushMenuAhead == key) brushMenuAhead = null
+                                                } ?: return@awaitEachGesture
                                                 vm.swipedBrush = null
                                                 focus.clearFocus()
                                                 brushMenu = key
@@ -863,37 +873,6 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
                                     }
                                 }
                             }
-                            // held, its menu under it, their left edges in line: in a set Rename, Duplicate,
-                            // Share and Delete; in the Recent set Find, Pin or Unpin, Share and Clear
-                            LibraryMenu(
-                                brushMenu == key, androidx.compose.ui.graphics.TransformOrigin(0f, 0f),
-                                MenuPlace(with(density) { MenuTop.roundToPx() }) { a, _ -> IntOffset(a.left, a.bottom) },
-                                onDismiss = { brushMenu = null }, overPanel = true,
-                            ) {
-                                fun pick(action: () -> Unit) {
-                                    brushMenu = null
-                                    action()
-                                }
-                                if (recent) {
-                                    MenuItem(PcIcons.SwipeFind, "Find", iconSize = 26.dp) { pick { vm.findBrush(b) } }
-                                    if (pinned) {
-                                        MenuItem(PcIcons.SwipeUnpin, "Unpin", iconSize = 26.dp) { pick { vm.pinRecentBrush(b, false) } }
-                                    } else {
-                                        MenuItem(PcIcons.SwipePin, "Pin", iconSize = 26.dp) { pick { vm.pinRecentBrush(b, true) } }
-                                    }
-                                } else {
-                                    MenuItem(PcIcons.MenuRename, "Rename") { pick { vm.renamingBrush = key } }
-                                    MenuItem(PcIcons.MenuDuplicate, "Duplicate") { pick { vm.duplicateBrush(b) } }
-                                }
-                                MenuDivider()
-                                MenuItem(PcIcons.MenuShare, "Share") { pick { share(b) } }
-                                MenuDivider()
-                                if (recent) {
-                                    MenuItem(PcIcons.MenuClear, "Clear") { pick { vm.clearRecentBrush(b) } }
-                                } else {
-                                    MenuItem(PcIcons.MenuTrash, "Delete", Pc.MenuDanger) { pick { deleting = "Delete this brush?" to { vm.deleteBrush(b) } } }
-                                }
-                            }
                         }
                     }
                 }
@@ -953,6 +932,104 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
         }
         }
         floating?.let { FloatingBottom(it) }
+    }
+
+    // the menus a brush held, the chosen set and the Recent set tapped show, drawn in the window over
+    // everything (no panel cuts them off), each in the frame it is asked for: none waits for a window
+    // of its own to come up. (The brush's or set's shown closing is the last asked for.)
+    val lastMenus = remember { arrayOfNulls<Any>(2) }
+    MenuLayerContent {
+        val below = with(density) { MenuTop.roundToPx() }
+        val left = with(density) { 6.dp.roundToPx() }
+        // held, a brush's menu under it, their left edges in line: in a set Rename, Duplicate, Share
+        // and Delete; in the Recent set Find, Pin or Unpin, Share and Clear
+        (brushMenu ?: brushMenuAhead)?.let { lastMenus[0] = it }
+        (lastMenus[0] as String?)?.let { key ->
+            androidx.compose.runtime.key(key) {
+                listed.firstOrNull { (b, _) -> "${b.set}-${b.index}" == key }?.let { (b, pinned) ->
+                    LibraryWindowMenu(
+                        brushMenu == key, brushAnchors[key], androidx.compose.ui.graphics.TransformOrigin(0f, 0f),
+                        MenuPlace(below) { a, _ -> IntOffset(a.left, a.bottom) },
+                        onDismiss = { brushMenu = null }, overPanel = true, askedAt = menuAsked[0], ahead = brushMenuAhead == key,
+                    ) {
+                        fun pick(action: () -> Unit) {
+                            brushMenu = null
+                            action()
+                        }
+                        if (recent) {
+                            MenuItem(PcIcons.SwipeFind, "Find", iconSize = 26.dp) { pick { vm.findBrush(b) } }
+                            if (pinned) {
+                                MenuItem(PcIcons.SwipeUnpin, "Unpin", iconSize = 26.dp) { pick { vm.pinRecentBrush(b, false) } }
+                            } else {
+                                MenuItem(PcIcons.SwipePin, "Pin", iconSize = 26.dp) { pick { vm.pinRecentBrush(b, true) } }
+                            }
+                        } else {
+                            MenuItem(PcIcons.MenuRename, "Rename") { pick { vm.renamingBrush = key } }
+                            MenuItem(PcIcons.MenuDuplicate, "Duplicate") { pick { vm.duplicateBrush(b) } }
+                        }
+                        MenuDivider()
+                        MenuItem(PcIcons.MenuShare, "Share") { pick { share(b) } }
+                        MenuDivider()
+                        if (recent) {
+                            MenuItem(PcIcons.MenuClear, "Clear") { pick { vm.clearRecentBrush(b) } }
+                        } else {
+                            MenuItem(PcIcons.MenuTrash, "Delete", Pc.MenuDanger) { pick { deleting = "Delete this brush?" to { vm.deleteBrush(b) } } }
+                        }
+                    }
+                }
+            }
+        }
+        // the chosen set tapped, its menu left of it, 6 clear of it, centred on it
+        setMenu?.let { lastMenus[1] = it }
+        (lastMenus[1] as Int?)?.let { i ->
+            androidx.compose.runtime.key(i) {
+                sets.getOrNull(i)?.let { set ->
+                    LibraryWindowMenu(
+                        setMenu == i, setAnchors[i], androidx.compose.ui.graphics.TransformOrigin(1f, 0.5f),
+                        MenuPlace(below) { a, size -> IntOffset(a.left - size.width - left, a.center.y - size.height / 2) },
+                        onDismiss = { setMenu = null }, askedAt = menuAsked[0],
+                    ) {
+                        MenuItem(PcIcons.MenuRename, "Rename") {
+                            setMenu = null
+                            vm.renamingSet = i
+                        }
+                        MenuItem(PcIcons.MenuDuplicate, "Duplicate") {
+                            setMenu = null
+                            vm.duplicateBrushSet(i)
+                        }
+                        Box(Modifier.onGloballyPositioned { c -> c.positionOnScreen().y.let { customizeRow = it to it + c.size.height } }) {
+                            MenuItem(PcIcons.SetIcons.getOrElse(set.icon.toInt()) { PcIcons.BrushSet }, "Customize icon", trailing = PcIcons.MenuChevron) {
+                                iconPicker = !iconPicker
+                            }
+                        }
+                        MenuDivider()
+                        MenuItem(PcIcons.MenuShare, "Share") {
+                            setMenu = null
+                            share(null)
+                        }
+                        // the only set too: the library is then left with none
+                        MenuDivider()
+                        MenuItem(PcIcons.MenuTrash, "Delete", Pc.MenuDanger) {
+                            setMenu = null
+                            deleting = "Delete this set and its brushes?" to { vm.deleteBrushSet(i) }
+                        }
+                    }
+                }
+            }
+        }
+        // the Recent set's, as a set's, of one item and 65 tall, as measured
+        LibraryWindowMenu(
+            recentMenu, recentAnchor, androidx.compose.ui.graphics.TransformOrigin(1f, 0.5f),
+            MenuPlace(below) { a, size -> IntOffset(a.left - size.width - left, a.center.y - size.height / 2) },
+            onDismiss = { recentMenu = false }, askedAt = menuAsked[0],
+        ) {
+            Box(Modifier.padding(vertical = 5.5.dp)) {
+                MenuItem(PcIcons.MenuClear, "Clear") {
+                    recentMenu = false
+                    vm.clearRecentBrushes()
+                }
+            }
+        }
     }
 
     // while the question is up, brushes read from a file wait to join the library
@@ -1055,12 +1132,38 @@ internal fun LibraryMenu(
 ) {
     MenuPresence(open, origin) { look ->
         PcPopup(textScale = MATCHED_POPUP_TEXT, popupPositionProvider = place, onDismissRequest = onDismiss, properties = PopupProperties(focusable = true)) {
-            val shape = RoundedCornerShape(16.dp)
-            // frosted over the canvas; over the library itself, nearly solid
-            val glass = if (overPanel) Modifier.background(Pc.GlassMenuOverPanel) else rememberFrost(16.dp).background(Pc.GlassMenu)
-            Column(look.width(LibraryMenuWidth).clip(shape).then(glass).border(1.dp, MenuEdge, shape).padding(vertical = 7.dp), content = content)
+            LibraryMenuBody(look, overPanel, content)
         }
     }
+}
+
+/**
+ * A menu of the library as [LibraryMenu]'s, hanging from [anchor] and drawn in the window over everything
+ * ([WindowMenu]: put it in the library's [MenuLayerContent]), so that it shows in the frame it is opened,
+ * opening from when it was asked for ([askedAt]); or, [ahead], composed unseen ahead of that time.
+ */
+@Composable
+private fun LibraryWindowMenu(
+    open: Boolean,
+    anchor: MenuAnchor?,
+    origin: androidx.compose.ui.graphics.TransformOrigin,
+    place: PopupPositionProvider,
+    onDismiss: () -> Unit,
+    overPanel: Boolean = false,
+    askedAt: Long = 0L,
+    ahead: Boolean = false,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    WindowMenu(open, anchor, origin, place, onDismiss, askedAt, MATCHED_POPUP_TEXT, ahead) { look -> LibraryMenuBody(look, overPanel, content) }
+}
+
+/** A library menu's glass and rows, [modifier] carrying how it looks now (see [MenuPresence]). */
+@Composable
+private fun LibraryMenuBody(modifier: Modifier, overPanel: Boolean, content: @Composable ColumnScope.() -> Unit) {
+    val shape = RoundedCornerShape(16.dp)
+    // frosted over the canvas; over the library itself, nearly solid
+    val glass = if (overPanel) Modifier.background(Pc.GlassMenuOverPanel) else rememberFrost(16.dp).background(Pc.GlassMenu)
+    Column(modifier.width(LibraryMenuWidth).clip(shape).then(glass).border(1.dp, MenuEdge, shape).padding(vertical = 7.dp), content = content)
 }
 
 /** A menu row: its icon (a 40 frame) centred 29.5 in, the label from 52, a chevron 27.5 from the right. */
@@ -1196,6 +1299,10 @@ private fun LibrariesPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier, 
     var titleMenu by remember { mutableStateOf(false) }
     var adding by remember { mutableStateOf(false) }
     var cardMenu by remember { mutableStateOf<Int?>(null) }
+    // what the cards' menus hang from, while each is in the grid; when the one opening was asked for
+    // (uptime ms: its hold)
+    val cardAnchors = remember { mutableStateMapOf<Int, MenuAnchor>() }
+    val cardAsked = remember { longArrayOf(0L) }
     // the cards where they show and the grid's corner (window pixels); two fingers pinching out:
     // the card they began on, and how far they have gone
     val cardBounds = remember { mutableStateMapOf<Int, Rect>() }
@@ -1281,31 +1388,25 @@ private fun LibrariesPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier, 
                 items(vm.brushLibraries.size) { i ->
                     val library = vm.brushLibraries[i]
                     androidx.compose.runtime.DisposableEffect(i) { onDispose { cardBounds.remove(i) } }
+                    val anchor = remember { MenuAnchor() }
+                    androidx.compose.runtime.DisposableEffect(i, anchor) {
+                        cardAnchors[i] = anchor
+                        onDispose { if (cardAnchors[i] === anchor) cardAnchors.remove(i) }
+                    }
                     Box(
                         Modifier.onGloballyPositioned { cardBounds[i] = it.boundsInWindow() }.graphicsLayer {
                             val k = if (pinchedCard == i) cardZoom.coerceIn(1f, PINCH_TO_LIBRARY) else 1f
                             scaleX = k
                             scaleY = k
-                        },
+                        }.menuAnchor(anchor),
                     ) {
-                        LibraryCard(vm, i, library, onOpen = { vm.openLibrary(i) }, onMenu = { cardMenu = i })
-                        LibraryMenu(cardMenu == i, androidx.compose.ui.graphics.TransformOrigin(0.5f, 0f), MenuPlace { a, size -> IntOffset(a.left + (a.width - size.width) / 2, a.top + a.height / 4) }, onDismiss = { cardMenu = null }) {
-                            MenuItem(PcIcons.MenuRename, "Rename") {
-                                cardMenu = null
-                                vm.renamingLibrary = i
-                            }
-                            MenuItem(PcIcons.MenuDuplicate, "Duplicate") {
-                                cardMenu = null
-                                vm.duplicateLibrary(i)
-                            }
-                            if (vm.brushLibraries.size > 1) {
-                                MenuDivider(11.dp)
-                                MenuItem(PcIcons.MenuTrash, "Delete", Pc.MenuDanger) {
-                                    cardMenu = null
-                                    vm.deletingLibrary = i
-                                }
-                            }
-                        }
+                        LibraryCard(
+                            vm, i, library, onOpen = { vm.openLibrary(i) },
+                            onMenu = {
+                                cardAsked[0] = android.os.SystemClock.uptimeMillis()
+                                cardMenu = i
+                            },
+                        )
                     }
                 }
             }
@@ -1322,6 +1423,36 @@ private fun LibrariesPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier, 
             }
         }
         floating?.let { FloatingBottom(it) }
+    }
+    // held, a card's menu over it, drawn in the window over everything (see BrushLibrary's)
+    val lastCard = remember { arrayOfNulls<Int>(1) }
+    MenuLayerContent {
+        cardMenu?.let { lastCard[0] = it }
+        lastCard[0]?.let { i ->
+            androidx.compose.runtime.key(i) {
+                LibraryWindowMenu(
+                    cardMenu == i, cardAnchors[i], androidx.compose.ui.graphics.TransformOrigin(0.5f, 0f),
+                    MenuPlace { a, size -> IntOffset(a.left + (a.width - size.width) / 2, a.top + a.height / 4) },
+                    onDismiss = { cardMenu = null }, askedAt = cardAsked[0],
+                ) {
+                    MenuItem(PcIcons.MenuRename, "Rename") {
+                        cardMenu = null
+                        vm.renamingLibrary = i
+                    }
+                    MenuItem(PcIcons.MenuDuplicate, "Duplicate") {
+                        cardMenu = null
+                        vm.duplicateLibrary(i)
+                    }
+                    if (vm.brushLibraries.size > 1) {
+                        MenuDivider(11.dp)
+                        MenuItem(PcIcons.MenuTrash, "Delete", Pc.MenuDanger) {
+                            cardMenu = null
+                            vm.deletingLibrary = i
+                        }
+                    }
+                }
+            }
+        }
     }
     Alert(
         vm.deletingLibrary,
@@ -1393,23 +1524,38 @@ private fun LibraryCard(vm: CanvasViewModel, i: Int, library: io.github.artcraft
 private fun brushMenuWaitMillis(sinceDown: Long): Long = (brushMenuWait(sinceDown / 1000.0) * 1000).roundToLong()
 
 /**
+ * How long before a held brush's menu shows it is composed (unseen until then), milliseconds: a
+ * menu asked for is first drawn a frame or two later (the press seen, then the menu composed), and
+ * a frame drawn reaches the screen two refresh periods later (see [rememberFrameLag]), so composed
+ * this far ahead its first frame is seen as the hold is reached.
+ */
+internal const val MENU_AHEAD_MS = 80L
+
+/**
  * The press [down] on a brush held still for [wait] milliseconds more: not lifted, not taken (the
  * list scrolling), not moved past the touch slop. Its last change then (where it took hold), else
- * null.
+ * null. Still held [ahead] milliseconds before then, [onAhead] is called.
  */
-private suspend fun AwaitPointerEventScope.awaitBrushHold(down: PointerInputChange, wait: Long): PointerInputChange? {
+private suspend fun AwaitPointerEventScope.awaitBrushHold(down: PointerInputChange, wait: Long, ahead: Long, onAhead: () -> Unit): PointerInputChange? {
     var last = down
-    val cut = withTimeoutOrNull(wait.coerceAtLeast(1L)) {
-        var still = true
-        while (still) {
-            val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id }
-            still = change != null && change.pressed && !change.isConsumed &&
-                (change.position - down.position).getDistance() <= viewConfiguration.touchSlop
-            if (change != null && still) last = change
+    val early = (wait - ahead).coerceAtLeast(0L)
+    for (phase in 0..1) {
+        val part = if (phase == 0) early else wait - early
+        if (phase == 1) onAhead()
+        if (part <= 0L) continue
+        val cut = withTimeoutOrNull(part) {
+            var still = true
+            while (still) {
+                val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id }
+                still = change != null && change.pressed && !change.isConsumed &&
+                    (change.position - down.position).getDistance() <= viewConfiguration.touchSlop
+                if (change != null && still) last = change
+            }
+            true
         }
-        true
+        if (cut != null) return null
     }
-    return if (cut == null) last else null
+    return last
 }
 
 /**
