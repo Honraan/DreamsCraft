@@ -164,6 +164,58 @@ pub(crate) fn warm_pictures<'a>(brushes: impl IntoIterator<Item = &'a procraft_e
     }
 }
 
+/// `brush` (the library's brush, cloned for its sample stroke) made to draw its shape and grain
+/// pictures not yet drawn as twins (see `Pixels::twin`), one for each of the library's own, kept
+/// in `st` until the library closes. A sample stroke drew the library's own pictures, and every
+/// brush held them for the rest of the run (60 MB once all the stock library's strokes were drawn,
+/// the library closed or not); now they go as it closes. The strokes stay kept, so it opens again
+/// drawing none; pictures drawn already (a tool's brush's) are drawn with as they are.
+fn preview_twins(st: &mut crate::State, brush: &mut procraft_engine::brush::Brush) {
+    use procraft_engine::brush::Pixels;
+    let twins = &mut st.preview_pictures;
+    each_source(brush, &mut |source| {
+        if source.pixels.is_drawn() {
+            return;
+        }
+        let twin = match twins.iter().find(|(own, _)| Pixels::same(own, &source.pixels)) {
+            Some((_, twin)) => twin.clone(),
+            None => {
+                let Some(twin) = source.pixels.twin() else { return };
+                twins.push((source.pixels.clone(), twin.clone()));
+                twin
+            }
+        };
+        source.pixels = twin;
+    });
+}
+
+/// Brush `at` of the library, just chosen, takes for its own the pictures its sample stroke drew
+/// (see [`preview_twins`]): ready for its first stroke, as before they were let go.
+fn adopt_preview_pictures(st: &mut crate::State, (set, index): (usize, usize)) {
+    use procraft_engine::brush::Pixels;
+    let twins = std::mem::take(&mut st.preview_pictures);
+    if let Some(brush) = st.library.get_mut(set).and_then(|s| s.brushes.get_mut(index)) {
+        each_source(brush, &mut |source| {
+            if let Some((_, twin)) =
+                twins.iter().find(|(own, twin)| twin.is_drawn() && Pixels::same(own, &source.pixels))
+            {
+                source.pixels = twin.clone();
+            }
+        });
+    }
+    st.preview_pictures = twins;
+}
+
+/// Each shape and grain picture of `brush` and of its second.
+fn each_source(brush: &mut procraft_engine::brush::Brush, f: &mut impl FnMut(&mut procraft_engine::brush::Source)) {
+    for source in [&mut brush.shape.source, &mut brush.grain.source].into_iter().flatten() {
+        f(source);
+    }
+    if let Some(second) = brush.secondary.as_deref_mut() {
+        each_source(second, f);
+    }
+}
+
 /// Draws `brush`'s pictures still to be drawn now, side by side (see [`warm_pictures`]).
 pub(crate) fn draw_pictures(brush: &procraft_engine::brush::Brush) {
     draw_side_by_side(&undrawn([brush]));
@@ -510,6 +562,7 @@ impl CanvasSession {
             crate::ToolKind::Smudge => st.smudge_brush = (set, index),
         }
         st.note_choice((set, index));
+        adopt_preview_pictures(&mut st, (set, index));
         warm_pictures([st.brush(st.tool)]);
         st.load_brush_pictures();
         // a brush a plugin's brush engine draws: its look made now, on a thread of its own, for its
@@ -549,7 +602,7 @@ impl CanvasSession {
     /// A sample stroke drawn with the brush, white on transparent, fitted into `width` × `height`
     /// pixels.
     pub fn brush_preview(&self, set: u32, index: u32, width: u32, height: u32) -> Option<ThumbnailImage> {
-        let brush = self.shared.lock().library.get(set as usize)?.brushes.get(index as usize)?.clone();
+        let brush = self.library_brush_to_preview(set, index)?;
         self.drawn_preview(brush, width, height)
     }
 
@@ -563,7 +616,7 @@ impl CanvasSession {
         width: u32,
         height: u32,
     ) -> Option<ThumbnailImage> {
-        let brush = self.shared.lock().library.get(set as usize)?.brushes.get(index as usize)?.clone();
+        let brush = self.library_brush_to_preview(set, index)?;
         self.sample_stroke(brush, width, height, false)
     }
 
@@ -596,14 +649,27 @@ impl CanvasSession {
     /// Lets go of the canvas the brushes' sample strokes are drawn on, with all it holds (100 MB
     /// and more of the GPU's memory after a heavy set's): for when the brush library closes. The
     /// strokes drawn stay kept; the next one drawn makes another canvas. It goes by itself a
-    /// moment after the last stroke drawn on it as well, and with the artwork's canvas.
+    /// moment after the last stroke drawn on it as well, and with the artwork's canvas. The shape
+    /// and grain pictures drawn for the strokes go too (see `preview_twins`).
     pub fn let_go_of_previews(&self) {
-        let canvas = self.shared.lock().preview.take();
-        drop(canvas);
+        let gone = {
+            let mut st = self.shared.lock();
+            (st.preview.take(), std::mem::take(&mut st.preview_pictures))
+        };
+        // (64 KB a picture, let go of with the lock let go)
+        drop(gone);
     }
 }
 
 impl CanvasSession {
+    /// Brush `index` of `set`, to draw its sample stroke with (see [`preview_twins`]).
+    fn library_brush_to_preview(&self, set: u32, index: u32) -> Option<procraft_engine::brush::Brush> {
+        let mut st = self.shared.lock();
+        let mut brush = st.library.get(set as usize)?.brushes.get(index as usize)?.clone();
+        preview_twins(&mut st, &mut brush);
+        Some(brush)
+    }
+
     /// What the canvas the sample strokes are drawn on holds, while it is kept: its textures, the
     /// buffers made for its strokes' work, and of those its lists of tiles, bytes. For tests.
     #[doc(hidden)]

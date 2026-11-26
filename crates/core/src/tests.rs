@@ -20436,6 +20436,116 @@ fn paced_sample_strokes_make_the_next_piece_ready_while_the_gpu_lays_one() {
 /// built up gradually, on a full GPU and an old one's fragment passes, but for a level here and
 /// there where the pieces meet (as with any stroke sent in pieces). A wet brush's stroke goes as
 /// several pieces.
+/// The library looked through and closed: the shape and grain pictures its sample strokes drew
+/// (each brush held them for the rest of the run, 60 MB once all the stock library's were drawn)
+/// go with it, and the library's brushes are left as they were, those the tools hold ready for the
+/// next stroke; opened again, the library shows its strokes kept and draws no picture; a brush
+/// chosen from it takes the pictures its stroke drew, so its first stroke draws none. Printed: the
+/// pictures drawn for three sets' strokes, what was let go, and how long closing took.
+#[test]
+fn the_library_closed_lets_go_of_the_pictures_its_strokes_drew() {
+    use procraft_engine::brush::{Pixels, WeakPixels};
+    let Ok(gpu) = Gpu::headless() else { return eprintln!("skipped: no GPU") };
+    let s = session_on(gpu, 64, 64);
+    let undrawn = |s: &CanvasSession, (set, index): (u32, u32)| {
+        let st = s.shared.lock();
+        let brush = st.library.get(set as usize).and_then(|l| l.brushes.get(index as usize)).cloned();
+        brush.map_or(0, |b| crate::brushes::pictures_to_draw(&b).len())
+    };
+    let tool_pictures = |s: &CanvasSession| {
+        let st = s.shared.lock();
+        [ToolKind::Paint, ToolKind::Smudge, ToolKind::Erase]
+            .iter()
+            .map(|&t| crate::brushes::pictures_to_draw(st.brush(t)).len())
+            .sum::<usize>()
+    };
+    let drawn_twins = |s: &CanvasSession| -> Vec<Pixels> {
+        let st = s.shared.lock();
+        st.preview_pictures.iter().filter(|(_, twin)| twin.is_drawn()).map(|(_, twin)| twin.clone()).collect()
+    };
+    // the library's pictures none of them drawn, as in a run of its own (other tests in this one
+    // draw the stock brushes' pictures, which every session's library shares)
+    {
+        let mut st = s.shared.lock();
+        let mut twins: Vec<(Pixels, Pixels)> = Vec::new();
+        let mut fresh = |source: &mut Option<procraft_engine::brush::Source>| {
+            let Some(source) = source.as_mut() else { return };
+            let twin = match twins.iter().find(|(own, _)| Pixels::same(own, &source.pixels)) {
+                Some((_, twin)) => twin.clone(),
+                None => {
+                    let Some(twin) = source.pixels.twin() else { return };
+                    twins.push((source.pixels.clone(), twin.clone()));
+                    twin
+                }
+            };
+            source.pixels = twin;
+        };
+        for brush in st.library.iter_mut().flat_map(|set| set.brushes.iter_mut()) {
+            fresh(&mut brush.shape.source);
+            fresh(&mut brush.grain.source);
+            if let Some(second) = brush.secondary.as_deref_mut() {
+                fresh(&mut second.shape.source);
+                fresh(&mut second.grain.source);
+            }
+        }
+    }
+    // the tools' brushes ready, as choosing them makes them; then three sets looked through
+    for tool in [ToolKind::Paint, ToolKind::Smudge, ToolKind::Erase] {
+        let pictures = crate::brushes::pictures_to_draw(s.shared.lock().brush(tool));
+        crate::brushes::draw_these(&pictures);
+    }
+    assert_eq!(tool_pictures(&s), 0);
+    let library = s.brush_library();
+    let looked: Vec<_> =
+        library.iter().filter(|set| ["Inks", "Gouache", "Charcoal"].contains(&set.name.as_str())).collect();
+    assert_eq!(looked.len(), 3);
+    let brushes: Vec<(u32, u32)> = looked.iter().flat_map(|set| &set.brushes).map(|b| (b.set, b.index)).collect();
+    let own_undrawn: usize = brushes.iter().map(|&b| undrawn(&s, b)).sum();
+    for &(set, index) in &brushes {
+        assert!(s.brush_preview(set, index, 530, 162).is_some(), "{set} {index}");
+    }
+    // the strokes drew twins; the brushes' own stay as they were
+    let twins = drawn_twins(&s);
+    assert_eq!(brushes.iter().map(|&b| undrawn(&s, b)).sum::<usize>(), own_undrawn, "a brush's own picture drawn");
+    let weak: Vec<WeakPixels> = twins.iter().map(Pixels::downgrade).collect();
+    drop(twins);
+    let started = std::time::Instant::now();
+    s.let_go_of_previews();
+    let took = started.elapsed();
+    let gone = weak.iter().filter(|w| w.upgrade().is_none()).count();
+    let side = procraft_engine::textures::TEXTURE_SIZE;
+    println!(
+        "{} brushes' strokes drew {} pictures, {own_undrawn} of the brushes' own still to draw; closed, {gone} let go ({:.1} MB) in {:.2} ms",
+        brushes.len(),
+        weak.len(),
+        (gone * side * side) as f64 / f64::from(1 << 20),
+        took.as_secs_f64() * 1e3
+    );
+    assert!(weak.len() >= 20, "only {} pictures drawn", weak.len());
+    assert_eq!(gone, weak.len(), "pictures still held after the library closed");
+    assert!(took < std::time::Duration::from_millis(250), "closing took {took:?}");
+    // the brushes in use keep theirs: their next stroke draws none
+    assert_eq!(tool_pictures(&s), 0, "the tools' brushes' pictures let go of");
+    // opened again: the strokes come from those kept, drawing no picture
+    let again = std::time::Instant::now();
+    for &(set, index) in &brushes {
+        assert!(s.brush_preview(set, index, 530, 162).is_some(), "{set} {index} again");
+    }
+    println!("the {} strokes again in {:.1} ms", brushes.len(), again.elapsed().as_secs_f64() * 1e3);
+    assert!(drawn_twins(&s).is_empty(), "a picture drawn opening the library again");
+    // a brush whose stroke is drawn now, chosen: it takes the pictures drawn, its first stroke
+    // drawing none
+    let pencils = library.iter().find(|set| set.name == "Pencils").unwrap();
+    let chosen = pencils.brushes.iter().map(|b| (b.set, b.index)).find(|&b| undrawn(&s, b) > 0).unwrap();
+    assert!(s.brush_preview(chosen.0, chosen.1, 530, 162).is_some());
+    assert!(undrawn(&s, chosen) > 0, "its own left undrawn by its stroke");
+    assert!(s.select_brush(chosen.0, chosen.1));
+    assert_eq!(undrawn(&s, chosen), 0, "the chosen brush's pictures to draw again");
+    // kept with it once the library closes
+    s.let_go_of_previews();
+    assert_eq!(tool_pictures(&s), 0);
+}
+
 #[test]
 fn brush_previews_come_out_the_same_paced_or_not() {
     use procraft_engine::brush::Rendering;

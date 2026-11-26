@@ -713,6 +713,10 @@ pub(crate) struct State {
     strokes: u32,
     /// The small canvas brush previews are drawn on.
     preview: Option<(Box<Canvas>, Document)>,
+    /// The library's brushes' shape and grain pictures as its sample strokes draw them: each
+    /// brush's own (as the library holds it) beside the twin the strokes drew instead, until the
+    /// library closes (see `brushes::preview_twins`).
+    preview_pictures: Vec<(procraft_engine::brush::Pixels, procraft_engine::brush::Pixels)>,
     /// Sample strokes drawn already, kept by what they were drawn from.
     drawn_previews: drawn_previews::DrawnPreviews,
     color: [f32; 3],
@@ -2255,6 +2259,7 @@ impl CanvasSession {
             sliders: HashMap::new(),
             strokes: 0,
             preview: None,
+            preview_pictures: Vec::new(),
             drawn_previews: Default::default(),
             color: [0.0, 0.0, 0.0],
             secondary: [1.0, 1.0, 1.0],
@@ -3289,8 +3294,9 @@ impl CanvasSession {
         st.canvas = None;
         st.pending_pixels.clear();
         st.scene = None;
-        // and the canvas the brushes' sample strokes are drawn on
+        // and the canvas the brushes' sample strokes are drawn on, and the pictures they drew
         st.preview = None;
+        st.preview_pictures.clear();
     }
 
     /// Canvas Orientation Memory: on, the quarter turn the artwork is kept at (which it opens

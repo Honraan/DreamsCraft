@@ -15,10 +15,25 @@
 //! may leave (readback buffers the device keeps, the allocator's rounding); what the strokes'
 //! canvas may keep of its work, that measured and half again; and its lists alone, eight of 1 MB
 //! (each past that is let go after its stroke).
+//!
+//! On the tablet (an Adreno 750, Vulkan) the GPU memory the system counts for the app was still 40
+//! to 48 MB over the canvas's after the library closed, besides the 31 MB the interface's own
+//! drawing caches took. Logged there, the allocator held 0 to 8 MB of it (the readback buffer
+//! kept, in a block of its own); the rest, 33 to 40 MB, was the driver's own, taken the first time
+//! any stamp was laid in the run, by the library's strokes or the canvas's: a first pen stroke on
+//! the canvas took the same (allocator 80 MB, the driver 35 MB more), and whichever came second
+//! took next to none of it (the library after a stroke 0.5 to 10 MB, a stroke after the library
+//! 3.7 MB), the Pencils' ten strokes as much as two heavy sets' twenty; it stays with the device,
+//! the canvas left and opened again. So it isn't the library's to give back. What is, the third
+//! test below looks at as the tablet does it: the canvas drawn a frame at a time with the
+//! library's frosted panel over it while its strokes are drawn, then closed, what is left printed
+//! resource by resource.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use procraft_core::CanvasSession;
+use procraft_engine::profile::Profile;
 use procraft_gpu::{Gpu, wgpu};
 
 const SIDE: (u32, u32) = (2000, 1200);
@@ -130,4 +145,89 @@ fn the_strokes_canvas_goes_a_while_after_the_last() {
     );
     assert!(gone >= Duration::from_millis(1500), "let go of after {gone:?}: too soon for the next row's");
     assert!(left <= CLOSED_MOST, "{left} MB left");
+}
+
+/// The allocator's allocations by resource (its label), count and bytes.
+fn by_resource(gpu: &Gpu) -> BTreeMap<String, (usize, u64)> {
+    let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+    let mut out: BTreeMap<String, (usize, u64)> = BTreeMap::new();
+    for a in gpu.device.generate_allocator_report().map(|r| r.allocations).unwrap_or_default() {
+        let e = out.entry(a.name).or_default();
+        e.0 += 1;
+        e.1 += a.size;
+    }
+    out
+}
+
+#[test]
+fn the_library_over_a_canvas_being_drawn_leaves_little_when_it_closes() {
+    let Some((s, gpu)) = session() else { return };
+    // the window the canvas is drawn into, a frame at a time
+    let window = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("window"),
+        size: wgpu::Extent3d { width: SIDE.0, height: SIDE.1, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = window.create_view(&wgpu::TextureViewDescriptor::default());
+    let began = Instant::now();
+    let frames = |n: usize| {
+        for _ in 0..n {
+            let _ = s.draw(&view, wgpu::TextureFormat::Rgba8Unorm, SIDE, Profile::Srgb, began);
+            let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+        }
+    };
+    frames(10);
+    let (canvas_only, before) = (reserved(&gpu), by_resource(&gpu));
+    // the library open, its frosted panel over the canvas, its strokes drawn with frames between
+    let panel = vec![1040.0, 90.0, 1960.0, 1160.0, 26.0, 1.0];
+    s.set_glass(panel, Vec::new());
+    frames(5);
+    let library = s.brush_library();
+    let mut drawn = 0;
+    for name in ["Gouache", "Oils"] {
+        let set = library.iter().find(|set| set.name == name).unwrap();
+        for b in &set.brushes {
+            if s.brush_preview(b.set, b.index, 530, 162).is_some() {
+                drawn += 1;
+            }
+            frames(2);
+        }
+    }
+    let open = reserved(&gpu);
+    // closed
+    s.set_glass(Vec::new(), Vec::new());
+    s.let_go_of_previews();
+    frames(5);
+    let closed = reserved(&gpu);
+    let after = by_resource(&gpu);
+    let left: Vec<String> = after
+        .iter()
+        .filter_map(|(name, &(n, bytes))| {
+            let (was_n, was) = before.get(name).copied().unwrap_or_default();
+            (bytes > was)
+                .then(|| format!("{name} x{} {:.2} MB", n.saturating_sub(was_n), (bytes - was) as f64 / MB as f64))
+        })
+        .collect();
+    let over = |v: u64| v.saturating_sub(canvas_only) / MB;
+    println!(
+        "{drawn} strokes drawn over the canvas being drawn: the GPU {} MB over the canvas's with them, {} MB once closed; left over the canvas's, by resource: {}",
+        over(open),
+        over(closed),
+        if left.is_empty() { "nothing".to_owned() } else { left.join(", ") }
+    );
+    assert_eq!(gpu.errors(), 0, "GPU validation errors");
+    assert!(drawn >= 18, "{drawn} strokes drawn");
+    assert!(s.preview_canvas_bytes().is_none(), "the strokes' canvas let go of");
+    assert!(over(closed) <= CLOSED_MOST, "{} MB held with the library closed", over(closed));
+    // nothing the strokes drew with but the readback buffer the device keeps and the panel's glass
+    // (the canvas's own, made as the panel first showed)
+    for (name, &(_, bytes)) in &after {
+        let was = before.get(name).map_or(0, |&(_, b)| b);
+        assert!(bytes <= was || ["readback", "backdrop"].contains(&name.as_str()), "{name} left: {left:?}");
+    }
 }
