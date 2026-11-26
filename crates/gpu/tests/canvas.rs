@@ -161,13 +161,13 @@ fn a_whole_layer_kept_in_a_step_let_go_undoes_as_it_should() {
 /// Both layers' pixels after each step.
 type States = Vec<(Vec<u8>, Vec<u8>)>;
 
-/// Nine steps over two layers on a canvas of a device of little memory, its newest two steps kept
-/// on the GPU: strokes and a whole layer cleared (read back in several bands as it is packed). The
-/// layers after each step.
-fn steps_to_pack(gpu: &Gpu) -> (Document, Canvas, States) {
+/// Nine steps over two layers on a canvas of a device whose layers' textures are given `budget`
+/// bytes, its newest two steps kept on the GPU: strokes and a whole layer cleared (read back in
+/// several bands as it is packed). The layers after each step.
+fn steps_to_pack(gpu: &Gpu, budget: u64) -> (Document, Canvas, States) {
     let mut doc = Document::new(1100, 1000);
     let mut canvas = Canvas::new(gpu, &doc).unwrap();
-    canvas.set_resident_budget(1 << 30);
+    canvas.set_resident_budget(budget);
     canvas.keep_recent_history(Some(0));
     let first = doc.current();
     let second = doc.add_layer();
@@ -212,7 +212,7 @@ fn undo_and_redo_through(gpu: &Gpu, doc: &mut Document, canvas: &mut Canvas, sta
 fn older_steps_kept_compressed_off_the_gpu_undo_and_redo_as_they_were() {
     let Some(gpu) = gpu() else { return };
     let _check = NoErrors(&gpu);
-    let (mut doc, mut canvas, states) = steps_to_pack(&gpu);
+    let (mut doc, mut canvas, states) = steps_to_pack(&gpu, 1 << 30);
     canvas.pack_history_now(&gpu);
     assert!(canvas.history_packed_bytes() > 0, "nothing packed");
     // the newest two left on the GPU, a stroke's region each: the whole layer cleared is packed
@@ -225,11 +225,40 @@ fn older_steps_kept_compressed_off_the_gpu_undo_and_redo_as_they_were() {
     undo_and_redo_through(&gpu, &mut doc, &mut canvas, &states);
 }
 
+/// A tablet of more memory (12 GB: its layers given 2.9 GB) keeps the older steps compressed off
+/// the GPU too, as one of little memory does, and they undo and redo as they were: kept on the GPU,
+/// a long session's history held 768 MB on such a tablet (one whose GPU shares its memory), which
+/// the system closed for memory as soon as it was put away. Without a budget (a computer's GPU of
+/// its own) they all stay on it.
+#[test]
+fn a_tablet_of_more_memory_keeps_older_steps_compressed_too() {
+    let Some(gpu) = gpu() else { return };
+    let _check = NoErrors(&gpu);
+    let (mut doc, mut canvas, states) = steps_to_pack(&gpu, 2900 << 20);
+    canvas.pack_history_now(&gpu);
+    let (_, mut computer, _) = steps_to_pack(&gpu, 0);
+    computer.pack_history_now(&gpu);
+    println!(
+        "the history on the GPU {} KB, {} KB packed; without a budget {} KB on the GPU, {} KB packed",
+        canvas.history_bytes() >> 10,
+        canvas.history_packed_bytes() >> 10,
+        computer.history_bytes() >> 10,
+        computer.history_packed_bytes() >> 10
+    );
+    // the newest two left on the GPU, a stroke's region each: the whole layer cleared is packed
+    let layer = 1100 * 1000 * 4;
+    assert!(canvas.history_packed_bytes() > 0, "nothing packed");
+    assert!(canvas.history_bytes() < layer / 4, "{} bytes still on the GPU", canvas.history_bytes());
+    undo_and_redo_through(&gpu, &mut doc, &mut canvas, &states);
+    assert_eq!(computer.history_packed_bytes(), 0, "packed without a budget");
+    assert!(computer.history_bytes() >= layer, "the layer cleared not kept on the GPU without a budget");
+}
+
 #[test]
 fn steps_undone_while_their_pixels_are_being_packed_come_back_as_they_were() {
     let Some(gpu) = gpu() else { return };
     let _check = NoErrors(&gpu);
-    let (mut doc, mut canvas, states) = steps_to_pack(&gpu);
+    let (mut doc, mut canvas, states) = steps_to_pack(&gpu, 1 << 30);
     // a lot being packed (started by the last render, as the app's would be), undone under it
     assert!(canvas.wants_render(), "no packing under way");
     undo_and_redo_through(&gpu, &mut doc, &mut canvas, &states);

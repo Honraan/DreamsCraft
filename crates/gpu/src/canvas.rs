@@ -4,7 +4,7 @@
 //! Calls queue work; [`Canvas::render`] records and submits it in order, recomposites what
 //! changed and, given a target, draws the canvas to it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
@@ -207,13 +207,15 @@ const MAX_UNDO_BYTES: u64 = 768 << 20;
 const LEAST_UNDO_BYTES: u64 = 256 << 20;
 
 /// A device of little memory (3 or 4 GB): its layers' textures given at most this much (a
-/// quarter of its memory). There the history keeps its older steps' pixels compressed off the GPU
-/// (see [`Canvas::pack_history`]), and the composite's caches have no second textures of their
-/// own (see [`CachePicture`]).
+/// quarter of its memory). There the composite's caches have no second textures of their own (see
+/// [`CachePicture`]).
 const LOW_MEMORY_BUDGET: u64 = 1280 << 20;
-/// On such a device, the newest steps the history keeps on the GPU, so undoing and redoing them
-/// is as quick as ever: those whose pixels come to a quarter of the history's room, and two at
-/// least.
+/// On a device that gives the layers' textures a budget (a tablet's, whose GPU shares the memory
+/// with everything else), the newest steps the history keeps on the GPU, so undoing and redoing
+/// them is as quick as ever: those whose pixels come to a quarter of the history's room, and two at
+/// least. The older steps' pixels are kept compressed off the GPU (see [`Canvas::pack_history`]):
+/// all on the GPU, a long session's history held 768 MB on a tablet of 12 GB, which the system
+/// closed for memory as soon as it was put away.
 const RECENT_HISTORY_SHARE: u64 = 4;
 const RECENT_STEPS: usize = 2;
 /// The most pixels one lot of the history's packing reads back, and the most regions (at least
@@ -1013,11 +1015,15 @@ fn quad_reach(s: &StampInstance) -> IRect {
 /// render: each part of a render's work reads one of its own (the queue writes them all before
 /// that work runs), taken in turn from `next`, each grown to the most a part has listed in it; and
 /// each one's bind group, kept with what it binds. Past [`RULE_LISTS_KEPT`] a render makes the rest
-/// for itself.
+/// for itself, until the lists taken since its work last went to the GPU come to
+/// [`RULE_LISTS_AT_ONCE`]: then what it has recorded is sent and they are taken again from the
+/// first (see [`Canvas::render`]).
 #[derive(Default)]
 struct RuleLists {
     kept: Vec<RuleList>,
     next: usize,
+    /// The bytes of the lists taken since the work last went to the GPU.
+    taken: u64,
     /// Whether a list (or what the rule's passes write to) that couldn't be made has been said.
     told: bool,
     /// The most words a list has held.
@@ -1029,6 +1035,7 @@ impl RuleLists {
     fn begin(&mut self) {
         self.kept.truncate(RULE_LISTS_KEPT);
         self.next = 0;
+        self.taken = 0;
     }
 
     /// The bind groups binding a carried part's full floats are let go (with what they bind: see
@@ -1062,6 +1069,15 @@ struct RuleBinds {
 
 /// The most lists of the rule's tiles kept between renders (see [`RuleLists`]).
 const RULE_LISTS_KEPT: usize = 8;
+
+/// The most bytes of the rule's lists (and what their writes are staged in) a render takes before
+/// what it has recorded goes to the GPU and they are taken again from the first, the GPU let get
+/// through all but the last such lot meanwhile. Each part of a render's work read a list of its
+/// own, kept until the next render: a render laying all that was queued at once (a time-lapse frame
+/// read after a big brush's shape was dragged about, every move queued) took one for each part of
+/// each, 754 MB of them for 4000 pieces of a stroke on a 2048 canvas and twice that with what their
+/// writes were staged in, and a tablet whose GPU shares its memory was closed short of it.
+const RULE_LISTS_AT_ONCE: u64 = 32 << 20;
 
 /// How many stamps, uniform slots, smudge stamps' slots and wet passes a canvas's buffers for them
 /// hold as it is made: each grows as a render wants more (see [`Canvas::let_go_of_work_past`]).
@@ -3037,8 +3053,8 @@ fn collapsed(steps: Vec<Step>) -> Step {
 }
 
 /// Pixels of a layer region from before an edit: on the GPU (the region's size, or the whole
-/// layer's for the whole region), or (an older step's on a device of little memory) the region's
-/// rows compressed off it until the step is undone.
+/// layer's for the whole region), or (an older step's on a device that gives the layers a budget)
+/// the region's rows compressed off it until the step is undone.
 struct Snapshot {
     layer: LayerId,
     rect: IRect,
@@ -3543,6 +3559,13 @@ pub struct Canvas {
     selection_sent: u64,
     /// Pieces of work sent early, there being too much for one.
     pieces_sent: u64,
+    /// The most bytes of the rule's lists a render takes before sending what it has recorded (see
+    /// [`RULE_LISTS_AT_ONCE`]), and how many times a render has waited for the GPU to get through
+    /// pieces it sent before, their lists and staged writes past twice that.
+    rule_lists_at_once: u64,
+    lists_waits: u64,
+    /// The most bytes of the rule's lists held at once (for tests).
+    lists_held_most: u64,
     /// Each piece waited for on the GPU before the one after the next is sent, and pieces of no
     /// more than [`PACED_WORK`] (see [`Canvas::pace`]); and the longest one took since last asked.
     paced: bool,
@@ -4056,6 +4079,9 @@ impl Canvas {
             work_at_once: WORK_AT_ONCE,
             stamps_at_once: STAMPS_AT_ONCE,
             pieces_sent: 0,
+            rule_lists_at_once: RULE_LISTS_AT_ONCE,
+            lists_waits: 0,
+            lists_held_most: 0,
             selection_sent: 0,
             paced: false,
             paced_longest: std::time::Duration::ZERO,
@@ -5790,6 +5816,30 @@ impl Canvas {
         self.pieces_sent
     }
 
+    /// Takes at most `bytes` of the rule's lists in a render before sending what it has recorded,
+    /// in place of [`RULE_LISTS_AT_ONCE`]: for tests (a little: sent at every piece; `u64::MAX`:
+    /// each list taken held to the render's end, as before there was a most).
+    #[doc(hidden)]
+    pub fn set_rule_lists_at_once(&mut self, bytes: u64) {
+        self.rule_lists_at_once = bytes;
+    }
+
+    /// How many times renders have waited for the GPU to get through the pieces they sent before,
+    /// their lists and staged writes past twice [`RULE_LISTS_AT_ONCE`], and the most bytes of the
+    /// rule's lists they held at once: for tests.
+    #[doc(hidden)]
+    pub fn rule_lists_held(&self) -> (u64, u64) {
+        (self.lists_waits, self.lists_held_most)
+    }
+
+    /// The rule's lists taken again from the first (a render begins, or its work so far is sent),
+    /// as many kept as are to be; the most they held at once noted.
+    fn rule_lists_again(&mut self) {
+        self.lists_held_most = self.lists_held_most.max(self.rule_list_bytes());
+        self.rule_lists.begin();
+        self.fragments.rule_lists_begin();
+    }
+
     /// How many bytes of the selection's coverage have been sent to the GPU: for tests.
     #[doc(hidden)]
     pub fn selection_bytes_sent(&self) -> u64 {
@@ -5863,18 +5913,19 @@ impl Canvas {
     }
 
     /// Keeps the newest undo steps whose pixels come to `bytes` on the GPU (two at least), the
-    /// rest packed on a device of little memory: for tests. None: as the device's room has it.
+    /// rest packed on a device that gives the layers a budget: for tests. None: as the device's
+    /// room has it.
     #[doc(hidden)]
     pub fn keep_recent_history(&mut self, bytes: Option<u64>) {
         self.recent_history = bytes;
     }
 
-    /// On a device of little memory, keeps the history's older steps' pixels compressed off the
-    /// GPU, a lot at a time: read back (the copies queued now, the waiting and compressing on a
-    /// thread of its own), then put in place of their textures in a later render. The newest
-    /// steps stay on the GPU (see [`RECENT_HISTORY_SHARE`]), so undoing and redoing them is as
-    /// quick as ever; an older one is uploaded again as it is undone (see [`Canvas::unpacked`]).
-    /// Nothing new is started while an edit is under way.
+    /// On a device that gives the layers' textures a budget, keeps the history's older steps'
+    /// pixels compressed off the GPU, a lot at a time: read back (the copies queued now, the
+    /// waiting and compressing on a thread of its own), then put in place of their textures in a
+    /// later render. The newest steps stay on the GPU (see [`RECENT_HISTORY_SHARE`]), so undoing
+    /// and redoing them is as quick as ever; an older one is uploaded again as it is undone (see
+    /// [`Canvas::unpacked`]). Nothing new is started while an edit is under way.
     fn pack_history(&mut self, gpu: &Gpu) {
         if let Some(packing) = self.packing.take() {
             match packing.done.try_recv() {
@@ -5892,7 +5943,7 @@ impl Canvas {
             || self.smudge.is_some()
             || self.transforming.is_some()
             || self.liquify.is_some();
-        if !self.low_memory() || busy {
+        if self.resident_budget == 0 || busy {
             return;
         }
         // the newest steps that fit the room kept for them stay
@@ -7610,6 +7661,8 @@ impl Canvas {
         let mut relay_laid = 0u64;
         // when what was recorded was last sent, laying a stroke again (see `RELAY_SEND_EVERY`)
         let mut relay_sent_at = started;
+        // the pieces sent with the rule's lists they took, not yet waited for (see `send_piece`)
+        let mut lists_in_flight: VecDeque<(wgpu::SubmissionIndex, u64)> = VecDeque::new();
         self.relaying = false;
         let mut in_place_laid = 0u64;
         // and stamps in a stroke's textures, so too; the two together in no more of the GPU's time
@@ -7722,8 +7775,11 @@ impl Canvas {
             if let Op::Stamps { instances, style, second, .. } = &op {
                 let work = stamps_work(instances, self.full(), style.in_place() && !second);
                 let due = relay_until.is_some() && self.relay_paced && relay_sent_at.elapsed() >= RELAY_SEND_EVERY;
-                if recorded > 0 && (recorded.saturating_add(work) > self.work_at_once || due) {
-                    self.send_piece(gpu, &mut encoder, (&mut uniforms, &mut smudge_uniforms, &mut wet_uniforms));
+                // (and once the lists it took come to the most a render takes before sending)
+                let lists = self.rule_lists.taken.saturating_add(self.fragments.rule_taken) >= self.rule_lists_at_once;
+                if recorded > 0 && (recorded.saturating_add(work) > self.work_at_once || due || lists) {
+                    let uniforms = (&mut uniforms, &mut smudge_uniforms, &mut wet_uniforms);
+                    self.send_piece(gpu, &mut encoder, uniforms, &mut lists_in_flight);
                     recorded = 0;
                     relay_sent_at = std::time::Instant::now();
                 }
@@ -7732,7 +7788,8 @@ impl Canvas {
             // a paced canvas sends a stroke's end as a piece of its own: no stamps' work, and on a
             // slow GPU among its slowest
             if self.paced && recorded > 0 && matches!(op, Op::Commit(_)) {
-                self.send_piece(gpu, &mut encoder, (&mut uniforms, &mut smudge_uniforms, &mut wet_uniforms));
+                let uniforms = (&mut uniforms, &mut smudge_uniforms, &mut wet_uniforms);
+                self.send_piece(gpu, &mut encoder, uniforms, &mut lists_in_flight);
                 recorded = 0;
             }
             if let Op::Commit(stroke) = &op {
@@ -8931,6 +8988,8 @@ impl Canvas {
         for buffer in uploaded {
             self.uploads.give_back(buffer);
         }
+        // (the lists past those kept go with its work, not held until the next render)
+        self.rule_lists_again();
         // (how fast the GPU gets through paint laid in place is seen once this is done: from when
         // this began, as OpenGL does much of the work as it is sent)
         let looked_at = (in_place_laid > 0 && self.in_place_sent.is_none())
@@ -11497,6 +11556,8 @@ impl Canvas {
         }
         self.rule_lists.next += 1;
         let list = self.rule_lists.kept.get_mut(at)?;
+        // (and the bytes its words are staged in on their way)
+        self.rule_lists.taken = self.rule_lists.taken.saturating_add(list.buffer.size().saturating_add(bytes));
         gpu.queue.write_buffer(&list.buffer, 0, bytemuck::cast_slice(words));
         if let Some((bound, bind)) = &list.bind
             && bound == binds
@@ -11574,12 +11635,17 @@ impl Canvas {
     }
 
     /// Sends the work recorded so far with the three kinds of uniforms a render's painting uses,
-    /// going on with a new encoder (see [`WORK_AT_ONCE`]).
+    /// going on with a new encoder (see [`WORK_AT_ONCE`]); the rule's lists are taken again from
+    /// the first (their writes for what follows come after this piece on the GPU), and the GPU is
+    /// let get through the pieces sent before while the lists and staged writes of those not done
+    /// yet come to more than twice [`RULE_LISTS_AT_ONCE`] (`in_flight`: the render's pieces sent and
+    /// not yet waited for, and the bytes of lists each took).
     fn send_piece(
         &mut self,
         gpu: &Gpu,
         encoder: &mut wgpu::CommandEncoder,
         (uniforms, smudge, wet): (&mut UniformData, &mut UniformData, &mut UniformData),
+        in_flight: &mut VecDeque<(wgpu::SubmissionIndex, u64)>,
     ) {
         if !smudge.data.is_empty() {
             gpu.queue.write_buffer(&self.smudge_params, 0, &smudge.data);
@@ -11592,6 +11658,23 @@ impl Canvas {
         *smudge = UniformData::default();
         *wet = UniformData::default();
         self.pieces_sent = self.pieces_sent.wrapping_add(1);
+        // (taken to the render's end where no most is set: for tests, as before there was one)
+        if self.rule_lists_at_once == u64::MAX {
+            self.wait_if_paced(gpu, sent, at, false);
+            return;
+        }
+        let taken = self.rule_lists.taken.saturating_add(self.fragments.rule_taken);
+        self.rule_lists_again();
+        if taken > 0 {
+            in_flight.push_back((sent.clone(), taken));
+        }
+        let room = self.rule_lists_at_once.saturating_mul(2);
+        while in_flight.iter().map(|(_, bytes)| bytes).sum::<u64>() > room {
+            let Some((index, _)) = in_flight.pop_front() else { break };
+            // (a wait that fails, the device lost, is said once by the poll)
+            let _ = crate::poll(&gpu.device, wgpu::PollType::Wait { submission_index: Some(index), timeout: None });
+            self.lists_waits = self.lists_waits.wrapping_add(1);
+        }
         self.wait_if_paced(gpu, sent, at, false);
     }
 

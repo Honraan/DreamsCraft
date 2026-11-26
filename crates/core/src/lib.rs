@@ -77,6 +77,10 @@ mod list_slider;
 mod lost;
 #[cfg(test)]
 mod low_storage_tests;
+#[cfg(test)]
+mod many_brushes_tests;
+#[cfg(test)]
+mod memory_tests;
 mod modes;
 mod named_layouts;
 mod open_marks;
