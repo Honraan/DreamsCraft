@@ -230,6 +230,9 @@ struct Placed {
     time_ms: f64,
     /// The pressure as the size, opacity, bleed and roundness took it (and the stamp's own).
     pressed: [f32; 5],
+    /// What its opacity's pressure is taken with before its opacity range: its flow, lean and
+    /// speed together (see [`StrokeBuilder::opacity_full`]).
+    rest: f32,
     /// How much of the stamp's roundness is the drawn shape's, which the pressure squeezes (the
     /// rest is what leaning adds).
     drawn_share: f32,
@@ -1138,6 +1141,13 @@ pub struct InputSettings {
     /// The pen says how it leans. One that doesn't draws as a finger does: no lean at all (not
     /// even upright's least), and its brush's tilt switches out of the way.
     pub tilt_known: bool,
+    /// How far a pen's pressure reaches, at least 1: each use of it (size, opacity, bleed,
+    /// roundness), once through the curves, is this many times the pen's share of its most force,
+    /// and the stamp's own pressure is too, held to full. On an iPad it is the Pencil's most force
+    /// in the system's units, where an ordinary press is 1: so an ordinary press is full, and a
+    /// harder one presses past it (a stamp grows up to the brush's most size, and is laid more
+    /// opaque than its flow and lean alone let it). 1 where a pen's pressure is its share of full.
+    pub pressure_scale: f32,
 }
 
 impl Default for InputSettings {
@@ -1151,6 +1161,7 @@ impl Default for InputSettings {
             speed_distance: 1.0,
             tip_attached: true,
             tilt_known: true,
+            pressure_scale: 1.0,
         }
     }
 }
@@ -2390,7 +2401,7 @@ impl StrokeBuilder {
     /// the stroke is drawn for show or is an exact path; and the speed the path went there at.
     fn pressed_on(&mut self, p: PathPoint, dt: Option<f64>) -> PathPoint {
         let pen = self.pointer.has_pressure();
-        let curved = if self.pressure_counts() { self.brush.pressures(p.pressure) } else { [1.0; 5] };
+        let curved = if self.pressure_counts() { self.reaching(self.brush.pressures(p.pressure)) } else { [1.0; 5] };
         // frames of a 60 Hz display since the last point (a sample's worth at the input's rate,
         // if it came with it)
         let gone = self.pressed_from.zip(dt).map(|(from, dt)| {
@@ -2413,6 +2424,9 @@ impl StrokeBuilder {
             }
             _ => curved,
         };
+        // each use may press past full; the stamp's own pressure is held to it
+        let [s, o, b, r, own] = soft.map(|v| v.max(0.0));
+        let soft = [s, o, b, r, own.min(1.0)];
         self.soft = Some(soft);
         self.pressure = Some(p.pressure);
         self.pressed_from = Some(p.pos);
@@ -3000,7 +3014,9 @@ impl StrokeBuilder {
     /// take it down to the brush's least, not to nothing.
     fn sized(&self, by: f32) -> f32 {
         let least = (self.brush.min_size.min(self.brush.biggest()) * self.scale).min(self.diameter);
-        least + (self.diameter - least) * by.max(0.0)
+        // pressed past full, it grows towards the brush's most size and no further
+        let most = (self.brush.biggest() * self.scale).max(self.diameter);
+        (least + (self.diameter - least) * by.max(0.0)).min(most)
     }
 
     /// What faster input leaves of the size at a point (an amount below 0: slower input).
@@ -3078,7 +3094,7 @@ impl StrokeBuilder {
             return self.step(p);
         }
         let share = self.drawn_share(p);
-        let left = self.tapered(at, p.soft, self.speed_size(p), share, self.start_span(), self.spacing_end);
+        let left = self.tapered(at, p.soft, 1.0, self.speed_size(p), share, self.start_span(), self.spacing_end);
         let roundness = match left.round {
             Some((after, before)) => (self.roundness_at(p) * after / before).clamp(0.05, MOST_ROUNDNESS),
             None => self.roundness_at(p),
@@ -3206,6 +3222,14 @@ impl StrokeBuilder {
         ((1.0 + widen.max(0.0)) * (last + self.spaced(p, at)) * 0.5).max(0.25)
     }
 
+    /// Each use's pressure (`curved`, as the brush's curves take a pen's pressure) as far as the
+    /// pen's pressure reaches (see [`InputSettings::pressure_scale`]): a pen's scaled, past full
+    /// for a hard press; one given, as it was given.
+    fn reaching(&self, curved: [f32; 5]) -> [f32; 5] {
+        let scale = self.input.pressure_scale;
+        if self.pointer.has_pressure() && scale.is_finite() && scale > 1.0 { curved.map(|v| v * scale) } else { curved }
+    }
+
     /// Each use's pressure followed from `before` towards `now` over `frames` (of a 60 Hz display)
     /// in which the pen moved `moved` canvas pixels: when the pen moves fast, a use with a response
     /// speed lags (to (frames / pixels, at least 0.2) to the power twice its response, each
@@ -3219,7 +3243,8 @@ impl StrokeBuilder {
             let (n, b) = (now.get(k).copied().unwrap_or(1.0), before.get(k).copied().unwrap_or(1.0));
             let response = self.extras.pressure_response.get(k).copied().unwrap_or(0.0);
             let followed = b + (n - b) * pace.powf(2.0 * response);
-            ((followed + b * ramp) / (ramp + 1.0)).clamp(0.0, 1.0)
+            // (past full for a pen pressing past it: see `reaching`)
+            ((followed + b * ramp) / (ramp + 1.0)).max(0.0)
         })
     }
 
@@ -3309,7 +3334,8 @@ impl StrokeBuilder {
         // flow, pressure, tilt and speed together through the opacity range, eased; then what
         // pressure lets through (the brush's pressure flow) and the fall off
         let b = &self.brush;
-        let control = b.flow.clamp(0.0, 1.0).powf(1.0 / FLOW_POWER) * pressure_alpha * tilt_alpha * speed_alpha;
+        let rest = b.flow.clamp(0.0, 1.0).powf(1.0 / FLOW_POWER) * tilt_alpha * speed_alpha;
+        let control = rest * pressure_alpha;
         let ranged = (b.min_opacity + (b.max_opacity - b.min_opacity) * control).clamp(0.01, 1.0);
         // a capped stroke builds up towards what the pressure lets through rather than taking it
         let transfer = pressure_flow;
@@ -3542,6 +3568,7 @@ impl StrokeBuilder {
                 wet,
                 time_ms: self.now_ms,
                 pressed: p.soft,
+                rest,
                 drawn_share,
                 speed_size,
                 overlap,
@@ -3564,6 +3591,16 @@ impl StrokeBuilder {
         let round = self.brush.shape.roundness.clamp(0.05, 1.0) * squeezed;
         let wide = self.sized(size_left).max(1e-3);
         drawn_share * self.sized(size_left * round) / wide + (1.0 - drawn_share)
+    }
+
+    /// The opacity factor of the pressure at which a stamp whose flow, lean and speed come to
+    /// `rest` is laid fully opaque (the opacity range's top is reached), never under the factor
+    /// of full pressure.
+    fn opacity_full(&self, rest: f32) -> f32 {
+        let b = &self.brush;
+        let reach = (b.max_opacity - b.min_opacity) * rest;
+        let full = if reach > 0.0 { (1.0 - b.min_opacity) / reach } else { f32::INFINITY };
+        if full.is_finite() { full.max(1.0) } else { f32::INFINITY }
     }
 
     fn taper(&self) -> &Taper {
@@ -3622,7 +3659,7 @@ impl StrokeBuilder {
     /// `(length, end)`.
     fn finish_stamp(&self, p: &Placed, start_span: f32, end: Option<(f32, f32)>) -> Stamp {
         let Tapered { size, alpha, thinned, round, grain_press } =
-            self.tapered(p.distance, p.pressed, p.speed_size, p.drawn_share, start_span, end);
+            self.tapered(p.distance, p.pressed, p.rest, p.speed_size, p.drawn_share, start_span, end);
         let mut grain_press = grain_press.unwrap_or(p.grain_press);
         let roundness = match round {
             Some((after, before)) => (p.roundness * after / before).clamp(0.05, MOST_ROUNDNESS),
@@ -3687,6 +3724,7 @@ impl StrokeBuilder {
         &self,
         at: f32,
         pressed: [f32; 5],
+        rest: f32,
         speed_size: f32,
         share: f32,
         start_span: f32,
@@ -3729,7 +3767,10 @@ impl StrokeBuilder {
                 size *= self.sized(faded_left) / sized;
             }
             if o0 > 0.0 {
-                alpha *= (o1 / o0).powf(FLOW_POWER);
+                // pressed past where the opacity is full, a fade takes nothing away until it
+                // falls below that
+                let full = self.opacity_full(rest);
+                alpha *= (o1.min(full) / o0.min(full)).powf(FLOW_POWER);
             }
             grain_press = Some((b * kept).clamp(0.0, 1.0));
         }
@@ -7090,5 +7131,163 @@ mod tests {
         b.add(&input);
         let centres: Vec<Sample> = b.finish().iter().map(|s| Sample::at(s.center, 1.0, 0.0)).collect();
         assert!(shake(&centres) < shake(&input) / 2.0, "{}", shake(&centres));
+    }
+
+    /// Brushes whose stamps take the pen's pressure every way: size, opacity, response, tapers
+    /// that fade with it, roundness, bleed and a capped transfer.
+    fn pressure_brushes() -> Vec<(&'static str, Brush)> {
+        let mut responding = Brush { pressure_size: 0.8, pressure_opacity: 0.9, ..plain() };
+        responding.set_settings([("pressure_opacity_response", 0.5), ("pressure_size_response", 0.3)]);
+        let mut tapering = Brush {
+            pressure_size: 0.6,
+            pressure_opacity: 0.7,
+            pen_taper: Taper { start: 0.3, end: 0.3, size: 0.8, opacity: 0.5 },
+            ..plain()
+        };
+        tapering.set_setting("pen_taper_pressure", 0.7);
+        let mut capped = Brush { pressure_opacity: 0.5, rendering: Rendering::Capped, ..plain() };
+        capped.set_settings([("pressure_flow", 0.7), ("pressure_roundness", 0.6), ("pressure_bleed", 0.5)]);
+        vec![
+            ("plain", Brush { pressure_size: 0.8, pressure_opacity: 0.9, min_opacity: 0.1, flow: 0.6, ..plain() }),
+            ("responding", responding),
+            ("tapering", tapering),
+            ("thinning", Brush { pressure_size: -0.5, pressure_opacity: -0.4, ..plain() }),
+            ("capped", capped),
+        ]
+    }
+
+    /// A pen's stroke along a wave at 240 samples a second, its pressure swelling from light to
+    /// `most` and back.
+    fn swelling(most: f32) -> Vec<Sample> {
+        (0..=200)
+            .map(|i| {
+                let t = i as f32 / 200.0;
+                let pressure = 0.05 + (most - 0.05) * (std::f32::consts::PI * t).sin();
+                let pos = Vec2::new(20.0 + 600.0 * t, 200.0 + 60.0 * (5.0 * t).sin());
+                Sample { tilt: 0.4, azimuth: 1.0, ..Sample::at(pos, pressure, i as f64 * 1000.0 / 240.0) }
+            })
+            .collect()
+    }
+
+    /// What a stroke laid: how many stamps, and the sums of their alpha, radius, roundness,
+    /// grain press and x.
+    fn digest(stamps: &[Stamp]) -> [f64; 6] {
+        let sum = |f: &dyn Fn(&Stamp) -> f32| stamps.iter().map(|s| f64::from(f(s))).sum::<f64>();
+        [
+            stamps.len() as f64,
+            sum(&|s| s.alpha),
+            sum(&|s| s.radius),
+            sum(&|s| s.roundness),
+            sum(&|s| s.grain_press),
+            sum(&|s| s.center.x),
+        ]
+    }
+
+    fn laid(brush: Brush, input: InputSettings, samples: &[Sample]) -> Vec<Stamp> {
+        let mut b = StrokeBuilder::new(brush, 30.0, Pointer::Stylus).with_input(input);
+        for chunk in samples.chunks(4) {
+            b.add(chunk);
+        }
+        b.finish()
+    }
+
+    #[test]
+    fn a_pens_strokes_lay_as_they_always_did_where_its_pressure_reaches_no_further() {
+        // what each laid before a pen's pressure could reach past full (counted then)
+        let before: [(&str, [f64; 6]); 5] = [
+            ("plain", [218.0, 54.24884361959994, 2041.7217843532562, 218.0, 115.64348555728793, 64647.30577850342]),
+            ("responding", [225.0, 58.28480628877878, 2029.970287322998, 225.0, 120.16640589013696, 62722.58845329285]),
+            ("tapering", [201.0, 88.52841857075691, 2074.953508257866, 201.0, 106.86204132251441, 60775.65877342224]),
+            ("thinning", [206.0, 99.2295306622982, 2067.089107990265, 206.0, 136.3881193101406, 66894.69047546387]),
+            (
+                "capped",
+                [
+                    291.0,
+                    147.5532096028328,
+                    2443.9599001407623,
+                    200.5981124341488,
+                    140.33019382879138,
+                    82818.76692581177,
+                ],
+            ),
+        ];
+        for ((name, brush), (was_name, was)) in pressure_brushes().into_iter().zip(before) {
+            assert_eq!(name, was_name);
+            let now = digest(&laid(brush, InputSettings::default(), &swelling(0.95)));
+            println!("{name}: {now:?}");
+            for (k, (a, b)) in now.iter().zip(was).enumerate() {
+                assert!((a - b).abs() <= 1e-6 * b.abs().max(1.0), "{name}, sum {k}: {a} now, {b} before");
+            }
+        }
+    }
+
+    /// A pen pressing `pressure` all along a line `per` pixels a sample at 240 samples a second,
+    /// its pressure reaching `scale` times as far.
+    fn pressing(brush: &Brush, diameter: f32, pointer: Pointer, pressure: f32, per: f32, scale: f32) -> Vec<Stamp> {
+        let samples: Vec<Sample> = (0..240)
+            .map(|i| Sample::at(Vec2::new(20.0 + per * i as f32, 300.0), pressure, f64::from(i) * 1000.0 / 240.0))
+            .collect();
+        let input = InputSettings { pressure_scale: scale, ..InputSettings::default() };
+        let mut b = StrokeBuilder::new(brush.clone(), diameter, pointer).with_input(input);
+        for chunk in samples.chunks(4) {
+            b.add(chunk);
+        }
+        b.finish()
+    }
+
+    /// The stamp half way along.
+    fn middle(stamps: &[Stamp]) -> Stamp {
+        stamps[stamps.len() / 2]
+    }
+
+    #[test]
+    fn a_pen_whose_pressure_reaches_further_is_full_at_its_share_and_grows_past_it_to_the_brushs_most() {
+        // size and opacity all pressure, drawn at a third of the brush's most size
+        let brush = Brush { pressure_size: 1.0, pressure_opacity: 1.0, min_size: 0.0, ..plain() };
+        let most = brush.biggest();
+        let diameter = most / 3.0;
+        let at = |pressure: f32, scale: f32| middle(&pressing(&brush, diameter, Pointer::Stylus, pressure, 0.5, scale));
+        // a quarter of the way, reaching four times as far: as full pressure reaching no further
+        let (quarter, full) = (at(0.25, 4.0), at(1.0, 1.0));
+        println!(
+            "a quarter pressed reaching 4x: radius {:.3} alpha {:.4}; full: radius {:.3} alpha {:.4}",
+            quarter.radius, quarter.alpha, full.radius, full.alpha
+        );
+        assert!((quarter.radius - full.radius).abs() < 1e-3 && (quarter.alpha - full.alpha).abs() < 1e-4);
+        // half way: twice the size; all the way: as big as the brush gets, and no bigger
+        let (half, all) = (at(0.5, 4.0), at(1.0, 4.0));
+        println!(
+            "half: radius {:.3}; all the way: radius {:.3} (the brush's most {:.3})",
+            half.radius,
+            all.radius,
+            most / 2.0
+        );
+        assert!((half.radius - diameter).abs() < 0.02 * diameter, "{} {}", half.radius, diameter);
+        assert!((all.radius - most / 2.0).abs() < 0.02 * most, "{} {}", all.radius, most / 2.0);
+        // a finger is full whatever a pen's pressure reaches
+        let finger = middle(&pressing(&brush, diameter, Pointer::Finger, 0.25, 0.5, 4.0));
+        assert!((finger.radius - full.radius).abs() < 1e-3 && (finger.alpha - full.alpha).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_pens_pressure_fading_into_the_end_takes_nothing_while_it_presses_past_full() {
+        // the pressure fades into a long end taper that thins and lightens nothing of its own
+        let mut brush = Brush {
+            pressure_opacity: 1.0,
+            pen_taper: Taper { start: 0.0, end: 1.0, size: 0.0, opacity: 0.0 },
+            ..plain()
+        };
+        brush.set_setting("pen_taper_pressure", 1.0);
+        let faded = |scale: f32| {
+            let stamps = pressing(&brush, 20.0, Pointer::Stylus, 1.0, 2.0, scale);
+            let full = middle(&stamps).alpha;
+            (stamps.iter().filter(|s| s.alpha < 0.99 * full).count(), stamps.len())
+        };
+        let ((plain_faded, n), (reaching_faded, _)) = (faded(1.0), faded(4.0));
+        println!(
+            "stamps faded by the pressure's fall into the end: {plain_faded} of {n} pressed fully, {reaching_faded} pressed 4x past it"
+        );
+        // pressed four times past full, only the last quarter of the fall shows
+        assert!(plain_faded > 8 && reaching_faded > 0 && reaching_faded * 2 < plain_faded);
     }
 }

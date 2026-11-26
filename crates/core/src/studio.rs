@@ -546,7 +546,16 @@ impl CanvasSession {
             speed_distance: st.input.speed_distance,
             tip_attached,
             tilt_known: st.input.tilt_known,
+            pressure_scale: st.input.pressure_scale,
         };
+    }
+
+    /// How far the pressure of the pen drawing the strokes to come reaches (see
+    /// [`crate::pen_pressure_scale`]): on an iPad, its Pencil's most force, so an ordinary press
+    /// is full and a harder one presses past it; 1 where a pen's pressure is its share of full.
+    pub fn set_pen_pressure_scale(&self, scale: f32) {
+        let scale = if scale.is_finite() { scale.clamp(1.0, 16.0) } else { 1.0 };
+        self.shared.lock().input.pressure_scale = scale;
     }
 
     /// Whether the pen drawing the strokes to come says how it leans (as each platform's input

@@ -230,6 +230,8 @@ final class CanvasView: UIView {
                 strokeTouch = key
             }
             if touch.type == .pencil {
+                // its pressure reaches as far as its most force: an ordinary press is full
+                session.setPenPressureScale(scale: penPressureScale(most: Double(touch.maximumPossibleForce)))
                 pencil.down(touch)
                 penId = id
                 feedback.prepare()
@@ -578,14 +580,15 @@ final class CanvasView: UIView {
 }
 
 /// One sample, as the core takes it: pixels; pressure 0..1 (the force against the most the device
-/// senses; a touch with none presses fully); the lean from upright and the direction the Pencil's
-/// top leans, clockwise from up (its azimuth is from the view's x axis); the time in milliseconds
-/// of the clock the core's waits run on (`CACurrentMediaTime`'s); and how far the barrel is turned
-/// (Apple Pencil Pro, iPadOS 17.5; 0 for the others).
+/// senses, as the core works it out; a touch with none presses fully); the lean from upright and
+/// the direction the Pencil's top leans, clockwise from up (its azimuth is from the view's x axis);
+/// the time in milliseconds of the clock the core's waits run on (`CACurrentMediaTime`'s); and how
+/// far the barrel is turned (Apple Pencil Pro, iPadOS 17.5; 0 for the others). How far the pressure
+/// reaches past that share is the session's (`setPenPressureScale`).
 func penSample(_ touch: UITouch, in view: UIView, scale: CGFloat) -> PenSample {
     let at = touch.preciseLocation(in: view)
     let pencil = touch.type == .pencil
-    let force = touch.maximumPossibleForce > 0 ? touch.force / touch.maximumPossibleForce : 1
+    let pressure = penPressure(force: Double(touch.force), most: Double(touch.maximumPossibleForce))
     let tilt = pencil ? Double.pi / 2 - Double(touch.altitudeAngle) : 0
     var lean = pencil ? Double(touch.azimuthAngle(in: view)) + Double.pi / 2 : 0
     lean = lean.truncatingRemainder(dividingBy: 2 * Double.pi)
@@ -599,7 +602,7 @@ func penSample(_ touch: UITouch, in view: UIView, scale: CGFloat) -> PenSample {
     return PenSample(
         x: Float(at.x * scale),
         y: Float(at.y * scale),
-        pressure: Float(min(max(force, 0), 1)),
+        pressure: pressure,
         tilt: Float(tilt),
         orientation: Float(lean),
         timeMs: touch.timestamp * 1000,

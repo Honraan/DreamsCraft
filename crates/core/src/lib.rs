@@ -272,6 +272,7 @@ pub use presets::{
     CanvasPreset, P3, SRGB, per_inch, preset_height, preset_label, preset_number, preset_width, presets_from_json,
     presets_json, profile_chip, standard_presets,
 };
+pub use pressure::{pen_pressure, pen_pressure_scale};
 pub use project::{
     ArtworkInfo, Leaving, PdfBook, export_file_name, read_signature, save_failure_said, write_photo, write_signature,
 };
@@ -2632,9 +2633,16 @@ impl CanvasSession {
         let whole_pixels = st.whole_pixels(&samples).filter(|_| shown_ahead);
         let make = |st: &State, brush: Brush, diameter: f32, seed: u32| {
             let preview_tilt = brush.setting("preview_tilt") >= 0.5;
+            // (the pad's sample scribble is pressed as it is to be laid: its pressure reaches no
+            // further, whatever pen drew on the pad)
+            let input = if st.pad_sample {
+                procraft_engine::stroke::InputSettings { pressure_scale: 1.0, ..st.input.clone() }
+            } else {
+                st.input.clone()
+            };
             let builder = StrokeBuilder::with_seed(brush, diameter, pointer.into(), seed)
                 .scaled(st.brush_scale())
-                .with_input(st.input.clone())
+                .with_input(input)
                 .on_view_turned(st.view.map_or(0.0, |v| v.rotation()))
                 .on_canvas_made_turned(st.doc.made_turns)
                 .seen_at(st.view.map_or(1.0, |v| v.zoom()) / st.display_scale);
