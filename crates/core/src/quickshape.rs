@@ -8,7 +8,7 @@ use procraft_engine::brush::Brush;
 use procraft_engine::document::LayerId;
 use procraft_engine::geom::Vec2;
 use procraft_engine::input::Sample;
-use procraft_engine::quickshape::{Anchor, Shape, ShapeKind, end_hook_reach, fit_ellipse, recognise, without_end_hook};
+use procraft_engine::quickshape::{Anchor, Shape, ShapeKind, end_hook_reach, fit_round, recognise, without_end_hook};
 use procraft_engine::stroke::StrokeBuilder;
 use procraft_gpu::{Canvas, SecondStroke, StrokeStyle};
 
@@ -127,6 +127,11 @@ impl ShapeEdit {
     /// A drag undone can be done again.
     pub(crate) fn can_redo(&self) -> bool {
         !self.later.is_empty()
+    }
+
+    /// Whether it is still held: by the pen that drew it, or by a drag on its outline.
+    pub(crate) fn is_held(&self) -> bool {
+        self.held.is_some()
     }
 
     /// The samples its stroke is drawn along: its outline, the pen doing as it did along the stroke
@@ -577,7 +582,7 @@ fn refresh_corners(shape: &mut Shape, modes: &[Anchor]) {
 fn along_ellipse(nodes: &[Vec2], drawn: &[Vec2]) -> Option<Vec<Vec2>> {
     let frame = |n: &[Vec2]| Some((*n.first()?, *n.get(1)? - *n.first()?, *n.get(2)? - *n.first()?));
     let (c, a, b) = frame(nodes)?;
-    let (fc, fa, fb) = frame(&fit_ellipse(drawn).nodes)?;
+    let (fc, fa, fb) = frame(&fit_round(drawn).nodes)?;
     let det = fa.x * fb.y - fa.y * fb.x;
     if det.abs() < 1e-6 || a.x * b.y - a.y * b.x == 0.0 || drawn.len() < 2 {
         return None;
@@ -1026,6 +1031,7 @@ impl CanvasSession {
 #[cfg(test)]
 mod tests {
     use procraft_engine::input::Pointer;
+    use procraft_engine::quickshape::fit_ellipse;
 
     use super::*;
 

@@ -1922,6 +1922,171 @@ fn continue_filling_s_touches_never_wait_on_their_fill() {
     assert!(!red(&s, 500, 1000));
 }
 
+/// What a pinch costs on an empty `width` × `height` canvas fitted to a 1600 square window, with
+/// Continue filling off, on as it was (the first finger's fill handed to the app's fill thread as
+/// it landed, a whole layer's, and taken back by the second finger), and on now: each step (both
+/// fingers moved, out to twice as far apart and back, and the frame they make drawn through the
+/// view and done on the GPU), in milliseconds; and the fill commands the touches handed over.
+/// None without a GPU.
+fn pinch_cost(width: u32, height: u32) -> Option<[(Vec<f64>, usize); 3]> {
+    use crate::TouchCommand;
+    use crate::touch::Fill;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    let gpu = match Gpu::headless() {
+        Ok(gpu) => gpu,
+        Err(e) => {
+            eprintln!("skipped: {e}");
+            return None;
+        }
+    };
+    let s = CanvasSession::new(width, height);
+    let fitted = View::fit((width, height), (1600, 1600));
+    {
+        let mut st = s.shared.lock();
+        st.window_size = (1600, 1600);
+        st.view = Some(fitted);
+        st.gpu = Some(gpu.clone());
+        st.ensure_canvas();
+    }
+    // the app's fill thread, pouring what the touches hand it, in order; told None, it says when
+    // all before is done
+    let (to_fill, asked) = mpsc::channel::<Option<TouchCommand>>();
+    let (idle, idled) = mpsc::channel::<()>();
+    let filler = std::thread::spawn({
+        let s = std::sync::Arc::clone(&s);
+        move || {
+            for c in asked {
+                match c {
+                    Some(TouchCommand::PourAt { x, y, fill }) => {
+                        _ = s.pour_begin(x, y, fill.r, fill.g, fill.b, fill.threshold)
+                    }
+                    Some(TouchCommand::FillThreshold { threshold }) => s.pour_threshold(threshold),
+                    Some(TouchCommand::PourEnd { keep }) => s.pour_end(keep, None),
+                    Some(_) => {}
+                    None => {
+                        let _ = idle.send(());
+                    }
+                }
+            }
+        }
+    });
+    let view = window_view(&s, 1600);
+    let fill = Fill { r: 0.9, g: 0.1, b: 0.1, threshold: 0.3 };
+    let frame = || {
+        s.draw(
+            &view,
+            procraft_gpu::wgpu::TextureFormat::Rgba8Unorm,
+            (1600, 1600),
+            procraft_engine::profile::Profile::Srgb,
+            Instant::now(),
+        );
+        let (done, drawn) = mpsc::channel();
+        gpu.queue.on_submitted_work_done(move || {
+            let _ = done.send(());
+        });
+        while drawn.try_recv().is_err() {
+            let _ = gpu.device.poll(procraft_gpu::wgpu::PollType::Poll);
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    };
+    let runs = [0usize, 1, 2].map(|mode| {
+        s.shared.lock().view = Some(fitted);
+        s.set_touch_filling((mode > 0).then_some(fill));
+        frame();
+        let mut handed = 0;
+        let mut hand = |out: Vec<TouchCommand>| {
+            for c in out {
+                if matches!(
+                    c,
+                    TouchCommand::PourAt { .. } | TouchCommand::FillThreshold { .. } | TouchCommand::PourEnd { .. }
+                ) {
+                    handed += 1;
+                    let _ = to_fill.send(Some(c));
+                }
+            }
+        };
+        let t0 = 10_000.0 * (mode + 1) as f64;
+        let (a, b) = ((700.0f32, 800.0f32), (900.0f32, 800.0f32));
+        hand(s.touch_down(1, PointerKind::Finger, vec![sample(a.0, a.1, t0)]));
+        // as it was: the first finger's fill, handed over as it landed
+        if mode == 1 {
+            let _ = to_fill.send(Some(TouchCommand::PourAt { x: a.0, y: a.1, fill }));
+        }
+        hand(s.touch_down(2, PointerKind::Finger, vec![sample(b.0, b.1, t0 + 30.0)]));
+        // and taken back by the second
+        if mode == 1 {
+            let _ = to_fill.send(Some(TouchCommand::PourEnd { keep: false }));
+        }
+        let mut steps = Vec::new();
+        for k in 1..=40 {
+            let spread = if k <= 20 { k } else { 40 - k } as f32 * 10.0;
+            let ms = t0 + 30.0 + 16.0 * f64::from(k);
+            let t = Instant::now();
+            hand(s.touch_move(1, vec![sample(a.0 - spread, a.1, ms)]));
+            hand(s.touch_move(2, vec![sample(b.0 + spread, b.1, ms)]));
+            frame();
+            steps.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        hand(s.touch_up(2, vec![sample(b.0, b.1, t0 + 700.0)]));
+        hand(s.touch_up(1, vec![sample(a.0, a.1, t0 + 710.0)]));
+        let _ = to_fill.send(None);
+        let _ = idled.recv();
+        (steps, handed)
+    });
+    drop(to_fill);
+    assert!(filler.join().is_ok());
+    assert_eq!(gpu.errors(), 0);
+    Some(runs)
+}
+
+/// The pinch's steps' mean and worst (milliseconds).
+fn mean_and_worst(steps: &[f64]) -> (f64, f64) {
+    (steps.iter().sum::<f64>() / steps.len().max(1) as f64, steps.iter().copied().fold(0.0, f64::max))
+}
+
+/// Prints [`pinch_cost`]'s runs on a `width` × `height` canvas; their means and worsts.
+fn print_pinch_cost(width: u32, height: u32) -> Option<[(f64, f64, usize); 3]> {
+    let runs = pinch_cost(width, height)?;
+    println!("a pinch on an empty {width} x {height} canvas, 40 steps (two moves and their frame):");
+    let mut out = [(0.0, 0.0, 0); 3];
+    for ((what, (steps, handed)), to) in
+        ["Continue filling off", "on, as it was", "on, now"].iter().zip(&runs).zip(&mut out)
+    {
+        let (mean, worst) = mean_and_worst(steps);
+        println!("  {what}: {mean:.2} ms a step on average, {worst:.1} ms at most ({handed} fill commands)");
+        *to = (mean, worst, *handed);
+    }
+    Some(out)
+}
+
+/// #411: with Continue filling on, zooming in and out lagged: each pinch's first finger filled the
+/// whole layer on the app's fill thread as it landed (on a large canvas the layer read back and
+/// flooded, with the canvas held) and the second finger took it back, so the pinch's first steps
+/// waited. A touch now fills once it is one finger's, so a pinch hands over no fill and costs what
+/// it costs with Continue filling off. Here on a 2048 square canvas. Printed: each run's steps.
+/// Bound: on now, no fill handed over, the steps within 1.5x (+2 ms on average, +8 ms at worst)
+/// of off.
+#[test]
+fn a_pinch_with_continue_filling_on_costs_what_it_does_with_it_off() {
+    let Some([off, was, now]) = print_pinch_cost(2048, 2048) else { return };
+    assert_eq!(off.2, 0);
+    assert_eq!(was.2, 0, "the touches themselves hand over nothing; as it was is the test's");
+    assert_eq!(now.2, 0, "a pinch hands over no fill");
+    assert!(now.0 <= off.0 * 1.5 + 2.0, "{:.2} ms against {:.2} ms off", now.0, off.0);
+    assert!(now.1 <= off.1 * 1.5 + 8.0, "{:.1} ms against {:.1} ms off", now.1, off.1);
+}
+
+/// The same at the sizes #411 named: a 4096 square canvas and A3 at 300 dpi (3508 × 4961). Run
+/// with `--ignored --nocapture` (release for real numbers).
+#[test]
+#[ignore]
+fn pinch_with_continue_filling_cost() {
+    for (w, h) in [(4096, 4096), (3508, 4961)] {
+        let _ = print_pinch_cost(w, h);
+    }
+}
+
 /// What ColorDrop costs on a large canvas (`POUR_COST_SIDE`, 4096 square): a colour dropped into a
 /// small ring, its threshold slid, and let go, each timed as the app waits for it; then the same
 /// into the whole empty layer. Run on a device with `--ignored --nocapture`.
@@ -7934,11 +8099,12 @@ fn a_shape_still_held_follows_the_pen_and_a_finger_snaps_it() {
     assert_eq!(s.quickshape_info().unwrap().handles, on.handles);
     assert_eq!(s.quickshape_finger(false).unwrap().handles, on.handles);
     s.quickshape_done();
-    // a held ellipse near round is a circle while a finger is down
+    // a held ellipse near round (its long axis less than half as long again as its short) is a
+    // circle while a finger is down
     let pts: Vec<PenSample> = (0..=60)
         .map(|i| {
             let t = i as f32 / 60.0 * std::f32::consts::TAU;
-            sample(100.0 + 60.0 * t.cos() + 2.0 * (7.0 * t).sin(), 100.0 + 40.0 * t.sin(), f64::from(i) * 8.0)
+            sample(100.0 + 60.0 * t.cos() + 2.0 * (7.0 * t).sin(), 100.0 + 45.0 * t.sin(), f64::from(i) * 8.0)
         })
         .collect();
     s.stroke_begin(PointerKind::Finger, pts[..1].to_vec());

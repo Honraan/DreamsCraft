@@ -2607,6 +2607,12 @@ enum Op {
         coverage: Vec<u8>,
         colour: [f32; 3],
     },
+    /// The open fill stroke's region laid again only within these rectangles, each over its own
+    /// coverage, the rest as it was (see [`Canvas::fill_stroke_parts`]).
+    RegionParts {
+        parts: Vec<(IRect, Vec<u8>)>,
+        colour: [f32; 3],
+    },
     Commit(Box<ActiveStroke>),
     /// The next stroke committed changed pixels only within these rectangles: its undo step
     /// keeps only them.
@@ -5256,10 +5262,46 @@ impl Canvas {
         let colour = active.style.color.map(|c| if c.is_finite() { c.clamp(0.0, 1.0) } else { 0.0 });
         self.untip();
         // what is still queued of it, last, would only be cleared
-        if matches!(self.ops.last(), Some(Op::Region { .. })) {
+        while matches!(self.ops.last(), Some(Op::Region { .. } | Op::RegionParts { .. })) {
             self.ops.pop();
         }
         self.ops.push(Op::Region { rect, coverage, colour });
+    }
+
+    /// The open fill stroke's region (see [`Canvas::fill_stroke`]) changed only within the
+    /// rectangles of `parts` since it was laid: each laid again over its coverage (a byte a pixel,
+    /// its rows, 255 all of it), the rest kept, and only they are drawn again. So a region growing
+    /// on a large canvas costs a frame what it grew by, not all of it.
+    pub fn fill_stroke_parts(&mut self, parts: Vec<(IRect, Vec<u8>)>) {
+        let Some(active) = self.active.as_mut() else { return };
+        if active.style.in_place() || active.second.is_some() || active.pencil {
+            return;
+        }
+        let canvas = IRect::from_size(self.width, self.height);
+        let parts: Vec<(IRect, Vec<u8>)> = parts
+            .into_iter()
+            .filter(|(rect, coverage)| {
+                // (only whole parts on the canvas: those the fill makes are)
+                !rect.is_empty()
+                    && rect.intersect(canvas) == *rect
+                    && coverage.len() == rect.width() as usize * rect.height() as usize
+            })
+            .collect();
+        if parts.is_empty() {
+            return;
+        }
+        for (rect, _) in &parts {
+            self.dirty = self.dirty.union(*rect);
+            active.bounds = active.bounds.union(*rect);
+        }
+        active.first = active.bounds;
+        if self.measuring {
+            return;
+        }
+        self.prediction.clear();
+        let colour = active.style.color.map(|c| if c.is_finite() { c.clamp(0.0, 1.0) } else { 0.0 });
+        self.untip();
+        self.ops.push(Op::RegionParts { parts, colour });
     }
 
     /// Whether strokes are only being measured (see [`Canvas::measure`]).
@@ -7795,6 +7837,11 @@ impl Canvas {
                             None => self.second_unsynthesized = self.second_unsynthesized.union(rect),
                         }
                     }
+                }
+                Op::RegionParts { parts, colour } => {
+                    self.carried[0].forget();
+                    let format = self.pipelines.stroke_format;
+                    uploaded.extend(self.upload_region_parts(gpu, &mut encoder, format, colour, &parts));
                 }
                 Op::Region { rect, coverage, colour } => {
                     self.carried[0].forget();
@@ -13018,6 +13065,62 @@ impl Canvas {
             copy_at(texture, rect.x0, rect.y0),
             extent(w, h),
         );
+        Some(buffer)
+    }
+
+    /// A fill region's `parts` (each a rectangle and its coverage) laid on the stroke texture in
+    /// `colour` (texels as `format` has them), through one upload buffer, each part placed where a
+    /// copy may start and its rows 256 bytes apart. The buffer, to give back once sent.
+    fn upload_region_parts(
+        &self,
+        gpu: &Gpu,
+        encoder: &mut wgpu::CommandEncoder,
+        format: wgpu::TextureFormat,
+        colour: [f32; 3],
+        parts: &[(IRect, Vec<u8>)],
+    ) -> Option<wgpu::Buffer> {
+        let texel: u64 = if format == STROKE_FORMAT { 8 } else { 4 };
+        // where each part starts in the buffer, and its rows' stride
+        let mut placed = Vec::with_capacity(parts.len());
+        let mut size = 0u64;
+        for (rect, _) in parts {
+            let stride = (u64::from(rect.width()) * texel).div_ceil(256) * 256;
+            placed.push((size, stride));
+            size = (size + stride * u64::from(rect.height())).next_multiple_of(crate::placed::PLACEMENT);
+        }
+        if size == 0 {
+            return None;
+        }
+        let buffer = self.uploads.take(&gpu.device, size);
+        {
+            let Ok(mut view) = buffer.slice(..size).get_mapped_range_mut() else {
+                log::error!("an upload buffer wasn't mapped");
+                return None;
+            };
+            for ((rect, coverage), &(at, stride)) in parts.iter().zip(&placed) {
+                let texels = region_texels(format, colour, coverage);
+                let wide = rect.width() as usize * texel as usize;
+                for (y, row) in texels.chunks_exact(wide.max(1)).enumerate() {
+                    // (within the buffer: each part's rows were made room for above)
+                    let from = at as usize + y * stride as usize;
+                    view.slice(from..from + wide).copy_from_slice(row);
+                }
+            }
+        }
+        buffer.unmap();
+        for ((rect, _), &(offset, stride)) in parts.iter().zip(&placed) {
+            let layout = wgpu::TexelCopyBufferLayout {
+                offset,
+                bytes_per_row: u32::try_from(stride).ok(),
+                rows_per_image: Some(rect.height()),
+            };
+            gpu.copy_buffer_to_texture(
+                encoder,
+                wgpu::TexelCopyBufferInfo { buffer: &buffer, layout },
+                copy_at(&self.stroke, rect.x0, rect.y0),
+                extent(rect.width(), rect.height()),
+            );
+        }
         Some(buffer)
     }
 

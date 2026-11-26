@@ -105,6 +105,8 @@ mod project;
 mod projection;
 mod quick_menu;
 mod quickshape;
+#[cfg(test)]
+mod quickshape_tests;
 mod recolor;
 mod reference_view;
 mod reference_window;
@@ -1789,6 +1791,9 @@ pub(crate) struct Shared {
     pub(crate) cursor: cursor_turn::CursorTurns,
     /// Where the artwork is on the screen as last seen, for a dragged colour's rest.
     pub(crate) lands_on: pour::LandsOn,
+    /// What the stroke's sound last went by, for its thread to go on with while a frame holds the
+    /// canvas (see [`CanvasSession::stroke_sound`]).
+    pub(crate) sound_read: parking_lot::Mutex<Option<stroke_sound::SoundRead>>,
     /// Counts this session among those alive until all of it goes (see [`live_sessions`]).
     _alive: activity::Alive,
     /// The folders the plugins name, told of each save (interface 22); none until the plugins are
@@ -2457,6 +2462,7 @@ impl CanvasSession {
                 input_queued: std::sync::atomic::AtomicBool::new(false),
                 cursor: cursor_turn::CursorTurns::default(),
                 lands_on: pour::LandsOn::default(),
+                sound_read: parking_lot::Mutex::new(None),
                 _alive: activity::Alive::new(),
                 folders: Mutex::new(None),
                 reopened: std::sync::atomic::AtomicU64::new(0),

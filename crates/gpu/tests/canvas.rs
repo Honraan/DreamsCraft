@@ -6043,6 +6043,49 @@ fn a_fill_stroke_lays_its_region_in_place_of_its_stamps_as_its_paint_one_step_an
     assert_eq!(pixel(&layer, 256, 190, 8)[3], 255);
 }
 
+/// #411: a growing fill's region laid again only in parts (rectangles, odd sizes, several at once,
+/// one over the canvas's edge left out) keeps the rest as it was laid, and is laid as one step as
+/// if laid whole; the same where copies are placed as Direct3D 12 places them.
+#[test]
+fn a_fill_stroke_s_parts_lay_again_only_where_they_are_the_rest_kept() {
+    use procraft_engine::geom::IRect;
+    let Some(gpu) = gpu() else { return };
+    let _check = NoErrors(&gpu);
+    for placed in [false, true] {
+        gpu.emulate_placed_copies(placed);
+        let mut doc = Document::new(96, 80);
+        let mut canvas = Canvas::new(&gpu, &doc).unwrap();
+        canvas.begin_stroke(doc.current(), style(StrokeTool::Paint, 1.0).as_fill());
+        // all of it half covered, then shown a frame
+        canvas.fill_stroke(IRect::new(0, 0, 96, 80), vec![128; 96 * 80]);
+        canvas.render(&gpu, &mut doc, None);
+        // then three parts covered fully, one a single pixel, one nothing; one off the canvas
+        let parts = vec![
+            (IRect::new(5, 3, 42, 33), vec![255; 37 * 30]),
+            (IRect::new(60, 50, 61, 51), vec![255; 1]),
+            (IRect::new(70, 10, 93, 41), vec![0; 23 * 31]),
+            (IRect::new(90, 70, 100, 80), vec![255; 100]),
+        ];
+        canvas.fill_stroke_parts(parts);
+        canvas.end_stroke();
+        canvas.render(&gpu, &mut doc, None);
+        let layer = canvas.read_layer(&gpu, doc.current()).unwrap();
+        let a = |x: u32, y: u32| pixel(&layer, 96, x, y)[3];
+        assert_eq!((a(5, 3), a(41, 32), a(20, 20)), (255, 255, 255), "placed {placed}");
+        assert_eq!(a(60, 50), 255, "placed {placed}");
+        assert_eq!((a(70, 10), a(92, 40)), (0, 0), "placed {placed}");
+        // the rest as laid before, and the part off the canvas left out
+        for (x, y) in [(4, 3), (42, 20), (20, 33), (61, 50), (60, 51), (69, 10), (93, 40), (95, 79), (0, 79)] {
+            assert!(a(x, y).abs_diff(128) <= 1, "({x}, {y}) {} placed {placed}", a(x, y));
+        }
+        // one step takes it all back
+        canvas.undo();
+        canvas.render(&gpu, &mut doc, None);
+        assert!(canvas.read_layer(&gpu, doc.current()).unwrap().iter().all(|&v| v == 0), "placed {placed}");
+        gpu.emulate_placed_copies(false);
+    }
+}
+
 /// A target `size` pixels of `format` to show a canvas on, as the window does, and its view.
 fn window_target(gpu: &Gpu, size: (u32, u32), format: wgpu::TextureFormat) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
