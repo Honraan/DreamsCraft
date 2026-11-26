@@ -226,7 +226,7 @@ pub use gradients::{GradientInfo, GradientStop, Gradients};
 pub use guide::{GuideInfo, GuideType, GuideUnit, SymmetryType};
 pub use history::{COLOUR_HOLD_MS, ColourHistory};
 pub use hues::{HueControl, RING_HUES, SLIDER_HUES, hue_at, hue_position, hue_stops};
-pub use kept_colours::{COLOUR_WRITE_GAP_MS, FIRST_BRUSH_COLOUR, FIRST_MASK_COLOUR, KeptColours};
+pub use kept_colours::{COLOUR_WRITE_GAP_MS, FIRST_BRUSH_COLOUR, FIRST_MASK_COLOUR, FIRST_SECOND_COLOUR, KeptColours};
 pub use keys::{KEY_ZOOM, KeyCombo, KeyDrag, KeyShortcut, ShortcutGroup, ShortcutRow, key_shortcut, key_shortcut_list};
 pub use layer_bundle::{LayerBundle, LayerDrop};
 pub use layers::{

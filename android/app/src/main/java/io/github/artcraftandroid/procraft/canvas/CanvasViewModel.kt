@@ -296,13 +296,14 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * The second colour (0xRRGGBB), beside the current one in the colour panel: swapped with it,
-     * and mixed in by brushes whose colour dynamics say so.
+     * and mixed in by brushes whose colour dynamics say so. Kept for the next start with the others.
      */
     var secondaryRgb: Int
         get() = secondaryState
         private set(v) {
             secondaryState = v
             pushSecondary()
+            keptColours.keepSecond(keptOfSecond(v))
         }
 
     private fun pushSecondary() {
@@ -335,8 +336,9 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     private var otherColour = floatArrayOf(0f, 0f, 0f)
 
     /**
-     * The brush colour and the masks', kept by the shared core in their file as each changes, so the
-     * next start finds them however this run ends (a force-stop or a kill runs no onStop).
+     * The brush colour, the masks' and the second colour, kept by the shared core in their file as
+     * each changes, so the next start finds them however this run ends (a force-stop or a kill runs
+     * no onStop).
      */
     private val keptColours = io.github.artcraftandroid.procraft.core.KeptColours.open(File(app.filesDir, "colour").path)
 
@@ -353,6 +355,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         saturation = s
         brightness = v
         otherColour = keptColours.mask().toFloatArray()
+        secondaryState = secondRgbOf(keptColours.second())
     }
 
     /** Keeps the brush colour and the masks' for the next start (the core writes them soon, off this thread). */

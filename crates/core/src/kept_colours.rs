@@ -1,12 +1,14 @@
-//! The colour painted with and the one masks paint with, as last left, the same in every app: the
-//! app holds them, tells each change, and they are written to the file it names as they change,
-//! so the next start finds them however this run ends (closed, put away, or killed outright,
-//! which runs nothing of the app's on the way out). Colours are hue, saturation and brightness
-//! (0..1), so a grey keeps the hue it was chosen on.
+//! The colour painted with, the one masks paint with and the second colour (beside the current one
+//! in the colour panel), as last left, the same in every app: the app holds them, tells each
+//! change, and they are written to the file it names as they change, so the next start finds them
+//! however this run ends (closed, put away, or killed outright, which runs nothing of the app's on
+//! the way out). The brush and mask colours are hue, saturation and brightness (0..1), so a grey
+//! keeps the hue it was chosen on; the second colour is red, green and blue (sRGB, 0..1), as the
+//! apps hold it.
 //!
-//! The file is one line, `h s b mh ms mb`: the brush colour and the masks'. A change is written
-//! whole (beside the file, then renamed over it) on a thread of its own, at once, and while the
-//! colour keeps changing (a finger dragged over the colour disc) at most once every
+//! The file is one line, `h s b mh ms mb r g b`: the brush colour, the masks' and the second. A
+//! change is written whole (beside the file, then renamed over it) on a thread of its own, at once,
+//! and while a colour keeps changing (a finger dragged over the colour disc) at most once every
 //! [`COLOUR_WRITE_GAP_MS`], the latest each time: the file is never more than that behind.
 
 use std::path::PathBuf;
@@ -23,6 +25,9 @@ pub const FIRST_BRUSH_COLOUR: [f32; 3] = [0.59, 1.0, 1.0];
 
 /// The colour masks paint with at first: black.
 pub const FIRST_MASK_COLOUR: [f32; 3] = [0.0, 0.0, 0.0];
+
+/// The second colour at first (and where the file holds none whole): white.
+pub const FIRST_SECOND_COLOUR: [f32; 3] = [1.0, 1.0, 1.0];
 
 #[derive(uniffi::Object)]
 pub struct KeptColours {
@@ -45,7 +50,9 @@ struct Shared {
 struct State {
     brush: [f32; 3],
     mask: [f32; 3],
-    /// The file held them as the app started.
+    /// The second colour: red, green, blue.
+    second: [f32; 3],
+    /// The file held the brush colour or the masks' as the app started.
     found: bool,
     /// They changed since they were last written.
     unwritten: bool,
@@ -60,7 +67,7 @@ impl KeptColours {
     /// Colours kept only while the app runs, starting on the first ones.
     #[uniffi::constructor]
     pub fn new() -> Arc<KeptColours> {
-        Arc::new(KeptColours::with(None, None, None))
+        Arc::new(KeptColours::with(None, (None, None, None)))
     }
 
     /// The colours kept at `path`, as the app last left them; each read leniently (a colour that
@@ -68,8 +75,8 @@ impl KeptColours {
     #[uniffi::constructor]
     pub fn open(path: String) -> Arc<KeptColours> {
         let file = PathBuf::from(path);
-        let (brush, mask) = std::fs::read(&file).map(|b| read_kept(&String::from_utf8_lossy(&b))).unwrap_or_default();
-        Arc::new(KeptColours::with(Some(file), brush, mask))
+        let kept = std::fs::read(&file).map(|b| read_kept(&String::from_utf8_lossy(&b))).unwrap_or_default();
+        Arc::new(KeptColours::with(Some(file), kept))
     }
 
     /// The brush colour: hue, saturation, brightness.
@@ -82,8 +89,13 @@ impl KeptColours {
         self.state().mask.to_vec()
     }
 
-    /// Whether the file held a colour as it was opened (else the app may carry over the colours it
-    /// kept elsewhere before).
+    /// The second colour, beside the current one in the colour panel: red, green, blue (sRGB).
+    pub fn second(&self) -> Vec<f32> {
+        self.state().second.to_vec()
+    }
+
+    /// Whether the file held the brush colour or the masks' as it was opened (else the app may
+    /// carry over the colours it kept elsewhere before).
     pub fn was_kept(&self) -> bool {
         self.state().found
     }
@@ -100,6 +112,46 @@ impl KeptColours {
         }
         state.brush = brush;
         state.mask = mask;
+        self.changed(state);
+    }
+
+    /// The second colour now (red, green, blue; each clamped to 0..1), as [`KeptColours::keep`]
+    /// keeps the others: cheap when unchanged, written soon on another thread when changed.
+    pub fn keep_second(&self, second: Vec<f32>) {
+        let mut state = self.state();
+        let second = colour_of(&second).unwrap_or(state.second);
+        if second == state.second {
+            return;
+        }
+        state.second = second;
+        self.changed(state);
+    }
+}
+
+impl KeptColours {
+    fn with(file: Option<PathBuf>, (brush, mask, second): Kept) -> KeptColours {
+        let state = State {
+            brush: brush.unwrap_or(FIRST_BRUSH_COLOUR),
+            mask: mask.unwrap_or(FIRST_MASK_COLOUR),
+            second: second.unwrap_or(FIRST_SECOND_COLOUR),
+            found: brush.is_some() || mask.is_some(),
+            unwritten: false,
+            writing: false,
+            writer: false,
+        };
+        let shared = Shared {
+            state: Mutex::new(state),
+            written: Condvar::new(),
+            file,
+            failing: AtomicBool::new(false),
+            writes: AtomicU32::new(0),
+        };
+        KeptColours { shared: Arc::new(shared) }
+    }
+
+    /// A colour changed (in `state`, still held): written soon by the writing thread, started if it
+    /// isn't running.
+    fn changed(&self, mut state: MutexGuard<'_, State>) {
         if self.shared.file.is_none() {
             return;
         }
@@ -118,27 +170,6 @@ impl KeptColours {
             self.shared.state().writer = false;
             self.shared.write_now();
         }
-    }
-}
-
-impl KeptColours {
-    fn with(file: Option<PathBuf>, brush: Option<[f32; 3]>, mask: Option<[f32; 3]>) -> KeptColours {
-        let state = State {
-            brush: brush.unwrap_or(FIRST_BRUSH_COLOUR),
-            mask: mask.unwrap_or(FIRST_MASK_COLOUR),
-            found: brush.is_some() || mask.is_some(),
-            unwritten: false,
-            writing: false,
-            writer: false,
-        };
-        let shared = Shared {
-            state: Mutex::new(state),
-            written: Condvar::new(),
-            file,
-            failing: AtomicBool::new(false),
-            writes: AtomicU32::new(0),
-        };
-        KeptColours { shared: Arc::new(shared) }
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -195,7 +226,7 @@ impl Shared {
         }
         state.unwritten = false;
         state.writing = true;
-        let text = write_kept(state.brush, state.mask);
+        let text = write_kept(state.brush, state.mask, state.second);
         drop(state);
         self.write(&text);
         self.state().writing = false;
@@ -232,21 +263,25 @@ fn colour_of(values: &[f32]) -> Option<[f32; 3]> {
     }
 }
 
-/// The colours as the file keeps them: one line, `h s b mh ms mb`.
-fn write_kept([h, s, b]: [f32; 3], [mh, ms, mb]: [f32; 3]) -> String {
-    format!("{h} {s} {b} {mh} {ms} {mb}\n")
+/// The colours as the file keeps them: one line, `h s b mh ms mb r g b`.
+fn write_kept([h, s, b]: [f32; 3], [mh, ms, mb]: [f32; 3], [r, g, bl]: [f32; 3]) -> String {
+    format!("{h} {s} {b} {mh} {ms} {mb} {r} {g} {bl}\n")
 }
 
-/// The brush colour and the masks' a file keeps, leniently: each that is there whole, as three
-/// numbers in its place (clamped to 0..1); a file cut short keeps the colours before the cut.
-fn read_kept(text: &str) -> (Option<[f32; 3]>, Option<[f32; 3]>) {
+/// The brush colour, the masks' and the second colour, each if a file holds it whole.
+type Kept = (Option<[f32; 3]>, Option<[f32; 3]>, Option<[f32; 3]>);
+
+/// The colours a file keeps, leniently: each that is there whole, as three numbers in its place
+/// (clamped to 0..1); a file cut short keeps the colours before the cut (an older one, of the
+/// brush colour and the masks' alone, keeps those).
+fn read_kept(text: &str) -> Kept {
     let values: Vec<Option<f32>> =
-        text.split_whitespace().take(6).map(|t| t.parse::<f32>().ok().filter(|c| c.is_finite())).collect();
+        text.split_whitespace().take(9).map(|t| t.parse::<f32>().ok().filter(|c| c.is_finite())).collect();
     let colour = |at: usize| match values.get(at..at + 3)? {
         [Some(h), Some(s), Some(b)] => colour_of(&[*h, *s, *b]),
         _ => None,
     };
-    (colour(0), colour(3))
+    (colour(0), colour(3), colour(6))
 }
 
 #[cfg(test)]
@@ -276,14 +311,16 @@ mod tests {
         assert!(!kept.was_kept(), "a first start");
         assert_eq!(kept.brush(), FIRST_BRUSH_COLOUR.to_vec());
         assert_eq!(kept.mask(), FIRST_MASK_COLOUR.to_vec());
+        assert_eq!(kept.second(), vec![1.0, 1.0, 1.0], "the second colour white at first");
         let history = crate::ColourHistory::open(dir.join("colour-history.json").to_string_lossy().into_owned());
         let session = crate::CanvasSession::new(64, 64);
         session.use_colour_history(history.clone());
 
-        // an orange chosen, a stroke painted in it, a grey for masks
-        let (orange, grey) = (vec![0.07, 0.9, 0.95], vec![0.3, 0.0, 0.5]);
+        // an orange chosen, a stroke painted in it, a grey for masks, a teal swapped in beside it
+        let (orange, grey, teal) = (vec![0.07, 0.9, 0.95], vec![0.3, 0.0, 0.5], vec![0.0, 0.5, 0.5]);
         let chosen = Instant::now();
         kept.keep(orange.clone(), grey.clone());
+        kept.keep_second(teal.clone());
         session.set_color(0.95, 0.4, 0.1);
         let at = |ms| {
             vec![crate::PenSample {
@@ -313,6 +350,7 @@ mod tests {
         assert!(again.was_kept());
         assert_eq!(again.brush(), orange, "the brush colour chosen");
         assert_eq!(again.mask(), grey, "the masks' colour");
+        assert_eq!(again.second(), teal, "the second colour");
         let history = crate::ColourHistory::open(dir.join("colour-history.json").to_string_lossy().into_owned());
         assert_eq!(history.colours().first(), Some(&0xF2661A), "the colour painted with heads the history");
         drop(again);
@@ -328,12 +366,17 @@ mod tests {
         let file = dir.join("colour");
         let kept = KeptColours::open(path(&dir));
         kept.keep(vec![0.25, 0.5, 0.75], vec![0.1, 0.2, 0.3]);
+        kept.keep_second(vec![0.9, 0.8, 0.7]);
         assert!(kept.wait_written(Duration::from_secs(10)));
         std::mem::forget(kept);
         // a write cut off half-way, beside it
         std::fs::write(dir.join("colour.7.tmp"), b"0.9 0.9 0.").unwrap();
         let again = KeptColours::open(path(&dir));
-        assert_eq!((again.brush(), again.mask()), (vec![0.25, 0.5, 0.75], vec![0.1, 0.2, 0.3]), "the last whole file");
+        assert_eq!(
+            (again.brush(), again.mask(), again.second()),
+            (vec![0.25, 0.5, 0.75], vec![0.1, 0.2, 0.3], vec![0.9, 0.8, 0.7]),
+            "the last whole file"
+        );
         drop(again);
 
         let read = |text: &[u8]| {
@@ -341,7 +384,13 @@ mod tests {
             let k = KeptColours::open(path(&dir));
             (k.brush(), k.mask(), k.was_kept())
         };
-        let (first, black) = (FIRST_BRUSH_COLOUR.to_vec(), FIRST_MASK_COLOUR.to_vec());
+        let second = |text: &[u8]| {
+            std::fs::write(&file, text).unwrap();
+            let k = KeptColours::open(path(&dir));
+            (k.brush(), k.second())
+        };
+        let (first, black, white) =
+            (FIRST_BRUSH_COLOUR.to_vec(), FIRST_MASK_COLOUR.to_vec(), FIRST_SECOND_COLOUR.to_vec());
         // cut in the masks' colour: the brush colour kept
         assert_eq!(read(b"0.25 0.5 0.75 0.1 0."), (vec![0.25, 0.5, 0.75], black.clone(), true));
         // cut in the brush colour: the first colours, as a first start
@@ -354,11 +403,20 @@ mod tests {
         assert_eq!(read(b"NaN 0.5 0.5 inf 0 0"), (first.clone(), black.clone(), false));
         assert_eq!(read(b"1.5 -2 0.5 0 0 9\n"), (vec![1.0, 0.0, 0.5], vec![0.0, 0.0, 1.0], true));
         assert_eq!(read(b"\x00\x00\xFF\xFE garbage"), (first.clone(), black.clone(), false));
+        // the second colour: kept whole; the older file (six numbers, before it was kept), a cut in
+        // it or a damaged one leave it white and the others as they were
+        let brush = vec![0.25, 0.5, 0.75];
+        assert_eq!(second(b"0.25 0.5 0.75 0 0 0 0.2 0.4 0.6\n"), (brush.clone(), vec![0.2, 0.4, 0.6]));
+        assert_eq!(second(b"0.25 0.5 0.75 0 0 0\n"), (brush.clone(), white.clone()));
+        assert_eq!(second(b"0.25 0.5 0.75 0 0 0 0.2 0."), (brush.clone(), white.clone()));
+        assert_eq!(second(b"0.25 0.5 0.75 0 0 0 0.2 NaN 0.6"), (brush.clone(), white.clone()));
+        assert_eq!(second(b"0.25 0.5 0.75 0 0 0 2 -1 0.5 junk after"), (brush.clone(), vec![1.0, 0.0, 0.5]));
+        assert_eq!(second(b"x"), (first.clone(), white.clone()));
         // the next change written whole over it
         let k = KeptColours::open(path(&dir));
         k.keep(vec![0.5, 0.5, 0.5], k.mask());
         assert!(k.wait_written(Duration::from_secs(10)));
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "0.5 0.5 0.5 0 0 0\n");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "0.5 0.5 0.5 0 0 0 1 1 1\n");
         drop(k);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -375,22 +433,29 @@ mod tests {
         // told every frame with no change: nothing written
         for _ in 0..1000 {
             kept.keep(FIRST_BRUSH_COLOUR.to_vec(), FIRST_MASK_COLOUR.to_vec());
+            kept.keep_second(FIRST_SECOND_COLOUR.to_vec());
         }
         assert_eq!(shared.writes.load(Ordering::Relaxed), 0, "unchanged: nothing written");
         // and something that isn't a colour changes nothing
         kept.keep(vec![0.5], vec![f32::NAN, 0.0, 0.0]);
+        kept.keep_second(vec![0.5, 0.5]);
+        kept.keep_second(vec![f32::INFINITY, 0.5, 0.5]);
         assert_eq!(kept.brush(), FIRST_BRUSH_COLOUR.to_vec());
+        assert_eq!(kept.second(), FIRST_SECOND_COLOUR.to_vec());
         assert_eq!(shared.writes.load(Ordering::Relaxed), 0);
 
         // a drag: a change every half millisecond for a second (many more than a screen shows)
         let start = Instant::now();
         let mut changes = 0u32;
         let mut busy = Duration::ZERO;
-        let mut last = Vec::new();
+        let (mut last, mut last_second) = (Vec::new(), Vec::new());
         while start.elapsed() < Duration::from_millis(1000) {
             last = vec![(changes % 1000) as f32 / 1000.0, 0.8, 0.9];
+            // the colours swapped now and then (the second colour taking the current one's place)
+            last_second = vec![0.1, (changes / 100 % 10) as f32 / 10.0, 0.3];
             let t = Instant::now();
             kept.keep(last.clone(), FIRST_MASK_COLOUR.to_vec());
+            kept.keep_second(last_second.clone());
             busy += t.elapsed();
             changes += 1;
             std::thread::sleep(Duration::from_micros(500));
@@ -398,7 +463,8 @@ mod tests {
         let lasted = start.elapsed();
         assert!(kept.wait_written(Duration::from_secs(10)));
         let writes = shared.writes.load(Ordering::Relaxed);
-        let per_keep = busy.as_secs_f64() / f64::from(changes) * 1e6;
+        // (each change told both ways: the colours, then the second)
+        let per_keep = busy.as_secs_f64() / f64::from(changes) / 2.0 * 1e6;
         let most = (lasted.as_millis() as u64 / COLOUR_WRITE_GAP_MS + 2) as u32;
         println!(
             "{changes} changes over {:.0} ms: {writes} writes (at most {most}); keep() {per_keep:.2} µs each",
@@ -409,13 +475,14 @@ mod tests {
         assert!(per_keep < 100.0, "keep() takes {per_keep:.2} µs: no disk on the caller's thread");
         let again = KeptColours::open(path(&dir));
         assert_eq!(again.brush(), last, "the last colour of the drag written");
+        assert_eq!(again.second(), last_second, "and the last second colour");
         drop(again);
 
         // a write: the small file renamed into place
         let n = 50;
         let t = Instant::now();
         for i in 0..n {
-            shared.write(&write_kept([i as f32 / 100.0, 0.5, 0.5], FIRST_MASK_COLOUR));
+            shared.write(&write_kept([i as f32 / 100.0, 0.5, 0.5], FIRST_MASK_COLOUR, FIRST_SECOND_COLOUR));
         }
         let per_write = t.elapsed().as_secs_f64() / f64::from(n) * 1e3;
         println!("a write takes {per_write:.3} ms");
@@ -433,13 +500,18 @@ mod tests {
         let kept = KeptColours::open(path(&dir));
         kept.keep(vec![0.1, 0.1, 0.1], vec![0.0, 0.0, 0.0]);
         kept.keep(vec![0.2, 0.2, 0.2], vec![0.0, 0.0, 0.0]);
+        kept.keep_second(vec![0.4, 0.4, 0.4]);
         drop(kept);
-        assert_eq!(KeptColours::open(path(&dir)).brush(), vec![0.2, 0.2, 0.2]);
+        let again = KeptColours::open(path(&dir));
+        assert_eq!((again.brush(), again.second()), (vec![0.2, 0.2, 0.2], vec![0.4, 0.4, 0.4]));
+        drop(again);
         let _ = std::fs::remove_dir_all(&dir);
 
         let memory = KeptColours::new();
         memory.keep(vec![0.3, 0.3, 0.3], vec![0.0, 0.0, 0.0]);
+        memory.keep_second(vec![0.6, 0.6, 0.6]);
         assert_eq!(memory.brush(), vec![0.3, 0.3, 0.3]);
+        assert_eq!(memory.second(), vec![0.6, 0.6, 0.6]);
         assert!(memory.wait_written(Duration::ZERO));
         assert_eq!(memory.shared.writes.load(Ordering::Relaxed), 0);
     }

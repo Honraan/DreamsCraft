@@ -81,8 +81,9 @@ final class CanvasModel {
         set { AppSettings.shared.colorMode = ColorMode.allCases.firstIndex(of: newValue) ?? 0 }
     }
     /// The second colour (0xRRGGBB), beside the current one in the colour panel: swapped with it,
-    /// and mixed in by brushes whose colour dynamics say so.
-    private(set) var secondaryRgb: UInt32 = 0xFFFFFF
+    /// and mixed in by brushes whose colour dynamics say so. Kept for the next start with the
+    /// others (white at first).
+    private(set) var secondaryRgb: UInt32 = CanvasModel.rgb(ofKept: CanvasModel.keptColours.second())
     /// The paint colour as hue (0..1), saturation and brightness.
     private(set) var hue: Float = 0
     private(set) var saturation: Float = 0
@@ -183,8 +184,9 @@ final class CanvasModel {
         return ColourHistory.open(path: support.appendingPathComponent("colour-history.json").path)
     }()
 
-    /// The brush colour and the masks', kept by the shared core in their file as each changes, so
-    /// the next start finds them however this run ends (killed, nothing runs on the way out).
+    /// The brush colour, the masks' and the second colour, kept by the shared core in their file as
+    /// each changes, so the next start finds them however this run ends (killed, nothing runs on
+    /// the way out).
     static let keptColours: KeptColours = {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory())
@@ -2200,12 +2202,21 @@ final class CanvasModel {
         setRgb(secondaryRgb)
         secondaryRgb = current
         pushSecondary()
+        let c = secondaryRgb
+        Self.keptColours.keepSecond(second: [16, 8, 0].map { Float((c >> UInt32($0)) & 0xFF) / 255 })
     }
 
     private func pushSecondary() {
         let c = secondaryRgb
         let channel = { (shift: UInt32) in Float((c >> shift) & 0xFF) / 255 }
         session.setSecondaryColor(r: channel(16), g: channel(8), b: channel(0))
+    }
+
+    /// The second colour (0xRRGGBB) from the red, green and blue (0..1) the core keeps it as; white
+    /// for anything that isn't three numbers.
+    static func rgb(ofKept kept: [Float]) -> UInt32 {
+        guard kept.count == 3, kept.allSatisfy({ $0.isFinite }) else { return 0xFFFFFF }
+        return kept.reduce(UInt32(0)) { ($0 << 8) | UInt32((min(max($1, 0), 1) * 255).rounded()) }
     }
 
     private func applyColor() {
