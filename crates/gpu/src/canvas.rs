@@ -3391,7 +3391,7 @@ pub struct Canvas {
     /// such render's work sent, to see whether it was done as the next began.
     tip_work: u64,
     tip_ceiling: u64,
-    tip_sent: Option<wgpu::SubmissionIndex>,
+    tip_sent: Option<crate::Sent>,
     tip_stamps: (u64, u64),
     /// Where stamps laid by their stroke's rule go before their part of the stroke takes them
     /// (see [`Canvas::lay_by_rule`]), made when first wanted.
@@ -3585,7 +3585,7 @@ pub struct Canvas {
     /// The last render that laid a stroke laid again, as sent (its submission, when it was sent, and
     /// how much work), until it is seen done; the most work the next such render lays (see
     /// [`RELAY_GPU_MS`]); and whether it is held to that, its work sent as it is recorded.
-    relay_sent: Option<(wgpu::SubmissionIndex, std::time::Instant, u64)>,
+    relay_sent: Option<(crate::Sent, std::time::Instant, u64)>,
     relay_budget: u64,
     relay_paced: bool,
     /// Paint laid in place left for the next render (see [`PACED_MOST_MS`]); the last render that
@@ -3593,14 +3593,14 @@ pub struct Canvas {
     /// the GPU got through that (work a millisecond, at least, see [`seen_rate`]); and how much of
     /// such work the last render left.
     catching_up: bool,
-    in_place_sent: Option<(wgpu::SubmissionIndex, std::time::Instant, u64)>,
+    in_place_sent: Option<(crate::Sent, std::time::Instant, u64)>,
     in_place_rate: Option<f64>,
     in_place_paced: bool,
     in_place_rate_set: Option<f64>,
     in_place_held: u64,
     /// As those for paint laid in place, for the stamps laid in a stroke's textures; and the most
     /// such work a render that shows the canvas has laid: for tests.
-    dry_sent: Option<(wgpu::SubmissionIndex, std::time::Instant, u64)>,
+    dry_sent: Option<(crate::Sent, std::time::Instant, u64)>,
     dry_rate: Option<f64>,
     dry_rate_set: Option<f64>,
     dry_paced: bool,
@@ -3892,7 +3892,9 @@ impl Canvas {
                 (t, v)
             }
         };
-        let composite = texture(gpu, "composite", width, height, LAYER_FORMAT);
+        // (a test's canvas refused: its composite asked wider than the GPU allows)
+        let composite_width = if gpu.refuses_canvases() { max.saturating_add(1) } else { width };
+        let composite = texture(gpu, "composite", composite_width, height, LAYER_FORMAT);
         let composite_view = composite.create_view(&wgpu::TextureViewDescriptor::default());
         let (shape_images, grain_images) =
             if images { (textures::shapes(), textures::grains()) } else { (Vec::new(), Vec::new()) };
@@ -5560,11 +5562,7 @@ impl Canvas {
     /// [`seen_rate`]).
     fn in_place_most(&mut self, gpu: &Gpu, shown: bool, queued: u64) -> u64 {
         if let Some((index, sent, work)) = self.in_place_sent.take() {
-            let now = wgpu::PollType::Wait {
-                submission_index: Some(index.clone()),
-                timeout: Some(std::time::Duration::ZERO),
-            };
-            if crate::poll(&gpu.device, now).is_ok() {
+            if gpu.finished(&index) {
                 self.in_place_rate = Some(seen_rate(work, sent.elapsed().as_secs_f64() * 1000.0));
             } else {
                 self.in_place_sent = Some((index, sent, work));
@@ -5580,11 +5578,7 @@ impl Canvas {
     /// does for paint laid in place, [`DRY_LEAST`] at least.
     fn dry_most(&mut self, gpu: &Gpu, shown: bool, queued: u64) -> u64 {
         if let Some((index, sent, work)) = self.dry_sent.take() {
-            let now = wgpu::PollType::Wait {
-                submission_index: Some(index.clone()),
-                timeout: Some(std::time::Duration::ZERO),
-            };
-            if crate::poll(&gpu.device, now).is_ok() {
+            if gpu.finished(&index) {
                 self.dry_rate = Some(seen_rate(work, sent.elapsed().as_secs_f64() * 1000.0));
             } else {
                 self.dry_sent = Some((index, sent, work));
@@ -5641,11 +5635,7 @@ impl Canvas {
     /// was sent (frames laying it come one after another, so it is seen done soon after).
     fn relay_most(&mut self, gpu: &Gpu) -> u64 {
         if let Some((index, sent, work)) = self.relay_sent.take() {
-            let now = wgpu::PollType::Wait {
-                submission_index: Some(index.clone()),
-                timeout: Some(std::time::Duration::ZERO),
-            };
-            if crate::poll(&gpu.device, now).is_ok() {
+            if gpu.finished(&index) {
                 self.relay_budget = relay_budget(work, sent.elapsed().as_secs_f64() * 1000.0);
             } else {
                 self.relay_sent = Some((index, sent, work));
@@ -8791,22 +8781,32 @@ impl Canvas {
         }
         // (how fast the GPU gets through paint laid in place is seen once this is done: from when
         // this began, as OpenGL does much of the work as it is sent)
-        if in_place_laid > 0 && self.in_place_sent.is_none() {
-            self.in_place_sent = Some((sent.clone(), started, in_place_laid));
-        }
-        if dry_laid > 0 && self.dry_sent.is_none() {
-            self.dry_sent = Some((sent.clone(), started, dry_laid));
-        }
-        if target_shown {
-            self.tip_sent = Some(sent.clone());
+        let looked_at = (in_place_laid > 0 && self.in_place_sent.is_none())
+            || (dry_laid > 0 && self.dry_sent.is_none())
+            || target_shown
+            || (relay_laid > 0 && self.relay_sent.is_none());
+        let tracked = looked_at.then(|| gpu.sent());
+        if let Some(tracked) = tracked.as_ref() {
+            if in_place_laid > 0 && self.in_place_sent.is_none() {
+                self.in_place_sent = Some((tracked.clone(), started, in_place_laid));
+            }
+            if dry_laid > 0 && self.dry_sent.is_none() {
+                self.dry_sent = Some((tracked.clone(), started, dry_laid));
+            }
+            if target_shown {
+                self.tip_sent = Some(tracked.clone());
+            }
         }
         if target_shown {
             self.dry_laid_most = self.dry_laid_most.max(dry_laid);
         }
         // what is left for the renders after: what comes before the next is what came since
         (self.in_place_held, self.dry_held) = paced_work(&self.ops, full);
-        if relay_laid > 0 && self.relay_sent.is_none() {
-            self.relay_sent = Some((sent.clone(), std::time::Instant::now(), relay_laid));
+        if relay_laid > 0
+            && self.relay_sent.is_none()
+            && let Some(tracked) = tracked
+        {
+            self.relay_sent = Some((tracked, std::time::Instant::now(), relay_laid));
         }
         self.wait_if_paced(gpu, sent, at, true);
         self.renders = self.renders.wrapping_add(1);
@@ -14416,9 +14416,8 @@ impl Canvas {
     /// A render that shows the canvas begins: the work the tips get grows if the GPU had done the
     /// last such render by now, and halves if it hadn't (see [`TIP_WORK_FIRST`]).
     fn keep_tips_to_the_gpu(&mut self, gpu: &Gpu) {
-        let Some(index) = self.tip_sent.take() else { return };
-        let now = wgpu::PollType::Wait { submission_index: Some(index), timeout: Some(std::time::Duration::ZERO) };
-        if crate::poll(&gpu.device, now).is_ok() {
+        let Some(sent) = self.tip_sent.take() else { return };
+        if gpu.finished(&sent) {
             self.tip_ceiling = self.tip_ceiling.saturating_add(self.tip_ceiling / 500).min(TIP_WORK_MOST);
             let most = self.tip_ceiling / 4 * 3;
             self.tip_work = self.tip_work.saturating_add(self.tip_work / 16).min(most).max(TIP_WORK_LEAST);

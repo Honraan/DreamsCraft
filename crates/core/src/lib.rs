@@ -69,6 +69,8 @@ mod layer_ops;
 mod layer_store;
 mod layers;
 mod layout;
+#[cfg(test)]
+mod limited_gpu_tests;
 mod liquify;
 mod liquify_steps;
 mod list_slider;
@@ -1990,13 +1992,24 @@ impl Shared {
     /// seconds, and the app's own thread would wait that long on any call. Each layer is copied
     /// out (and decoded) as it goes, so what was opened stays in the state (a save meanwhile still
     /// has it); if the document or what was opened changed meanwhile, the canvas is made again
-    /// under the hold.
+    /// under the hold. One that can't be made is told to the app (see
+    /// [`Shared::tell_canvas_failed`]).
     #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
     pub(crate) fn make_canvas(&self) {
+        if let Err(e) = self.make_canvas_untold() {
+            self.tell_canvas_failed(&e);
+        }
+    }
+
+    /// [`Shared::make_canvas`], what went wrong handed back and not yet told: none is made again on
+    /// this device (another device's makes it, see `device::lost::canvas_failed`), and what was
+    /// opened stays.
+    #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+    pub(crate) fn make_canvas_untold(&self) -> Result<(), procraft_gpu::GpuError> {
         let (gpu, doc, ids) = {
             let st = self.lock();
             let Some(gpu) = st.gpu.as_ref().filter(|_| st.canvas.is_none() && !st.closed && !st.pixels_lost) else {
-                return;
+                return Ok(());
             };
             (gpu.clone(), st.doc.clone(), st.pending_pixels.iter().map(|(id, _)| *id).collect::<Vec<_>>())
         };
@@ -2013,7 +2026,7 @@ impl Shared {
         let made = canvas_of_opened(&gpu, &doc, &ids, opened, read);
         let mut st = self.lock();
         if st.canvas.is_some() {
-            return;
+            return Ok(());
         }
         let same = st.doc == doc && st.pending_pixels.iter().map(|(id, _)| *id).eq(ids.iter().copied());
         match made {
@@ -2031,12 +2044,23 @@ impl Shared {
                 st.ensure_canvas();
             }
             Err(e) => {
-                log::error!("canvas: {e}");
-                st.error = Some(e.to_string());
+                log::warn!("canvas: {e}");
                 st.canvas_failed = true;
-                st.open_mark = None;
+                return Err(e);
             }
         }
+        Ok(())
+    }
+
+    /// The canvas couldn't be made (`e`): the app is told (its info's `error`: this device's
+    /// graphics can't draw it), and what was opened stays.
+    #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+    pub(crate) fn tell_canvas_failed(&self, e: &procraft_gpu::GpuError) {
+        log::error!("canvas: {e}");
+        let mut st = self.lock();
+        st.error = Some(e.to_string());
+        st.canvas_failed = true;
+        st.open_mark = None;
     }
 }
 
