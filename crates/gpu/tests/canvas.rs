@@ -6518,3 +6518,94 @@ fn a_gpu_laying_the_carried_rule_pass_wrong_lays_dual_brushes_by_the_plain_pass(
     // itself (up to 580 ms beside other builds and tests), 83 to 112 ms on the Adreno 750
     assert!(ms_here.unwrap() < 1500.0 && ms_wrong.unwrap() < 1500.0, "the check took {ms_here:?} and {ms_wrong:?} ms");
 }
+
+/// On a device of little memory (a canvas given the layers' budget a 4 GB phone gets) a dual brush
+/// laid by its rule isn't carried: neither part's full floats are made (four layers' worth each,
+/// made at the stroke's start: a 4 GB phone's Mali lost its device a few seconds into every such
+/// stroke), nor is the carry checked, and the stroke comes out as the plain rule pass lays it,
+/// pixel for pixel. Without a budget (a tablet of more memory, the desktop) it is carried as before.
+#[test]
+fn a_device_of_little_memory_lays_dual_brushes_without_carrying_them() {
+    use procraft_gpu::SecondStroke;
+    let side = 256u32;
+    let stamps = |n: usize, second: bool| -> Vec<Stamp> {
+        (0..n)
+            .map(|i| {
+                let t = i as f32 + if second { 0.5 } else { 0.0 };
+                let x = 20.0 + (t * 0.7) % 216.0;
+                let y = 128.0 + (t * 0.04).sin() * 80.0 + if second { (t * 0.31).cos() * 10.0 } else { 0.0 };
+                let radius = 6.0 + 20.0 * (t * 0.023).sin().abs() + if second { 4.0 } else { 0.0 };
+                Stamp {
+                    transfer: 0.3 + 0.7 * (t * 0.07).cos().abs(),
+                    time_ms: f64::from(t) * 4.0,
+                    ..Stamp::round(Vec2::new(x, y), radius, 0.15 + 0.8 * (t * 0.061).cos().abs())
+                }
+            })
+            .collect()
+    };
+    let first =
+        StrokeStyle { rendering: Rendering::Gradual, ..StrokeStyle::new(StrokeTool::Paint, [0.7, 0.25, 0.1], 1.0) };
+    let second = StrokeStyle {
+        rendering: Rendering::Capped,
+        hardness: 0.6,
+        ..StrokeStyle::new(StrokeTool::Paint, [0.1, 0.3, 0.8], 1.0)
+    };
+    // the layer once the stroke, drawn a few stamps a frame, ends; the most the canvas's textures
+    // took while it was drawn over what they took before; how many of them held full floats then;
+    // and what the carry's check found
+    let laid = |budget: u64, carry: Option<bool>| -> Option<(Vec<u8>, u64, usize, Option<bool>)> {
+        let gpu = gpu()?;
+        let _check = NoErrors(&gpu);
+        if let Some(carry) = carry {
+            gpu.settle_carry(carry);
+        }
+        let mut doc = Document::new(side, side);
+        let mut canvas = Canvas::new(&gpu, &doc).unwrap();
+        canvas.set_resident_budget(budget);
+        canvas.render(&gpu, &mut doc, None);
+        let before = canvas.texture_bytes();
+        canvas.begin_dual_stroke(
+            doc.current(),
+            first,
+            SecondStroke { style: second, mode: 1, threshold: -1.0, classic: false },
+        );
+        let (mut most, mut full) = (before, 0);
+        for (f, s) in stamps(240, false).chunks(8).zip(stamps(240, true).chunks(8)) {
+            canvas.add_second_stamps(s);
+            canvas.add_stamps(f);
+            canvas.render(&gpu, &mut doc, None);
+            most = most.max(canvas.texture_bytes());
+            full = full.max(canvas.textures().iter().filter(|t| t.format() == wgpu::TextureFormat::Rgba32Uint).count());
+        }
+        canvas.end_stroke();
+        canvas.render(&gpu, &mut doc, None);
+        Some((canvas.read_layer(&gpu, doc.current()).unwrap(), most - before, full, gpu.carry_checked()))
+    };
+    // a 4 GB phone's: a quarter of its memory, less what the canvas holds besides its layers
+    let phone = 900u64 << 20;
+    let Some((plain, plain_more, plain_full, _)) = laid(0, Some(false)) else { return };
+    let (carried, carried_more, carried_full, carried_check) = laid(0, None).unwrap();
+    let (low, low_more, low_full, low_check) = laid(phone, None).unwrap();
+    let layer = u64::from(side * side) * 4;
+    let apart = |a: &[u8], b: &[u8]| a.chunks(4).zip(b.chunks(4)).filter(|(x, y)| x != y).count();
+    let most = |a: &[u8], b: &[u8]| a.iter().zip(b).map(|(x, y)| x.abs_diff(*y)).max().unwrap_or(0);
+    println!(
+        "while the stroke is drawn, in layers' worth: plain pass +{:.1}, carried +{:.1} ({carried_full} \
+         full-float textures), little memory +{:.1} ({low_full}); little memory {} px apart from the plain pass",
+        plain_more as f64 / layer as f64,
+        carried_more as f64 / layer as f64,
+        low_more as f64 / layer as f64,
+        apart(&low, &plain)
+    );
+    assert!(plain.chunks(4).filter(|p| p[3] > 0).count() > 5000, "little laid");
+    assert_eq!(plain_full, 0, "the plain pass holds no full floats");
+    // carried as before where memory isn't short: both parts' full floats, four layers' worth each
+    assert_eq!((carried_check, carried_full), (Some(true), 2));
+    assert!(carried_more >= plain_more + 8 * layer, "carried: +{carried_more} bytes, plain +{plain_more}");
+    // (within the level here and there a stroke laid whole again as it ends comes to)
+    assert!(most(&carried, &plain) <= 1, "carried unlike the plain pass");
+    // short of memory: no full floats, no check, the plain pass's pixels
+    assert_eq!((low_check, low_full), (None, 0));
+    assert!(low_more + 8 * layer <= carried_more, "little memory: +{low_more} bytes, carried +{carried_more}");
+    assert_eq!(apart(&low, &plain), 0, "little memory lays the stroke as the plain pass does");
+}

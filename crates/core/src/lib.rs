@@ -72,6 +72,7 @@ mod layout;
 mod liquify;
 mod liquify_steps;
 mod list_slider;
+mod lost;
 #[cfg(test)]
 mod low_storage_tests;
 mod modes;
@@ -859,6 +860,9 @@ pub(crate) struct State {
     pub(crate) pending_stores: Vec<(procraft_engine::document::LayerId, Vec<u8>)>,
     /// The canvas couldn't be made from these pixels (a failure elsewhere doesn't stop the next try).
     pub(crate) canvas_failed: bool,
+    /// The canvas holding the artwork's pixels went with a lost GPU device (see `lost.rs`): none is
+    /// made and nothing is saved until the artwork is opened again from its folder.
+    pub(crate) pixels_lost: bool,
     /// The artwork opened from its folder, noted as being opened until it shows, its canvas fails
     /// (told), or the session goes: one the app ended while opening is told when next picked.
     pub(crate) open_mark: Option<open_marks::Mark>,
@@ -1405,8 +1409,9 @@ impl State {
     /// on it (or kept compressed, past what fits) as it is decoded (see [`canvas_of_opened`]).
     #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
     pub(crate) fn ensure_canvas(&mut self) {
-        // one that couldn't be made isn't made again: what was opened stays, and a save writes it
-        if self.canvas.is_some() || self.closed || self.canvas_failed {
+        // one that couldn't be made isn't made again: what was opened stays, and a save writes it;
+        // nor one whose pixels went with a lost device (it would be empty)
+        if self.canvas.is_some() || self.closed || self.canvas_failed || self.pixels_lost {
             return;
         }
         let Some(gpu) = self.gpu.clone() else { return };
@@ -1764,6 +1769,9 @@ pub(crate) struct Shared {
     /// The folders the plugins name, told of each save (interface 22); none until the plugins are
     /// taken up ([`CanvasSession::use_plugins`]).
     pub(crate) folders: Mutex<Option<Arc<folders::Folders>>>,
+    /// How many times the artwork was opened again from its folder after its GPU device was lost
+    /// (see `lost.rs`), for the apps to read their layers and thumbnails again.
+    pub(crate) reopened: std::sync::atomic::AtomicU64,
 }
 
 /// Pen input waiting for the canvas (see [`Shared::queued`]): the stroke's samples in order (those
@@ -1957,7 +1965,9 @@ impl Shared {
     pub(crate) fn make_canvas(&self) {
         let (gpu, doc, ids) = {
             let st = self.lock();
-            let Some(gpu) = st.gpu.as_ref().filter(|_| st.canvas.is_none() && !st.closed) else { return };
+            let Some(gpu) = st.gpu.as_ref().filter(|_| st.canvas.is_none() && !st.closed && !st.pixels_lost) else {
+                return;
+            };
             (gpu.clone(), st.doc.clone(), st.pending_pixels.iter().map(|(id, _)| *id).collect::<Vec<_>>())
         };
         // none if the artwork changed meanwhile: what is made is let go
@@ -1983,7 +1993,10 @@ impl Shared {
                 st.canvas = Some(c);
                 st.put_opened_stores(&hashes);
             }
-            Ok((_, _, unread)) => {
+            Ok((stale, _, unread)) => {
+                // let go of before the next is made: two canvases at once took a 4 GB phone's GPU
+                // past what it had, and its device was lost
+                drop(stale);
                 st.layers_unread(unread);
                 st.ensure_canvas();
             }
@@ -2132,6 +2145,8 @@ fn canvas_of_opened(
             c.parked_layers(),
             copies / 1024
         );
+        // (a device lost soon after this was lost by its opening: see `device::lost`)
+        device::canvas_made();
         Ok((c, hashes, unread))
     });
     made.and_then(|made| made)
@@ -2376,6 +2391,7 @@ impl CanvasSession {
             name,
             pending_pixels: project::opened(pixels),
             canvas_failed: false,
+            pixels_lost: false,
             open_mark: None,
             unreadable: std::collections::HashSet::new(),
             unreadable_untold: Vec::new(),
@@ -2418,6 +2434,7 @@ impl CanvasSession {
                 lands_on: pour::LandsOn::default(),
                 _alive: activity::Alive::new(),
                 folders: Mutex::new(None),
+                reopened: std::sync::atomic::AtomicU64::new(0),
             }),
         })
     }
@@ -2526,7 +2543,7 @@ impl CanvasSession {
         st.end_reveal();
         // the graphics stopped (perhaps while the app was away, its notice long gone): nothing
         // drawn will show, so each stroke tells it again
-        if st.gpu.as_ref().is_some_and(Gpu::is_lost) {
+        if st.lost_device() {
             st.crop_edit.lost_told = false;
         }
         if let Some(kept) = st.pad_strokes.as_mut() {

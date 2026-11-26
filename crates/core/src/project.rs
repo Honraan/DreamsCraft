@@ -35,6 +35,10 @@ pub enum Leaving {
     /// It couldn't be saved: it stays open, with what to ask (a title and what it says): stay (the
     /// default), or leave without saving, which loses what wasn't saved.
     Stays { title: String, message: String },
+    /// Its GPU device was lost, and what it held with it: nothing more can be saved, so it is left
+    /// as its folder has it (as last saved, never written over), and the canvas may go. What it
+    /// says tells that plainly, once, as it is left.
+    Lost { message: String },
 }
 /// How long after a change an open artwork kept saved looks for what to save (it waits for a
 /// change first: nothing changing, it never looks).
@@ -388,6 +392,19 @@ impl Saved {
     pub(crate) fn read(&mut self, id: LayerId, hash: u64) {
         self.layers.insert(id, hash);
     }
+
+    /// The folder the artwork was opened from or last saved into; empty before either.
+    pub(crate) fn folder(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The artwork opened again from its folder in place (see `lost.rs`): what the folder holds is
+    /// as `fresh`, that open, found it; the autosave running goes on.
+    pub(crate) fn reopened(&mut self, fresh: Saved) {
+        let autosave = self.autosave;
+        *self = fresh;
+        self.autosave = autosave;
+    }
 }
 
 /// A quick hash of pixels, to tell a changed layer from one saved already.
@@ -466,6 +483,11 @@ impl crate::State {
             let there = known.get(&id) == Some(&hash) && layer_path(dir, id).exists();
             (!there).then_some((id, hash, rgba))
         };
+        // a device lost read back nothing true, and a canvas that went with one held the pixels:
+        // nothing is saved, and the folder keeps the last save as it is
+        if self.lost_device() {
+            return Err(file_error("reading the layers", "the graphics device was lost"));
+        }
         // the time on it up to now saved with it
         self.count_tracked_time();
         let model = self.model_snapshot()?;
@@ -818,9 +840,13 @@ impl CanvasSession {
                     unsaved = None;
                     continue;
                 }
-                let lost = || session.shared.lock().gpu.as_ref().is_some_and(procraft_gpu::Gpu::is_lost);
+                // a device lost holds nothing to save: the last save stands, and the autosave waits for
+                // the next change, which comes once the artwork is opened again on a new device
+                // (see `lost.rs`)
+                let lost = || session.shared.lock().lost_device();
                 if lost() {
-                    return;
+                    unsaved = None;
+                    continue;
                 }
                 // (strokes, which come and go, the save waits for itself, reading ahead meanwhile)
                 if !session.shared.lock().settled() {
@@ -832,7 +858,8 @@ impl CanvasSession {
                 let result = session.save_if_idle_with(&mut saved, &dir);
                 // lost during the save: that is what failed it, and it tells of itself
                 if result.is_err() && lost() {
-                    return;
+                    unsaved = None;
+                    continue;
                 }
                 let mut failure = session.shared.save_failure.lock().unwrap_or_else(|e| e.into_inner());
                 match result {
@@ -1485,9 +1512,16 @@ impl CanvasSession {
     /// that is only in memory: one that can't be saved (the storage full, say) [`Leaving::Stays`]
     /// open, painting from memory and kept saved again (what wasn't saved goes at the autosave's next
     /// look, once there is room), with what to ask: stay, or leave without saving, which loses it.
-    /// The apps all leave so; only the system ending the app can lose it.
+    /// The apps all leave so; only the system ending the app can lose it. One whose GPU device was
+    /// lost (and what was painted since its last save with it) is [`Leaving::Lost`] at once, as
+    /// its folder has it: staying could never save it (see `lost.rs`).
     pub fn save_to_leave(self: Arc<Self>, dir: String) -> Leaving {
         self.stop_autosave();
+        // the device lost: nothing more can be saved, and staying would save nothing either; left
+        // as last saved (told, unless nothing changed since)
+        if let Some(left) = self.leave_lost(Path::new(&dir)) {
+            return left;
+        }
         let mut failed = None;
         for _ in 0..LEAVE_SAVES {
             match self.save(dir.clone()) {
@@ -1534,7 +1568,11 @@ impl CanvasSession {
     /// whichever comes first, as a driver that takes the app down on another may), else one of its
     /// own; false if there is none.
     pub fn prepare_offscreen(&self) -> bool {
-        let app = crate::device::kept().clone();
+        // (a lost one can't draw: made again, else one of its own)
+        if crate::device::kept().as_ref().is_some_and(procraft_gpu::Gpu::is_lost) {
+            crate::device::warm_gpu();
+        }
+        let app = crate::device::kept().clone().filter(|g| !g.is_lost());
         let mut st = self.shared.lock();
         if st.gpu.is_none() {
             match app.map_or_else(procraft_gpu::Gpu::headless, Ok) {

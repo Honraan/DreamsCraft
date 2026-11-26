@@ -1734,6 +1734,15 @@ impl App {
                 }
                 false
             }
+            // the graphics stopped: nothing more can be saved, nor would staying save it; left as
+            // last saved (its folder never written over), and said so
+            procraft_core::Leaving::Lost { message } => {
+                log::warn!("left with the GPU device lost: {message}");
+                if then.is_some() {
+                    files::tell("The graphics stopped working", &message);
+                }
+                true
+            }
         }
     }
 

@@ -23810,7 +23810,9 @@ fn run_loop_timed(s: &CanvasSession, mode: u8, refreshes: Option<crate::pacing::
         st.needs_frame = true;
     }
     let running = std::sync::Arc::clone(&shared);
-    let thread = std::thread::spawn(move || crate::frame_loop::draw_loop(&running, &mut screen, || {}));
+    let thread = std::thread::spawn(move || {
+        crate::frame_loop::draw_loop(&running, &mut screen, || {});
+    });
     LoopRunning { shared, thread: Some(thread), mode, configures, presented }
 }
 

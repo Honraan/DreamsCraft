@@ -699,8 +699,24 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     private val failureWatch = WhileNeeded(viewModelScope, SAVE_FAILURE_POLL_MS, Dispatchers.IO) {
         val s = session ?: return@WhileNeeded false
         s.takeSaveFailure()?.let { told(Result.failure(Exception(it))) }
+        // opened again from its folder after the graphics stopped: its layers read again
+        val reopened = s.reopenedAfterLoss()
+        if (reopened != reopenedSeen) withContext(Dispatchers.Main) { if (session === s) reopenedAgain(reopened) }
         s.takeFailure()?.let { withContext(Dispatchers.Main) { showNotice(it, warning = true) } }
         session === s && s.editsSaved() != s.edits()
+    }
+
+    /** How many times the open artwork was opened again after the graphics stopped, as last read. */
+    private var reopenedSeen = 0uL
+
+    /** The open artwork was opened again from its folder after the graphics stopped ([count] times): its layers, thumbnails and undo state read again. */
+    private fun reopenedAgain(count: ULong) {
+        reopenedSeen = count
+        thumbnails.clear()
+        thumbnailVersions.clear()
+        refresh()
+        refreshView()
+        if (layersShown) refreshThumbnails()
     }
 
     /**
@@ -3790,6 +3806,12 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                     resumeTracking()
                     leaveUnsaved = LeaveUnsaved(outcome.title, outcome.message, then)
                 }
+                is io.github.artcraftandroid.procraft.core.Leaving.Lost -> {
+                    // the graphics stopped: nothing more can be saved, nor would staying save it; left
+                    // as last saved (its folder never written over), and said so once
+                    leave(s, dir, saved = false, then)
+                    message = outcome.message
+                }
             }
         }
     }
@@ -4177,6 +4199,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         if (!brushesLoaded) loadBrushes(s)
         s.useColourHistory(colourHistory)
         session = s
+        reopenedSeen = s.reopenedAfterLoss()
         val model = s.modelInfo()
         modelOpen = model != null
         textureSets = model?.textureSets ?: emptyList()

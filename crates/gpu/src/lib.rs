@@ -33,7 +33,7 @@ pub use canvas::{
     textures_bytes,
 };
 pub use canvas::{CanvasPaper, CarryFault, GREY_LOOK, ViewLook};
-pub use kept::keep_pipelines_in;
+pub use kept::{forget_kept_pipelines, keep_pipelines_for, keep_pipelines_in};
 pub use lighting::Lighting;
 pub use scene::{
     GrainLook, Light, MOST_LIGHTS, MaterialLook, MeshView, Orbit, ShownSelection, SurfaceMap, material_source,
@@ -299,6 +299,10 @@ pub struct Gpu {
     errors: Arc<AtomicU64>,
     /// Whether the device has been lost (its driver reset or stopped).
     lost: Arc<AtomicBool>,
+    /// When it was lost, as the driver told it (see [`Gpu::lost_at`]).
+    lost_at: Arc<OnceLock<std::time::Instant>>,
+    /// Whether its loss has been taken into account (see [`Gpu::take_loss`]).
+    loss_taken: Arc<AtomicBool>,
     /// The canvases' pipelines, once the first canvas has made them.
     canvas_pipelines: Arc<OnceLock<Arc<canvas::Pipelines>>>,
     /// The pipeline cache kept between runs (see [`kept`]), once the canvases' pipelines are made
@@ -631,8 +635,10 @@ impl Gpu {
         }));
         // a device lost keeps nothing it held: what its textures had is gone
         let lost = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&lost);
+        let lost_at = Arc::new(OnceLock::new());
+        let (flag, when) = (Arc::clone(&lost), Arc::clone(&lost_at));
         device.set_device_lost_callback(move |reason, message| {
+            let _ = when.set(std::time::Instant::now());
             flag.store(true, Ordering::Relaxed);
             log::error!("GPU lost ({reason:?}): {message}");
         });
@@ -643,6 +649,8 @@ impl Gpu {
             queue,
             errors,
             lost,
+            lost_at,
+            loss_taken: Arc::default(),
             canvas_pipelines: Arc::default(),
             kept: Arc::default(),
             readbacks: Arc::default(),
@@ -706,6 +714,23 @@ impl Gpu {
         self.lost.load(Ordering::Relaxed)
     }
 
+    /// When the device was lost, if it has been (as its driver told it, which can be before the
+    /// app first finds out).
+    pub fn lost_at(&self) -> Option<std::time::Instant> {
+        self.lost_at.get().copied()
+    }
+
+    /// The backend the device was made from.
+    pub fn backend(&self) -> wgpu::Backend {
+        self.adapter.get_info().backend
+    }
+
+    /// Whether the device is lost and this is the first time that is asked (by any of its clones):
+    /// so each loss is counted once, whoever finds it.
+    pub fn take_loss(&self) -> bool {
+        self.is_lost() && !self.loss_taken.swap(true, Ordering::Relaxed)
+    }
+
     /// Runs `work`, waits for what it sent the GPU, and says whether any of it went wrong: a
     /// texture or buffer there was no memory for (made all the same, but holding nothing), work
     /// that used one (left undone: a copy into it copies nothing), the device lost meanwhile, or
@@ -752,9 +777,9 @@ impl Gpu {
     /// compiled form kept by an earlier run, where there is one (see [`keep_pipelines_in`]).
     pub(crate) fn canvas_pipelines(&self) -> Arc<canvas::Pipelines> {
         Arc::clone(self.canvas_pipelines.get_or_init(|| {
-            let kept = self
-                .kept
-                .get_or_init(|| kept::folder().and_then(|dir| kept::Kept::open(&self.device, &self.adapter, &dir)));
+            let kept = self.kept.get_or_init(|| {
+                kept::folder().and_then(|(dir, build)| kept::Kept::open(&self.device, &self.adapter, &dir, &build))
+            });
             let abilities = canvas::Abilities::of(self);
             let pipelines = canvas::Pipelines::new(&self.device, abilities, kept.as_ref().map(|k| k.cache.clone()));
             if let Some(kept) = kept {

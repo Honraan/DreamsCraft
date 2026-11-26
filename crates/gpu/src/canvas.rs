@@ -4558,7 +4558,10 @@ impl Canvas {
     /// Whether the open stroke's part (`second`: its second) is carried from lot to lot (see
     /// [`Carried`]): a dual brush's laid by its rule in the stroke's textures (neither part laid in
     /// place, nor its stroke onto an adjustment's mask), where the GPU's compute passes lay it as
-    /// the plain pass does (checked the first time, see `carry_check.rs`).
+    /// the plain pass does (checked the first time, see `carry_check.rs`), and not on a device of
+    /// little memory: what a part is carried in is four layers' worth, made at the stroke's start,
+    /// and a 4 GB phone's Mali lost its device a few seconds into every stroke that made them for
+    /// both parts. There the stroke's end lays it whole again, as before there was a carry.
     fn carries(&self, second: bool) -> bool {
         let Some(active) = self.active else { return false };
         let Some(dual) = active.second else { return false };
@@ -4570,6 +4573,7 @@ impl Canvas {
             && self.pipelines.compute.is_some()
             && self.pipelines.fragments.is_none()
             && !self.carry_refused
+            && !self.low_memory()
             && (self.checking_carry || self.gpu.carries_rule())
     }
 

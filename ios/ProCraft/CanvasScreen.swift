@@ -1130,6 +1130,12 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
                     AppLog.error("save", "the artwork couldn't be saved to leave it: \(message)")
                     model.resumeTracking()
                     model.leaveUnsaved = (title, message)
+                case let .lost(message):
+                    // the graphics stopped: nothing more can be saved, nor would staying save it; left
+                    // as last saved (its folder never written over), and said so
+                    AppLog.error("save", "left with the GPU device lost: \(message)")
+                    self.leaveCanvas(saved: false)
+                    GalleryModel.shared.message = message
                 }
             }
         }

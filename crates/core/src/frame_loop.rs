@@ -98,9 +98,19 @@ const RETRY_MOST: Duration = Duration::from_millis(250);
 /// A frame that holds the canvas longer than this is logged: touches wait on it.
 const SLOW_FRAME: Duration = Duration::from_millis(200);
 
-/// Draws frames into `screen` as they are asked for until the session says stop; `presented` is
-/// called after each frame is shown.
-pub(crate) fn draw_loop<S: Screen>(shared: &Shared, screen: &mut S, mut presented: impl FnMut()) {
+/// Why the render loop ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ended {
+    /// The session said stop (the window is going).
+    Stopped,
+    /// The GPU device was lost while the canvas showed: nothing it holds draws again, so the
+    /// render thread makes a new one (see `render.rs`).
+    Lost,
+}
+
+/// Draws frames into `screen` as they are asked for until the session says stop, or its device is
+/// lost while the canvas shows; `presented` is called after each frame is shown.
+pub(crate) fn draw_loop<S: Screen>(shared: &Shared, screen: &mut S, mut presented: impl FnMut()) -> Ended {
     // the format and colours the surface was last configured for, and whether it asked for wide
     // colour
     let mut configured: Option<(wgpu::TextureFormat, Profile)> = None;
@@ -124,11 +134,16 @@ pub(crate) fn draw_loop<S: Screen>(shared: &Shared, screen: &mut S, mut presente
             let mut st = shared.lock();
             loop {
                 // nothing is drawn while the app is away, and a device lost draws nothing again:
-                // there is only its stopping to wait for
+                // shown, it is handed back to be made anew; away, there is only the app's return or
+                // the window's stop to wait for
                 // (pen input waiting for the canvas asks for one; none while frames are held, the
                 // canvas being redrawn a stroke at a time: its end asks for one)
                 let wanted = |st: &crate::State| !st.holding_frames && (st.needs_frame || shared.input_waiting());
-                while !st.stop && (st.hidden || !wanted(&st) || st.gpu.as_ref().is_some_and(Gpu::is_lost)) {
+                let lost = |st: &crate::State| st.gpu.as_ref().is_some_and(Gpu::is_lost);
+                while !st.stop && (st.hidden || !wanted(&st) || lost(&st)) {
+                    if !st.hidden && lost(&st) {
+                        return Ended::Lost;
+                    }
                     // the GPU's end of the last frame looked for first, a little while at most
                     if let Some(again) = look_at_gpu(screen, &mut pacer, Instant::now(), None) {
                         _ = shared.wake.wait_until(&mut st, again);
@@ -197,7 +212,7 @@ pub(crate) fn draw_loop<S: Screen>(shared: &Shared, screen: &mut S, mut presente
             last_frame = Some(Instant::now());
             shared.took_back();
             if st.stop {
-                break;
+                return Ended::Stopped;
             }
             (st.window_size, std::mem::replace(&mut st.reconfigure, false), st.wide_colour())
         };
@@ -205,7 +220,7 @@ pub(crate) fn draw_loop<S: Screen>(shared: &Shared, screen: &mut S, mut presente
         // changed, or the app's setting)
         if reconfigure || configured.is_none() || wants_wide != wide {
             let st = shared.lock();
-            let Some(gpu) = st.gpu.as_ref() else { break };
+            let Some(gpu) = st.gpu.as_ref() else { return Ended::Stopped };
             configured = screen.configure(gpu, size, wants_wide);
             wide = wants_wide;
         }

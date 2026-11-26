@@ -215,7 +215,7 @@ impl CanvasSession {
                 return Some(crate::project::unreadable_said(&names));
             }
         }
-        if st.gpu.as_ref().is_some_and(Gpu::is_lost) && !std::mem::replace(&mut st.crop_edit.lost_told, true) {
+        if st.lost_device() && !std::mem::replace(&mut st.crop_edit.lost_told, true) {
             st.crop_edit.failure = None;
             return Some(LOST_SAID.to_owned());
         }

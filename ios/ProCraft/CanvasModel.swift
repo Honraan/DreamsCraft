@@ -2691,9 +2691,14 @@ final class CanvasModel {
             // off the main thread: a big artwork's first frame holds the session a while
             DispatchQueue.global(qos: .utility).async {
                 let reason = session.takeSaveFailure()
+                // opened again from its folder after the graphics stopped (counted)
+                let reopened = session.reopenedAfterLoss()
                 let failure = session.takeFailure()
-                guard reason != nil || failure != nil else { return }
+                guard reason != nil || failure != nil || reopened > 0 else { return }
                 DispatchQueue.main.async {
+                    if let self, reopened != self.reopenedSeen {
+                        self.reopenedAgain(reopened)
+                    }
                     if let reason {
                         self?.saveFailed(reason)
                     }
@@ -2704,6 +2709,20 @@ final class CanvasModel {
                 }
             }
         }
+    }
+
+    /// How many times the artwork was opened again after the graphics stopped, as last read.
+    @ObservationIgnored private var reopenedSeen: UInt64 = 0
+
+    /// The artwork was opened again from its folder after the graphics stopped (`count` times): its
+    /// layers, their thumbnails and the undo buttons read again.
+    private func reopenedAgain(_ count: UInt64) {
+        reopenedSeen = count
+        thumbnails.removeAll()
+        thumbnailVersions.removeAll()
+        refresh()
+        refreshView()
+        refreshThumbnails()
     }
 
     /// A save failed, for `reason`: said the first time since one last succeeded (the storage full
