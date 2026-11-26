@@ -893,6 +893,14 @@ fn stamp_work(s: &StampInstance, full: IRect, in_place: bool) -> u64 {
     if in_place { pixels * IN_PLACE_PIXEL_WORK + IN_PLACE_STAMP_WORK } else { pixels + STAMP_WORK }
 }
 
+/// Where `stamps` reach (canvas pixels, as [`stamp_work`] counts them): where they show.
+fn stamps_reach(stamps: &[StampInstance]) -> IRect {
+    stamps.iter().fold(IRect::EMPTY, |r, s| {
+        let at = procraft_engine::geom::Vec2::new(s.center[0], s.center[1]);
+        r.union(IRect::around(at, s.radius * s.roundness.max(1.0) * std::f32::consts::SQRT_2))
+    })
+}
+
 /// A stamp's (alpha, transfer) as its instance takes them: a capped stroke keeps its transfer
 /// apart for its rule (see [`Canvas::lay_by_rule`]), or (drawn "over", `capped` false) takes it
 /// into the alpha. A gradual stroke's stamp keeps its own alpha where its stroke takes the rule
@@ -7352,6 +7360,11 @@ impl Canvas {
                     let count = u32::try_from(instances.len()).unwrap_or(u32::MAX);
                     let first = next_instance;
                     next_instance = next_instance.saturating_add(count);
+                    // shown where they reach in this render's composite: held back from the render
+                    // that queued them (a frame's share at a time, see `DRY_FRAME_MS`), they come
+                    // after the composite there was made again without them
+                    let reach = stamps_reach(&instances);
+                    self.dirty = self.dirty.union(reach.intersect(full));
                     let (grain, grain_scale, grain_depth) =
                         style.moving_grain().map_or((-1, 1.0, 0.0), |(g, s, d)| (g as i32, s, d));
                     let own_grain = self.full_grain_bind(device, &style);
@@ -7478,10 +7491,7 @@ impl Canvas {
                     // both, it comes out the same, nothing reading what it puts together), or where
                     // it went before the paint began as the stroke ends
                     if second {
-                        let rect = instances.iter().fold(IRect::EMPTY, |r, s| {
-                            let at = procraft_engine::geom::Vec2::new(s.center[0], s.center[1]);
-                            r.union(IRect::around(at, s.radius * s.roundness.max(1.0) * std::f32::consts::SQRT_2))
-                        });
+                        let rect = reach;
                         match self.smudge.as_ref().filter(|s| s.apart.is_some()) {
                             Some(_) if self.joins_synthesis => self.synthesis_due = self.synthesis_due.union(rect),
                             Some(_) => self.synthesize(gpu, &mut encoder, &mut smudge_uniforms, rect),
