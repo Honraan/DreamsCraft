@@ -3037,8 +3037,10 @@ impl StrokeBuilder {
     fn diameter_at(&self, p: PathPoint) -> f32 {
         let (pressure, _) = self.pressed(p);
         let drawn = self.sized(pressure * self.speed_size(p));
-        // leaning adds to it, up to the most the brush may be
-        let most = (self.brush.biggest() * self.scale).max(drawn);
+        // leaning adds to it past the brush's own most size, up to the most any size of the brush
+        // may be (the size controls' end, which its spacing sets): a pencil of a few pixels goes
+        // broad as it lies down
+        let most = (self.brush.most_size() * self.brush.size_unit() * self.scale).max(drawn);
         (drawn + self.tilt_growth(p)).min(most)
     }
 
@@ -5855,6 +5857,32 @@ mod tests {
         tilted.tilt = 0.0;
         let upright = StrokeBuilder::new(brush, 10.0, Pointer::Stylus).preview(&[tilted]);
         assert!(upright[0].radius < 5.1);
+    }
+
+    #[test]
+    fn a_lean_grows_a_stamp_past_the_brushs_own_most_size_up_to_the_most_any_size_of_it_may_be() {
+        // a pencil whose most size is 12 pixels, drawn at 10, lying flat: its growth goes on past
+        // 12 (it stopped there, so a pencil hardly widened however far it leaned)
+        let angle = 0.1 * std::f32::consts::FRAC_PI_2;
+        let brush =
+            Brush { tilt: Tilt { angle, size: 0.6, opacity: 0.0 }, pressure_size: 0.0, max_size: 12.0, ..plain() };
+        let flat = Sample { tilt: crate::brush::FLAT_TILT, ..Sample::at(Vec2::new(0.0, 0.0), 1.0, 0.0) };
+        let pen = StrokeBuilder::new(brush.clone(), 10.0, Pointer::Stylus).preview(&[flat]);
+        let grown = 0.6 * Tilt::reach(crate::brush::FLAT_TILT, 0.1) * brush.size_unit();
+        println!("a 10 px pencil (most 12 px) lying flat: {:.1} px across (grown by {grown:.1})", 2.0 * pen[0].radius);
+        assert!(grown > 20.0);
+        assert!((pen[0].radius - (10.0 + grown) / 2.0).abs() < 1e-3, "{}", pen[0].radius);
+        // no further than the size controls' end, which its spacing sets (one unit at the
+        // tightest spacing)
+        let tight = Brush { spacing: 0.0, tilt: Tilt { angle, size: 1.0, opacity: 0.0 }, ..brush };
+        let end = tight.most_size() * tight.size_unit();
+        let pen = StrokeBuilder::new(tight.clone(), 150.0, Pointer::Stylus).preview(&[flat]);
+        let full = 150.0 + Tilt::reach(crate::brush::FLAT_TILT, 0.1) * tight.size_unit();
+        println!(
+            "150 px at spacing 0, tilt size 1: {:.1} px across (end {end:.1}, unheld {full:.1})",
+            2.0 * pen[0].radius
+        );
+        assert!(full > end && (2.0 * pen[0].radius - end).abs() < 1e-3, "{} {end}", 2.0 * pen[0].radius);
     }
 
     #[test]
