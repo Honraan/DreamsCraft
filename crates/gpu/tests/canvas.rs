@@ -1674,6 +1674,112 @@ fn a_narrow_blur_is_a_gaussian_of_every_pixel_either_side() {
     }
 }
 
+/// The Gaussian blur painted on, worked out on the CPU along one row of a picture whose rows are
+/// all alike (each pass kept to 8 bits as the GPU keeps them): the row halved for each level as
+/// mip levels are, each level blurred by `3 + 2k` taps, read back between texels at the canvas's
+/// pixels, between two levels by `amount`, and the least mixed into the row as it was.
+fn pyramid_row(row: &[f32], amount: f32) -> Vec<f32> {
+    let w = row.len();
+    let levels = procraft_gpu::pyramid_levels(w as u32, 1) as usize;
+    let blur = |src: &[f32], k: usize| -> Vec<f32> {
+        let taps = (3 + 2 * k) as f32;
+        let (sigma, reach) = (taps / 3.0, taps as i32 - 1);
+        let weights: Vec<f32> = (-reach..=reach).map(|j| (-((j * j) as f32) / (2.0 * sigma * sigma)).exp()).collect();
+        let total: f32 = weights.iter().sum();
+        let n = src.len() as i32;
+        (0..n)
+            .map(|x| {
+                let sum: f32 =
+                    (-reach..=reach).zip(&weights).map(|(j, wt)| src[(x + j).clamp(0, n - 1) as usize] * wt).sum();
+                (sum / total).round()
+            })
+            .collect()
+    };
+    let mut unblurred = row.to_vec();
+    let mut pyramid = Vec::new();
+    for k in 0..levels {
+        if k > 0 {
+            let lw = (w >> k).max(1);
+            unblurred = (0..lw)
+                .map(|i| ((unblurred[2 * i] + unblurred[(2 * i + 1).min(unblurred.len() - 1)]) / 2.0).round())
+                .collect();
+        }
+        pyramid.push(blur(&unblurred, k));
+    }
+    let read = |level: &[f32], x: usize| -> f32 {
+        let p = (x as f32 + 0.5) / w as f32 * level.len() as f32 - 0.5;
+        let i = p.floor();
+        let f = p - i;
+        let at = |j: f32| level[(j.max(0.0) as usize).min(level.len() - 1)];
+        at(i) * (1.0 - f) + at(i + 1.0) * f
+    };
+    let up = (levels as f32 + 1.0) * amount;
+    let level = (up - 1.0).max(0.0);
+    let low = level.floor().min(levels as f32 - 1.0) as usize;
+    let high = (low + 1).min(levels - 1);
+    let between = (level - level.floor()).clamp(0.0, 1.0);
+    (0..w)
+        .map(|x| {
+            let blurred = read(&pyramid[low], x) * (1.0 - between) + read(&pyramid[high], x) * between;
+            (row[x] + (blurred - row[x]) * up.min(1.0)).round()
+        })
+        .collect()
+}
+
+/// The standard deviation of the drops along `row` (an edge blurred: its blur's own spread).
+fn spread(row: &[f32]) -> f32 {
+    let drops: Vec<f32> = row.windows(2).map(|w| w[0] - w[1]).collect();
+    let total: f32 = drops.iter().sum();
+    let mean = drops.iter().enumerate().map(|(i, d)| i as f32 * d).sum::<f32>() / total;
+    (drops.iter().enumerate().map(|(i, d)| (i as f32 - mean).powi(2) * d).sum::<f32>() / total).sqrt()
+}
+
+/// Painted on, the Gaussian blur reads each pixel from a pyramid of six ever wider blurs by its
+/// amount: as worked out on the CPU, within a few levels of 8 bits; nothing at none, and at its
+/// most only a quarter as wide as the plain blur at that amount was (the 60% it starts at: a
+/// ninth).
+#[test]
+fn a_gaussian_blur_painted_on_reads_its_pyramid_as_worked_out() {
+    let Some(gpu) = gpu() else { return };
+    let _check = NoErrors(&gpu);
+    assert_eq!([1, 2, 3, 32, 33, 64, 1024, 4096].map(|s| procraft_gpu::pyramid_levels(s, 1)), [1, 1, 2, 5, 6, 6, 6, 6]);
+    let (w, h) = (1024u32, 4u32);
+    let mut doc = Document::new(w, h);
+    let mut canvas = Canvas::new(&gpu, &doc).unwrap();
+    let layer = doc.current();
+    // a hard edge: opaque black on the left half, clear on the right
+    let picture: Vec<u8> = (0..w * h).flat_map(|i| if i % w < w / 2 { [0, 0, 0, 255] } else { [0; 4] }).collect();
+    canvas.upload_layer(&gpu, layer, &picture).unwrap();
+    let row: Vec<f32> = (0..w).map(|x| if x < w / 2 { 255.0 } else { 0.0 }).collect();
+    println!("amount  spread (pyramid)  worked out  plain blur's sigma before");
+    for amount in [0.0, 0.05, 0.1, 0.2, 0.35, 0.5, 0.6, 0.8, 1.0] {
+        canvas.begin_transform(layer);
+        canvas.set_filter(procraft_gpu::Filter::PyramidBlur { amount });
+        canvas.render(&gpu, &mut doc, None);
+        let px = canvas.read_layer(&gpu, layer).unwrap();
+        canvas.end_transform(false);
+        canvas.render(&gpu, &mut doc, None);
+        let expected = pyramid_row(&row, amount);
+        for y in 0..h {
+            let got: Vec<f32> = (0..w).map(|x| f32::from(pixel(&px, w, x, y)[3])).collect();
+            let most = got.iter().zip(&expected).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+            assert!(most <= 3.0, "{amount}: row {y} off by {most}");
+        }
+        let got: Vec<f32> = (0..w).map(|x| f32::from(pixel(&px, w, x, 0)[3])).collect();
+        let before = procraft_engine::selection::feather_radius(amount);
+        println!("{amount:6.2} {:14.2} {:11.2} {before:12.2}", spread(&got), spread(&expected));
+        if amount == 0.0 {
+            assert!(got == row, "nothing at none");
+        }
+        if amount == 1.0 {
+            assert!(spread(&got) * 4.0 < before, "{} against {before}", spread(&got));
+        }
+        if amount == 0.6 {
+            assert!(spread(&got) * 9.0 < before, "{} against {before}", spread(&got));
+        }
+    }
+}
+
 #[test]
 fn every_adjustment_draws_and_changes_the_layer() {
     use procraft_gpu::Filter;

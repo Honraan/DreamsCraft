@@ -26202,3 +26202,85 @@ fn a_dual_brushs_stroke_shows_its_tip_and_comes_out_as_without_it() {
 fn a_stroke_painting_in_place_shows_its_tip_and_comes_out_as_without_it() {
     tips_reach_the_pen(&["Pangolin", "Ibis", "Highmoor", "Olympus", "Copperwing", "Lundy"]);
 }
+
+/// A hard edge (opaque black on the left half, clear on the right) on the current layer of a
+/// `side` square canvas, and that layer.
+fn hard_edge(s: &CanvasSession, side: u32) -> procraft_engine::document::LayerId {
+    let picture: Vec<u8> =
+        (0..side * side).flat_map(|i| if i % side < side / 2 { [0, 0, 0, 255] } else { [0; 4] }).collect();
+    let mut guard = s.shared.lock();
+    let st = &mut *guard;
+    let current = st.doc.current();
+    let (canvas, gpu) = (st.canvas.as_mut().unwrap(), st.gpu.as_ref().unwrap());
+    canvas.upload_layer(gpu, current, &picture).unwrap();
+    current
+}
+
+/// How far a blur spread the hard edge along the middle row of `layer` (a `side` square), read
+/// as it shows while the adjustment is open (reading it through the session would keep it): the
+/// standard deviation of the drops in alpha from pixel to pixel, which are the blur's own kernel.
+fn edge_spread(s: &CanvasSession, layer: procraft_engine::document::LayerId, side: u32) -> f32 {
+    let rgba = {
+        let mut guard = s.shared.lock();
+        let st = &mut *guard;
+        let (canvas, gpu) = (st.canvas.as_mut().unwrap(), st.gpu.as_ref().unwrap());
+        canvas.render(gpu, &mut st.doc, None);
+        canvas.read_layer(gpu, layer).unwrap()
+    };
+    let row = (side / 2) as usize * side as usize;
+    let alpha: Vec<f32> = (0..side as usize).map(|x| f32::from(rgba[(row + x) * 4 + 3]) / 255.0).collect();
+    let drops: Vec<f32> = alpha.windows(2).map(|w| w[0] - w[1]).collect();
+    let total: f32 = drops.iter().sum();
+    let mean = drops.iter().enumerate().map(|(i, d)| i as f32 * d).sum::<f32>() / total;
+    let variance = drops.iter().enumerate().map(|(i, d)| (i as f32 - mean).powi(2) * d).sum::<f32>() / total;
+    variance.sqrt()
+}
+
+/// The Gaussian blur adjustment spreads a hard edge as far as its sigma at that amount says, on
+/// canvases of every size alike (canvas pixels, whatever the canvas): at 1% three times less than
+/// it did, at 5% half as far again. Prints the amounts, the sigma it had and has, and what was
+/// measured.
+#[test]
+fn the_gaussian_blur_spreads_an_edge_as_far_as_its_sigma_on_any_canvas() {
+    use crate::adjust::gaussian_blur_sigma;
+    use crate::adjust_menu::Adjustment;
+    let cases: [(u32, &[f32]); 4] = [
+        (128, &[0.01, 0.03, 0.05]),
+        (256, &[0.01, 0.03, 0.05, 0.1]),
+        (512, &[0.01, 0.05, 0.1]),
+        (1024, &[0.03, 0.1, 0.2]),
+    ];
+    println!("canvas  amount  sigma before  sigma now  measured");
+    for (side, amounts) in cases {
+        let Some(s) = session(side, side) else { return };
+        let layer = hard_edge(&s, side);
+        for &a in amounts {
+            s.adjustment_start(Adjustment::GaussianBlur);
+            s.adjustment_amount_by(a);
+            assert!((s.adjustment_shown().amount - a).abs() < 1e-6);
+            let measured = edge_spread(&s, layer, side);
+            s.adjustment_end(false);
+            let (before, now) = (procraft_engine::selection::feather_radius(a), gaussian_blur_sigma(a));
+            println!("{side:6} {a:7.3} {before:12.3} {now:10.3} {measured:9.3}");
+            assert!((measured - now).abs() <= 0.04 * now + 0.15, "{side} {a}: {measured} against {now}");
+        }
+        // put back each time: the edge as it was
+        assert!(edge_spread(&s, layer, side) < 0.01);
+    }
+}
+
+/// Painted on, the Gaussian blur picks a blur per pixel from its pyramid at its own amount (60%
+/// to begin with), and on the layer it is the plain blur at the amount swiped.
+#[test]
+fn the_gaussian_blur_painted_on_reads_its_pyramid_and_on_the_layer_its_sigma() {
+    use crate::adjust::gaussian_blur_sigma;
+    use crate::adjust_menu::Adjustment;
+    use procraft_gpu::Filter;
+    let Some(s) = session(64, 64) else { return };
+    s.adjustment_start(Adjustment::GaussianBlur);
+    s.adjustment_amount_by(0.2);
+    assert_eq!(s.shared.lock().last_filter, Some(Filter::Blur { sigma: gaussian_blur_sigma(0.2) }));
+    s.adjustment_pencil(true);
+    assert_eq!(s.shared.lock().last_filter, Some(Filter::PyramidBlur { amount: 0.6 }));
+    s.adjustment_end(false);
+}

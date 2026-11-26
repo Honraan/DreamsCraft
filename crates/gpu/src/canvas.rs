@@ -2808,6 +2808,9 @@ struct Transforming {
     masked: bool,
     /// The copy alone, for an adjustment's last pass to mix with.
     before_bind: wgpu::BindGroup,
+    /// The copy's pyramid of blurs for a Gaussian blur painted on, made the first time it is
+    /// wanted (the copy stays as it is while the edit is open).
+    pyramid: OnceLock<Option<wgpu::TextureView>>,
 }
 
 /// An adjustment drawn into the layer being edited (begun as a transform is), from its copy.
@@ -2818,6 +2821,10 @@ pub enum Filter {
     Hsb { hue: f32, saturation: f32, brightness: f32 },
     /// A Gaussian blur of `sigma` canvas pixels.
     Blur { sigma: f32 },
+    /// A Gaussian blur painted on: each pixel a level of [`PYRAMID_LEVELS`] ever wider blurs (the
+    /// copy halved again for each, blurred over two more texels each side) picked by `amount`
+    /// (0..1) × how much is painted there, the copy mixed in for the least.
+    PyramidBlur { amount: f32 },
     /// Each pixel pushed away from its neighbours by `amount`.
     Sharpen { amount: f32 },
     /// Fractal noise of `kind` (0 clouds, 1 billows, 2 ridges): `amount`, `frequency` (per canvas
@@ -7105,7 +7112,7 @@ impl Canvas {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.table_view) },
             ],
         });
-        Some(Transforming { layer: id, before, bind, masked, before_bind })
+        Some(Transforming { layer: id, before, bind, masked, before_bind, pyramid: OnceLock::new() })
     }
 
     /// The liquify field's bind group with the edit's copy: its bits where the field is kept in
@@ -10148,6 +10155,9 @@ impl Canvas {
                 ("fs_halftone", values([pitch.max(2.0), kind.min(2) as f32, 0.0, 0.0], [0.0; 4]))
             }
             Filter::Blur { sigma } => ("fs_up", values([0.0; 4], [sigma, 0.0, 0.0, 0.0])),
+            Filter::PyramidBlur { amount } => {
+                ("fs_pyramid", values([amount, pyramid_levels(self.width, self.height) as f32, 0.0, 0.0], [0.0; 4]))
+            }
             Filter::Bloom { sigma, amount, threshold, transition, burn } => {
                 ("fs_bloom", values([amount, threshold, transition, burn], [sigma, 0.0, 0.0, 0.0]))
             }
@@ -10168,6 +10178,10 @@ impl Canvas {
         };
         let blurred = match filter {
             Filter::Blur { sigma } | Filter::Bloom { sigma, .. } => self.blur_copy(gpu, encoder, uniforms, sigma),
+            Filter::PyramidBlur { .. } => {
+                let made = t.pyramid.get_or_init(|| self.blur_pyramid(gpu, encoder, uniforms));
+                made.clone()
+            }
             _ => None,
         };
         // liquify in integers shows the layer through its field's bits
@@ -10494,8 +10508,82 @@ impl Canvas {
         Some(down)
     }
 
-    /// A blur's working texture `width` x `height` for `part` (0 a halving, 1 across, 2 down),
-    /// made the first time and kept until the adjustment ends.
+    /// The edit's copy as a pyramid for a Gaussian blur painted on: a texture the canvas's size
+    /// with [`pyramid_levels`] mip levels, level `k` the copy halved `k` times and then blurred by
+    /// `3 + 2k` taps (out to `2 + 2k` texels either side, a third of the taps its sigma); none
+    /// without the passes it needs.
+    fn blur_pyramid(
+        &self,
+        gpu: &Gpu,
+        encoder: &mut wgpu::CommandEncoder,
+        uniforms: &mut UniformData,
+    ) -> Option<wgpu::TextureView> {
+        let device = &gpu.device;
+        let t = self.transforming.as_ref()?;
+        let (w, h) = (self.width, self.height);
+        let levels = pyramid_levels(w, h);
+        let (down_pipeline, blur_pipeline) =
+            (self.pipelines.filters.get("fs_down")?, self.pipelines.filters.get("fs_blur")?);
+        let pyramid = gpu.texture(&wgpu::TextureDescriptor {
+            label: Some("adjustment pyramid"),
+            size: extent(w, h),
+            mip_level_count: levels,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: LAYER_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let mut pass = |encoder: &mut wgpu::CommandEncoder,
+                        target: &wgpu::TextureView,
+                        pipeline: &wgpu::RenderPipeline,
+                        source: &wgpu::TextureView,
+                        uniform: FilterUniform| {
+            let offset = uniforms.push(&uniform);
+            let bind = self.adjustment_bind(device, source, false);
+            let mut p =
+                render_pass(encoder, "adjustment pyramid", target, wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT));
+            p.set_pipeline(pipeline);
+            p.set_bind_group(0, &bind, &[]);
+            p.set_bind_group(1, &self.uniform_bind, &[offset]);
+            p.set_bind_group(2, &t.before_bind, &[]);
+            p.draw(0..3, 0..1);
+        };
+        // the copy, then each level halved from the one before as mip levels are
+        let mut unblurred = t.before.create_view(&wgpu::TextureViewDescriptor::default());
+        for k in 0..levels {
+            let (lw, lh) = ((w >> k).max(1), (h >> k).max(1));
+            let size = [lw as f32, lh as f32, 0.0, 0.0];
+            if k > 0 {
+                let next = self.blur_texture(gpu, "adjustment pyramid level", lw, lh, 3);
+                let uniform = FilterUniform { a: [0.0; 4], b: [0.0; 4], size, c: [0.0; 4] };
+                pass(encoder, &next, down_pipeline, &unblurred, uniform);
+                unblurred = next;
+            }
+            let taps = (3 + 2 * k) as f32;
+            let (sigma, reach) = (taps / 3.0, taps - 1.0);
+            // (the canvas's size: the scratch texture, as for a narrow blur)
+            let across = if k == 0 {
+                self.scratch.get(gpu).1.clone()
+            } else {
+                self.blur_texture(gpu, "adjustment pyramid across", lw, lh, 4)
+            };
+            let uniform = FilterUniform { a: [1.0, 0.0, sigma, reach], b: [0.0; 4], size, c: [0.0; 4] };
+            pass(encoder, &across, blur_pipeline, &unblurred, uniform);
+            let level = pyramid.create_view(&wgpu::TextureViewDescriptor {
+                base_mip_level: k,
+                mip_level_count: Some(1),
+                ..Default::default()
+            });
+            let uniform = FilterUniform { a: [0.0, 1.0, sigma, reach], b: [0.0; 4], size, c: [0.0; 4] };
+            pass(encoder, &level, blur_pipeline, &across, uniform);
+        }
+        Some(pyramid.create_view(&wgpu::TextureViewDescriptor::default()))
+    }
+
+    /// A blur's working texture `width` x `height` for `part` (0 a halving, 1 across, 2 down; a
+    /// pyramid's 3 a level halved, 4 a level blurred across), made the first time and kept until
+    /// the adjustment ends.
     fn blur_texture(&self, gpu: &Gpu, label: &str, width: u32, height: u32, part: u8) -> wgpu::TextureView {
         let mut kept = self.blur_textures.lock().unwrap_or_else(PoisonError::into_inner);
         kept.entry((width, height, part))
@@ -14123,7 +14211,20 @@ const ADD: wgpu::BlendState = wgpu::BlendState {
     },
 };
 
-const FILTER_PASSES: [&str; 17] = [
+/// How many levels a Gaussian blur painted on picks from at most.
+pub const PYRAMID_LEVELS: u32 = 6;
+
+/// How many levels a Gaussian blur painted on picks from on a canvas `width` x `height`: as many
+/// as halvings take its longer side down to a pixel (rounded up), one at least and
+/// [`PYRAMID_LEVELS`] at most.
+pub fn pyramid_levels(width: u32, height: u32) -> u32 {
+    let longest = width.max(height).max(1);
+    // halvings to a pixel, rounded up: the bits below the top one, one more if any is set
+    let halvings = longest.ilog2() + u32::from(!longest.is_power_of_two());
+    halvings.clamp(1, PYRAMID_LEVELS)
+}
+
+const FILTER_PASSES: [&str; 18] = [
     "fs_glitch",
     "fs_clone",
     "fs_liquified",
@@ -14131,6 +14232,7 @@ const FILTER_PASSES: [&str; 17] = [
     "fs_down",
     "fs_blur",
     "fs_up",
+    "fs_pyramid",
     "fs_sharpen",
     "fs_noise",
     "fs_streak",

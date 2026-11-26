@@ -32,7 +32,7 @@ pub use canvas::{
     Thumbnail, TipKind, VEIL_GRID, VeilCell, VeilCells, grey_levels, most_resident, read_texture, start_reading,
     textures_bytes,
 };
-pub use canvas::{CanvasPaper, CarryFault, GREY_LOOK, ViewLook};
+pub use canvas::{CanvasPaper, CarryFault, GREY_LOOK, PYRAMID_LEVELS, ViewLook, pyramid_levels};
 pub use kept::{forget_kept_pipelines, keep_pipelines_for, keep_pipelines_in};
 pub use lighting::Lighting;
 pub use scene::{
