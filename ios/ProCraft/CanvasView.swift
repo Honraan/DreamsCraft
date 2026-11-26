@@ -128,6 +128,10 @@ final class CanvasView: UIView {
             // the system's three-finger editing gestures off all the way out to the app, SwiftUI's
             // own responders round the canvas too
             EditingGestures.cover(from: self)
+            // the side sliders over the canvas tell the Pencil's touches from a finger's by it
+            if let window {
+                TouchKinds.shared.watch(window)
+            }
             setNeedsLayout()
         }
     }

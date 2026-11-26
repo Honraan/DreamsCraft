@@ -311,7 +311,8 @@ pub use side_bar::{
     side_bar_kept_centre,
 };
 pub use side_slider::{
-    ShadowStep, SideSliderTap, side_slider_drag_share, side_slider_shown_percent, side_slider_tap, side_thumb_shadow,
+    ShadowStep, SideSliderTap, side_slider_drag_share, side_slider_drags, side_slider_land, side_slider_lift,
+    side_slider_shown_percent, side_slider_tap, side_thumb_shadow,
 };
 pub use storage::{NO_ROOM, save_failure_to_tell, storage_full_writes, storage_was_full};
 pub use studio::{
