@@ -4,13 +4,15 @@
 //!
 //! Laid in one lot from nothing, a carried part starts where the plain pass starts and adds the
 //! same stamps up the same way: only the full floats it keeps besides are new. Yet on the Adreno
-//! 750 (Vulkan; its OpenGL ES failed the carry's tests as well) the carried pass's half floats came
-//! out wrong once it kept the paint's own bits beside them, its shader compiler's doing as far as
-//! can be told: a dual brush built up by its rule whose mode goes by its second's strength drew
-//! next to nothing there, a preview 562 pixels where the plain pass drew 2759, a stroke 292 where it
-//! drew 5012. Kept the half floats' bits instead, the pass drew as the plain pass does. A GPU whose
-//! check finds the two apart (or that can't be checked) lays such strokes by the plain pass, as
-//! before there was a carry: laid whole again as they end.
+//! 750 (Vulkan and OpenGL ES alike) the two came apart while the passes read their rule from the
+//! part's list inside the loop over its stamps (see `rule_laid` in stamp_rule.wgsl): its compiler
+//! got the rule wrong there, in each pass its own way, the carried part going towards its transfer
+//! laid as the strongest. The check's stroke came out 3281 of 8192 texels apart, and a dual brush
+//! whose mode goes by its second's strength drew next to nothing carried, a preview 562 pixels
+//! where the plain pass drew 2759. With a pass made for each rule, the rule a constant in it, both
+//! lay as other GPUs do and the check passes. It stays for a GPU that finds another way to lay the
+//! two apart: one whose check finds them apart (or that can't be checked) lays such strokes by the
+//! plain pass, as before there was a carry: laid whole again as they end.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -31,7 +33,8 @@ pub enum CarryFault {
     /// As this GPU lays it.
     None,
     /// Its half floats come out a quarter of the paint laid, as a compiler that gets them wrong
-    /// left them (the Adreno's drew next to nothing of a dual brush cut by its second).
+    /// left them (the Adreno's drew next to nothing of a dual brush cut by its second, before each
+    /// rule had a pass of its own).
     Miscompiled,
     /// The check can't be made (as a GPU that fails a readback, or loses its device, can't).
     CheckFails,
@@ -310,6 +313,33 @@ fn half(bytes: [u8; 2]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The check's stroke comes out alike through both rule passes on this GPU, so the check
+    /// passes and the carry stays on; and its round part, which reads no brush image, as an RTX
+    /// 5060 lays it (1471.1 of paint on Vulkan, Direct3D 12 and OpenGL alike). The Adreno 750,
+    /// reading each stamp's rule inside the passes' loop, laid that part 1410.4 by the plain pass
+    /// and 1242.5 carried, 3281 of 8192 texels apart, and the check turned the carry off.
+    #[test]
+    fn the_check_s_stroke_is_laid_alike_by_both_passes_and_the_carry_stays_on() {
+        let Ok(gpu) = Gpu::headless() else { return };
+        // each part's paint: its texels' alpha added up
+        let paint = |halves: &[u8]| -> Vec<f32> {
+            let parts = halves.chunks(halves.len() / 2);
+            parts.map(|part| part.as_chunks::<8>().0.iter().map(|t| half([t[6], t[7]])).sum()).collect()
+        };
+        let (plain, carried) = (paint(&laid(&gpu, false).unwrap()), paint(&laid(&gpu, true).unwrap()));
+        let (texels, most) = apart(&gpu).unwrap();
+        let started = Instant::now();
+        let carries = gpu.check_carry();
+        println!(
+            "paint by the plain pass {plain:.1?}, carried {carried:.1?}; {texels} texels apart (by {most:.5} at most); \
+             the check: carry {carries}, in {:.1} ms",
+            started.elapsed().as_secs_f64() * 1e3
+        );
+        assert_eq!(texels, 0, "the passes lay the check's stroke apart");
+        assert!((plain[1] / 1471.1 - 1.0).abs() < 0.01, "the round part: {} against 1471.1", plain[1]);
+        assert!(carries, "the check turned the carry off");
+    }
 
     #[test]
     fn half_floats_read_as_their_values() {

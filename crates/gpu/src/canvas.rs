@@ -3145,11 +3145,12 @@ impl Abilities {
 /// and stamps laid by their stroke's rule pixel by pixel (see `Canvas::lay_by_rule`), each with
 /// what it is given.
 pub(crate) struct ComputePipelines {
-    stamp_rule: wgpu::ComputePipeline,
+    /// The rule pass, one for each rule it lays by (see [`by_rule`]: 1, then 2).
+    stamp_rule: [wgpu::ComputePipeline; 2],
     rule_layout: wgpu::BindGroupLayout,
     /// A dual brush's part carried from lot to lot (see [`Carried`]), and what it is given: the
-    /// rule's and the part's full floats.
-    stamp_rule_carried: wgpu::ComputePipeline,
+    /// rule's and the part's full floats. One for each rule, as `stamp_rule`.
+    stamp_rule_carried: [wgpu::ComputePipeline; 2],
     rule_carry_layout: wgpu::BindGroupLayout,
     smudge_layout: wgpu::BindGroupLayout,
     smudge_carry: wgpu::ComputePipeline,
@@ -10649,10 +10650,12 @@ impl Canvas {
             out: out.clone(),
             carried: carried.as_ref().map(|(_, view)| view.clone()),
         };
-        let (layout, pipeline) = match carry {
+        let (layout, pipelines) = match carry {
             Some(_) => (&compute.rule_carry_layout, &compute.stamp_rule_carried),
             None => (&compute.rule_layout, &compute.stamp_rule),
         };
+        // (the pass made for the rule: see `ComputePipelines`)
+        let Some(pipeline) = pipelines.get(rule.wrapping_sub(1) as usize) else { return };
         let full = self.full();
         let mut bounds = instances.iter().fold(IRect::EMPTY, |b, s| b.union(quad_reach(s))).intersect(full);
         if carry.is_some() && !bounds.is_empty() {
@@ -13453,22 +13456,26 @@ impl Pipelines {
                 true => module("stamp rule", &carry_check::miscompiled(rule_source)),
                 false => module("stamp rule", rule_source),
             };
-            let stamp_rule = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("stamp rule"),
-                layout: Some(&layout("stamp rule", &[Some(&rule_layout), Some(&brush_layout)])),
-                module: &rule_module,
-                entry_point: Some("cs_stamp_rule"),
-                compilation_options: Default::default(),
-                cache: kept,
-            });
-            let stamp_rule_carried = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("stamp rule carried"),
-                layout: Some(&layout("stamp rule carried", &[Some(&rule_carry_layout), Some(&brush_layout)])),
-                module: &rule_module,
-                entry_point: Some("cs_stamp_rule_carried"),
-                compilation_options: Default::default(),
-                cache: kept,
-            });
+            // a pass for each rule, which it takes as a constant (see `rule_laid` in stamp_rule.wgsl)
+            let rule_passes = |label, groups: &wgpu::PipelineLayout, entry| {
+                [1u32, 2].map(|rule| {
+                    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some(label),
+                        layout: Some(groups),
+                        module: &rule_module,
+                        entry_point: Some(entry),
+                        compilation_options: wgpu::PipelineCompilationOptions {
+                            constants: &[("RULE", f64::from(rule))],
+                            ..Default::default()
+                        },
+                        cache: kept,
+                    })
+                })
+            };
+            let plain_groups = layout("stamp rule", &[Some(&rule_layout), Some(&brush_layout)]);
+            let stamp_rule = rule_passes("stamp rule", &plain_groups, "cs_stamp_rule");
+            let carry_groups = layout("stamp rule carried", &[Some(&rule_carry_layout), Some(&brush_layout)]);
+            let stamp_rule_carried = rule_passes("stamp rule carried", &carry_groups, "cs_stamp_rule_carried");
             ComputePipelines {
                 stamp_rule,
                 rule_layout,
