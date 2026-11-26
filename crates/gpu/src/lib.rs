@@ -39,7 +39,7 @@ pub use scene::{
     GrainLook, Light, MOST_LIGHTS, MaterialLook, MeshView, Orbit, ShownSelection, SurfaceMap, material_source,
 };
 pub use sphere::{SphereLook, SpherePreview, preview_environment};
-pub use stale::{STALE, StaleTextures, starts_stale};
+pub use stale::{STALE, StaleTextures, draws_copies, starts_stale};
 pub use wgpu;
 
 #[cfg(windows)]
@@ -594,6 +594,11 @@ impl Gpu {
         if stale {
             log::info!("new textures start stale on this GPU: each is cleared as it is made");
         }
+        // (`PROCRAFT_DRAWN_COPIES`: as such a GPU, for running the tests so)
+        let drawn = draws_copies(&info) || std::env::var_os("PROCRAFT_DRAWN_COPIES").is_some();
+        if drawn {
+            log::info!("texture copies drawn on this GPU (PowerVR GL)");
+        }
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("procraft"),
             // where the GPU has it: the pipelines' compiled form to keep between runs
@@ -656,7 +661,7 @@ impl Gpu {
             readbacks: Arc::default(),
             old,
             placed: Arc::default(),
-            stale: Arc::new(stale::Stale::new(stale)),
+            stale: Arc::new(stale::Stale::new(stale, drawn)),
             carry: Arc::default(),
         };
         // what an old GPU can't do, and what the canvas does without it (in the shared log)

@@ -16,9 +16,17 @@
 //! Tests on other GPUs can make textures as such a GPU's (see [`Gpu::emulate_stale_textures`]):
 //! with the clear, or without it, when a copy into a texture not yet written leaves the blocks it
 //! would write all zero holding [`STALE`] instead, as the memory would.
+//!
+//! PowerVR's OpenGL ES driver (a Rogue GE8320's) copies a texture (wgpu's `glCopyTexSubImage2D`)
+//! from what it held before what was drawn into it just before: the composite, copied the picture
+//! of the layers below the one worked on as soon as that was drawn, came out clear but for the
+//! layer worked on, and only the boxes composited again later showed the drawing. Drawn into and
+//! then read by a draw, a texture holds what was drawn on that GPU, so there copies are drawn
+//! instead (see [`draws_copies`], [`Gpu::copies_drawn`]): each texel read and written as it is,
+//! between textures of one format that can be (others are copied as before).
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use crate::Gpu;
 
@@ -96,18 +104,66 @@ pub(crate) struct Stale {
     unwritten: Mutex<Vec<Unwritten>>,
     /// The pipelines a copy as the driver makes it draws with, by the texture format drawn into.
     copiers: Mutex<Vec<(wgpu::TextureFormat, wgpu::RenderPipeline)>>,
+    /// Texture copies are drawn on this device (see the module's note and [`draws_copies`]), how
+    /// many have been and how many couldn't be (copied as before; the first told in the log), and
+    /// the pipelines they are drawn with, by the format drawn into.
+    drawn: AtomicBool,
+    copies_drawn: AtomicU64,
+    copies_not_drawn: AtomicU64,
+    drawers: Mutex<Vec<(wgpu::TextureFormat, wgpu::RenderPipeline)>>,
 }
 
 impl Stale {
-    pub(crate) fn new(starts_stale: bool) -> Stale {
+    pub(crate) fn new(starts_stale: bool, draws_copies: bool) -> Stale {
         let how = if starts_stale { StaleTextures::Cleared } else { StaleTextures::Fresh };
         Stale {
             how: AtomicU8::new(how.as_u8()),
             emulated: std::sync::atomic::AtomicBool::new(false),
             unwritten: Mutex::new(Vec::new()),
             copiers: Mutex::new(Vec::new()),
+            drawn: AtomicBool::new(draws_copies),
+            copies_drawn: AtomicU64::new(0),
+            copies_not_drawn: AtomicU64::new(0),
+            drawers: Mutex::new(Vec::new()),
         }
     }
+}
+
+/// Whether texture copies are drawn on a GPU (see the module's note): PowerVR's on OpenGL ES,
+/// as wgpu tells them.
+pub fn draws_copies(info: &wgpu::AdapterInfo) -> bool {
+    info.backend == wgpu::Backend::Gl && info.name.to_ascii_lowercase().contains("powervr")
+}
+
+/// A drawn copy (see [`Gpu::copies_drawn`]): a triangle over the viewport, which lies over the
+/// texture drawn into where `source` would to put each of its texels where it goes (the scissor
+/// keeping to the copy), each texel read where it lies in `source`. `{T}` is the texel's type.
+const DRAWN_COPY: &str = r"
+@group(0) @binding(0) var source: texture_2d<{T}>;
+
+struct Out {
+    @builtin(position) position: vec4<f32>,
+    @location(0) texel: vec2<f32>,
+}
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> Out {
+    let corner = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    var out: Out;
+    out.position = vec4<f32>(corner.x * 2.0 - 1.0, 1.0 - corner.y * 2.0, 0.0, 1.0);
+    out.texel = corner * vec2<f32>(textureDimensions(source));
+    return out;
+}
+
+@fragment
+fn fs(@location(0) texel: vec2<f32>) -> @location(0) vec4<{T}> {
+    return textureLoad(source, vec2<i32>(floor(texel)), 0);
+}
+";
+
+/// [`DRAWN_COPY`] for texels of unsigned integers (`uint`) or floats.
+pub(crate) fn drawn_copy_source(uint: bool) -> String {
+    DRAWN_COPY.replace("{T}", if uint { "u32" } else { "f32" })
 }
 
 /// The 4 by 4 blocks of a copy into a stale texture, as its driver writes them (see the module's
@@ -196,10 +252,51 @@ impl Gpu {
                 .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
     }
 
+    /// Whether texture copies are drawn on this device (see the module's note).
+    pub fn copies_drawn(&self) -> bool {
+        self.stale.drawn.load(Ordering::Relaxed)
+    }
+
+    /// Texture copies drawn from now on (`on`), on this device and its clones, as on a GPU whose
+    /// copies are (see the module's note), textures made from now on made so they can be: for
+    /// tests on other GPUs.
+    #[doc(hidden)]
+    pub fn draw_copies(&self, on: bool) {
+        self.stale.drawn.store(on, Ordering::Relaxed);
+    }
+
+    /// How many texture copies have been drawn on this device (see [`Gpu::copies_drawn`]).
+    #[doc(hidden)]
+    pub fn copies_drawn_count(&self) -> u64 {
+        self.stale.copies_drawn.load(Ordering::Relaxed)
+    }
+
+    /// How many texture copies couldn't be drawn where copies are (copied as before).
+    #[doc(hidden)]
+    pub fn copies_not_drawn_count(&self) -> u64 {
+        self.stale.copies_not_drawn.load(Ordering::Relaxed)
+    }
+
+    /// What a texture as `desc` asks is made for: where copies are drawn (see the module's note),
+    /// a 2D colour texture of one layer and level that is copied to or from is also one to read
+    /// and to draw into, so that its copies can be drawn, where its format allows.
+    fn usage_for_copies(&self, desc: &wgpu::TextureDescriptor<'_>) -> wgpu::TextureUsages {
+        let copied = desc.usage.intersects(wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST);
+        let single = desc.size.depth_or_array_layers == 1 && desc.mip_level_count == 1;
+        if !self.copies_drawn() || !copied || !single || texel_kind(desc.format).is_none() {
+            return desc.usage;
+        }
+        let allowed = self.adapter.get_texture_format_features(desc.format).allowed_usages;
+        let both = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT;
+        if self.clears_by_drawing(desc) && allowed.contains(both) { desc.usage | both } else { desc.usage }
+    }
+
     /// A texture made as `desc` says. Where new textures start stale (see the module's note), one
     /// that can also be drawn into, cleared by drawing every mip level and layer of it as it is
-    /// made, before any copy or write reaches it.
+    /// made, before any copy or write reaches it. Where copies are drawn, one that can be read
+    /// and drawn into when it is copied (see [`Gpu::copies_drawn`]).
     pub fn texture(&self, desc: &wgpu::TextureDescriptor<'_>) -> wgpu::Texture {
+        let desc = &wgpu::TextureDescriptor { usage: self.usage_for_copies(desc), ..desc.clone() };
         let how = self.stale_textures();
         if how == StaleTextures::Fresh {
             return self.device.create_texture(desc);
@@ -328,7 +425,8 @@ impl Gpu {
     }
 
     /// `encoder.copy_texture_to_texture`, made as the driver of a GPU whose textures start stale
-    /// makes it where a test asks (see [`Gpu::emulate_stale_textures`]).
+    /// makes it where a test asks (see [`Gpu::emulate_stale_textures`]), and drawn where copies
+    /// are drawn and it can be (see [`Gpu::copies_drawn`]).
     pub fn copy_texture_to_texture(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -338,7 +436,28 @@ impl Gpu {
     ) {
         let stale = self.leaves_stale(&into, size.depth_or_array_layers, Gpu::writes_whole(&into, size));
         if stale.is_empty() {
-            encoder.copy_texture_to_texture(from, into, size);
+            if !self.drew_copy(encoder, &from, &into, size) {
+                if self.copies_drawn() && self.stale.copies_not_drawn.fetch_add(1, Ordering::Relaxed) == 0 {
+                    let (a, b) = (from.texture, into.texture);
+                    log::info!(
+                        "a texture copy couldn't be drawn, copied as before: {:?} {}x{}x{} level {} into {:?} \
+                         {}x{}x{} level {} ({:?}, {:?})",
+                        a.format(),
+                        a.width(),
+                        a.height(),
+                        a.depth_or_array_layers(),
+                        from.mip_level,
+                        b.format(),
+                        b.width(),
+                        b.height(),
+                        b.depth_or_array_layers(),
+                        into.mip_level,
+                        a.usage(),
+                        b.usage()
+                    );
+                }
+                encoder.copy_texture_to_texture(from, into, size);
+            }
             return;
         }
         let copied = self.copied_texture(into.texture.format(), size);
@@ -554,6 +673,178 @@ impl Gpu {
         copiers.push((format, pipeline.clone()));
         pipeline
     }
+
+    /// Whether a copy of `size` from `from` into `into` can be drawn here, and if so whether its
+    /// texels are unsigned integers: copies are drawn on this device (see the module's note), and
+    /// it goes between two textures of one format that a draw reads and writes back as it is (no
+    /// sRGB, no depth, no signed integers), within both, read from a texture of one layer and
+    /// at its first level (OpenGL reads a layer of an array as nothing) and drawn into at its
+    /// first level, one layer of it.
+    fn copy_drawable(
+        &self,
+        from: &wgpu::TexelCopyTextureInfo<'_>,
+        into: &wgpu::TexelCopyTextureInfo<'_>,
+        size: wgpu::Extent3d,
+    ) -> Option<bool> {
+        if !self.copies_drawn() || from.texture == into.texture {
+            return None;
+        }
+        let (source, target) = (from.texture, into.texture);
+        let format = target.format();
+        let uint = texel_kind(format)?;
+        let plain = |t: &wgpu::Texture| t.dimension() == wgpu::TextureDimension::D2 && t.sample_count() == 1;
+        let within = |t: &wgpu::Texture, at: wgpu::Origin3d| {
+            at.x.checked_add(size.width).is_some_and(|x| x <= t.width())
+                && at.y.checked_add(size.height).is_some_and(|y| y <= t.height())
+                && at.z < t.depth_or_array_layers()
+        };
+        let drawable = source.format() == format
+            && plain(source)
+            && plain(target)
+            && source.depth_or_array_layers() == 1
+            && size.depth_or_array_layers == 1
+            && size.width > 0
+            && size.height > 0
+            && from.mip_level == 0
+            && into.mip_level == 0
+            && from.aspect == wgpu::TextureAspect::All
+            && into.aspect == wgpu::TextureAspect::All
+            && source.usage().contains(wgpu::TextureUsages::TEXTURE_BINDING)
+            && target.usage().contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+            && within(source, from.origin)
+            && within(target, into.origin);
+        drawable.then_some(uint)
+    }
+
+    /// Draws a copy of `size` from `from` into `into` where it can be drawn (see
+    /// [`Gpu::copy_drawable`]); false where it can't, nothing done.
+    fn drew_copy(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        from: &wgpu::TexelCopyTextureInfo<'_>,
+        into: &wgpu::TexelCopyTextureInfo<'_>,
+        size: wgpu::Extent3d,
+    ) -> bool {
+        let Some(uint) = self.copy_drawable(from, into, size) else { return false };
+        let pipeline = self.drawer(into.texture.format(), uint);
+        let one = |base_array_layer| wgpu::TextureViewDescriptor {
+            label: Some("drawn copy"),
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            base_mip_level: 0,
+            mip_level_count: Some(1),
+            base_array_layer,
+            array_layer_count: Some(1),
+            ..Default::default()
+        };
+        let source = from.texture.create_view(&one(0));
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("drawn copy"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&source) }],
+        });
+        let target = into.texture.create_view(&one(into.origin.z));
+        // a copy of the whole level needs nothing it held (a tiled GPU then reads none of it in)
+        let load = if Gpu::writes_whole(into, size) {
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+        } else {
+            wgpu::LoadOp::Load
+        };
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("drawn copy"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        // the source laid over the target where its part goes (as far up or left of it as need be)
+        let x = into.origin.x as f32 - from.origin.x as f32;
+        let y = into.origin.y as f32 - from.origin.y as f32;
+        pass.set_viewport(x, y, from.texture.width() as f32, from.texture.height() as f32, 0.0, 1.0);
+        pass.set_scissor_rect(into.origin.x, into.origin.y, size.width, size.height);
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.draw(0..3, 0..1);
+        drop(pass);
+        self.stale.copies_drawn.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// The pipeline copies into `format` are drawn with (texels of unsigned integers: `uint`),
+    /// made once.
+    fn drawer(&self, format: wgpu::TextureFormat, uint: bool) -> wgpu::RenderPipeline {
+        let mut drawers = self.stale.drawers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, p)) = drawers.iter().find(|(f, _)| *f == format) {
+            return p.clone();
+        }
+        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("drawn copy"),
+            source: wgpu::ShaderSource::Wgsl(drawn_copy_source(uint).into()),
+        });
+        // (read with textureLoad only: any float format binds, filterable or not)
+        let sample_type =
+            if uint { wgpu::TextureSampleType::Uint } else { wgpu::TextureSampleType::Float { filterable: false } };
+        let binds = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("drawn copy"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("drawn copy"),
+            bind_group_layouts: &[Some(&binds)],
+            immediate_size: 0,
+        });
+        let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("drawn copy"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        drawers.push((format, pipeline.clone()));
+        pipeline
+    }
+}
+
+/// How a draw reads and writes back texels of `format` exactly, if it can: as unsigned integers
+/// (true) or floats (false); none for sRGB (read as linear, written back again), compressed,
+/// depth, stencil and signed integer formats.
+fn texel_kind(format: wgpu::TextureFormat) -> Option<bool> {
+    if format.is_srgb() || format.is_compressed() {
+        return None;
+    }
+    match format.sample_type(None, None) {
+        Some(wgpu::TextureSampleType::Uint) => Some(true),
+        Some(wgpu::TextureSampleType::Float { .. }) => Some(false),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -665,6 +956,8 @@ mod tests {
     #[test]
     fn a_copy_into_a_new_texture_leaves_nothing_stale_once_textures_are_cleared_as_they_are_made() {
         let Ok(gpu) = Gpu::headless() else { return eprintln!("skipped: no GPU") };
+        // (copies as Iris Xe makes them, not drawn, whatever the tests run as)
+        gpu.draw_copies(false);
         let picture = half_clear();
         let stale = as_left_stale(&picture);
         let blocks = stale.chunks(4).zip(picture.chunks(4)).filter(|(a, b)| a != b).count() / 16;
@@ -896,6 +1189,342 @@ mod tests {
             assert!(got[1][..row * side as usize].iter().all(|&b| b == 0), "{format:?}: the first layer, cleared");
             assert_eq!(&got[1][row * side as usize..], &picture[..], "{format:?}: cleared as made");
         }
+        assert_eq!(gpu.errors(), 0);
+    }
+
+    #[test]
+    fn copies_are_drawn_only_on_powervr_gpus_with_opengl_es() {
+        let gpu = |name: &str, backend| wgpu::AdapterInfo {
+            name: name.into(),
+            ..wgpu::AdapterInfo::new(wgpu::DeviceType::IntegratedGpu, backend)
+        };
+        assert!(draws_copies(&gpu("PowerVR Rogue GE8320", wgpu::Backend::Gl)));
+        assert!(draws_copies(&gpu("PowerVR Rogue GE8300", wgpu::Backend::Gl)));
+        assert!(draws_copies(&gpu("PowerVR B-Series BXM-8-256", wgpu::Backend::Gl)));
+        assert!(!draws_copies(&gpu("PowerVR Rogue GE8320", wgpu::Backend::Vulkan)));
+        assert!(!draws_copies(&gpu("Mali-G57 MC2", wgpu::Backend::Gl)));
+        assert!(!draws_copies(&gpu("Adreno (TM) 750", wgpu::Backend::Gl)));
+        assert!(!draws_copies(&gpu("NVIDIA GeForce RTX 5060 Laptop GPU/PCIe/SSE2", wgpu::Backend::Gl)));
+    }
+
+    /// `n` bytes of a texture's texels in `format`, made up from `seed`: any bytes, but floats
+    /// kept normal (no NaN, infinity or denormal, which a GPU's shader may change on the way).
+    fn texels(format: wgpu::TextureFormat, n: usize, seed: u32) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        match format {
+            wgpu::TextureFormat::Rgba16Float => (0..n / 2)
+                .flat_map(|_| {
+                    let r = next();
+                    let exponent = 1 + (r >> 10) % 30;
+                    let half = (r & 0x83ff) as u16 | ((exponent as u16) << 10);
+                    half.to_le_bytes()
+                })
+                .collect(),
+            wgpu::TextureFormat::R32Float => (0..n / 4)
+                .flat_map(|_| {
+                    let r = next();
+                    let exponent = 1 + (r >> 23) % 254;
+                    ((r & 0x807f_ffff) | (exponent << 23)).to_le_bytes()
+                })
+                .collect(),
+            _ => (0..n).map(|_| next() as u8).collect(),
+        }
+    }
+
+    /// Every layer of `texture` (`side` square, `texel` bytes a texel), read back.
+    fn read_layers(gpu: &Gpu, texture: &wgpu::Texture, side: u32, texel: u32) -> Vec<u8> {
+        let row = side * texel;
+        let padded = row.div_ceil(256) * 256;
+        let layers = texture.depth_or_array_layers();
+        let read = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: u64::from(padded * side * layers),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &read,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(side),
+                },
+            },
+            wgpu::Extent3d { width: side, height: side, depth_or_array_layers: layers },
+        );
+        gpu.queue.submit([encoder.finish()]);
+        read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        gpu.wait().unwrap();
+        let padded_rows = read.slice(..).get_mapped_range().unwrap().to_vec();
+        padded_rows.chunks(padded as usize).flat_map(|r| r[..row as usize].to_vec()).collect()
+    }
+
+    /// A copy as a test makes it: from where in which texture to where in which, how big.
+    struct CopyCase {
+        name: &'static str,
+        format: wgpu::TextureFormat,
+        source_layers: u32,
+        source_mips: u32,
+        target_layers: u32,
+        from: (u32, u32, u32),
+        into: (u32, u32, u32),
+        size: (u32, u32),
+        /// Within one texture (the source is the target).
+        within: bool,
+        /// Its source made around the GPU's own textures, without being read by draws.
+        unread: bool,
+        drawn: bool,
+    }
+
+    /// Copies of every kind the canvas makes, drawn where copies are drawn and copied as before
+    /// otherwise, come out texel for texel as the GPU's own copies: whole layers (the canvas's,
+    /// unsigned integers as carried parts keep, half and single floats), parts of them at other
+    /// places, into an array's second layer. Copies a draw can't make are copied as before: from an
+    /// array's layer or a level past the first, sRGB and signed integer texels, within one texture,
+    /// from a texture a draw can't read. What the texture drawn into held round a part is kept.
+    #[test]
+    fn drawn_copies_are_the_gpu_s_own_copies_texel_for_texel() {
+        let Ok(gpu) = Gpu::headless() else { return eprintln!("skipped: no GPU") };
+        let side = 64u32;
+        let case = |name, format, from, into, size, drawn| CopyCase {
+            name,
+            format,
+            source_layers: 1,
+            source_mips: 1,
+            target_layers: 1,
+            from,
+            into,
+            size,
+            within: false,
+            unread: false,
+            drawn,
+        };
+        use wgpu::TextureFormat as F;
+        let both = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT;
+        let whole = (side, side);
+        let mut cases = Vec::new();
+        for format in [F::Rgba8Unorm, F::R8Unorm, F::Rgba16Float, F::R32Float, F::Rgba32Uint, F::R32Uint] {
+            cases.push(case("whole", format, (0, 0, 0), (0, 0, 0), whole, true));
+            cases.push(case("a part elsewhere", format, (5, 7, 0), (30, 40, 0), (23, 17), true));
+            cases.push(CopyCase {
+                target_layers: 2,
+                ..case("into an array's second layer", format, (11, 0, 0), (2, 3, 1), (40, 21), true)
+            });
+        }
+        cases.push(CopyCase {
+            source_layers: 2,
+            ..case("from an array's second layer", F::Rgba8Unorm, (0, 0, 1), (0, 0, 0), whole, false)
+        });
+        cases.push(CopyCase {
+            source_mips: 2,
+            ..case("from the second level", F::Rgba8Unorm, (0, 0, 0), (0, 0, 0), (side / 2, side / 2), false)
+        });
+        cases.push(case("sRGB", F::Rgba8UnormSrgb, (0, 0, 0), (0, 0, 0), whole, false));
+        cases.push(case("signed integers", F::Rgba8Sint, (0, 0, 0), (8, 8, 0), (20, 20), false));
+        cases.push(CopyCase {
+            within: true,
+            target_layers: 2,
+            ..case("within one texture", F::Rgba8Unorm, (0, 0, 0), (32, 32, 1), (20, 20), false)
+        });
+        cases.push(CopyCase {
+            unread: true,
+            ..case("from a texture not read", F::Rgba8Unorm, (0, 0, 0), (0, 0, 0), whole, false)
+        });
+        for (seed, c) in cases.iter().enumerate() {
+            let texel = c.format.block_copy_size(None).unwrap();
+            let mut got = Vec::new();
+            for drawn in [false, true] {
+                gpu.draw_copies(drawn);
+                let desc = |layers, mips| wgpu::TextureDescriptor {
+                    label: Some("copied"),
+                    size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: layers },
+                    mip_level_count: mips,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: c.format,
+                    usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                };
+                let filled = |t: &wgpu::Texture, layers: u32, salt: u32| {
+                    for mip in 0..t.mip_level_count() {
+                        let s = side >> mip;
+                        let bytes = (s * s * texel) as usize;
+                        for layer in 0..layers {
+                            gpu.write_texture(
+                                wgpu::TexelCopyTextureInfo {
+                                    texture: t,
+                                    mip_level: mip,
+                                    origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
+                                    aspect: wgpu::TextureAspect::All,
+                                },
+                                &texels(c.format, bytes, salt + layer * 7 + mip * 13 + seed as u32 * 101),
+                                wgpu::TexelCopyBufferLayout {
+                                    offset: 0,
+                                    bytes_per_row: Some(s * texel),
+                                    rows_per_image: None,
+                                },
+                                wgpu::Extent3d { width: s, height: s, depth_or_array_layers: 1 },
+                            );
+                        }
+                    }
+                };
+                // (an array the canvas copies into is one it draws into)
+                let drawn_into = if c.target_layers > 1 { both } else { wgpu::TextureUsages::empty() };
+                let target = gpu.texture(&wgpu::TextureDescriptor {
+                    usage: desc(c.target_layers, 1).usage | drawn_into,
+                    ..desc(c.target_layers, 1)
+                });
+                filled(&target, c.target_layers, 1);
+                let made;
+                let source = if c.within {
+                    &target
+                } else {
+                    made = if c.unread {
+                        gpu.device.create_texture(&desc(c.source_layers, c.source_mips))
+                    } else {
+                        gpu.texture(&desc(c.source_layers, c.source_mips))
+                    };
+                    filled(&made, c.source_layers, 2);
+                    &made
+                };
+                let before = gpu.copies_drawn_count();
+                let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                let at = |t, (x, y, z), mip| wgpu::TexelCopyTextureInfo {
+                    texture: t,
+                    mip_level: mip,
+                    origin: wgpu::Origin3d { x, y, z },
+                    aspect: wgpu::TextureAspect::All,
+                };
+                gpu.copy_texture_to_texture(
+                    &mut encoder,
+                    at(source, c.from, c.source_mips - 1),
+                    at(&target, c.into, 0),
+                    wgpu::Extent3d { width: c.size.0, height: c.size.1, depth_or_array_layers: 1 },
+                );
+                gpu.queue.submit([encoder.finish()]);
+                let drew = gpu.copies_drawn_count() - before;
+                let expected =
+                    drawn && c.drawn && gpu.adapter.get_texture_format_features(c.format).allowed_usages.contains(both);
+                assert_eq!(drew, u64::from(expected), "{} {:?}: copies drawn (drawn: {drawn})", c.name, c.format);
+                got.push(read_layers(&gpu, &target, side, texel));
+            }
+            gpu.draw_copies(false);
+            assert!(got[0] == got[1], "{} {:?}: drawn, not as copied", c.name, c.format);
+            assert_eq!(gpu.errors(), 0, "{} {:?}", c.name, c.format);
+        }
+        assert_eq!(gpu.errors(), 0);
+    }
+
+    /// Where copies are drawn, a texture of one layer and level that is copied is made one a draw
+    /// reads and draws into, where its format allows; others, and every texture elsewhere, are
+    /// made as asked.
+    #[test]
+    fn textures_copied_where_copies_are_drawn_can_be_read_and_drawn_into() {
+        let Ok(gpu) = Gpu::headless() else { return eprintln!("skipped: no GPU") };
+        gpu.draw_copies(false);
+        let copied = wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST;
+        let both = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT;
+        let desc = |format, layers, mips, usage| wgpu::TextureDescriptor {
+            label: Some("usage"),
+            size: wgpu::Extent3d { width: 16, height: 16, depth_or_array_layers: layers },
+            mip_level_count: mips,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage,
+            view_formats: &[],
+        };
+        let plain = desc(wgpu::TextureFormat::Rgba8Unorm, 1, 1, copied);
+        assert_eq!(gpu.texture(&plain).usage(), copied);
+        gpu.draw_copies(true);
+        assert_eq!(gpu.texture(&plain).usage(), copied | both);
+        for (asked, why) in [
+            (desc(wgpu::TextureFormat::Rgba8Unorm, 3, 1, copied), "an array"),
+            (desc(wgpu::TextureFormat::Rgba8Unorm, 1, 2, copied), "levels"),
+            (desc(wgpu::TextureFormat::Rgba8UnormSrgb, 1, 1, copied), "sRGB"),
+            (desc(wgpu::TextureFormat::Rgba8Sint, 1, 1, copied), "signed integers"),
+            (desc(wgpu::TextureFormat::Rgba8Unorm, 1, 1, wgpu::TextureUsages::TEXTURE_BINDING), "never copied"),
+            (desc(wgpu::TextureFormat::Depth32Float, 1, 1, wgpu::TextureUsages::RENDER_ATTACHMENT), "depth"),
+        ] {
+            assert_eq!(gpu.texture(&asked).usage(), asked.usage, "{why}");
+        }
+        gpu.draw_copies(false);
+        assert_eq!(gpu.errors(), 0);
+    }
+
+    /// What drawing a copy costs against the GPU's own copy (OpenGL's `glCopyTexSubImage2D` on its
+    /// backend): a layer 2048 pixels square, and 256 tiles of 64 a side in one go (as wet paint's
+    /// windows take them), each the quickest of a few rounds and waited for. Drawn, a layer takes
+    /// no more than three times as long or 8 ms more, and a tile no more than 1 ms more, with every
+    /// other test on the GPU at once (alone on the PC's GPU, 2026-11-25: a layer 0.33 ms copied and
+    /// 0.35 ms drawn on Vulkan, 0.15 and 0.22 ms on OpenGL; a tile 0.004 and 0.028 ms on Vulkan,
+    /// 0.0025 and 0.017 ms on OpenGL).
+    #[test]
+    fn a_drawn_copy_costs_about_what_a_copy_does() {
+        let Ok(gpu) = Gpu::headless() else { return eprintln!("skipped: no GPU") };
+        let desc = |side| wgpu::TextureDescriptor {
+            label: Some("timed"),
+            size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        };
+        gpu.draw_copies(true);
+        let (from, into) = (gpu.texture(&desc(2048)), gpu.texture(&desc(2048)));
+        let tiles: Vec<wgpu::Texture> = (0..256).map(|_| gpu.texture(&desc(64))).collect();
+        let tile = wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 };
+        // (the quickest of a few rounds, each way in turn: other work on the GPU slows some)
+        let mut layer = [f64::MAX; 2];
+        let mut per_tile = [f64::MAX; 2];
+        for round in 0..12 {
+            for (i, drawn) in [false, true].into_iter().enumerate() {
+                gpu.draw_copies(drawn);
+                let started = std::time::Instant::now();
+                let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                gpu.copy_texture_to_texture(&mut encoder, from.as_image_copy(), into.as_image_copy(), from.size());
+                gpu.queue.submit([encoder.finish()]);
+                gpu.wait().unwrap();
+                let ms = started.elapsed().as_secs_f64() * 1000.0;
+                let started = std::time::Instant::now();
+                let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                for (k, t) in tiles.iter().enumerate() {
+                    let at = wgpu::Origin3d { x: (k as u32 % 32) * 64, y: (k as u32 / 32) * 64, z: 0 };
+                    let part = wgpu::TexelCopyTextureInfo { origin: at, ..from.as_image_copy() };
+                    gpu.copy_texture_to_texture(&mut encoder, part, t.as_image_copy(), tile);
+                }
+                gpu.queue.submit([encoder.finish()]);
+                gpu.wait().unwrap();
+                let tile_ms = started.elapsed().as_secs_f64() * 1000.0 / tiles.len() as f64;
+                // (the first round makes the pipeline and warms the textures)
+                if round > 0 {
+                    layer[i] = layer[i].min(ms);
+                    per_tile[i] = per_tile[i].min(tile_ms);
+                }
+            }
+        }
+        gpu.draw_copies(false);
+        eprintln!(
+            "a 2048 px layer copied in {:.3} ms, drawn {:.3} ms; a 64 px tile copied in {:.4} ms, drawn {:.4} ms ({:?})",
+            layer[0],
+            layer[1],
+            per_tile[0],
+            per_tile[1],
+            gpu.adapter.get_info().backend
+        );
+        assert!(layer[1] <= (3.0 * layer[0]).max(layer[0] + 8.0), "a layer: {layer:?} ms");
+        assert!(per_tile[1] <= per_tile[0] + 1.0, "a tile: {per_tile:?} ms");
         assert_eq!(gpu.errors(), 0);
     }
 
