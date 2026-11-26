@@ -227,7 +227,10 @@ fn adopt_preview_pictures(st: &mut crate::State, (set, index): (usize, usize)) {
 }
 
 /// Each shape and grain picture of `brush` and of its second.
-fn each_source(brush: &mut procraft_engine::brush::Brush, f: &mut impl FnMut(&mut procraft_engine::brush::Source)) {
+pub(crate) fn each_source(
+    brush: &mut procraft_engine::brush::Brush,
+    f: &mut impl FnMut(&mut procraft_engine::brush::Source),
+) {
     for source in [&mut brush.shape.source, &mut brush.grain.source].into_iter().flatten() {
         f(source);
     }
