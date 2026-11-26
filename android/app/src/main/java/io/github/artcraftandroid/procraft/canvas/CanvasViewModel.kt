@@ -2166,7 +2166,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * Puts [copy] (premultiplied, as kept here) on the system's clipboard in place of what it held: a
-     * PNG other apps paste, its transparency kept, from the app's files. Made off the main thread, as
+     * PNG other apps paste, its transparency kept, from the app's files, marked sensitive so keyboards
+     * don't keep it in clipboards of their own (see [markedAsPictureCopy]). Made off the main thread, as
      * a big canvas takes a moment. Whatever goes wrong on the way (a picture too big to make, a
      * system that refuses it) costs only other apps' paste, told once: the copy stays here to paste.
      */
@@ -2190,7 +2191,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 val superseded = turn != clipTurn
                 val uri = if (written && !superseded) runCatching { androidx.core.content.FileProvider.getUriForFile(app, app.packageName + ".files", file) }.getOrNull() else null
                 val board = systemClipboard
-                val put = uri != null && board != null && runCatching { board.setPrimaryClip(android.content.ClipData.newUri(app.contentResolver, "Picture", uri)) }.isSuccess
+                val put = uri != null && board != null && runCatching { board.setPrimaryClip(markedAsPictureCopy(android.content.ClipData.newUri(app.contentResolver, "Picture", uri))) }.isSuccess
                 if (put) {
                     clipUri = uri
                     clipPutAt = runCatching { board?.primaryClipDescription?.timestamp }.getOrNull()
