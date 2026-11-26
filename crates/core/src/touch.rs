@@ -5361,4 +5361,88 @@ mod tests {
         s.set_touch_settings(TouchSettings { undo_taps: false, ..TouchSettings::default() });
         assert!(!real_tap(&s, &hands_three_finger_taps()[1], 1.0, 8.0, true).contains(&TouchCommand::Redo));
     }
+
+    /// Three fingers tapped on an iPad, as its touches come: two pixels a point, every finger that
+    /// moved in one event 120 times a second, each with the two samples the system coalesced since
+    /// the last; the Pencil held over the glass (its hover as the iPad reports it) or not. Then
+    /// the same when the system takes the touches back as they land (as its own three-finger
+    /// editing gestures do where they aren't turned off): nothing is redone, nothing is left
+    /// down, and the next tap redoes.
+    #[test]
+    fn three_fingers_tapped_on_an_ipad_redo_once_and_a_tap_the_system_took_back_does_nothing() {
+        // (lands, lifts) ms, each finger 140 points from the last
+        let fingers = [(0.0, 120.0), (20.0, 130.0), (45.0, 140.0)];
+        let place = |i: usize, ms: f64| {
+            let wobble = (ms * 0.3 + i as f64).sin() as f32;
+            (2.0 * (300.0 + 140.0 * i as f32 + wobble), 2.0 * (400.0 + 20.0 * i as f32))
+        };
+        let samples = |i: usize, ms: f64, coalesced: bool| -> Vec<PenSample> {
+            let times = if coalesced { vec![ms - 1000.0 / 240.0, ms] } else { vec![ms] };
+            times
+                .into_iter()
+                .map(|t| {
+                    let (x, y) = place(i, t);
+                    PenSample { x, y, pressure: 1.0, tilt: 0.0, orientation: 0.0, time_ms: t, roll: 0.0 }
+                })
+                .collect()
+        };
+        let tap = |s: &CanvasSession, from: f64, taken_back: bool| {
+            let mut out = Vec::new();
+            let mut down = [false; 3];
+            let mut ms = from;
+            let end = from + 150.0;
+            while ms <= end {
+                while let Some(due) = s.touch_deadline().filter(|due| *due <= ms) {
+                    out.extend(s.touch_tick(due));
+                }
+                for (i, &(lands, lifts)) in fingers.iter().enumerate() {
+                    if !down[i] && ms >= from + lands && ms < from + lifts {
+                        down[i] = true;
+                        out.extend(s.touch_down(i as u64 + 1, PointerKind::Finger, samples(i, ms, false)));
+                    }
+                }
+                if taken_back && down.iter().all(|d| *d) {
+                    // the system's gesture took them: each called off
+                    for i in 0..3 {
+                        out.extend(s.touch_cancel_one(i as u64 + 1));
+                    }
+                    return out;
+                }
+                let moves: Vec<TouchMove> = (0..3)
+                    .filter(|&i| down[i] && ms < from + fingers[i].1)
+                    .map(|i| TouchMove { id: i as u64 + 1, samples: samples(i, ms, true) })
+                    .collect();
+                if !moves.is_empty() {
+                    out.extend(s.touch_moves(moves));
+                }
+                for (i, &(_, lifts)) in fingers.iter().enumerate() {
+                    if down[i] && ms + 1000.0 / 120.0 > from + lifts {
+                        down[i] = false;
+                        out.extend(s.touch_up(i as u64 + 1, samples(i, from + lifts, false)));
+                    }
+                }
+                ms += 1000.0 / 120.0;
+            }
+            out
+        };
+        for hovering in [false, true] {
+            let s = session();
+            s.set_display_scale(2.0);
+            if hovering {
+                s.touch_pen_hover(Some(PenHover { x: 900.0, y: 300.0, height: 0.4, time_ms: 0.0 }));
+            }
+            let out = tap(&s, 1000.0, false);
+            assert!(redid_once(&out), "hovering {hovering}: {out:?}");
+            // taken back as they land: no redo, no undo, nothing painted, nothing left down
+            let out = tap(&s, 2000.0, true);
+            assert!(
+                !out.iter().any(|c| matches!(c, TouchCommand::Redo | TouchCommand::Undo | TouchCommand::StrokeEnded)),
+                "hovering {hovering}, taken back: {out:?}"
+            );
+            assert!(s.touches().down.is_empty(), "hovering {hovering}: touches left down");
+            // and the next tap redoes
+            let out = tap(&s, 3000.0, false);
+            assert!(redid_once(&out), "hovering {hovering}, after: {out:?}");
+        }
+    }
 }

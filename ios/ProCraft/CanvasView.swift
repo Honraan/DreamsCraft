@@ -125,6 +125,9 @@ final class CanvasView: UIView {
         if window == nil {
             detach()
         } else {
+            // the system's three-finger editing gestures off all the way out to the app, SwiftUI's
+            // own responders round the canvas too
+            EditingGestures.cover(from: self)
             setNeedsLayout()
         }
     }
