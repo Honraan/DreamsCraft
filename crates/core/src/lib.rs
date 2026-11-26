@@ -134,6 +134,8 @@ mod text_draw;
 mod text_runs;
 mod timelapse;
 mod touch;
+#[cfg(test)]
+mod trail_tests;
 mod transform;
 mod turn;
 mod tween;

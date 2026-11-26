@@ -141,23 +141,23 @@ const RELAY_LEAST: u64 = 16 << 20;
 /// A render laying a stroke again sends what it has recorded each time this long has gone into
 /// recording it, so the GPU works on it while the rest is recorded (rather than after it all).
 const RELAY_SEND_EVERY: std::time::Duration = std::time::Duration::from_micros(1500);
-/// How much GPU time a render that shows the canvas gives paint laid in place (smudging, wet paint),
-/// ms, by how fast the GPU got through such work before: the rest waits for the renders after. Laid
-/// all at once, a stroke whose GPU fell behind the pen laid more in each frame, so each frame took
-/// longer and laid more again, until one held the GPU past its timeout (the device lost, the app
-/// gone) or the canvas for seconds: now it falls behind the pen evenly instead, and catches up.
-const IN_PLACE_FRAME_MS: f64 = 33.0;
+/// The most GPU time a render that shows the canvas gives the stamps it lays of a stroke (paint
+/// laid in place, and stamps in a stroke's textures, a dual brush's second among them, the two
+/// together), ms, by how fast the GPU was seen to get through such work: within it a render lays
+/// all that came since the last and half of what was left (see [`paced_most`]), so the stroke keeps
+/// under the pen as long as the GPU keeps up with it at a few frames a second; only work past it
+/// waits for the renders after, the stroke shown as far as it is laid (and, laid again from
+/// scratch, as it was until all of it is). Laid all at once, a stroke whose GPU fell behind the pen
+/// laid more in each frame until one held the GPU past its timeout (the device lost, the app gone),
+/// and a big dual brush's second laid again as its start turned took a laptop's GPU 0.5 to 2 s a
+/// frame. Held to a share of 20 or 33 ms a frame instead, a stroke trailed further and further
+/// behind the pen wherever its work took a GPU longer than that, or the GPU seemed slower than it
+/// was, and caught up only once the pen lifted.
+const PACED_MOST_MS: f64 = 150.0;
 /// The least work of paint laid in place a render lays however slow the GPU seems (see
 /// [`WORK_AT_ONCE`]): a few stamps of a big wet brush (a GPU's speed seen late, or with other work,
 /// can seem slower than it is).
 const IN_PLACE_LEAST: u64 = WORK_AT_ONCE;
-/// How much GPU time a render that shows the canvas gives the stamps it lays in a stroke's
-/// textures (a dual brush's second among them), ms, by how fast the GPU got through such work
-/// before: the rest waits for the renders after, the stroke shown as far as it is laid (and, laid
-/// again from scratch, as it was until all of it is). Laid all at once, a big dual brush's second
-/// laid again as its start turned, or coming while its paint laid in place caught up, took a
-/// laptop's GPU 0.5 to 2 s a frame, and one past two seconds took the device with it.
-const DRY_FRAME_MS: f64 = 20.0;
 /// The least work of a stroke's textures a render lays however slow the GPU seems: a few big
 /// stamps (see [`stamp_work`]).
 const DRY_LEAST: u64 = 16 << 20;
@@ -913,6 +913,43 @@ fn stamps_reach(stamps: &[StampInstance]) -> IRect {
     stamps.iter().fold(IRect::EMPTY, |r, s| {
         let at = procraft_engine::geom::Vec2::new(s.center[0], s.center[1]);
         r.union(IRect::around(at, s.radius * s.roundness.max(1.0) * std::f32::consts::SQRT_2))
+    })
+}
+
+/// How fast the GPU gets through a kind of a stroke's stamps (work a millisecond, at least), by
+/// the last render that laid some: its `work`, seen done `ms` after it was sent. That is seen as a
+/// later render begins, so the while counts the wait for it too: the GPU is at least that fast, and
+/// about that fast when it was still at the work as a render began. Only the last sighting counts,
+/// so a render lays at most [`PACED_MOST_MS`] over that while as much as the last did (see
+/// [`paced_most`]): nine times as much a frame at 60 frames a second while the GPU keeps up, and
+/// what takes it that long once it doesn't. A rate kept from before (the fastest seen, lowered a
+/// tenth by a render that ran late) stayed too high after a lighter brush, or as the GPU slowed,
+/// and renders by it ran long: ten times too high, about a second each for a stroke the GPU
+/// couldn't keep up with, and a second and a half for the first of a stroke laid again as it ended
+/// (see the model in this file's tests).
+fn seen_rate(work: u64, ms: f64) -> f64 {
+    work as f64 / ms.max(0.5)
+}
+
+/// The most work of a kind of a stroke's stamps a render that shows the canvas lays, `queued`
+/// waiting, of which renders before left `held`: all that came since and half of what was left,
+/// `least` at least, and no more than the GPU gets through in [`PACED_MOST_MS`] at `rate`.
+fn paced_most(rate: f64, queued: u64, held: u64, least: u64) -> u64 {
+    let most = ((rate * PACED_MOST_MS) as u64).max(least);
+    queued.saturating_sub(held).saturating_add(held / 2).clamp(least, most)
+}
+
+/// The work of the paint laid in place, and of the stamps laid in a stroke's textures, among
+/// `ops` (see [`stamp_work`]): as a render paces each.
+fn paced_work(ops: &[Op], full: IRect) -> (u64, u64) {
+    ops.iter().fold((0, 0), |(in_place, dry), op| match op {
+        Op::Stamps { instances, style, second: false, pencil: false, .. } if style.in_place() => {
+            (in_place.saturating_add(stamps_work(instances, full, true)), dry)
+        }
+        Op::Stamps { instances, style, second, .. } if !style.in_place() || *second => {
+            (in_place, dry.saturating_add(stamps_work(instances, full, false)))
+        }
+        _ => (in_place, dry),
     })
 }
 
@@ -3538,19 +3575,23 @@ pub struct Canvas {
     relay_sent: Option<(wgpu::SubmissionIndex, std::time::Instant, u64)>,
     relay_budget: u64,
     relay_paced: bool,
-    /// Paint laid in place left for the next render (see [`IN_PLACE_FRAME_MS`]); the last render
-    /// that laid such work, as sent (its submission, when, and how much), until it is seen done; and
-    /// how fast the GPU gets through such work, as seen (work a millisecond, at least).
+    /// Paint laid in place left for the next render (see [`PACED_MOST_MS`]); the last render that
+    /// laid such work, as sent (its submission, when, and how much), until it is seen done; how fast
+    /// the GPU got through that (work a millisecond, at least, see [`seen_rate`]); and how much of
+    /// such work the last render left.
     catching_up: bool,
     in_place_sent: Option<(wgpu::SubmissionIndex, std::time::Instant, u64)>,
     in_place_rate: Option<f64>,
     in_place_paced: bool,
-    /// As those for paint laid in place, for the stamps laid in a stroke's textures (see
-    /// [`DRY_FRAME_MS`]); and the most such work a render that shows the canvas has laid: for tests.
+    in_place_rate_set: Option<f64>,
+    in_place_held: u64,
+    /// As those for paint laid in place, for the stamps laid in a stroke's textures; and the most
+    /// such work a render that shows the canvas has laid: for tests.
     dry_sent: Option<(wgpu::SubmissionIndex, std::time::Instant, u64)>,
     dry_rate: Option<f64>,
     dry_rate_set: Option<f64>,
     dry_paced: bool,
+    dry_held: u64,
     dry_laid_most: u64,
     /// How the last plugin filter's draw went, not yet asked for.
     filter_run: Option<plugin_filter::FilterRun>,
@@ -4009,10 +4050,13 @@ impl Canvas {
             in_place_sent: None,
             in_place_rate: None,
             in_place_paced: true,
+            in_place_rate_set: None,
+            in_place_held: 0,
             dry_sent: None,
             dry_rate: None,
             dry_rate_set: None,
             dry_paced: true,
+            dry_held: 0,
             dry_laid_most: 0,
             filter_run: None,
             composites: 0,
@@ -5442,8 +5486,8 @@ impl Canvas {
         self.relaying
     }
 
-    /// Whether paint laid in place is waiting for the GPU to get through what came before (see
-    /// [`IN_PLACE_FRAME_MS`]): the stroke shown so far as laid, and more laid at each render.
+    /// Whether a stroke's stamps are waiting for the GPU to get through what came before (see
+    /// [`PACED_MOST_MS`]): the stroke shown so far as laid, and more laid at each render.
     pub fn catching_up(&self) -> bool {
         self.catching_up
     }
@@ -5461,50 +5505,44 @@ impl Canvas {
         self.relaying || self.catching_up || !self.ops.is_empty()
     }
 
-    /// The most work of paint laid in place a render lays (see [`IN_PLACE_FRAME_MS`]): as much as
-    /// the GPU gets through in that while, by the fastest it was seen to (each sighting counting a
-    /// little less as more come, so that a GPU slowing down is followed), and [`IN_PLACE_LEAST`] at
-    /// least; all of it before that is known, or in a render that doesn't show the canvas. The last
-    /// render that laid such work is seen here if it is done (its time from being sent to being seen
-    /// done is at least what the GPU took: the GPU is at least that fast).
-    fn in_place_most(&mut self, gpu: &Gpu, shown: bool) -> u64 {
+    /// The most work of paint laid in place a render lays, `queued` waiting (see [`paced_most`]),
+    /// [`IN_PLACE_LEAST`] at least; all of it before the GPU's rate is known, or in a render that
+    /// doesn't show the canvas. The last render that laid such work is seen here if it is done (see
+    /// [`seen_rate`]).
+    fn in_place_most(&mut self, gpu: &Gpu, shown: bool, queued: u64) -> u64 {
         if let Some((index, sent, work)) = self.in_place_sent.take() {
             let now = wgpu::PollType::Wait {
                 submission_index: Some(index.clone()),
                 timeout: Some(std::time::Duration::ZERO),
             };
             if crate::poll(&gpu.device, now).is_ok() {
-                let rate = work as f64 / (sent.elapsed().as_secs_f64() * 1000.0).max(0.5);
-                self.in_place_rate = Some(self.in_place_rate.map_or(rate, |r| (r * 0.9).max(rate)));
+                self.in_place_rate = Some(seen_rate(work, sent.elapsed().as_secs_f64() * 1000.0));
             } else {
                 self.in_place_sent = Some((index, sent, work));
             }
         }
-        match self.in_place_rate {
-            Some(rate) if shown && self.in_place_paced => ((rate * IN_PLACE_FRAME_MS) as u64).max(IN_PLACE_LEAST),
+        match self.in_place_rate_set.or(self.in_place_rate) {
+            Some(rate) if shown && self.in_place_paced => paced_most(rate, queued, self.in_place_held, IN_PLACE_LEAST),
             _ => u64::MAX,
         }
     }
 
-    /// The most work of stamps in a stroke's textures a render lays (see [`DRY_FRAME_MS`]): as
-    /// much as the GPU gets through in that while, by the fastest it was seen to (each sighting
-    /// counting a little less as more come), [`DRY_LEAST`] at least; all of it before that is known,
-    /// or in a render that doesn't show the canvas (as [`Canvas::in_place_most`] does).
-    fn dry_most(&mut self, gpu: &Gpu, shown: bool) -> u64 {
+    /// The most work of stamps in a stroke's textures a render lays, as [`Canvas::in_place_most`]
+    /// does for paint laid in place, [`DRY_LEAST`] at least.
+    fn dry_most(&mut self, gpu: &Gpu, shown: bool, queued: u64) -> u64 {
         if let Some((index, sent, work)) = self.dry_sent.take() {
             let now = wgpu::PollType::Wait {
                 submission_index: Some(index.clone()),
                 timeout: Some(std::time::Duration::ZERO),
             };
             if crate::poll(&gpu.device, now).is_ok() {
-                let rate = work as f64 / (sent.elapsed().as_secs_f64() * 1000.0).max(0.5);
-                self.dry_rate = Some(self.dry_rate.map_or(rate, |r| (r * 0.9).max(rate)));
+                self.dry_rate = Some(seen_rate(work, sent.elapsed().as_secs_f64() * 1000.0));
             } else {
                 self.dry_sent = Some((index, sent, work));
             }
         }
         match self.dry_rate_set.or(self.dry_rate) {
-            Some(rate) if shown && self.dry_paced => ((rate * DRY_FRAME_MS) as u64).max(DRY_LEAST),
+            Some(rate) if shown && self.dry_paced => paced_most(rate, queued, self.dry_held, DRY_LEAST),
             _ => u64::MAX,
         }
     }
@@ -5524,12 +5562,19 @@ impl Canvas {
     }
 
     /// Whether the stamps laid in a stroke's textures are laid only as fast as the GPU gets through
-    /// them (see [`DRY_FRAME_MS`]), and how fast it is taken to (work a millisecond; none: as seen):
-    /// for tests comparing it with all of it laid in each render.
+    /// them (see [`PACED_MOST_MS`]), and how fast it is taken to (work a millisecond; none: as
+    /// seen): for tests comparing it with all of it laid in each render, or with a slow GPU.
     #[doc(hidden)]
     pub fn set_dry_paced(&mut self, on: bool, rate: Option<f64>) {
         self.dry_paced = on;
         self.dry_rate_set = rate;
+    }
+
+    /// The work of paint laid in place, and of stamps in a stroke's textures, the last render that
+    /// showed the canvas left for the renders after (see [`stamp_work`]): for tests.
+    #[doc(hidden)]
+    pub fn paced_held(&self) -> (u64, u64) {
+        (self.in_place_held, self.dry_held)
     }
 
     /// The most work of stamps in a stroke's textures a render that showed the canvas laid (see
@@ -5572,10 +5617,18 @@ impl Canvas {
     }
 
     /// Whether paint laid in place is laid only as fast as the GPU gets through it (see
-    /// [`IN_PLACE_FRAME_MS`]): for tests comparing it with all of it laid in each render.
+    /// [`PACED_MOST_MS`]): for tests comparing it with all of it laid in each render.
     #[doc(hidden)]
     pub fn set_in_place_paced(&mut self, on: bool) {
         self.in_place_paced = on;
+    }
+
+    /// How fast the GPU is taken to get through paint laid in place (work a millisecond; none: as
+    /// seen), as [`Canvas::set_dry_paced`] sets for the stamps in a stroke's textures: for tests
+    /// laying it a set share at a time.
+    #[doc(hidden)]
+    pub fn set_in_place_rate(&mut self, rate: Option<f64>) {
+        self.in_place_rate_set = rate;
     }
 
     /// The most stamps one buffer of this device holds.
@@ -7287,12 +7340,13 @@ impl Canvas {
         let rewinds = ops.iter().any(|op| matches!(op, Op::RewindInPlace(_) | Op::RewindSecond(_)));
         let relays = target.is_some() && (self.relaying || rewinds || lays_ended_stroke_again(&ops));
         let relay_most = if relays { self.relay_most(gpu) } else { u64::MAX };
-        // stamps in a stroke's textures, in a render that shows the canvas: a frame's share of the
-        // GPU's time (see `DRY_FRAME_MS`), in pieces no bigger where cutting them changes nothing (a
-        // part laid by its rule and not carried from lot to lot rounds each piece's sums: cut only
-        // as it always is)
+        // stamps in a stroke's textures, in a render that shows the canvas: what came since the last
+        // and some of what waits, within what the GPU gets through in a while (see `PACED_MOST_MS`),
+        // in pieces no bigger where cutting them changes nothing (a part laid by its rule and not
+        // carried from lot to lot rounds each piece's sums: cut only as it always is)
         let target_shown = target.is_some();
-        let dry_most = self.dry_most(gpu, target_shown);
+        let (queued_in_place, queued_dry) = paced_work(&ops, self.full());
+        let dry_most = self.dry_most(gpu, target_shown, queued_dry);
         let most = self.work_at_once.min(relay_most);
         let ops = in_pieces(ops, self.full(), (self.work_at_once, most, most.min(dry_most)), most_stamps);
         if target_shown {
@@ -7400,16 +7454,18 @@ impl Canvas {
         // when what was recorded was last sent, laying a stroke again (see `RELAY_SEND_EVERY`)
         let mut relay_sent_at = started;
         self.relaying = false;
-        // paint laid in place, in a render that shows the canvas: as much as the GPU gets through in
-        // a little while (see `IN_PLACE_FRAME_MS`), the rest left to the renders after
-        let in_place_most = self.in_place_most(gpu, target.is_some());
+        // paint laid in place, in a render that shows the canvas: what came since the last and some
+        // of what waits, within what the GPU gets through in a while (see `PACED_MOST_MS`), the rest
+        // left to the renders after
+        let in_place_most = self.in_place_most(gpu, target.is_some(), queued_in_place);
         let mut in_place_laid = 0u64;
-        // and stamps in a stroke's textures, so too (see `DRY_FRAME_MS`); the two together in no
-        // more of the GPU's time than paint laid in place alone takes (as fast as each was seen to
-        // go), past the least of each: laid apart, a big dual brush's paint and second came to
-        // twice that, its second's coming while its paint caught up
+        // and stamps in a stroke's textures, so too; the two together in no more of the GPU's time
+        // than that (as fast as each was seen to go), past the least of each: laid apart, a big
+        // dual brush's paint and second came to twice that, its second's coming while its paint
+        // caught up
         let mut dry_laid = 0u64;
-        let in_place_rate = self.in_place_rate.filter(|_| target_shown && self.in_place_paced);
+        let in_place_rate =
+            self.in_place_rate_set.or(self.in_place_rate).filter(|_| target_shown && self.in_place_paced);
         let dry_rate = self.dry_rate_set.or(self.dry_rate).filter(|_| target_shown && self.dry_paced);
         let mut spent_ms = 0.0f64;
         self.catching_up = false;
@@ -7441,7 +7497,7 @@ impl Canvas {
                 let ms = in_place_rate.map_or(0.0, |rate| work as f64 / rate);
                 let past_own = in_place_laid > 0 && in_place_laid.saturating_add(work) > in_place_most;
                 let past_both = spent_ms > 0.0
-                    && spent_ms + ms > IN_PLACE_FRAME_MS
+                    && spent_ms + ms > PACED_MOST_MS
                     && in_place_laid.saturating_add(work) > IN_PLACE_LEAST;
                 if past_own || past_both {
                     let rest: Vec<Op> = std::iter::once(op).chain(ops.by_ref()).collect();
@@ -7459,7 +7515,7 @@ impl Canvas {
                 let ms = dry_rate.map_or(0.0, |rate| work as f64 / rate);
                 let past_own = dry_laid > 0 && dry_laid.saturating_add(work) > dry_most;
                 let past_both =
-                    spent_ms > 0.0 && spent_ms + ms > IN_PLACE_FRAME_MS && dry_laid.saturating_add(work) > DRY_LEAST;
+                    spent_ms > 0.0 && spent_ms + ms > PACED_MOST_MS && dry_laid.saturating_add(work) > DRY_LEAST;
                 if past_own || past_both {
                     let rest: Vec<Op> = std::iter::once(op).chain(ops.by_ref()).collect();
                     self.hold_or_catch_up(&rest, relay_until.is_some());
@@ -7590,8 +7646,8 @@ impl Canvas {
                     let first = next_instance;
                     next_instance = next_instance.saturating_add(count);
                     // shown where they reach in this render's composite: held back from the render
-                    // that queued them (a frame's share at a time, see `DRY_FRAME_MS`), they come
-                    // after the composite there was made again without them
+                    // that queued them (see `PACED_MOST_MS`), they come after the composite there
+                    // was made again without them
                     let reach = stamps_reach(&instances);
                     self.dirty = self.dirty.union(reach.intersect(full));
                     let (grain, grain_scale, grain_depth) =
@@ -7722,10 +7778,7 @@ impl Canvas {
                     // both, it comes out the same, nothing reading what it puts together), or where
                     // it went before the paint began as the stroke ends
                     if second {
-                        let rect = instances.iter().fold(IRect::EMPTY, |r, s| {
-                            let at = procraft_engine::geom::Vec2::new(s.center[0], s.center[1]);
-                            r.union(IRect::around(at, s.radius * s.roundness.max(1.0) * std::f32::consts::SQRT_2))
-                        });
+                        let rect = reach;
                         match self.smudge.as_ref().filter(|s| s.apart.is_some()) {
                             // a tip's, put together as its paint's tip is laid (see `SaveInPlaceTip`)
                             Some(_) if tip => self.tip_synthesis = self.tip_synthesis.union(rect),
@@ -8696,6 +8749,8 @@ impl Canvas {
         if target_shown {
             self.dry_laid_most = self.dry_laid_most.max(dry_laid);
         }
+        // what is left for the renders after: what comes before the next is what came since
+        (self.in_place_held, self.dry_held) = paced_work(&self.ops, full);
         if relay_laid > 0 && self.relay_sent.is_none() {
             self.relay_sent = Some((sent.clone(), std::time::Instant::now(), relay_laid));
         }
@@ -15947,6 +16002,187 @@ fn start_reading_part(gpu: &Gpu, texture: &wgpu::Texture, rect: IRect) -> Readba
 
 #[cfg(test)]
 mod tests {
+    /// A stroke's stamps paced as renders lay them (see `paced_most` and `seen_rate`) on a model of
+    /// the canvas's renders: the stroke's work coming at an even pace, slowly for a second and then
+    /// fast for two (a few big stamps a frame), renders `spacing` ms apart (or as long as the GPU
+    /// takes, if longer), the GPU getting through `gpu` work a ms; how far the stroke trails the
+    /// pen at its worst (the oldest work not yet laid, ms), how long after the pen stops it is all
+    /// laid, and the longest render's GPU time. Held to a share of 20 ms of the GPU a frame by a
+    /// rate seen against the time between renders (as v0.0.8 was), a device drawing 30 frames a
+    /// second with a GPU to spare had its rate fall to the least share and the stroke trail the pen
+    /// by over a second; now it trails by a frame or two however the renders are spaced, and only a
+    /// GPU too slow for the stroke at a few frames a second lets it fall behind, its frames bounded.
+    /// They stay bounded where the rate before the stroke was far too high (`before`: seen with a
+    /// lighter brush, or before the GPU slowed) and where the whole stroke is laid `again` as the
+    /// pen stops: the fastest rate seen kept, and lowered a tenth by a render that ran late, let
+    /// renders there run for over a second.
+    #[test]
+    fn a_stroke_paced_to_the_gpu_keeps_under_the_pen_while_the_gpu_keeps_up() {
+        use super::{DRY_LEAST, PACED_MOST_MS, paced_most, seen_rate};
+        use std::collections::VecDeque;
+        // how a render's most comes of the renders before: a 20 ms share by a rate each sighting
+        // lowers a tenth (v0.0.8); what came since by the fastest rate seen, lowered a tenth by a
+        // render that ran late; and that by the last sighting alone (as it is)
+        #[derive(Clone, Copy, PartialEq)]
+        enum Rate {
+            Share,
+            Fastest,
+            Last,
+        }
+        // (worst trail, ms; ms from the pen stopping to all laid; longest render's GPU time, ms)
+        let model =
+            |rule: Rate, spacing: f64, gpu: f64, fast: f64, before: Option<f64>, again: u64| -> (f64, f64, f64) {
+                let (slow, slow_ms, fast_ms) = (fast / 40.0, 1000.0, 2000.0);
+                let (mut t, mut since, mut rate, mut held) = (0.0f64, 0.0f64, before, 0u64);
+                let mut again = Some(again).filter(|&work| work > 0);
+                let mut waiting: VecDeque<(f64, u64)> = VecDeque::new();
+                let (mut worst, mut drained, mut longest) = (0.0f64, 0.0f64, 0.0f64);
+                for _ in 0..100_000 {
+                    // what came since the last render, by when it came
+                    let pace = |at: f64| {
+                        if at < slow_ms {
+                            slow
+                        } else if at < slow_ms + fast_ms {
+                            fast
+                        } else {
+                            0.0
+                        }
+                    };
+                    let came = (pace(since) * (t - since)) as u64;
+                    if came > 0 {
+                        waiting.push_back((since, came));
+                    }
+                    // (the stroke laid again as the pen stops: all of it queued at once)
+                    if t >= slow_ms + fast_ms
+                        && let Some(work) = again.take()
+                    {
+                        waiting.push_back((t, work));
+                    }
+                    since = t;
+                    let queued: u64 = waiting.iter().map(|w| w.1).sum();
+                    let most = match rate {
+                        None => u64::MAX,
+                        Some(r) if rule == Rate::Share => ((r * 20.0) as u64).max(DRY_LEAST),
+                        Some(r) => paced_most(r, queued, held, DRY_LEAST),
+                    };
+                    let laid = queued.min(most);
+                    let mut left = laid;
+                    while let Some(front) = waiting.front_mut() {
+                        if front.1 > left {
+                            front.1 -= left;
+                            break;
+                        }
+                        left -= front.1;
+                        waiting.pop_front();
+                    }
+                    held = queued - laid;
+                    worst = worst.max(waiting.front().map_or(0.0, |w| t - w.0));
+                    let ms = laid as f64 / gpu;
+                    longest = longest.max(ms);
+                    let next = spacing.max(ms);
+                    if laid > 0 {
+                        let seen = seen_rate(laid, next);
+                        rate = Some(match (rule, rate) {
+                            (Rate::Last, _) | (_, None) => seen,
+                            (Rate::Share, Some(r)) => (r * 0.9).max(seen),
+                            (Rate::Fastest, Some(r)) if ms > spacing => (r * 0.9).max(seen),
+                            (Rate::Fastest, Some(r)) => r.max(seen),
+                        });
+                    }
+                    // (all laid in this render, past the pen's end: shown as it ends)
+                    if since >= slow_ms + fast_ms && waiting.is_empty() {
+                        drained = t - slow_ms - fast_ms;
+                        break;
+                    }
+                    t += next;
+                }
+                (worst, drained, longest)
+            };
+        // a fast stroke of big stamps: 1.5 million pixels' work a ms (a 300 px soft round at 3000 px
+        // a second, spaced a tenth of its size), 50 million a frame at 30 frames a second
+        let fast = 1.5e6;
+        for (spacing, name) in [(1000.0 / 30.0, "30 frames a second"), (1000.0 / 60.0, "60"), (1000.0 / 120.0, "120")] {
+            // a GPU getting through it in a quarter of the time
+            let gpu = fast * 4.0;
+            let (old_worst, old_end, _) = model(Rate::Share, spacing, gpu, fast, None, 0);
+            let (worst, end, longest) = model(Rate::Last, spacing, gpu, fast, None, 0);
+            println!(
+                "{name}, a GPU to spare: trailed by {old_worst:.0} ms at worst before ({old_end:.0} ms to lay after \
+                 the pen stopped), {worst:.0} ms now ({end:.0} ms), the longest render {longest:.1} ms of the GPU"
+            );
+            assert!(worst <= 2.0 * spacing + 1.0, "{name}: trailed by {worst:.0} ms");
+            assert!(end <= 2.0 * spacing + 1.0, "{name}: {end:.0} ms to lay after the pen stopped");
+            // (no further behind than with the fastest rate kept: a stroke getting up to pace
+            // grows no faster than a render's most by the last sighting lets it)
+            let (kept_worst, kept_end, _) = model(Rate::Fastest, spacing, gpu, fast, None, 0);
+            assert!(worst <= kept_worst + 1.0 && end <= kept_end + 1.0, "{name}: {worst:.0} ms, {kept_worst:.0} kept");
+        }
+        // (as it was: at 30 frames a second the rate fell to the least share and the stroke fell
+        // further behind all the while)
+        let (old_worst, ..) = model(Rate::Share, 1000.0 / 30.0, fast * 4.0, fast, None, 0);
+        assert!(old_worst > 1000.0, "trailed by {old_worst:.0} ms before");
+        // a GPU too slow for the stroke (it takes 7.5 times as long as the pen): the stroke falls
+        // behind, but no render's GPU work passes the most a render may take (beyond the least
+        // share, which this GPU takes 80 ms over)
+        let slow_gpu = fast / 7.5;
+        let (worst, end, longest) = model(Rate::Last, 1000.0 / 60.0, slow_gpu, fast, None, 0);
+        println!(
+            "a GPU too slow: trailed by {worst:.0} ms ({end:.0} ms after the pen), the longest render {longest:.0} ms"
+        );
+        assert!(longest <= PACED_MOST_MS + 1.0, "a render took {longest:.0} ms of the GPU");
+        assert!(worst > 1000.0, "kept up with a GPU too slow?");
+        // so too where the rate seen before the stroke was ten times what this GPU gets through
+        // its stamps at (a lighter brush before it, or the GPU slowed since): the fastest rate kept
+        // let renders run for most of a second or more
+        for (gpu, name) in [(slow_gpu, "7.5 times too slow"), (fast / 2.0, "twice too slow")] {
+            let before = Some(gpu * 10.0);
+            let (.., kept) = model(Rate::Fastest, 1000.0 / 60.0, gpu, fast, before, 0);
+            let (.., longest) = model(Rate::Last, 1000.0 / 60.0, gpu, fast, before, 0);
+            println!(
+                "a GPU {name}, its rate ten times too high before: the longest render {longest:.0} ms ({kept:.0} kept)"
+            );
+            assert!(longest <= PACED_MOST_MS + 1.0, "{name}: a render took {longest:.0} ms of the GPU");
+            assert!(kept > 800.0, "{name}: {kept:.0} ms with the fastest rate kept");
+        }
+        // and where the stroke is laid again whole as the pen stops (three seconds of this GPU's
+        // work at once, as a dual brush's second is where it isn't carried), after a rate ten times
+        // too high and a stroke the GPU kept up with: its first render took a second and a half
+        let gpu = fast * 4.0;
+        let again = (gpu * 3000.0) as u64;
+        let (.., kept) = model(Rate::Fastest, 1000.0 / 60.0, gpu, fast, Some(gpu * 10.0), again);
+        let (_, end, longest) = model(Rate::Last, 1000.0 / 60.0, gpu, fast, Some(gpu * 10.0), again);
+        println!(
+            "a stroke laid again: the longest render {longest:.0} ms ({kept:.0} kept), laid {end:.0} ms after the pen"
+        );
+        assert!(longest <= PACED_MOST_MS + 1.0, "laid again: a render took {longest:.0} ms of the GPU");
+        assert!(kept > 1000.0, "laid again: {kept:.0} ms with the fastest rate kept");
+        // (no slower for it: three seconds of work, and the renders it takes to get up to pace)
+        assert!(end <= 3000.0 + 10.0 * PACED_MOST_MS, "laid again: {end:.0} ms");
+    }
+
+    /// The GPU's rate is the last sighting's alone, whatever it was before; and a render lays all
+    /// that came since the last and half of what was left, within the least and the most.
+    #[test]
+    fn the_gpus_rate_is_the_last_seen_and_a_render_lays_what_came() {
+        use super::{PACED_MOST_MS, paced_most, seen_rate};
+        assert_eq!(seen_rate(1000, 10.0), 100.0);
+        assert_eq!(seen_rate(1000, 0.1), 2000.0, "no less than half a millisecond");
+        // a render seen done 15 ms after it was sent lets the next lay ten times as much, and one
+        // the GPU was 300 ms over half as much
+        let least = 1000;
+        let (laid, waiting) = (1_000_000, 1 << 30);
+        assert_eq!(paced_most(seen_rate(laid, 15.0), waiting, 0, least), 10 * laid);
+        assert_eq!(paced_most(seen_rate(laid, 300.0), waiting, 0, least), laid / 2);
+        // nothing left before: all that came
+        assert_eq!(paced_most(1e6, 50_000, 0, least), 50_000);
+        // half of what was left, besides what came
+        assert_eq!(paced_most(1e6, 50_000, 20_000, least), 40_000);
+        assert_eq!(paced_most(1e6, 10, 0, least), least);
+        // no more than the GPU gets through in PACED_MOST_MS
+        assert_eq!(paced_most(100.0, 1 << 30, 0, least), (100.0 * PACED_MOST_MS) as u64);
+        assert_eq!(paced_most(1.0, 1 << 30, 0, least), least);
+    }
+
     /// A stroke laid again over frames lays less a frame once the GPU is seen to fall well behind
     /// what a frame records (a GPU went on 30 to 150 ms after each frame of a big brush's end), as
     /// much as it gets through in [`super::RELAY_GPU_MS`]; as much as the recording time allows

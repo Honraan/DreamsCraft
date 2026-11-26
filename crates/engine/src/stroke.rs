@@ -4719,6 +4719,71 @@ mod tests {
         }
     }
 
+    /// A pen drawn along a line at `speed` (px a millisecond) and `rate` samples a second for
+    /// `ms`, pressure 0.6: how far (ms) the line as shown (laid, then the tip on to the input)
+    /// and what is laid for good trail the pen at its end.
+    fn trails(brush: &Brush, speed: f32, rate: f64, ms: f64) -> (f32, f32) {
+        let n = (rate * ms / 1000.0) as usize;
+        let samples: Vec<Sample> = (0..=n)
+            .map(|i| {
+                let t = i as f64 * 1000.0 / rate;
+                Sample::at(Vec2::new(100.0 + speed * t as f32, 50.0), 0.6, t)
+            })
+            .collect();
+        let pen = samples[n].pos.x;
+        let mut b = StrokeBuilder::new(brush.clone(), 4.0, Pointer::Stylus);
+        b.add(&samples);
+        let laid = b.placed_stamps().last().map_or(f32::NAN, |s| s.center.x);
+        let shown = b.preview_to_input(&[]).iter().chain(&b.placed_stamps()).map(|s| s.center.x).fold(laid, f32::max);
+        ((pen - shown) / speed, (pen - laid) / speed)
+    }
+
+    /// The per-sample model's line at a pen's 240 samples a second: how far (ms) what it has
+    /// settled trails the pen (each point followed by `strength` of the way from the one before,
+    /// settled once 11 newer have come).
+    fn modelled_trail(amount: f32, speed: f32, ms: f64) -> f32 {
+        let strength = 1.0 - streamline_keep(amount);
+        let interval = 1000.0 / 240.0;
+        let n = (240.0 * ms / 1000.0) as usize;
+        let mut at = 0.0f32;
+        let path: Vec<f32> = (0..=n)
+            .map(|i| {
+                let x = speed * (i as f64 * interval) as f32;
+                at = if i == 0 { x } else { at + strength * (x - at) };
+                at
+            })
+            .collect();
+        (speed * (n as f64 * interval) as f32 - path[n - 11]) / speed
+    }
+
+    #[test]
+    fn the_line_shown_ends_at_the_pen_and_what_is_laid_keeps_its_time_behind_at_any_pen_rate() {
+        // 2000 px a second for 400 ms, at a slow pen's rate, a pen's own and a fast one's
+        for streamline in [0.0, 0.1, 0.5, 0.88] {
+            for pressure_smoothing in [0.0, 0.06, 0.3] {
+                let brush = Brush { streamline, pressure_smoothing, ..plain() };
+                let windowed = streamline > 0.0 || pressure_smoothing > 0.0;
+                let model = if windowed { modelled_trail(streamline, 2.0, 400.0) } else { 0.0 };
+                for rate in [120.0, 240.0, 500.0] {
+                    let (shown, laid) = trails(&brush, 2.0, rate, 400.0);
+                    // the line as shown reaches the pen
+                    assert!(
+                        shown.abs() < 0.5,
+                        "{streamline}/{pressure_smoothing} at {rate} Hz: shown {shown} ms behind"
+                    );
+                    // what is laid trails it by the model's time and up to two samples at this
+                    // rate more: the window lets a point go at a whole sample, and the last stretch
+                    // waits for the point after it to curve by
+                    let off = laid - model;
+                    assert!(
+                        off > -0.5 && off < 2000.0 / rate as f32 + 0.5,
+                        "{streamline}/{pressure_smoothing} at {rate} Hz: laid {laid} ms behind, the model {model}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn with_no_smoothing_a_slow_line_read_in_whole_pixels_evens_its_steps_out_and_read_finer_goes_straight() {
         // a pen drawn slowly across at 30 degrees, 100 px a second, read at 240 Hz and handed over
