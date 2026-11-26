@@ -841,6 +841,11 @@ pub struct PendingThumbnail {
 }
 
 impl PendingThumbnail {
+    /// One already here.
+    pub fn ready(t: Thumbnail) -> PendingThumbnail {
+        PendingThumbnail { width: t.width, height: t.height, read: Readback::Ready(t.rgba) }
+    }
+
     /// The picture, once the GPU has copied it.
     pub fn pixels(self) -> Result<Thumbnail, GpuError> {
         Ok(Thumbnail { width: self.width, height: self.height, rgba: self.read.pixels()? })
@@ -12851,6 +12856,20 @@ impl Canvas {
         max_side: u32,
     ) -> Result<LayerThumbnailStep, GpuError> {
         self.render(gpu, doc, None);
+        self.start_layer_thumbnail_as_laid(gpu, doc, id, max_side)
+    }
+
+    /// [`Canvas::start_layer_thumbnail`] without the render first: the layer as the renders so far
+    /// have laid it. For a read beside the frames while they still lay work a share at a time (a
+    /// heavy stroke's end, paint catching up with the pen), which a render here would lay all at
+    /// once, holding whatever waits on the canvas meanwhile.
+    pub fn start_layer_thumbnail_as_laid(
+        &mut self,
+        gpu: &Gpu,
+        doc: &Document,
+        id: LayerId,
+        max_side: u32,
+    ) -> Result<LayerThumbnailStep, GpuError> {
         let mask = doc.layer(id).is_some_and(|l| l.kind == LayerKind::Mask);
         if let Some(p) = self.parked_pictures(id, max_side).filter(|_| !mask) {
             return Ok(LayerThumbnailStep::Ready(shrink(p.drawn.as_ref().unwrap_or(&p.whole), max_side)));
@@ -12894,12 +12913,6 @@ impl Canvas {
         }
         .intersect(full);
         Ok(FineThumbnail { pending: self.start_sample_view(gpu, &layer.view, rect, max_side), cut_mask: Some(mask) })
-    }
-
-    /// `rect` of a layer box-filtered to fit `max_side` pixels (never enlarged), read back.
-    fn sample_layer(&self, gpu: &Gpu, id: LayerId, rect: IRect, max_side: u32) -> Result<Thumbnail, GpuError> {
-        let layer = self.layers.get(&id).ok_or_else(|| GpuError::Readback(format!("no layer {id:?}")))?;
-        self.sample_view(gpu, &layer.view, rect, max_side)
     }
 
     /// Each paint layer's coverage (alpha, 0 to 255) at canvas pixel (`x`, `y`), in the
@@ -12982,12 +12995,25 @@ impl Canvas {
         max_side: u32,
     ) -> Result<Thumbnail, GpuError> {
         self.render(gpu, doc, None);
+        self.start_layer_picture_as_laid(gpu, id, max_side)?.pixels()
+    }
+
+    /// [`Canvas::layer_picture`] started, without the render first (see
+    /// [`Canvas::start_layer_thumbnail_as_laid`]): its copy queued, its pixels waited for once
+    /// whatever guards the canvas is let go.
+    pub fn start_layer_picture_as_laid(
+        &mut self,
+        gpu: &Gpu,
+        id: LayerId,
+        max_side: u32,
+    ) -> Result<PendingThumbnail, GpuError> {
         if let Some(p) = self.parked_pictures(id, max_side) {
-            return Ok(shrink(&p.whole, max_side));
+            return Ok(PendingThumbnail::ready(shrink(&p.whole, max_side)));
         }
         self.restore_all(gpu, [id], false);
         let full = self.full();
-        self.sample_layer(gpu, id, full, max_side)
+        let layer = self.layers.get(&id).ok_or_else(|| GpuError::Readback(format!("no layer {id:?}")))?;
+        Ok(self.start_sample_view(gpu, &layer.view, full, max_side))
     }
 
     /// The picture as it shows (while the caches are remade, as it was), scaled to fit
@@ -13027,6 +13053,12 @@ impl Canvas {
         self.invalidate();
         self.render_finished(gpu, doc);
         thumbnail.pixels()
+    }
+
+    /// The composite as the renders so far have left it, scaled to fit `max_side` pixels, started
+    /// without a render first (see [`Canvas::start_layer_thumbnail_as_laid`]).
+    pub fn start_composite_thumbnail_as_laid(&self, gpu: &Gpu, max_side: u32) -> PendingThumbnail {
+        self.start_sample_view(gpu, &self.composite_view, self.full(), max_side)
     }
 
     /// [`Canvas::composite_thumbnail_without`] started: the picture's copy queued, its pixels to be
@@ -13397,12 +13429,18 @@ impl Canvas {
     /// The composite's pixel at canvas pixel (`x`, `y`) as last rendered (premultiplied RGBA8);
     /// none off the canvas. Waits for the GPU.
     pub fn read_composite_pixel(&self, gpu: &Gpu, x: u32, y: u32) -> Option<[u8; 4]> {
+        let px = self.start_reading_composite_pixel(gpu, x, y)?.pixels().ok()?;
+        Some([*px.first()?, *px.get(1)?, *px.get(2)?, *px.get(3)?])
+    }
+
+    /// [`Canvas::read_composite_pixel`] started: its copy queued, its 4 bytes waited for once
+    /// whatever guards the canvas is let go. None off the canvas.
+    pub fn start_reading_composite_pixel(&self, gpu: &Gpu, x: u32, y: u32) -> Option<Readback> {
         if x >= self.width || y >= self.height {
             return None;
         }
         let (x, y) = (i32::try_from(x).ok()?, i32::try_from(y).ok()?);
-        let px = start_reading_part(gpu, &self.composite, IRect::new(x, y, x + 1, y + 1)).pixels().ok()?;
-        Some([*px.first()?, *px.get(1)?, *px.get(2)?, *px.get(3)?])
+        Some(start_reading_part(gpu, &self.composite, IRect::new(x, y, x + 1, y + 1)))
     }
 
     /// The composite's pixels as they would be without the layers `left_out` (the gallery's

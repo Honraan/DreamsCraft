@@ -22,6 +22,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod box_pinch;
+pub(crate) mod mail;
 mod pen;
 
 pub use pen::{HoverCursor, PenHover, PenPreferred, SqueezePhase};
@@ -521,6 +522,9 @@ struct Held {
 /// The touches' state: kept by the session, apart from the canvas's (they call into it).
 pub(crate) struct Touches {
     settings: TouchSettings,
+    /// When the airbrush's stroke held still next dabs, as last seen (the host's clock, ms): told
+    /// while something holds the canvas.
+    airbrush_next: Option<f64>,
     mode: Mode,
     down: Vec<Down>,
     stroke_pointer: u64,
@@ -689,6 +693,7 @@ impl Default for Touches {
     fn default() -> Touches {
         Touches {
             settings: TouchSettings::default(),
+            airbrush_next: None,
             mode: Mode::None,
             down: Vec::new(),
             stroke_pointer: 0,
@@ -1008,12 +1013,12 @@ impl CanvasSession {
             return self.pen_hover_ends();
         }
         let rest = held.split_off(1);
-        let mut out = self.touch_down(id, kind, held.clone());
+        let mut out = self.take_down(id, kind, held.clone());
         if lifts {
             // a tap: a dot where it touched
-            out.extend(self.touch_up(id, if rest.is_empty() { held } else { rest }));
+            out.extend(self.take_up(id, if rest.is_empty() { held } else { rest }));
         } else if !rest.is_empty() {
-            out.extend(self.touch_move(id, rest));
+            out.extend(self.take_move(id, rest));
         }
         out
     }
@@ -1084,12 +1089,12 @@ impl CanvasSession {
         drop(t);
         let rest = samples.split_off(from + 1);
         let pressed = samples.split_off(from);
-        let mut out = self.touch_down(id, kind, pressed.clone());
+        let mut out = self.take_down(id, kind, pressed.clone());
         if lifts {
             // a tap whose pressure came only as it lifted: a dot where it pressed
             out.extend(self.lifted(id, if rest.is_empty() { pressed } else { rest }, false));
         } else if !rest.is_empty() {
-            out.extend(self.touch_move(id, rest));
+            out.extend(self.take_move(id, rest));
         }
         out
     }
@@ -1099,7 +1104,7 @@ impl CanvasSession {
 impl CanvasSession {
     /// The gesture settings the touches follow from now on.
     pub fn set_touch_settings(&self, settings: TouchSettings) {
-        self.touches().settings = settings;
+        self.tell_touches(false, move |s| s.touches().settings = settings);
     }
 
     /// The modify button tapped: whether the next touch picks a colour.
@@ -1132,22 +1137,9 @@ impl CanvasSession {
 
     /// The selection tool open (each touch selects, as `how` says) or not.
     pub fn set_touch_selecting(&self, how: Option<SelectTouch>) {
-        let mut t = self.touches();
-        let closing = t.selecting.is_some() && how.is_none();
-        t.selecting = how;
-        if how.is_none() {
-            t.freehand.clear();
-        }
-        drop(t);
-        // the tool closed: the shapes' paths go (a selection it opens with has none)
-        if closing {
-            let mut guard = self.shared.lock();
-            let st = &mut *guard;
-            if !st.selection_outlines.is_empty() {
-                st.selection_outlines.clear();
-                self.shared.frame(st);
-            }
-        }
+        // (closing, it takes the canvas)
+        let closing = how.is_none() && self.touches().selecting.is_some();
+        self.tell_touches(closing, move |s| s.touch_selecting(how));
     }
 
     /// The colour selection being slid, shown at `threshold` from window point (`x`, `y`) where it
@@ -1231,7 +1223,7 @@ impl CanvasSession {
 
     /// A transform open (each touch works its box) or not.
     pub fn set_touch_transforming(&self, transforming: Option<TransformTouch>) {
-        self.touches().transforming = transforming;
+        self.tell_touches(false, move |s| s.touches().transforming = transforming);
     }
 
     /// The guide editor open (or not): a touch drags the guide's handle it lands on, and a tap on
@@ -1240,14 +1232,16 @@ impl CanvasSession {
     /// window), and nothing else: nothing paints, and fingers tapped, held, scrubbed or swiped do
     /// nothing.
     pub fn set_touch_guide_editing(&self, editing: bool) {
-        let mut t = self.touches();
-        t.guide_editing = editing;
-        t.guide_grab = None;
+        self.tell_touches(false, move |s| {
+            let mut t = s.touches();
+            t.guide_editing = editing;
+            t.guide_grab = None;
+        });
     }
 
     /// Continue filling on (each touch on the canvas fills with `fill`) or off.
     pub fn set_touch_filling(&self, fill: Option<Fill>) {
-        self.touches().filling = fill;
+        self.tell_touches(false, move |s| s.touches().filling = fill);
     }
 
     /// Layer Opacity on for layer `id` (a drag across the canvas changes its opacity, each drag
@@ -1284,7 +1278,7 @@ impl CanvasSession {
     /// The single touch companion's Zoom or Move on (a lone press dragged on the canvas zooms or
     /// moves it), or off.
     pub fn set_touch_companion(&self, mode: Option<CompanionMode>) {
-        self.touches().companion = mode;
+        self.tell_touches(false, move |s| s.touches().companion = mode);
     }
 
     /// A panel is open over the canvas (or not): a touch landing on the canvas waits, until a tap
@@ -1293,7 +1287,7 @@ impl CanvasSession {
     /// still, it does what a hold does; more fingers landing move the canvas: both leave the
     /// panel up.
     pub fn set_touch_panel_open(&self, open: bool) {
-        self.touches().panel_open = open;
+        self.tell_touches(false, move |s| s.touches().panel_open = open);
     }
 
     /// Layer Opacity's layer's opacity as dragged, while it is on.
@@ -1308,16 +1302,24 @@ impl CanvasSession {
 
     /// When the touches next need [`CanvasSession::touch_tick`] (a hold, a repeat, an airbrush's
     /// next dab), if ever.
+    ///
+    /// Asked after every input, it never waits on the canvas: while something holds it, the
+    /// airbrush's next dab is as last seen, and input kept meanwhile (see [`mail`]) asks for a tick
+    /// a frame on, which takes it once the canvas is free.
     pub fn touch_deadline(&self) -> Option<f64> {
-        let due = {
-            let t = self.touches();
-            [t.hold_due, t.quickshape_due, t.rapid_due, t.liquify_due, t.pen_wait_due]
+        let seen = self.shared.try_lock().map(|st| st.airbrush.map(|(_, _, next)| next));
+        let (due, airbrush) = {
+            let mut t = self.touches();
+            if let Some(seen) = seen {
+                t.airbrush_next = seen;
+            }
+            let due = [t.hold_due, t.quickshape_due, t.rapid_due, t.liquify_due, t.pen_wait_due]
                 .into_iter()
                 .flatten()
-                .reduce(f64::min)
+                .reduce(f64::min);
+            (due, t.airbrush_next)
         };
-        let airbrush = self.shared.lock().airbrush.map(|(_, _, next)| next);
-        [due, airbrush].into_iter().flatten().reduce(f64::min)
+        [due, airbrush, self.kept_input_due()].into_iter().flatten().reduce(f64::min)
     }
 
     /// An airbrush's stroke whose pen holds still is handed the pen again, as it last was, now.
@@ -1347,66 +1349,8 @@ impl CanvasSession {
     /// ([`TouchCommand::PenHovers`]) until it presses, and its touch begins there. One not known to
     /// give a pressure does so for [`PEN_PRESSURE_WAIT_MS`]; none coming, it paints from where it
     /// touched, at full pressure.
-    pub fn touch_down(&self, id: u64, kind: PointerKind, mut samples: Vec<PenSample>) -> Vec<TouchCommand> {
-        let Some(first) = last_of(&samples).copied() else { return Vec::new() };
-        let mut t = self.touches();
-        if is_pen(kind) {
-            Self::pen_input(&mut t, &mut samples);
-            t.pen_unpressed = None;
-            t.pen_waiting.clear();
-            t.pen_wait_due = None;
-            let Some(from) = Self::pen_presses(&samples) else {
-                t.pen_unpressed = Some((id, kind));
-                // one not known to give a pressure waits a moment for one, keeping what it does
-                if !t.pen_pressure {
-                    t.pen_wait_due = samples.first().map(|s| s.time_ms + PEN_PRESSURE_WAIT_MS);
-                    t.pen_waiting = samples;
-                }
-                drop(t);
-                return self.pen_hovers_at((first.x, first.y));
-            };
-            samples.drain(..from);
-            t.pen_pointer = Some(id);
-            // a finger waiting for another is the hand's
-            if let Some((waiting, _, _)) = t.palm_wait.take() {
-                t.palms.push(waiting);
-            }
-        } else if kind == PointerKind::Finger
-            && !t.modify_held
-            && Self::pen_near(&t, Some(first.time_ms))
-            && (t.pen_pointer.is_some() || t.down.is_empty())
-            && !self.pen_holds_shape(&t)
-        {
-            let waiting = t.palm_wait.take();
-            match waiting {
-                _ if t.pen_pointer.is_some() => t.palms.push(id),
-                None => t.palm_wait = Some((id, kind, samples)),
-                Some((other, other_kind, other_samples)) => {
-                    let landed = last_of(&other_samples).map_or(f64::MIN, |s| s.time_ms);
-                    if first.time_ms - landed <= TOGETHER_MS {
-                        drop(t);
-                        let mut out = self.touch_down_now(other, other_kind, other_samples);
-                        out.extend(self.touch_down_now(id, kind, samples));
-                        return out;
-                    }
-                    t.palms.extend([other, id]);
-                }
-            }
-            return Vec::new();
-        } else if let Some((other, other_kind, other_samples)) = t.palm_wait.take() {
-            // the pen gone meanwhile (its time run out): a finger left waiting still makes a
-            // gesture with one landing together with it, else it was the hand's
-            let landed = last_of(&other_samples).map_or(f64::MIN, |s| s.time_ms);
-            if kind == PointerKind::Finger && first.time_ms - landed <= TOGETHER_MS {
-                drop(t);
-                let mut out = self.touch_down_now(other, other_kind, other_samples);
-                out.extend(self.touch_down_now(id, kind, samples));
-                return out;
-            }
-            t.palms.push(other);
-        }
-        drop(t);
-        self.touch_down_now(id, kind, samples)
+    pub fn touch_down(&self, id: u64, kind: PointerKind, samples: Vec<PenSample>) -> Vec<TouchCommand> {
+        self.take_input(mail::Input::Down(id, kind, samples))
     }
 
     /// A pointer goes down on the canvas, taken as a touch.
@@ -1492,6 +1436,123 @@ impl CanvasSession {
     /// Pointers down move together, as one input event has them: the view goes by all of them at
     /// once, never by a spread that only some of them have got to.
     pub fn touch_moves(&self, moves: Vec<TouchMove>) -> Vec<TouchCommand> {
+        self.take_input(mail::Input::Moves(moves))
+    }
+
+    /// A pointer down moves (`samples` its input since the last).
+    pub fn touch_move(&self, id: u64, samples: Vec<PenSample>) -> Vec<TouchCommand> {
+        self.take_input(mail::Input::Move(id, samples))
+    }
+
+    /// A pointer lifts (`samples` its last input).
+    pub fn touch_up(&self, id: u64, samples: Vec<PenSample>) -> Vec<TouchCommand> {
+        self.take_input(mail::Input::Up(id, samples))
+    }
+
+    /// The platform took back one pointer (it was a hand resting on the screen): what it alone
+    /// was doing is taken back, and the touch it was part of is no tap.
+    pub fn touch_cancel_one(&self, id: u64) -> Vec<TouchCommand> {
+        self.take_input(mail::Input::CancelOne(id))
+    }
+
+    /// The platform called the touches off: what they were doing is taken back.
+    pub fn touch_cancel(&self) -> Vec<TouchCommand> {
+        self.take_input(mail::Input::Cancel)
+    }
+
+    /// Runs the waits (a hold, a repeat, an airbrush's next dab) that have run out by `now_ms`.
+    pub fn touch_tick(&self, now_ms: f64) -> Vec<TouchCommand> {
+        self.take_input(mail::Input::Tick(now_ms))
+    }
+}
+
+// what the entry points above take, in order (see `mail`)
+impl CanvasSession {
+    /// [`CanvasSession::set_touch_selecting`], as the touches take it.
+    fn touch_selecting(&self, how: Option<SelectTouch>) {
+        let mut t = self.touches();
+        let closing = t.selecting.is_some() && how.is_none();
+        t.selecting = how;
+        if how.is_none() {
+            t.freehand.clear();
+        }
+        drop(t);
+        // the tool closed: the shapes' paths go (a selection it opens with has none)
+        if closing {
+            let mut guard = self.shared.lock();
+            let st = &mut *guard;
+            if !st.selection_outlines.is_empty() {
+                st.selection_outlines.clear();
+                self.shared.frame(st);
+            }
+        }
+    }
+
+    /// [`CanvasSession::touch_down`], as the touches take it (see [`mail`]).
+    pub(crate) fn take_down(&self, id: u64, kind: PointerKind, mut samples: Vec<PenSample>) -> Vec<TouchCommand> {
+        let Some(first) = last_of(&samples).copied() else { return Vec::new() };
+        let mut t = self.touches();
+        if is_pen(kind) {
+            Self::pen_input(&mut t, &mut samples);
+            t.pen_unpressed = None;
+            t.pen_waiting.clear();
+            t.pen_wait_due = None;
+            let Some(from) = Self::pen_presses(&samples) else {
+                t.pen_unpressed = Some((id, kind));
+                // one not known to give a pressure waits a moment for one, keeping what it does
+                if !t.pen_pressure {
+                    t.pen_wait_due = samples.first().map(|s| s.time_ms + PEN_PRESSURE_WAIT_MS);
+                    t.pen_waiting = samples;
+                }
+                drop(t);
+                return self.pen_hovers_at((first.x, first.y));
+            };
+            samples.drain(..from);
+            t.pen_pointer = Some(id);
+            // a finger waiting for another is the hand's
+            if let Some((waiting, _, _)) = t.palm_wait.take() {
+                t.palms.push(waiting);
+            }
+        } else if kind == PointerKind::Finger
+            && !t.modify_held
+            && Self::pen_near(&t, Some(first.time_ms))
+            && (t.pen_pointer.is_some() || t.down.is_empty())
+            && !self.pen_holds_shape(&t)
+        {
+            let waiting = t.palm_wait.take();
+            match waiting {
+                _ if t.pen_pointer.is_some() => t.palms.push(id),
+                None => t.palm_wait = Some((id, kind, samples)),
+                Some((other, other_kind, other_samples)) => {
+                    let landed = last_of(&other_samples).map_or(f64::MIN, |s| s.time_ms);
+                    if first.time_ms - landed <= TOGETHER_MS {
+                        drop(t);
+                        let mut out = self.touch_down_now(other, other_kind, other_samples);
+                        out.extend(self.touch_down_now(id, kind, samples));
+                        return out;
+                    }
+                    t.palms.extend([other, id]);
+                }
+            }
+            return Vec::new();
+        } else if let Some((other, other_kind, other_samples)) = t.palm_wait.take() {
+            // the pen gone meanwhile (its time run out): a finger left waiting still makes a
+            // gesture with one landing together with it, else it was the hand's
+            let landed = last_of(&other_samples).map_or(f64::MIN, |s| s.time_ms);
+            if kind == PointerKind::Finger && first.time_ms - landed <= TOGETHER_MS {
+                drop(t);
+                let mut out = self.touch_down_now(other, other_kind, other_samples);
+                out.extend(self.touch_down_now(id, kind, samples));
+                return out;
+            }
+            t.palms.push(other);
+        }
+        drop(t);
+        self.touch_down_now(id, kind, samples)
+    }
+
+    /// [`CanvasSession::touch_moves`], as the touches take it (see [`mail`]).
+    pub(crate) fn take_moves(&self, moves: Vec<TouchMove>) -> Vec<TouchCommand> {
         let mut out = Vec::new();
         // the last that counts: a resting finger the pen put aside moves in the event too
         let last = {
@@ -1500,14 +1561,14 @@ impl CanvasSession {
         };
         for (i, step) in moves.into_iter().enumerate() {
             self.touches().more_to_come = i < last;
-            out.extend(self.touch_move(step.id, step.samples));
+            out.extend(self.take_move(step.id, step.samples));
         }
         self.touches().more_to_come = false;
         out
     }
 
-    /// A pointer down moves (`samples` its input since the last).
-    pub fn touch_move(&self, id: u64, mut samples: Vec<PenSample>) -> Vec<TouchCommand> {
+    /// [`CanvasSession::touch_move`], as the touches take it (see [`mail`]).
+    pub(crate) fn take_move(&self, id: u64, mut samples: Vec<PenSample>) -> Vec<TouchCommand> {
         let Some(last) = last_of(&samples).copied() else { return Vec::new() };
         let mut out = Vec::new();
         let mut t = self.touches();
@@ -1818,8 +1879,8 @@ impl CanvasSession {
         out
     }
 
-    /// A pointer lifts (`samples` its last input).
-    pub fn touch_up(&self, id: u64, mut samples: Vec<PenSample>) -> Vec<TouchCommand> {
+    /// [`CanvasSession::touch_up`], as the touches take it (see [`mail`]).
+    pub(crate) fn take_up(&self, id: u64, mut samples: Vec<PenSample>) -> Vec<TouchCommand> {
         let unpressed = self.touches().pen_unpressed.filter(|(unpressed, _)| *unpressed == id);
         if let Some((_, kind)) = unpressed {
             return self.unpressed_input(id, kind, samples, true);
@@ -1833,14 +1894,13 @@ impl CanvasSession {
         self.lifted(id, samples, false)
     }
 
-    /// The platform took back one pointer (it was a hand resting on the screen): what it alone
-    /// was doing is taken back, and the touch it was part of is no tap.
-    pub fn touch_cancel_one(&self, id: u64) -> Vec<TouchCommand> {
+    /// [`CanvasSession::touch_cancel_one`], as the touches take it (see [`mail`]).
+    pub(crate) fn take_cancel_one(&self, id: u64) -> Vec<TouchCommand> {
         self.lifted(id, Vec::new(), true)
     }
 
-    /// The platform called the touches off: what they were doing is taken back.
-    pub fn touch_cancel(&self) -> Vec<TouchCommand> {
+    /// [`CanvasSession::touch_cancel`], as the touches take it (see [`mail`]).
+    pub(crate) fn take_cancel(&self) -> Vec<TouchCommand> {
         let (ids, unpressed): (Vec<u64>, bool) = {
             let mut t = self.touches();
             t.palms.clear();
@@ -1859,8 +1919,8 @@ impl CanvasSession {
         out
     }
 
-    /// Runs the waits (a hold, a repeat, an airbrush's next dab) that have run out by `now_ms`.
-    pub fn touch_tick(&self, now_ms: f64) -> Vec<TouchCommand> {
+    /// [`CanvasSession::touch_tick`], as the touches take it (see [`mail`]).
+    pub(crate) fn take_tick(&self, now_ms: f64) -> Vec<TouchCommand> {
         self.airbrush_tick(now_ms);
         let mut out = Vec::new();
         // a pen not known to give a pressure, held still at none past its wait: one that gives none
@@ -2018,7 +2078,7 @@ impl CanvasSession {
         self.first_down(&mut t, held.kind, first, &held.first, out);
         drop(t);
         if !held.moves.is_empty() {
-            out.extend(self.touch_move(id, held.moves));
+            out.extend(self.take_move(id, held.moves));
         }
     }
 

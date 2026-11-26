@@ -769,6 +769,9 @@ pub(crate) struct State {
     /// When a frame was last drawn: a read beside the frames waits for them to lay what they lay a
     /// share at a time only while they are being drawn (see [`Shared::await_frames_laid`]).
     pub(crate) frame_drawn_at: Option<std::time::Instant>,
+    /// The thread that drew the last frame: the render thread on the tablets, the app's own on the
+    /// desktop (a read there waits for no frames: none would come meanwhile).
+    pub(crate) frame_thread: Option<std::thread::ThreadId>,
     /// A time-lapse frame asked for while frames are drawn, for this time-lapse: the frame that
     /// has laid what the frames lay a share at a time takes its picture (see
     /// [`State::take_lapse_picture`]).
@@ -1020,6 +1023,21 @@ impl State {
                 .canvas
                 .as_deref()
                 .is_some_and(|c| c.lays_over_frames() || (shape && (c.catching_up() || c.relaying())))
+    }
+
+    /// Whether the frames, being drawn, have work to lay a share at a time that a render showing
+    /// nothing would lay all at once: as [`State::frames_laying`], and the open stroke's paint
+    /// catching up with the pen too (see [`Shared::lock_beside_frames`]).
+    pub(crate) fn paced_work_waiting(&self) -> bool {
+        self.frames_drawn()
+            && self.canvas.as_deref().is_some_and(|c| c.lays_over_frames() || c.catching_up() || c.relaying())
+    }
+
+    /// Whether the canvas's composite is the picture as it last showed: it has been made at least
+    /// once (a canvas made anew, after its device was lost, holds a blank one until its first
+    /// render), so a read that renders nothing may take it as it is.
+    pub(crate) fn composite_shown(&self) -> bool {
+        self.canvas.as_deref().is_some_and(|c| c.composites() > 0)
     }
 
     /// Window pixels per point of what the interface draws, its handles over the canvas too.
@@ -1800,6 +1818,20 @@ pub(crate) struct Shared {
     /// [`CanvasSession::stroke_add`]).
     queued: parking_lot::Mutex<QueuedInput>,
     input_queued: std::sync::atomic::AtomicBool,
+    /// The touches' input kept while something held the canvas a while, to be taken in order once
+    /// it is free, and whether input is so kept at all (on the tablets, whose app's thread must
+    /// never wait long: see `touch/mail.rs`).
+    pub(crate) touch_mail: parking_lot::Mutex<touch::mail::Mail>,
+    touch_mail_on: std::sync::atomic::AtomicBool,
+    /// The frosted panels over the canvas as last told, and whether a frame has yet to take them:
+    /// told without waiting on the canvas (see [`CanvasSession::set_glass`]).
+    glass: parking_lot::Mutex<Glass>,
+    glass_new: std::sync::atomic::AtomicBool,
+    /// What the interface reads of the canvas each frame, as last read (see [`Shared::read_seen`]).
+    pub(crate) seen: parking_lot::Mutex<Seen>,
+    /// The longest a read beside the frames waits for them (ms; see
+    /// [`Shared::lock_beside_frames`]): [`FRAMES_LAY_MOST`], shorter in tests.
+    read_wait_ms: std::sync::atomic::AtomicU64,
     /// How the brush cursor's outline turns, read without waiting on the canvas.
     pub(crate) cursor: cursor_turn::CursorTurns,
     /// Where the artwork is on the screen as last seen, for a dragged colour's rest.
@@ -1815,6 +1847,25 @@ pub(crate) struct Shared {
     /// How many times the artwork was opened again from its folder after its GPU device was lost
     /// (see `lost.rs`), for the apps to read their layers and thumbnails again.
     pub(crate) reopened: std::sync::atomic::AtomicU64,
+}
+
+/// The frosted panels over the canvas as last told (see [`Shared::glass`]): five numbers and a
+/// look each, window pixels, as [`State::backdrops`] keeps them.
+#[derive(Default)]
+struct Glass {
+    regions: Vec<[f32; 6]>,
+    windows: Vec<[f32; 6]>,
+}
+
+/// What the interface reads of the canvas each frame while the view settles (where the view is,
+/// whether it still moves, the guide's lines, the snapped shape's handles), as last read: what it
+/// is told while something holds the canvas a while (see [`Shared::read_seen`]).
+#[derive(Default)]
+pub(crate) struct Seen {
+    pub(crate) view_matrix: Option<Vec<f32>>,
+    pub(crate) view_moving: Option<bool>,
+    pub(crate) guide: Option<guide::GuideInfo>,
+    pub(crate) shape: Option<Option<quickshape::QuickShapeInfo>>,
 }
 
 /// Pen input waiting for the canvas (see [`Shared::queued`]): the stroke's samples in order (those
@@ -1841,6 +1892,86 @@ impl Shared {
         let guard = self.state.try_lock()?;
         self.holder.took(at);
         Some(guard)
+    }
+
+    /// Whether the canvas is free, or comes free within `wait`: not waited for at all if whatever
+    /// holds it took it that long ago already (a long hold, which the app's thread mustn't wait
+    /// out: see `touch/mail.rs`). Taken and let go at once.
+    pub(crate) fn free_soon(&self, wait: std::time::Duration) -> bool {
+        !self.state.is_locked() || self.lock_soon(wait).is_some()
+    }
+
+    /// The lock, if it is free or comes free within `wait` (see [`Shared::free_soon`]).
+    #[track_caller]
+    pub(crate) fn lock_soon(&self, wait: std::time::Duration) -> Option<parking_lot::MutexGuard<'_, State>> {
+        let at = std::panic::Location::caller();
+        let guard = match self.state.try_lock() {
+            Some(guard) => guard,
+            None => {
+                let held = self.holder.taken_ago().unwrap_or_default();
+                if held >= wait {
+                    return None;
+                }
+                self.state.try_lock_for(wait - held)?
+            }
+        };
+        self.holder.took(at);
+        Some(guard)
+    }
+
+    /// `read` of the canvas, for the app's own thread each frame: read now if the canvas is free
+    /// within a frame's usual hold, and kept in `seen`'s place for it; else as last read, without
+    /// waiting (read once, waiting, if never yet).
+    #[track_caller]
+    pub(crate) fn read_seen<T: Clone>(
+        &self,
+        read: impl FnOnce(&State) -> T,
+        kept: impl Fn(&mut Seen) -> &mut Option<T>,
+    ) -> T {
+        let fresh = match self.lock_soon(touch::mail::WAIT_MOST) {
+            Some(st) => read(&st),
+            None => {
+                if let Some(seen) = kept(&mut self.seen.lock()).clone() {
+                    return seen;
+                }
+                read(&self.lock())
+            }
+        };
+        *kept(&mut self.seen.lock()) = Some(fresh.clone());
+        fresh
+    }
+
+    /// Whether the touches' input is kept while the canvas is held (see `touch/mail.rs`).
+    pub(crate) fn touch_mail_on(&self) -> bool {
+        self.touch_mail_on.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Keeps the touches' input while the canvas is held from now on (or not): the tablets' way,
+    /// for tests elsewhere.
+    #[cfg(test)]
+    pub(crate) fn set_touch_mail_on(&self, on: bool) {
+        self.touch_mail_on.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether touch input is kept for later (see `touch/mail.rs`).
+    pub(crate) fn touch_input_kept(&self) -> bool {
+        self.touch_mail_on() && self.touch_mail.lock().kept()
+    }
+
+    /// Takes the frosted panels told since the last frame into `st` (see
+    /// [`CanvasSession::set_glass`]).
+    pub(crate) fn take_glass(&self, st: &mut State) {
+        if !self.glass_new.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        let glass = self.glass.lock();
+        st.backdrops.clone_from(&glass.regions);
+        st.backdrop_windows.clone_from(&glass.windows);
+    }
+
+    /// Whether frosted panels were told that no frame has taken yet.
+    pub(crate) fn glass_waiting(&self) -> bool {
+        self.glass_new.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Pen input for later (the canvas held): samples after those waiting, or (`predicted`) where the
@@ -1962,6 +2093,45 @@ impl Shared {
             }
             std::thread::sleep(std::time::Duration::from_millis(4));
         }
+    }
+
+    /// The lock for a read beside the frames, from a thread that may wait (a thumbnail's, an
+    /// eyedropper's; never the app's own thread, nor the one that draws): taken once the frames
+    /// have laid the work they lay a share at a time ([`State::paced_work_waiting`]), waited for
+    /// with the lock let go between looks, for at most [`FRAMES_LAY_MOST`]; and whether that work
+    /// is all laid (`true`). While it isn't, the read renders nothing (a render that shows nothing
+    /// lays all of it at once, and a heavy brush's stroke on a phone's GPU took seconds so: a
+    /// thumbnail's read after a stroke held the canvas 13 s, and the app's thread waiting on it was
+    /// ended as not responding), and gives the picture as it last showed ([`State::composite_shown`])
+    /// or none: never a layer half laid again, nor a composite never made.
+    #[track_caller]
+    pub(crate) fn lock_beside_frames(&self) -> (parking_lot::MutexGuard<'_, State>, bool) {
+        let at = std::panic::Location::caller();
+        let wait = std::time::Duration::from_millis(self.read_wait_ms.load(std::sync::atomic::Ordering::Relaxed));
+        let until = std::time::Instant::now() + wait;
+        let here = std::thread::current().id();
+        loop {
+            let guard = self.state.try_lock().unwrap_or_else(|| self.wait_for(at));
+            self.holder.took(at);
+            // (on the thread that draws the frames, as the desktop's reads are, none come
+            // meanwhile: it lays what is left itself, as ever)
+            if !guard.paced_work_waiting() || guard.frame_thread == Some(here) {
+                return (guard, true);
+            }
+            if std::time::Instant::now() >= until {
+                return (guard, false);
+            }
+            drop(guard);
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        }
+    }
+
+    /// Waits at most `wait` for the frames in a read beside them (see
+    /// [`Shared::lock_beside_frames`]): for tests, which make the wait run out at once.
+    #[cfg(test)]
+    pub(crate) fn set_read_wait(&self, wait: std::time::Duration) {
+        let ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
+        self.read_wait_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether nothing is under way that a save would cut short ([`State::idle`]) and the frames,
@@ -2361,6 +2531,7 @@ impl CanvasSession {
             projection_stop: false,
             frames: 0,
             frame_drawn_at: None,
+            frame_thread: None,
             lapse_wanted: None,
             lapse_keeper: crate::timelapse::FrameKeeper::default(),
             pad_strokes: None,
@@ -2495,6 +2666,17 @@ impl CanvasSession {
                 nudge: Arc::new(activity::Nudge::default()),
                 queued: parking_lot::Mutex::new(QueuedInput::default()),
                 input_queued: std::sync::atomic::AtomicBool::new(false),
+                touch_mail: parking_lot::Mutex::new(touch::mail::Mail::default()),
+                touch_mail_on: std::sync::atomic::AtomicBool::new(cfg!(all(
+                    any(target_os = "android", target_os = "ios"),
+                    not(test)
+                ))),
+                glass: parking_lot::Mutex::new(Glass::default()),
+                glass_new: std::sync::atomic::AtomicBool::new(false),
+                seen: parking_lot::Mutex::new(Seen::default()),
+                read_wait_ms: std::sync::atomic::AtomicU64::new(
+                    u64::try_from(FRAMES_LAY_MOST.as_millis()).unwrap_or(u64::MAX),
+                ),
                 cursor: cursor_turn::CursorTurns::default(),
                 lands_on: pour::LandsOn::default(),
                 sound_read: parking_lot::Mutex::new(None),
@@ -2835,6 +3017,11 @@ impl CanvasSession {
     /// never kept. Waiting for the canvas, only the newest is kept (see
     /// [`CanvasSession::stroke_add`]).
     pub fn stroke_predict(&self, samples: Vec<PenSample>) {
+        // (the touches' own input kept for the canvas comes first: a prediction now would run
+        // ahead of where the stroke has got to, and the next comes after it)
+        if self.shared.touch_input_kept() {
+            return;
+        }
         let samples = self.pen_predicted(samples);
         let Some(mut guard) = self.shared.try_lock() else {
             self.shared.queue_input(samples, true);
@@ -3314,8 +3501,10 @@ impl CanvasSession {
     }
 
     /// Whether the view is still moving into place (what is drawn over the canvas follows it).
+    /// Asked each frame while it settles, it never waits long on the canvas (see
+    /// [`Shared::read_seen`]).
     pub fn view_moving(&self) -> bool {
-        self.shared.lock().view_motion.is_some()
+        self.shared.read_seen(|st| st.view_motion.is_some(), |seen| &mut seen.view_moving)
     }
 
     /// Whether the canvas is made (once the artwork is shown): until then nothing can read its
@@ -3332,13 +3521,29 @@ impl CanvasSession {
 
     /// The same, with `windows` drawn over them, where the glass is thin: what is behind only
     /// softens there.
+    ///
+    /// Told by the interface as it lays itself out (each frame while a panel moves), it never waits
+    /// on the canvas: a frame takes them (the app's thread waited here for a heavy stroke's frame,
+    /// seconds on a phone, and the system ended the app as not responding).
     pub fn set_glass(&self, regions: Vec<f32>, windows: Vec<f32>) {
         let ((regions, _), (windows, _)) = (regions.as_chunks::<6>(), windows.as_chunks::<6>());
-        let mut st = self.shared.lock();
-        if st.backdrops != regions || st.backdrop_windows != windows {
-            st.backdrops = regions.to_vec();
-            st.backdrop_windows = windows.to_vec();
-            self.shared.frame(&mut st);
+        {
+            let mut glass = self.shared.glass.lock();
+            if glass.regions == regions && glass.windows == windows {
+                return;
+            }
+            glass.regions = regions.to_vec();
+            glass.windows = windows.to_vec();
+        }
+        self.shared.glass_new.store(true, std::sync::atomic::Ordering::Release);
+        // a frame asked for now if the canvas is free; else whatever holds it is a frame, whose
+        // loop looks for them after, or something else, the render thread waiting to be woken
+        match self.shared.try_lock() {
+            Some(mut st) => {
+                self.shared.take_glass(&mut st);
+                self.shared.frame(&mut st);
+            }
+            None => _ = self.shared.wake.notify_all(),
         }
     }
 

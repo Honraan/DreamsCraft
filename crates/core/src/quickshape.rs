@@ -1106,8 +1106,11 @@ impl CanvasSession {
     }
 
     /// The snapped shape, while there is one.
+    ///
+    /// Asked each frame while the view settles, it never waits long on the canvas (see
+    /// [`crate::Shared::read_seen`]).
     pub fn quickshape_info(&self) -> Option<QuickShapeInfo> {
-        self.shared.lock().shape_info()
+        self.shared.read_seen(crate::State::shape_info, |seen| &mut seen.shape)
     }
 
     /// Shows the snapped shape as `kind` instead.

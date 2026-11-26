@@ -561,8 +561,11 @@ impl CanvasSession {
     /// Whether the pen drawing the strokes to come says how it leans (as each platform's input
     /// tells it). One that doesn't draws as a finger does: no lean at all, the tilt switches of
     /// its brushes out of the way.
+    ///
+    /// Told as each pen touch comes down, before it: in its place among the touches' input, never
+    /// waiting on the canvas (see `touch/mail.rs`).
     pub fn set_pen_tilt_known(&self, known: bool) {
-        self.shared.lock().input.tilt_known = known;
+        self.tell_touches(true, move |s| s.shared.lock().input.tilt_known = known);
     }
 
     /// How far input must move for the speed dynamics to count it as fast, as a part of the usual
