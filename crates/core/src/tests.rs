@@ -18887,6 +18887,108 @@ fn liquify_two_fingers_tapped_undo_a_stroke_and_three_redo_it() {
     assert!(whole(&s) == one);
 }
 
+/// Liquify by finger as a hand does it, every stroke made by touches and coasting on after its
+/// lift, then two fingers tapped again and again: each tap undoes one stroke whole, pixel for
+/// pixel, and Liquify stays open with the view and the layers as they were; three fingers tapped
+/// bring the strokes back one at a time (#390).
+#[test]
+fn liquify_finger_strokes_undo_a_tap_at_a_time_and_liquify_stays_open() {
+    use crate::{Adjustment, TouchCommand};
+    let Some(s) = liquify_on_a_line() else { return };
+    // some momentum, as by default: each stroke goes on after it lifts
+    s.adjustment_liquify_value(3, 0.5);
+    let open = |s: &CanvasSession| s.adjustment_shown().adjustment == Some(Adjustment::Liquify);
+    // how many pixels of the canvas shown differ
+    let differ = |a: &[u8], b: &[u8]| a.chunks(4).zip(b.chunks(4)).filter(|(p, q)| p != q).count();
+    // the touches' time runs on until nothing is due: what the lift set going stops
+    let settle = |mut now: f64| {
+        let mut ticks = 0;
+        while let Some(due) = s.touch_deadline() {
+            now = now.max(due);
+            s.touch_tick(now);
+            ticks += 1;
+            assert!(ticks < 400, "the stroke never stopped");
+        }
+    };
+    // a finger pushed down across the line at `x` from `ms`, quick to the end and lifted moving
+    let lifted = |x: f32, ms: f64| {
+        s.touch_down(1, PointerKind::Finger, vec![sample(x, 40.0, ms)]);
+        for i in 1..=16 {
+            s.touch_move(1, vec![sample(x, 40.0 + i as f32 * 2.0, ms + f64::from(i) * 8.0)]);
+        }
+        s.touch_up(1, vec![sample(x, 74.0, ms + 136.0)]);
+    };
+    // and gone on until it stopped
+    let stroke = |x: f32, ms: f64| {
+        lifted(x, ms);
+        settle(ms + 136.0);
+    };
+    // `fingers` tapped from `ms`, landing 15 ms apart where nothing would liquify much, lifted 90 ms
+    // after the first landed
+    let tap = |fingers: u64, ms: f64| -> Vec<TouchCommand> {
+        let mut out = Vec::new();
+        for id in 1..=fingers {
+            let x = 20.0 + id as f32 * 15.0;
+            out.extend(s.touch_down(id, PointerKind::Finger, vec![sample(x, 85.0, ms + (id - 1) as f64 * 15.0)]));
+        }
+        for id in 1..=fingers {
+            let x = 20.0 + id as f32 * 15.0;
+            out.extend(s.touch_up(id, vec![sample(x, 85.0, ms + 90.0 + id as f64)]));
+        }
+        settle(ms + 100.0);
+        out
+    };
+    let count = |out: &[TouchCommand], c: TouchCommand| out.iter().filter(|o| **o == c).count();
+    let line = whole(&s);
+    let (view, layers) = (s.view_matrix(), s.layers().len());
+    stroke(25.0, 1000.0);
+    let one = whole(&s);
+    stroke(70.0, 3000.0);
+    let two = whole(&s);
+    let (first, second) = (differ(&line, &one), differ(&one, &two));
+    assert!(first > 50 && second > 50, "the strokes moved {first} and {second} pixels");
+    assert!(open(&s));
+    // two fingers tapped: one undo; done as every platform does it, the last stroke goes whole
+    let out = tap(2, 5000.0);
+    assert_eq!((count(&out, TouchCommand::Undo), count(&out, TouchCommand::Redo)), (1, 0), "{out:?}");
+    assert_eq!(differ(&whole(&s), &two), 0, "the tap itself changed the canvas");
+    assert_eq!(s.undo().as_deref(), Some("Push"));
+    assert_eq!(differ(&whole(&s), &one), 0, "the undo left part of the last stroke");
+    assert!(open(&s), "Liquify closed with a stroke still to undo");
+    assert!(s.info().can_redo);
+    // again: the first stroke goes too, Liquify still open with nothing liquified
+    let out = tap(2, 6000.0);
+    assert_eq!(count(&out, TouchCommand::Undo), 1, "{out:?}");
+    assert_eq!(s.undo().as_deref(), Some("Push"));
+    assert_eq!(differ(&whole(&s), &line), 0, "the undo left part of the first stroke");
+    assert!(open(&s) && !s.adjustment_shown().liquified);
+    // three fingers tapped bring them back, one each, as they were
+    let out = tap(3, 7000.0);
+    assert_eq!((count(&out, TouchCommand::Undo), count(&out, TouchCommand::Redo)), (0, 1), "{out:?}");
+    assert_eq!(s.redo().as_deref(), Some("Push"));
+    assert_eq!(differ(&whole(&s), &one), 0, "the redo didn't bring the first stroke back whole");
+    let out = tap(3, 8000.0);
+    assert_eq!(count(&out, TouchCommand::Redo), 1, "{out:?}");
+    assert_eq!(s.redo().as_deref(), Some("Push"));
+    assert_eq!(differ(&whole(&s), &two), 0, "the redo didn't bring the second stroke back whole");
+    assert!(open(&s) && !s.info().can_redo);
+    // tapped as soon as a stroke lifts, still coasting: it is undone whole, the coasting with it
+    lifted(50.0, 9000.0);
+    for i in 1..=3 {
+        s.touch_tick(9136.0 + f64::from(i) * 16.0);
+    }
+    let coasted = differ(&whole(&s), &two);
+    assert!(coasted > 50, "the third stroke moved {coasted} pixels");
+    let out = tap(2, 9190.0);
+    assert_eq!(count(&out, TouchCommand::Undo), 1, "{out:?}");
+    assert_eq!(s.undo().as_deref(), Some("Push"));
+    assert_eq!(differ(&whole(&s), &two), 0, "the undo left part of the coasting stroke");
+    assert!(open(&s));
+    // and nothing else changed: the view, the layers
+    assert_eq!(s.view_matrix(), view, "the taps moved the view");
+    assert_eq!(s.layers().len(), layers);
+}
+
 /// Liquify held still works on as the time passes, a stamp at a time adding up to the whole of it.
 #[test]
 fn liquify_held_still_works_on() {
