@@ -47,19 +47,33 @@ pub struct DreamsTimelineDock {
     px_per_frame: f32,
     scroll_x: f32,
     dock_height: f32,
+    shown_bottom_inset: f32,
     drag_clip: Option<(u64, u32, f32)>,
 }
 
 impl Default for DreamsTimelineDock {
     fn default() -> Self {
-        Self { playing: None, px_per_frame: 14.0, scroll_x: 0.0, dock_height: 220.0, drag_clip: None }
+        Self {
+            playing: None,
+            px_per_frame: 14.0,
+            scroll_x: 0.0,
+            dock_height: 220.0,
+            shown_bottom_inset: 0.0,
+            drag_clip: None,
+        }
     }
 }
 
 impl DreamsTimelineDock {
+    /// Bottom window height (points) occupied by the active Timeline or Flipbook dock.
+    pub fn bottom_inset(&self) -> f32 {
+        self.shown_bottom_inset
+    }
+
     /// Stops any active playback cleanly (when leaving the canvas or opening a full-screen dialog).
     pub fn reset(&mut self, session: &CanvasSession) {
         self.drag_clip = None;
+        self.shown_bottom_inset = 0.0;
         if self.playing.take().is_some() {
             session.set_play_frame(None);
         }
@@ -123,11 +137,13 @@ impl DreamsTimelineDock {
         }
 
         let height = self.dock_height.clamp(160.0, (screen.height() * 0.55).max(160.0));
+        self.shown_bottom_inset = height;
         let dock = Rect::from_min_max(pos2(screen.left(), screen.bottom() - height), screen.max);
 
         egui::Area::new(Id::unique("dreams_timeline_dock")).fixed_pos(dock.min).order(Order::Middle).show(ctx, |ui| {
             // Absorb pointer events so painting strokes never leak behind the dock
             ui.allocate_rect(dock, Sense::click_and_drag());
+            crate::screen::claim(ui, dock);
             ui.painter().rect_filled(dock, 0.0, argb(SURFACE));
             ui.painter().line_segment(
                 [pos2(dock.left(), dock.top()), pos2(dock.right(), dock.top())],
@@ -632,9 +648,11 @@ impl DreamsTimelineDock {
     fn show_flipbook(&mut self, ctx: &egui::Context, session: &CanvasSession, tl: &TimelineState, screen: Rect) {
         let w = screen.width().min(680.0);
         let h = 88.0;
+        self.shown_bottom_inset = h + 14.0;
         let bar = Rect::from_min_size(pos2(screen.center().x - w * 0.5, screen.bottom() - h - 14.0), vec2(w, h));
         egui::Area::new(Id::unique("dreams_flipbook_dock")).fixed_pos(bar.min).order(Order::Middle).show(ctx, |ui| {
             ui.allocate_rect(bar, Sense::click_and_drag());
+            crate::screen::claim(ui, bar);
             ui.painter().rect_filled(bar, 18.0, argb(SURFACE));
             ui.painter().rect_stroke(bar, 18.0, Stroke::new(1.0, argb(EDGE)), StrokeKind::Inside);
 

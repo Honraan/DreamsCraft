@@ -152,11 +152,25 @@ private fun SettingsScreen(prefs: android.content.SharedPreferences, onDone: () 
                     }
                 }
             }
-            // the licences of what the app is made with
+            // the licences of what the app is made with; and the app's log to share, with no canvas
+            // to open for Help's (an artwork that closes the app as it opens, say)
+            val context = androidx.compose.ui.platform.LocalContext.current
+            val scope = androidx.compose.runtime.rememberCoroutineScope()
             Column(Modifier.padding(top = 24.dp).fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Group)) {
                 Row(Modifier.fillMaxWidth().clickable { licences = true }.padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text("Licenses", color = Ink, fontSize = 17.sp, modifier = Modifier.weight(1f))
                     Text("›", color = Dim, fontSize = 20.sp)
+                }
+                Box(Modifier.padding(start = 16.dp).fillMaxWidth().height(1.dp).background(Line))
+                Row(
+                    Modifier.fillMaxWidth().clickable {
+                        io.github.artcraftandroid.procraft.ui.shareLog(context, scope) {
+                            android.widget.Toast.makeText(context, io.github.artcraftandroid.procraft.ui.LOG_NOT_READY, android.widget.Toast.LENGTH_LONG).show()
+                        }
+                    }.padding(horizontal = 16.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("Share Log", color = Blue, fontSize = 17.sp)
                 }
             }
         }
@@ -251,7 +265,9 @@ private fun Licences(onBack: () -> Unit) {
         val text = "The interface font is Inter, by The Inter Project Authors, under the SIL Open Font License 1.1." + gap +
             asset("fonts/Inter-OFL.txt").trim() + gap +
             "The app keeps Lucide icons (lucide.dev), by Lucide Icons and Contributors, under the ISC License." + gap +
-            asset("icons/LICENSE-lucide.txt").trim() + gap + asset("licenses.txt")
+            asset("icons/LICENSE-lucide.txt").trim() + gap +
+            "The undo and redo icons are Google's Material Symbols (fonts.google.com/icons), under the Apache License 2.0 (its text at the end)." + gap +
+            asset("licenses.txt")
         text.split(gap).map { it.trimEnd() }.filter { it.isNotBlank() }
     }
     androidx.activity.compose.BackHandler(onBack = onBack)

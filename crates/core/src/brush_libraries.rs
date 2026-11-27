@@ -157,6 +157,11 @@ impl Default for Libraries {
 }
 
 impl Libraries {
+    /// The id of the library held.
+    pub(crate) fn held(&self) -> &str {
+        &self.held
+    }
+
     /// Whether shipped brushes join the library held.
     pub(crate) fn stock(&self) -> bool {
         self.list.iter().find(|e| e.id == self.held).is_some_and(|e| e.stock)
@@ -290,7 +295,7 @@ fn write(path: &Path, text: &str) -> bool {
         let _ = std::fs::create_dir_all(dir);
     }
     let written = crate::project::write_atomically(path, |p| {
-        std::fs::write(p, text.as_bytes()).map_err(|e| crate::project::file_error("keeping the brushes", e))
+        crate::storage::write(p, text.as_bytes()).map_err(|e| crate::project::file_error("keeping the brushes", e))
     });
     if let Err(e) = &written {
         log::error!("{e}");
@@ -733,7 +738,13 @@ impl CanvasSession {
         let dir = self.shared.lock().libraries.dir.clone()?;
         let mut sets: Vec<LibrarySet> = sets
             .into_iter()
-            .map(|(name, icon, brushes)| LibrarySet { origins: vec![None; brushes.len()], name, brushes, icon })
+            .map(|(name, icon, brushes)| LibrarySet {
+                origins: vec![None; brushes.len()],
+                name,
+                brushes,
+                icon,
+                plugin: None,
+            })
             .collect();
         {
             // their grains at their own size into the grains' files, as brushes brought in have

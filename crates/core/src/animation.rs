@@ -167,7 +167,8 @@ impl CanvasSession {
     /// off the main thread.
     pub fn draw_without_window(&self) -> bool {
         crate::device::warm_gpu();
-        let gpu = crate::device::kept().clone();
+        // (one lost draws nothing)
+        let gpu = crate::device::kept().clone().filter(|g| !g.is_lost());
         let mut st = self.shared.lock();
         st.gpu = gpu;
         st.ensure_canvas();
@@ -301,7 +302,7 @@ impl CanvasSession {
             self.exported(start + (0.95 - start) * next as f32 / units.len() as f32);
         }
         let bytes = gif.ok_or_else(|| file_error("saving", "there are no frames"))?.finish();
-        write_atomically(Path::new(&path), |f| fs::write(f, &bytes).map_err(|e| file_error("saving", e)))?;
+        write_atomically(Path::new(&path), |f| crate::storage::write(f, &bytes).map_err(|e| file_error("saving", e)))?;
         self.exported(1.0);
         Ok(())
     }
@@ -716,20 +717,37 @@ impl CanvasSession {
     /// Frame `id`'s picture over the whole canvas, fitted to `max_side` (premultiplied), for the
     /// timeline; none for a group with nothing showing or before the canvas exists.
     pub fn frame_thumbnail(&self, id: u64, max_side: u32) -> Option<ThumbnailImage> {
-        let mut guard = self.shared.lock();
-        let st = &mut *guard;
-        let id = LayerId(id);
-        let group = st.doc.layer(id)?.kind == LayerKind::Group;
-        let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else { return None };
+        // each copy started under the lock and waited for once it is let go, so touches and frames
+        // go on meanwhile (read after every stroke); beside the frames, once they have laid a heavy
+        // stroke's end rather than all of it at once
+        let (group, pending) = {
+            let (mut guard, laid) = self.shared.lock_beside_frames();
+            // (still laying it after a while, none: its layers are part laid, perhaps half laid
+            // again, a picture that never showed, and the app keeps the one it has)
+            if !laid {
+                return None;
+            }
+            let st = &mut *guard;
+            let id = LayerId(id);
+            let group = st.doc.layer(id)?.kind == LayerKind::Group;
+            let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else { return None };
+            canvas.render(gpu, &mut st.doc, None);
+            let layers = if group { showing_in(&st.doc, id, 1.0) } else { vec![(id, 1.0)] };
+            let mut pending = Vec::with_capacity(layers.len());
+            for (layer, opacity) in layers {
+                pending.push((canvas.start_layer_picture_as_laid(gpu, layer, max_side).ok()?, opacity));
+            }
+            (group, pending)
+        };
         if !group {
-            let t = canvas.layer_picture(gpu, &mut st.doc, id, max_side).ok()?;
+            let t = pending.into_iter().next()?.0.pixels().ok()?;
             return Some(ThumbnailImage { width: t.width, height: t.height, rgba: t.rgba });
         }
         // a group's layers laid over one another at this size, with no regard to their blend
         // modes: rendering the group alone would composite the whole canvas twice for each frame
         let mut picture: Option<ThumbnailImage> = None;
-        for (layer, opacity) in showing_in(&st.doc, id, 1.0) {
-            let t = canvas.layer_picture(gpu, &mut st.doc, layer, max_side).ok()?;
+        for (layer, opacity) in pending {
+            let t = layer.pixels().ok()?;
             let p = picture.get_or_insert_with(|| ThumbnailImage {
                 width: t.width,
                 height: t.height,

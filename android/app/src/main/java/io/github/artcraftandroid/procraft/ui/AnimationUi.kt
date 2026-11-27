@@ -108,6 +108,17 @@ internal fun animationBarWidth(window: Dp, screen: Dp, pitch: Dp): Dp {
     return pitch * frames + 26.dp
 }
 
+/** The settings' popover's width. */
+private val SettingsWidth = 290.dp
+
+/**
+ * Where the settings' popover stands from the bar's left: its middle over Settings' middle
+ * [settingsAt], kept within a [barWidth] bar, or from the bar's left end on a bar narrower than it
+ * (a narrow window and a wide canvas: three frames of a 16:9 canvas on a phone held upright).
+ */
+internal fun settingsPopoverLeft(settingsAt: Dp, barWidth: Dp): Dp =
+    (settingsAt - SettingsWidth / 2).coerceIn(0.dp, (barWidth - SettingsWidth).coerceAtLeast(0.dp))
+
 /** The screen's width as it is turned now ([window]'s, where it can't be told). */
 @Composable
 private fun displayWidth(window: Dp): Dp {
@@ -147,7 +158,7 @@ fun BoxScope.AnimationBar(vm: CanvasViewModel) {
             var colorsPage by remember { mutableStateOf(false) }
             if (!vm.animationSettingsOpen) colorsPage = false
             if (vm.animationSettingsOpen) {
-                DownPopover(290.dp, 145.dp, Modifier.offset(x = (settingsAt - 145.dp).coerceIn(0.dp, barWidth - 290.dp))) {
+                DownPopover(SettingsWidth, SettingsWidth / 2, Modifier.offset(x = settingsPopoverLeft(settingsAt, barWidth))) {
                     if (colorsPage) OnionColorsPage(vm) { colorsPage = false } else AnimationSettingsPage(vm) { colorsPage = true }
                 }
             } else if (vm.frameOptionsOpen) {
@@ -344,9 +355,10 @@ private fun ColumnScope.OnionColorsPage(vm: CanvasViewModel, onBack: () -> Unit)
     var mode by remember { mutableStateOf(io.github.artcraftandroid.procraft.canvas.ColorMode.DISC) }
     val rgbOf = { v: List<Float> -> v.take(3).fold(0) { acc, x -> (acc shl 8) or (x.coerceIn(0f, 1f) * 255f).roundToInt() } }
     val unit = { rgb: Int -> listOf((rgb shr 16) and 0xFF, (rgb shr 8) and 0xFF, rgb and 0xFF).map { it / 255f } }
-    val c = remember(after) {
-        HeldColor(rgbOf(if (after) a.after else a.before), greyHue = 0f) { rgb -> vm.changeAnimation { if (after) it.copy(after = unit(rgb)) else it.copy(before = unit(rgb)) } }
-    }
+    // where the picker's changes go: the frames before the current one, or (second) after it
+    val into = { second: Boolean -> { rgb: Int -> vm.changeAnimation { if (second) it.copy(after = unit(rgb)) else it.copy(before = unit(rgb)) } } }
+    // one picker for both, editing the swatch tapped
+    val c = remember { HeldColor(rgbOf(a.before), greyHue = 0f, into(false)) }
     // the back button at the panel's very edge
     Row(Modifier.offset(x = (-8).dp).fillMaxWidth().height(34.dp), verticalAlignment = Alignment.CenterVertically) {
         Box(Modifier.size(44.dp, 34.dp).clickable(onClick = onBack), contentAlignment = Alignment.Center) {
@@ -365,7 +377,10 @@ private fun ColumnScope.OnionColorsPage(vm: CanvasViewModel, onBack: () -> Unit)
         for ((i, v) in listOf(a.before, a.after).withIndex()) {
             Box(
                 Modifier.size(44.dp, 26.dp).clip(RoundedCornerShape(7.dp)).background(SwatchRim).padding(1.dp)
-                    .clip(RoundedCornerShape(6.dp)).background(Color(0xFF000000.toInt() or rgbOf(v))).clickable { after = i == 1 },
+                    .clip(RoundedCornerShape(6.dp)).background(Color(0xFF000000.toInt() or rgbOf(v))).clickable {
+                        after = i == 1
+                        c.edit(rgbOf(v), into(after))
+                    },
             )
         }
     }

@@ -8,9 +8,9 @@ use procraft_engine::brush::Brush;
 use procraft_engine::document::LayerId;
 use procraft_engine::geom::Vec2;
 use procraft_engine::input::Sample;
-use procraft_engine::quickshape::{Anchor, Shape, ShapeKind, end_hook_reach, fit_ellipse, recognise, without_end_hook};
-use procraft_engine::stroke::StrokeBuilder;
-use procraft_gpu::{Canvas, StrokeStyle};
+use procraft_engine::quickshape::{Anchor, Shape, ShapeKind, end_hook_reach, fit_round, recognise, without_end_hook};
+use procraft_engine::stroke::{Stamp, StrokeBuilder};
+use procraft_gpu::{Canvas, SecondStroke, StrokeStyle, StrokeTool};
 
 use crate::{CanvasSession, PointerKind, State};
 
@@ -107,6 +107,76 @@ pub(crate) struct ShapeEdit {
     /// Moved since its stroke was last drawn: drawn again as the next frame is, or as it is kept.
     /// A drag's moves come faster than frames, and each would lay the whole stroke again.
     stale: bool,
+    /// Its stroke being made again elsewhere as it is dragged about (see
+    /// [`State::draw_moved_shape`]).
+    replot: Option<Replot>,
+    /// How many times it has moved, and how many of those moves the stroke laid shows.
+    moves: u64,
+    laid_moves: u64,
+    /// Being dragged by a handle, its outline or itself (see [`ShapeEdit::moving`]).
+    dragging: bool,
+    /// The canvas's open stroke is the shape's preview, not its own stroke: the brush's stamps laid
+    /// dry in the stroke's textures, with no second (see [`preview_style`]), and the stroke's own
+    /// stamps as made for it, to lay as soon as the shape stops moving. A brush painting in place or
+    /// with a second laid again whole at each move of a drag fell behind on a slow GPU: the stroke
+    /// was begun again before the last was laid, so the shape never showed where it was dragged.
+    preview: bool,
+    previewed: Option<(Vec<Stamp>, Option<Vec<Stamp>>)>,
+    /// The canvas was seen still laying its stroke as itself a frame after it was given (it takes
+    /// longer than a frame to lay whole): moved about, it is shown by its preview.
+    heavy: bool,
+}
+
+/// A shape's stroke being made again on a thread of its own as the shape is dragged about: the
+/// frames go on meanwhile, the stroke shown as it was last laid, and it is laid as a frame finds it
+/// made. What it was made for (the shape's moves), and the stroke once made.
+struct Replot {
+    moves: u64,
+    made: std::sync::mpsc::Receiver<Made>,
+}
+
+/// A shape's stroke as it is to be made: its builders, a dual brush's second's too, and the
+/// samples along the shape (made with [`ShapeBuild::make`]); and the shape's moves it shows.
+struct ShapeBuild {
+    first: StrokeBuilder,
+    second: Option<StrokeBuilder>,
+    samples: Vec<Sample>,
+    moves: u64,
+}
+
+/// A shape's stroke made: its builders ended, and their final stamps.
+struct Made {
+    first: (StrokeBuilder, Vec<Stamp>),
+    second: Option<(StrokeBuilder, Vec<Stamp>)>,
+    moves: u64,
+}
+
+impl ShapeBuild {
+    /// The stroke made along the shape: only its finished stamps (none made on the way), a dual
+    /// brush's second on a thread of its own meanwhile.
+    fn make(self) -> Made {
+        let ShapeBuild { first, second, samples, moves } = self;
+        let along = |mut builder: StrokeBuilder| {
+            builder.add_quietly(&samples);
+            let stamps = builder.finish();
+            (builder, stamps)
+        };
+        let (first, second) = std::thread::scope(|scope| {
+            // (made here after the first where no thread can be had)
+            let second = second.map(|b| {
+                let spare = b.clone();
+                let thread = std::thread::Builder::new().name("procraft-shape-second".to_owned());
+                thread.spawn_scoped(scope, || along(b)).map_err(|_| Box::new(spare))
+            });
+            let first = along(first);
+            let second = second.and_then(|made| match made {
+                Ok(thread) => thread.join().ok(),
+                Err(spare) => Some(along(*spare)),
+            });
+            (first, second)
+        });
+        Made { first, second, moves }
+    }
 }
 
 impl ShapeEdit {
@@ -121,12 +191,59 @@ impl ShapeEdit {
         let first = shape.clone();
         let modes = initial_curve_modes(&shape);
         let (earlier, later) = (Vec::new(), Vec::new());
-        ShapeEdit { shape, first, earlier, later, choices, drawn, along, modes, held, stroke, stale: false }
+        ShapeEdit {
+            shape,
+            first,
+            earlier,
+            later,
+            choices,
+            drawn,
+            along,
+            modes,
+            held,
+            stroke,
+            stale: false,
+            replot: None,
+            moves: 0,
+            laid_moves: 0,
+            dragging: false,
+            preview: false,
+            previewed: None,
+            heavy: false,
+        }
+    }
+
+    /// Whether it is being moved about: held by the pen that drew it or on its outline, or dragged.
+    fn moving(&self) -> bool {
+        self.held.is_some() || self.dragging
+    }
+
+    /// Whether its stroke is shown by its preview (for tests).
+    #[cfg(test)]
+    pub(crate) fn previewing(&self) -> bool {
+        self.preview
+    }
+
+    /// It moved: its stroke is to be drawn again.
+    fn moved(&mut self) {
+        self.stale = true;
+        self.moves += 1;
+    }
+
+    /// How many of its moves the stroke laid trails behind (for tests).
+    #[cfg(test)]
+    pub(crate) fn moves_behind(&self) -> u64 {
+        self.moves.saturating_sub(self.laid_moves)
     }
 
     /// A drag undone can be done again.
     pub(crate) fn can_redo(&self) -> bool {
         !self.later.is_empty()
+    }
+
+    /// Whether it is still held: by the pen that drew it, or by a drag on its outline.
+    pub(crate) fn is_held(&self) -> bool {
+        self.held.is_some()
     }
 
     /// The samples its stroke is drawn along: its outline, the pen doing as it did along the stroke
@@ -148,8 +265,8 @@ impl ShapeEdit {
     }
 }
 
-/// A stroke made a shape, as it can be laid again: where, its builder as it began and its input.
-/// (A dual brush's isn't kept: its shape is its first alone.)
+/// A stroke made a shape, as it can be laid again: where, its builder as it began and its input,
+/// and a dual brush's second, which its shape is drawn with too.
 pub(crate) struct DrawnStroke {
     layer: LayerId,
     style: StrokeStyle,
@@ -157,17 +274,26 @@ pub(crate) struct DrawnStroke {
     samples: Vec<Sample>,
     /// What its randomness was seeded with: a brush engine draws it again the same.
     seed: u32,
+    second: Option<SecondAgain>,
 }
 
-/// A shape kept, as it first snapped, or the stroke it gave way to: the canvas's undo steps once
-/// that was laid tell if it still stands.
+/// A dual brush's second as its stroke began, to draw it again (along a shape, or the stroke a
+/// shape gave way to): how it is laid and combines, and its builder before any input.
+#[derive(Clone)]
+pub(crate) struct SecondAgain {
+    pub(crate) stroke: SecondStroke,
+    pub(crate) fresh: StrokeBuilder,
+}
+
+/// A shape kept, as it first snapped, or the stroke it gave way to: which stroke the canvas counts
+/// what was laid as (see `Canvas::step_of_stroke`) tells if it still stands.
 pub(crate) struct KeptShape {
     first: Shape,
     choices: Vec<ShapeKind>,
     drawn: Vec<Vec2>,
     along: StrokeAlong,
     stroke: DrawnStroke,
-    steps: u64,
+    laid_as: u64,
 }
 
 /// A snapped shape whose pen is still down: shown as worked out afresh from the shape as it
@@ -196,8 +322,10 @@ pub(crate) struct LastStroke {
     /// Which stroke the canvas counts it as (see `Canvas::step_of_stroke`): once it is laid, its
     /// step is the last made unless something has been done since.
     pub(crate) stroke: u64,
-    /// Its builder as it began (none for a dual brush), and its input.
+    /// Its builder as it began (none for a brush engine's dual brush), and its input.
     pub(crate) fresh: Option<StrokeBuilder>,
+    /// A dual brush's second as it began.
+    pub(crate) second: Option<SecondAgain>,
     pub(crate) samples: Vec<Sample>,
     /// Its builder as it began (a dual brush's first), for the line a shape is fitted to.
     pub(crate) line: StrokeBuilder,
@@ -217,12 +345,35 @@ impl LastStroke {
     /// The stroke as it can be laid again, given its input.
     fn laid_again(&self, samples: Vec<Sample>) -> Option<DrawnStroke> {
         let builder = self.fresh.clone()?;
-        Some(DrawnStroke { layer: self.layer, style: self.style, builder, samples, seed: self.seed })
+        let second = self.second.clone();
+        Some(DrawnStroke { layer: self.layer, style: self.style, builder, samples, seed: self.seed, second })
     }
 }
 
-/// What a shape's stroke's randomness is seeded with.
+/// Whether a stroke in `style` (`dual`: with a second) is shown by a preview while its shape is
+/// moved about, once it falls behind (see [`ShapeEdit::preview`]): one painting in place, or with a
+/// second; not a smudge, which can only be laid in place.
+fn has_preview(style: &StrokeStyle, dual: bool) -> bool {
+    style.tool != StrokeTool::Smudge && (style.in_place() || dual)
+}
+
+/// How a stroke in `style` is laid as its shape's preview (see [`ShapeEdit::preview`]): dry, in the
+/// stroke's textures, nothing laid in place.
+fn preview_style(style: StrokeStyle) -> StrokeStyle {
+    StrokeStyle { laid_in_place: false, store: 0, ..style.dry() }
+}
+
+/// What a shape's stroke's randomness is seeded with, and its second's (a dual brush's).
 pub(crate) const SHAPE_SEED: u32 = 0x5eed_1234;
+const SECOND_SHAPE_SEED: u32 = SHAPE_SEED ^ 0x5eed_0002;
+
+/// Begins the canvas's stroke for `stroke` again, as it began: a dual brush's with its second.
+fn begin_again(canvas: &mut Canvas, stroke: &DrawnStroke) {
+    match &stroke.second {
+        Some(second) => canvas.begin_dual_stroke(stroke.layer, stroke.style, second.stroke),
+        None => canvas.begin_stroke(stroke.layer, stroke.style),
+    }
+}
 
 /// The outline is redrawn with samples this far apart (canvas pixels), at the pace its stroke was
 /// drawn: this if that isn't known (canvas pixels a millisecond).
@@ -265,18 +416,21 @@ impl State {
     }
 
     /// `edit`'s shape was just kept: undo can give back the stroke it was made of.
-    pub(crate) fn note_kept_shape(&mut self, edit: Option<ShapeEdit>) {
-        let Some(ShapeEdit { first, choices, drawn, along, stroke: Some(stroke), .. }) = edit else { return };
-        // its step is made now, so that a later change shows against it
-        self.flush();
+    pub(crate) fn note_kept_shape(&mut self, edit: Option<Box<ShapeEdit>>) {
+        let Some(ShapeEdit { first, choices, drawn, along, stroke: Some(stroke), .. }) = edit.map(|e| *e) else {
+            return;
+        };
+        // (its step made by the frames as they lay it: made here, by a render that shows nothing,
+        // all of a heavy brush's shape still to lay went at once, holding the canvas for seconds)
         let Some(canvas) = self.canvas.as_ref() else { return };
-        let steps = canvas.steps_made();
-        self.kept_shape = Some(KeptShape { first, choices, drawn, along, stroke, steps });
+        let laid_as = canvas.strokes_ended();
+        self.kept_shape = Some(Box::new(KeptShape { first, choices, drawn, along, stroke, laid_as }));
     }
 
-    /// Whether `kept` is still the last thing done, with nothing undone after it.
+    /// Whether `kept` is still the last thing done, with nothing undone after it: its step is the last
+    /// made (once it has been laid).
     fn still_stands(&self, kept: &KeptShape) -> bool {
-        self.canvas.as_ref().is_some_and(|c| c.steps_made() == kept.steps && !c.can_redo())
+        self.canvas.as_ref().is_some_and(|c| c.step_of_stroke(kept.laid_as) == Some(c.steps_made()) && !c.can_redo())
     }
 
     /// There is a shape for redo to put back in place of the stroke it gave way to.
@@ -290,15 +444,16 @@ impl State {
         let Some(mut kept) = self.kept_shape.take().filter(|kept| self.still_stands(kept)) else { return false };
         let Some(canvas) = self.canvas.as_mut() else { return false };
         canvas.undo();
-        canvas.begin_stroke(kept.stroke.layer, kept.stroke.style);
+        begin_again(canvas, &kept.stroke);
         // a brush engine's stroke drawn by it again, as it was
         let mut builder = self.engine_again(kept.stroke.builder.clone(), kept.stroke.layer, kept.stroke.seed);
+        let mut second = kept.stroke.second.as_ref().map(|s| s.fresh.clone());
         let guide = self.doc.stroke_guide();
         let Some(canvas) = self.canvas.as_mut() else { return false };
-        crate::draw_samples(canvas, &mut builder, None, &kept.stroke.samples, &guide, false);
-        crate::close_stroke(canvas, builder, None, &guide);
-        self.flush();
-        kept.steps = self.canvas.as_ref().map_or(0, Canvas::steps_made);
+        crate::draw_samples(canvas, &mut builder, second.as_mut(), &kept.stroke.samples, &guide, false);
+        crate::close_stroke(canvas, builder, second, &guide);
+        // (laid by the frames, as a stroke drawn is: redo lays what is left first)
+        kept.laid_as = canvas.strokes_ended();
         self.unkept_shape = Some(kept);
         true
     }
@@ -312,50 +467,260 @@ impl State {
         }
         let (Some(kept), Some(canvas)) = (self.unkept_shape.take(), self.canvas.as_mut()) else { return false };
         canvas.undo();
-        canvas.begin_stroke(kept.stroke.layer, kept.stroke.style);
-        self.stroke = Some(kept.stroke.builder.clone());
+        begin_again(canvas, &kept.stroke);
+        self.stroke = Some(Box::new(kept.stroke.builder.clone()));
         self.second = None;
-        self.shape = Some(ShapeEdit::new(kept.first, kept.choices, kept.drawn, kept.along, None, Some(kept.stroke)));
+        self.shape =
+            Some(Box::new(ShapeEdit::new(kept.first, kept.choices, kept.drawn, kept.along, None, Some(kept.stroke))));
         self.draw_shape();
         self.finish_stroke();
         true
     }
 
-    /// Redraws the open stroke along the shape's outline.
+    /// Redraws the open stroke along the shape's outline, here and now (a stroke still being made
+    /// for it elsewhere is let go).
     fn draw_shape(&mut self) {
+        if let Some(build) = self.shape_build() {
+            let made = build.make();
+            self.lay_made(made, false);
+        }
+    }
+
+    /// The stroke along the shape's outline as it is to be made (see [`ShapeBuild`]); none without
+    /// a shape or a stroke. A stroke still being made for it elsewhere is let go.
+    fn shape_build(&mut self) -> Option<ShapeBuild> {
         if let Some(edit) = self.shape.as_mut() {
             edit.stale = false;
+            edit.replot = None;
         }
-        let (Some(edit), Some(old)) = (self.shape.as_ref(), self.stroke.as_ref()) else { return };
+        let (Some(edit), Some(old)) = (self.shape.as_ref(), self.stroke.as_ref()) else { return None };
+        let moves = edit.moves;
         // the outline is the path: nothing smooths it, or round its corners
         let builder = StrokeBuilder::with_seed(old.brush().clone(), old.diameter(), old.pointer(), SHAPE_SEED)
             .scaled(self.brush_scale())
-            .exact_path();
+            .exact_path()
+            .drawn_like(old);
+        let builder = crate::pressure::pressed_like(builder, old);
         let samples = edit.samples();
+        // a dual brush's second drawn along it too, as the stroke drew it
+        let scale = self.brush_scale();
+        let second = edit.stroke.as_ref().and_then(|s| s.second.as_ref()).map(|s| {
+            let fresh = &s.fresh;
+            let builder =
+                StrokeBuilder::with_seed(fresh.brush().clone(), fresh.diameter(), fresh.pointer(), SECOND_SHAPE_SEED)
+                    .scaled(scale)
+                    .exact_path()
+                    .drawn_like(fresh);
+            crate::pressure::pressed_like(builder, fresh)
+        });
         // a brush engine's stroke drawn by it along the shape
-        let mut builder = self.engine_again(builder, self.doc.current(), SHAPE_SEED);
-        builder.add(&samples);
-        let stamps = builder.finish();
-        // with a symmetry guide on, its copies too, as the stroke had them and as it is kept
-        let guide = self.doc.stroke_guide();
-        if let Some(canvas) = self.canvas.as_mut() {
-            // nothing drawn ahead of the pen before it snapped stays over the shape
-            canvas.set_prediction(&[]);
-            canvas.set_tip(&[]);
-            // made a shape, a dual brush's stroke goes on as its first alone
-            canvas.drop_second();
-            canvas.replace_stamps(&crate::guide::mirrored(&guide, &stamps));
-        }
-        self.stroke = Some(builder);
-        self.second = None;
+        let first = self.engine_again(builder, self.doc.current(), SHAPE_SEED);
+        Some(ShapeBuild { first, second, samples, moves })
     }
 
-    /// Redraws the open stroke along the shape if it moved since it was last drawn: as a frame is
-    /// drawn, and before it is kept (see [`ShapeEdit::stale`]).
+    /// Lays the stroke `made` along the shape as the open stroke: as its preview (`preview`, see
+    /// [`ShapeEdit::preview`]) or as itself.
+    fn lay_made(&mut self, made: Made, preview: bool) {
+        let Made { first: (builder, stamps), second, moves } = made;
+        if let Some(edit) = self.shape.as_mut() {
+            edit.laid_moves = moves;
+        }
+        let (second, second_stamps) = match second {
+            Some((builder, stamps)) => (Some(builder), Some(stamps)),
+            None => (None, None),
+        };
+        self.lay_shape_stamps(stamps, second_stamps, preview);
+        self.stroke = Some(Box::new(builder));
+        self.second = second.map(Box::new);
+    }
+
+    /// Lays the shape's stroke as its stamps `first` and a dual brush's second's `second` make it: as
+    /// its preview (`preview`, see [`ShapeEdit::preview`]) or as itself, the canvas's stroke begun
+    /// again as the one where it was the other (where it can be: a stroke there is none of to begin
+    /// again stays as itself).
+    fn lay_shape_stamps(&mut self, first: Vec<Stamp>, second: Option<Vec<Stamp>>, preview: bool) {
+        let switch = self.shape.as_mut().and_then(|edit| {
+            if edit.preview == preview {
+                return None;
+            }
+            let begun = edit.stroke.as_ref().map(|s| (s.layer, s.style, s.second.as_ref().map(|s| s.stroke)))?;
+            edit.preview = preview;
+            Some(begun)
+        });
+        let preview = self.shape.as_ref().is_some_and(|edit| edit.preview);
+        // with a symmetry guide on, its copies too, as the stroke had them and as it is kept
+        let guide = self.doc.stroke_guide();
+        let Some(canvas) = self.canvas.as_mut() else { return };
+        // nothing drawn ahead of the pen before it snapped stays over the shape
+        canvas.set_prediction(&[]);
+        canvas.set_tip(&[]);
+        if let Some((layer, style, second_stroke)) = switch {
+            // (as wide as it was told it was: painting in place, its tiles go by that)
+            let across = canvas.told_brush_across();
+            canvas.cancel_stroke();
+            match (preview, second_stroke) {
+                (true, _) => canvas.begin_stroke(layer, preview_style(style)),
+                (false, Some(second_stroke)) => canvas.begin_dual_stroke(layer, style, second_stroke),
+                (false, None) => canvas.begin_stroke(layer, style),
+            }
+            if let Some(across) = across {
+                canvas.brush_across(across);
+            }
+        }
+        if preview {
+            canvas.replace_stamps(&crate::guide::mirrored(&guide, &first));
+            if let Some(edit) = self.shape.as_mut() {
+                edit.previewed = Some((first, second));
+            }
+            return;
+        }
+        match &second {
+            Some(second) => canvas.replace_second_stamps(&crate::guide::mirrored(&guide, second)),
+            // (a brush engine's dual brush goes on as its first alone)
+            None => canvas.drop_second(),
+        }
+        canvas.replace_stamps(&crate::guide::mirrored(&guide, &first));
+        // (all of it shown: nothing more is to come of its last display frame)
+        canvas.lay_held();
+        if let Some(edit) = self.shape.as_mut() {
+            edit.previewed = None;
+        }
+    }
+
+    /// The shape's stroke laid as itself again in place of its preview (see [`ShapeEdit::preview`]),
+    /// as the preview shows it.
+    fn end_preview(&mut self) {
+        let previewed = self.shape.as_mut().filter(|edit| edit.preview).and_then(|edit| edit.previewed.take());
+        if let Some((first, second)) = previewed {
+            self.lay_shape_stamps(first, second, false);
+        }
+    }
+
+    /// Whether the shape's stroke laid now is laid as its preview (see [`ShapeEdit::preview`]):
+    /// while the shape is moved about, of a brush that has one, once the canvas has been seen to
+    /// take longer than a frame to lay it as itself (see [`ShapeEdit::heavy`]), or is still laying
+    /// what it was given before.
+    fn wants_preview(&self) -> bool {
+        let (Some(edit), Some(canvas)) = (self.shape.as_ref(), self.canvas.as_ref()) else { return false };
+        let has_one = edit.stroke.as_ref().is_some_and(|s| has_preview(&s.style, s.second.is_some()));
+        // (a brush engine's stroke goes as the engine draws it)
+        let engine = self.stroke.as_ref().is_some_and(|b| b.is_outside());
+        let behind = edit.preview || edit.heavy || canvas.relaying() || canvas.catching_up();
+        edit.moving() && has_one && !engine && behind
+    }
+
+    /// The shape stops moving (see [`ShapeEdit::moving`]): a stroke shown by its preview is laid as
+    /// itself again, now if nothing newer is to come, else as that is.
+    fn stopped_moving(&mut self) {
+        let Some(edit) = self.shape.as_ref() else { return };
+        if edit.moving() || !edit.preview {
+            return;
+        }
+        if edit.stale || edit.replot.is_some() {
+            self.needs_frame = true;
+        } else {
+            self.end_preview();
+        }
+    }
+
+    /// Redraws the open stroke along the shape if it moved since it was last drawn, as a frame is
+    /// drawn (see [`ShapeEdit::stale`]). The stroke is made on a thread of its own, the frames going
+    /// on meanwhile, and laid by the first frame to find it made; one moved since is made again then.
+    /// Made in the frame, a big shape held each frame of its drag for as long as its stroke took to
+    /// make (a third of a second for a wet brush round a whole canvas). A brush engine's (a plugin's)
+    /// is made here.
     pub(crate) fn draw_moved_shape(&mut self) {
-        if self.shape.as_ref().is_some_and(|edit| edit.stale) {
+        // (the last frame left some of its stroke as itself to lay: it takes longer than a frame)
+        if let (Some(edit), Some(canvas)) = (self.shape.as_mut(), self.canvas.as_ref())
+            && !edit.preview
+            && (canvas.relaying() || canvas.catching_up())
+        {
+            edit.heavy = true;
+        }
+        // a preview still being laid is laid to its end before the next is given (begun again at each
+        // move, a big brush's preview needing two frames never showed): what is made meanwhile waits
+        if let (Some(edit), Some(canvas)) = (self.shape.as_ref(), self.canvas.as_ref())
+            && edit.preview
+            && edit.moving()
+            && edit.replot.is_some()
+            && (canvas.relaying() || canvas.catching_up())
+        {
+            self.needs_frame = true;
+            return;
+        }
+        let waited = self.shape.as_ref().and_then(|e| e.replot.as_ref()).map(|r| r.made.try_recv());
+        match waited {
+            // (made for a move gone past once the shape has stopped: made again at once below, not
+            // laid only to be laid again)
+            Some(Ok(made)) if self.shape.as_ref().is_some_and(|e| !e.moving() && e.moves != made.moves) => {}
+            Some(Ok(made)) => {
+                let preview = self.wants_preview();
+                self.lay_made(made, preview);
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Empty)) => {
+                self.needs_frame = true;
+                return;
+            }
+            // (made nowhere: made here)
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                if let Some(edit) = self.shape.as_mut() {
+                    edit.stale = true;
+                }
+            }
+            None => {}
+        }
+        if let Some(edit) = self.shape.as_mut() {
+            edit.replot = None;
+        }
+        if !self.shape.as_ref().is_some_and(|edit| edit.stale) {
+            return;
+        }
+        let Some(build) = self.shape_build() else { return };
+        if build.first.is_outside() {
+            let made = build.make();
+            self.lay_made(made, false);
+            return;
+        }
+        let moves = build.moves;
+        let (send, made) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new().name("procraft-shape-stroke".to_owned());
+        match thread.spawn(move || {
+            // (nothing waits for it once the shape is gone, or drawn here since)
+            let _ = send.send(build.make());
+        }) {
+            Ok(_) => {
+                if let Some(edit) = self.shape.as_mut() {
+                    edit.replot = Some(Replot { moves, made });
+                }
+                self.needs_frame = true;
+            }
+            Err(e) => {
+                log::warn!("making a shape's stroke elsewhere: {e}");
+                self.draw_shape();
+            }
+        }
+    }
+
+    /// The open stroke along the shape as it is now, laid before this returns: the stroke being made
+    /// for it elsewhere waited for, or one made here if it has moved since (before it is kept).
+    pub(crate) fn draw_shape_now(&mut self) {
+        let pending = self.shape.as_mut().and_then(|e| e.replot.take().map(|r| (r, e.moves, e.stale)));
+        let waited = pending.is_some();
+        if let Some((replot, moves, stale)) = pending
+            && replot.moves == moves
+            && !stale
+        {
+            match replot.made.recv() {
+                Ok(made) => self.lay_made(made, false),
+                Err(_) => self.draw_shape(),
+            }
+            return;
+        }
+        if waited || self.shape.as_ref().is_some_and(|edit| edit.stale) {
             self.draw_shape();
         }
+        // (as itself, not its preview)
+        self.end_preview();
     }
 
     /// The pen still down after a snap moved to `to` (canvas point): the shape turns and grows
@@ -379,15 +744,18 @@ impl State {
             return false;
         }
         edit.shape = shape;
-        edit.stale = true;
+        edit.moved();
         true
     }
 
-    /// The pen that drew the snapped shape lifted: it stays where it is, open to be edited.
+    /// The pen that drew the snapped shape lifted, or a drag on its outline was let go: it stays
+    /// where it is, open to be edited.
     pub(crate) fn let_go_shape(&mut self) {
         if let Some(edit) = self.shape.as_mut() {
             edit.held = None;
+            edit.dragging = false;
         }
+        self.stopped_moving();
     }
 
     /// The stroke just kept is remembered, for QuickShape on the last stroke. It is laid by the next
@@ -532,7 +900,7 @@ fn refresh_corners(shape: &mut Shape, modes: &[Anchor]) {
 fn along_ellipse(nodes: &[Vec2], drawn: &[Vec2]) -> Option<Vec<Vec2>> {
     let frame = |n: &[Vec2]| Some((*n.first()?, *n.get(1)? - *n.first()?, *n.get(2)? - *n.first()?));
     let (c, a, b) = frame(nodes)?;
-    let (fc, fa, fb) = frame(&fit_ellipse(drawn).nodes)?;
+    let (fc, fa, fb) = frame(&fit_round(drawn).nodes)?;
     let det = fa.x * fb.y - fa.y * fb.x;
     if det.abs() < 1e-6 || a.x * b.y - a.y * b.x == 0.0 || drawn.len() < 2 {
         return None;
@@ -671,15 +1039,6 @@ fn resample(outline: &[Vec2], along: &StrokeAlong) -> Vec<Sample> {
     out
 }
 
-/// The outline (x and y in turn) of the shape a path of points (x and y in turn) looks like, if
-/// any: a freehand selection held still snaps to it.
-#[uniffi::export]
-pub fn quickshape_outline(points: Vec<f32>) -> Option<Vec<f32>> {
-    let path: Vec<Vec2> = points.as_chunks::<2>().0.iter().map(|&[x, y]| Vec2::new(x, y)).collect();
-    let shape = recognise(&path).into_iter().next()?;
-    Some(shape.outline().into_iter().flat_map(|p| [p.x, p.y]).collect())
-}
-
 #[uniffi::export]
 impl CanvasSession {
     /// The stroke being drawn has been held still: it snaps to the shape it looks like, if any.
@@ -698,7 +1057,7 @@ impl CanvasSession {
         let held = st.drawn.last().map(|&at| Held { snapped: first.clone(), from: at, at, finger: false });
         let (drawn, along) = (line, StrokeAlong::of(&st.drawn_samples, st.pace()));
         let stroke = st.began.take().and_then(|began| began.laid_again(st.drawn_samples.clone()));
-        st.shape = Some(ShapeEdit::new(first, choices, drawn, along, held, stroke));
+        st.shape = Some(Box::new(ShapeEdit::new(first, choices, drawn, along, held, stroke)));
         st.draw_shape();
         self.shared.frame(st);
         st.shape_info()
@@ -728,23 +1087,31 @@ impl CanvasSession {
         let choices = found.iter().map(|s| s.kind).collect();
         let canvas = st.canvas.as_mut()?;
         canvas.undo();
-        canvas.begin_stroke(last.layer, last.style);
+        match &last.second {
+            Some(second) => canvas.begin_dual_stroke(last.layer, last.style, second.stroke),
+            None => canvas.begin_stroke(last.layer, last.style),
+        }
         let layer_inv_scale = st.active_layer_inv_transform().scale_factor().clamp(0.05, 20.0);
         let scale = st.brush_scale() * layer_inv_scale;
         let stroke = last.laid_again(last.samples.clone());
         let along = StrokeAlong::of(&last.samples, last.pace);
-        st.stroke =
-            Some(StrokeBuilder::with_seed(last.brush, last.diameter, last.pointer.into(), SHAPE_SEED).scaled(scale));
+        let builder = StrokeBuilder::with_seed(last.brush, last.diameter, last.pointer.into(), SHAPE_SEED)
+            .scaled(scale)
+            .drawn_like(&last.line);
+        st.stroke = Some(Box::new(crate::pressure::pressed_like(builder, &last.line)));
         st.second = None;
-        st.shape = Some(ShapeEdit::new(first, choices, line, along, None, stroke));
+        st.shape = Some(Box::new(ShapeEdit::new(first, choices, line, along, None, stroke)));
         st.draw_shape();
         self.shared.frame(st);
         st.shape_info()
     }
 
     /// The snapped shape, while there is one.
+    ///
+    /// Asked each frame while the view settles, it never waits long on the canvas (see
+    /// [`crate::Shared::read_seen`]).
     pub fn quickshape_info(&self) -> Option<QuickShapeInfo> {
-        self.shared.lock().shape_info()
+        self.shared.read_seen(crate::State::shape_info, |seen| &mut seen.shape)
     }
 
     /// Shows the snapped shape as `kind` instead.
@@ -791,7 +1158,19 @@ impl CanvasSession {
         if let Some(edit) = self.shared.lock().shape.as_mut() {
             edit.earlier.push(edit.shape.clone());
             edit.later.clear();
+            edit.dragging = true;
         }
+    }
+
+    /// The drag of the snapped shape begun with [`CanvasSession::quickshape_step`] ends: a stroke
+    /// shown by its preview meanwhile is laid as itself.
+    pub(crate) fn quickshape_drag_end(&self) {
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        let Some(edit) = st.shape.as_mut() else { return };
+        edit.dragging = false;
+        st.stopped_moving();
+        self.shared.frame(st);
     }
 
     /// Undo where a shape is the last thing done: one still edited goes back a drag; with none
@@ -865,7 +1244,7 @@ impl CanvasSession {
             edit.shape.move_handle(index, to);
         }
         refresh_corners(&mut edit.shape, &edit.modes);
-        edit.stale = true;
+        edit.moved();
         self.shared.frame(st);
         st.shape_info()
     }
@@ -952,8 +1331,11 @@ impl CanvasSession {
     /// The drag on the outline (or the pen) let go: the shape stays as it shows.
     pub fn quickshape_unpin(&self) -> Option<QuickShapeInfo> {
         let mut guard = self.shared.lock();
-        guard.let_go_shape();
-        guard.shape_info()
+        let st = &mut *guard;
+        st.let_go_shape();
+        // (a stroke shown by its preview is laid as itself)
+        self.shared.frame(st);
+        st.shape_info()
     }
 
     /// The edited shape dragged from window point (`fx`, `fy`) to (`tx`, `ty`): it moves along.
@@ -964,7 +1346,7 @@ impl CanvasSession {
         let edit = st.shape.as_mut()?;
         edit.held = None;
         edit.shape = edit.shape.translated(by);
-        edit.stale = true;
+        edit.moved();
         self.shared.frame(st);
         st.shape_info()
     }
@@ -986,6 +1368,7 @@ impl CanvasSession {
 #[cfg(test)]
 mod tests {
     use procraft_engine::input::Pointer;
+    use procraft_engine::quickshape::fit_ellipse;
 
     use super::*;
 
@@ -1049,7 +1432,7 @@ mod tests {
         {
             let mut st = s.shared.lock();
             st.view = Some(procraft_engine::view::View::fit((1000, 800), (1000, 800)));
-            st.stroke = Some(StrokeBuilder::new(brush, 8.0, Pointer::Stylus));
+            st.stroke = Some(Box::new(StrokeBuilder::new(brush, 8.0, Pointer::Stylus)));
             st.remember_input(samples);
         }
         assert!(s.quickshape_hold().is_some());

@@ -22,6 +22,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod box_pinch;
+pub(crate) mod mail;
 mod pen;
 
 pub use pen::{HoverCursor, PenHover, PenPreferred, SqueezePhase};
@@ -29,6 +30,7 @@ pub use pen::{HoverCursor, PenHover, PenPreferred, SqueezePhase};
 use crate::adjust::PerspectiveKind;
 use crate::adjust_menu::Adjustment;
 use crate::adjusting::{CLONE_PUCK_RADIUS, CLONE_PUCK_SLOP, DIRECTIONAL_INNER, DIRECTIONAL_REACH, POSITIONAL_GRAB};
+use crate::pour::{PourTarget, pour_target};
 use crate::{CanvasSession, PenSample, PointerKind, ToolKind};
 
 /// A tap: down and up within this, moving no further than [`TAP_SLOP`] points.
@@ -41,8 +43,8 @@ const LIQUIFY_HELD_SLOP: f32 = 3.0;
 const TAP_SLOP: f32 = 24.0;
 /// How far from an item (points) a tap of the selection tool on a plugin's layer still takes it.
 const TAP_REACH: f32 = 6.0;
-/// Each of the fingers tapped together stays short of this (points) from where it landed: this
-/// far, they are moving the canvas.
+/// Each of the fingers tapped together stays short of this (points) from where it landed, and
+/// two of them short of moving the canvas ([`VIEW_SLOP`]).
 const FINGERS_TAP_SLOP: f32 = 15.0;
 /// A touch on the canvas with a panel open moved this far (points) is a drag, not a tap.
 const PANEL_SLOP: f32 = 10.0;
@@ -87,8 +89,15 @@ const SCRUB_TURNS: i32 = 3;
 const SCRUB_STEP: f32 = 24.0;
 /// Three fingers swiped down this far (points), mostly straight.
 const SWIPE_DOWN: f32 = 70.0;
-/// A stroke counts as still within this many points.
-const QUICKSHAPE_STILL: f32 = 6.0;
+/// A touch waited on to be held still keeps still while it has gone less than this (points, all
+/// told) since the wait began: each time it has gone this far, the wait starts again. So a touch
+/// drawing small circles never keeps still, however near it stays to where it began.
+const STILL: f32 = 3.0;
+/// A finger that has gone this far (points, all told) since it came down is no hold.
+const HOLD_REACH: f32 = 15.0;
+/// A stroke waits to be held still (draw and hold) only once it has gone this far (points, all
+/// told): a dot or a small scribble held never snaps to a shape.
+const QUICKSHAPE_FROM: f32 = 15.0;
 /// A snapped shape being edited: a handle within this takes a drag, and its outline within this.
 const QUICKSHAPE_GRAB: f32 = 22.0;
 /// A shape's node stays where it is until the finger has gone this far (points), and then goes as
@@ -199,6 +208,8 @@ pub struct TouchSettings {
     pub pen_second_button: Option<GestureAction>,
     /// Three fingers rubbed back and forth clear the layer.
     pub scrub: bool,
+    /// The pen's barrel rolled turns Liquify's twirl.
+    pub liquify_roll: bool,
     /// While the pen hovers over the canvas, a finger dragged across moves the brush's opacity and
     /// two pinched its size.
     pub hover_touch: bool,
@@ -212,6 +223,19 @@ pub struct TouchSettings {
     /// hand resting by the pen.
     #[uniffi(default = false)]
     pub pointer_follows_touch: bool,
+    /// What the pen's first and second buttons are set to do in Pen buttons, a QuickMenu action
+    /// each, in place of what Gesture controls say; `None`, what Gesture controls say.
+    #[uniffi(default = None)]
+    pub pen_button_does: Option<crate::QuickAction>,
+    #[uniffi(default = None)]
+    pub pen_second_button_does: Option<crate::QuickAction>,
+    /// A plugin's action (`<id>.<key>`, placed at the pen) Pen buttons set the pen's first and
+    /// second buttons to run, in place of the rest; `None`, as above. The app sets one only while
+    /// its plugin is on.
+    #[uniffi(default = None)]
+    pub pen_button_runs: Option<String>,
+    #[uniffi(default = None)]
+    pub pen_second_button_runs: Option<String>,
 }
 
 impl Default for TouchSettings {
@@ -234,11 +258,16 @@ impl Default for TouchSettings {
             pen_button: None,
             pen_second_button: None,
             scrub: true,
+            liquify_roll: true,
             hover_touch: false,
             hold_ms: 400.0,
             quickshape_ms: 650.0,
             rapid_undo_ms: 650.0,
             pointer_follows_touch: false,
+            pen_button_does: None,
+            pen_second_button_does: None,
+            pen_button_runs: None,
+            pen_second_button_runs: None,
         }
     }
 }
@@ -248,6 +277,21 @@ impl Default for TouchSettings {
 pub enum TouchCommand {
     Undo,
     Redo,
+    /// A pen button set to a QuickMenu action in Pen buttons (other than Undo and Redo, which come
+    /// as themselves) was pressed with the pen at (x, y): the app does it, as the QuickMenu's
+    /// button would.
+    Run {
+        action: crate::QuickAction,
+        x: f32,
+        y: f32,
+    },
+    /// A pen button set to a plugin's action in Pen buttons was pressed with the pen at (x, y): the
+    /// app runs it there ([`crate::Plugins::run_action_at`]).
+    RunPlugin {
+        key: String,
+        x: f32,
+        y: f32,
+    },
     ClearLayer,
     ToggleBars,
     /// The canvas settles to fit the window.
@@ -311,11 +355,28 @@ pub enum TouchCommand {
         x: f32,
         y: f32,
     },
+    /// Continue filling: the touch, once it is one finger's (let go, or slid past the slop; a
+    /// second finger landing first leaves it unmade), fills where it landed: the app pours `fill`
+    /// there (`pour_begin`), on a thread of its own if it has one (a whole layer's fill takes a
+    /// while on a large canvas), the touch's own work going on meanwhile; this touch's fill ends
+    /// with [`TouchCommand::PourEnd`]. (On a plugin's layer, whose plugin says at once whether it
+    /// takes the fill, the touch pours itself.)
+    PourAt {
+        x: f32,
+        y: f32,
+        fill: Fill,
+    },
     /// Continue filling: a touch slid the fill's threshold to this (keep it for the next, and redo
     /// the fill with it, `pour_threshold`, when next drawing: it redoes the whole fill, so once a
-    /// frame at most), and the fill was let go of (kept, at the threshold it was let go at).
+    /// frame at most; one coming just before [`TouchCommand::PourEnd`] is redone before it ends);
+    /// the touch's fill ends (`pour_end`: `keep` makes it an undo step, else it is taken back, by a
+    /// second finger), after what was asked of it before, on the thread it was poured on; and the
+    /// fill was let go of (kept, at the threshold it was let go at).
     FillThreshold {
         threshold: f32,
+    },
+    PourEnd {
+        keep: bool,
     },
     Filled,
     /// A transform's touch came down (its popovers close); the box as it now is; the node held and
@@ -406,7 +467,8 @@ enum Mode {
     Shape(u32),
     ShapePin,
     ShapeMove,
-    /// Continue filling: the touch filled where it landed, and slides the threshold.
+    /// Continue filling: the touch fills where it landed once it is one finger's, and slides the
+    /// threshold.
     Pour,
     /// A transform's touch: it took a node (or the content), and drags it once past the slop.
     Transform,
@@ -460,6 +522,9 @@ struct Held {
 /// The touches' state: kept by the session, apart from the canvas's (they call into it).
 pub(crate) struct Touches {
     settings: TouchSettings,
+    /// When the airbrush's stroke held still next dabs, as last seen (the host's clock, ms): told
+    /// while something holds the canvas.
+    airbrush_next: Option<f64>,
     mode: Mode,
     down: Vec<Down>,
     stroke_pointer: u64,
@@ -492,6 +557,8 @@ pub(crate) struct Touches {
     /// A plugin keeps two-finger gestures from turning the canvas, as it said when the last finger
     /// landed (the gesture lock's hook).
     turn_locked: bool,
+    /// A plugin keeps a quick pinch in from fitting the canvas, as it said then too.
+    fit_locked: bool,
     gesture_pair: Option<(u64, u64)>,
     last: (f32, f32, f32, f32),
     scrub_x: f32,
@@ -500,7 +567,8 @@ pub(crate) struct Touches {
     scrub_turns: i32,
     swipe_start: (f32, f32),
     swiped: bool,
-    hold_at: (f32, f32),
+    /// How far the touch waited on for a hold or draw and hold has gone.
+    travel: Travel,
     hold_due: Option<f64>,
     quickshape_due: Option<f64>,
     rapid_due: Option<f64>,
@@ -519,12 +587,10 @@ pub(crate) struct Touches {
     /// Continue filling is on: each touch fills; the fill's threshold as slid, and the touch's
     /// last place and time.
     filling: Option<Fill>,
-    /// The selection tool is open; its touch has moved past the slop; a freehand path held still
-    /// snapped to a shape; the colour selection's threshold as slid; the freehand path (canvas
-    /// pixels).
+    /// The selection tool is open; its touch has moved past the slop; the colour selection's
+    /// threshold as slid; the freehand path (canvas pixels).
     selecting: Option<SelectTouch>,
     select_moved: bool,
-    lasso_snapped: bool,
     /// An adjustment's touch went past the slop (it is not a tap), and has begun displacing;
     /// liquify's brush, when it last moved and when time last passed for it, and whether a pen
     /// holds it.
@@ -533,6 +599,8 @@ pub(crate) struct Touches {
     liquify_ms: f64,
     liquify_tick_ms: f64,
     liquify_pen: bool,
+    /// Where the pen's barrel last was (radians), once the stroke has read it.
+    liquify_roll: Option<f32>,
     /// Where liquify's brush came to rest and when, how long (seconds) it has worked on there, and
     /// when it next does.
     liquify_rest: (f32, f32),
@@ -555,6 +623,11 @@ pub(crate) struct Touches {
     box_pinch: Option<Option<[(f32, f32); 2]>>,
     pour_moved: bool,
     pour_last: (f32, f64),
+    /// Continue filling's touch's fill, not asked for yet: where it landed, with what, and what it
+    /// lands on. It waits to be one finger's, let go (a tap) or slid past the slop, as the
+    /// reference's one-finger tap fills as it ends; a second finger landing first (a pinch) leaves
+    /// it unmade, where a whole layer's fill made and taken back held the pinch up.
+    pour_waiting: Option<((f32, f32), Fill, PourTarget)>,
     /// Layer Opacity is on: the layer a drag changes and its opacity as dragged; whether the
     /// touch has changed it yet.
     layer_opacity: Option<(u64, f32)>,
@@ -620,6 +693,7 @@ impl Default for Touches {
     fn default() -> Touches {
         Touches {
             settings: TouchSettings::default(),
+            airbrush_next: None,
             mode: Mode::None,
             down: Vec::new(),
             stroke_pointer: 0,
@@ -638,6 +712,7 @@ impl Default for Touches {
             more_to_come: false,
             pinch: Vec::new(),
             turn_locked: false,
+            fit_locked: false,
             gesture_pair: None,
             last: (0.0, 0.0, 0.0, 0.0),
             scrub_x: 0.0,
@@ -646,7 +721,7 @@ impl Default for Touches {
             scrub_turns: 0,
             swipe_start: (0.0, 0.0),
             swiped: false,
-            hold_at: (0.0, 0.0),
+            travel: Travel::default(),
             hold_due: None,
             quickshape_due: None,
             rapid_due: None,
@@ -661,12 +736,12 @@ impl Default for Touches {
             filling: None,
             selecting: None,
             select_moved: false,
-            lasso_snapped: false,
             adjust_moved: false,
             adjust_displacing: false,
             liquify_ms: 0.0,
             liquify_tick_ms: 0.0,
             liquify_pen: false,
+            liquify_roll: None,
             liquify_rest: (0.0, 0.0),
             liquify_rest_ms: 0.0,
             liquify_held: 0.0,
@@ -682,6 +757,7 @@ impl Default for Touches {
             box_pinch: None,
             pour_moved: false,
             pour_last: (0.0, 0.0),
+            pour_waiting: None,
             layer_opacity: None,
             opacity_moved: false,
             recolor_dragged: false,
@@ -717,6 +793,59 @@ impl Default for Touches {
     }
 }
 
+/// How far a touch waited on to be held still has gone (window pixels): all told, since a hold's
+/// wait last began and since draw and hold's did; and where it was last.
+#[derive(Clone, Copy, Debug, Default)]
+struct Travel {
+    last: (f32, f32),
+    all: f32,
+    hold: f32,
+    shape: f32,
+}
+
+impl Touches {
+    /// The touch waited on to be held still came down at `at`: nothing gone yet, and draw and hold
+    /// waits until it has gone far enough.
+    fn travel_from(&mut self, at: (f32, f32)) {
+        self.travel = Travel { last: at, ..Travel::default() };
+        self.quickshape_due = None;
+    }
+
+    /// The touch waited on went on through `samples`. A hold's wait starts again each time it has
+    /// gone [`STILL`] since it began, and is given up once it has gone [`HOLD_REACH`] all told; with
+    /// `shapes` (a stroke that may snap to a shape), draw and hold waits only once it has gone
+    /// [`QUICKSHAPE_FROM`] all told, starting again likewise. True if draw and hold's wait began
+    /// again.
+    fn travelled(&mut self, samples: &[PenSample], shapes: bool) -> bool {
+        let (still, reach, from) = (STILL * self.scale, HOLD_REACH * self.scale, QUICKSHAPE_FROM * self.scale);
+        let mut again = false;
+        for s in samples {
+            let at = (s.x, s.y);
+            let step = dist(at, std::mem::replace(&mut self.travel.last, at));
+            let travel = &mut self.travel;
+            travel.all += step;
+            if self.hold_due.is_some() {
+                travel.hold += step;
+                if travel.all > reach {
+                    self.hold_due = None;
+                } else if travel.hold > still {
+                    travel.hold = 0.0;
+                    self.hold_due = Some(s.time_ms + self.settings.hold_ms);
+                }
+            }
+            if shapes && travel.all > from {
+                travel.shape += step;
+                if travel.shape > still {
+                    travel.shape = 0.0;
+                    self.quickshape_due = Some(s.time_ms + self.settings.quickshape_ms);
+                    again = true;
+                }
+            }
+        }
+        again
+    }
+}
+
 /// Where a pointer's samples end up, and when.
 fn last_of(samples: &[PenSample]) -> Option<&PenSample> {
     samples.last()
@@ -738,6 +867,14 @@ pub(crate) fn drag_step(dx: f32, ms: f64) -> f32 {
     let frames = (ms.max(1.0) / 1000.0 * 60.0).max(0.06) as f32;
     let speed = dx.abs() / frames;
     (speed / 30.0).powf(0.86) * dx / 200.0
+}
+
+/// How far the pen's barrel has turned since `last` (radians), the short way round, and it now at
+/// `now`. A pen with no barrel to read stays at 0, so turns nothing.
+fn barrel_turn(last: &mut Option<f32>, now: f32) -> f32 {
+    let Some(before) = last.replace(now) else { return 0.0 };
+    let turn = (now - before).rem_euclid(std::f32::consts::TAU);
+    if turn > std::f32::consts::PI { turn - std::f32::consts::TAU } else { turn }
 }
 
 /// A liquify stroke's points, (x, y, pressure, milliseconds since the last) each, the first since
@@ -766,6 +903,11 @@ impl CanvasSession {
         self.shared.touches.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Whether the selection tool is open (its touches select).
+    pub(crate) fn selection_tool_open(&self) -> bool {
+        self.touches().selecting.is_some()
+    }
+
     /// Whether the pen is near enough that a hand's touches are taken for its: on the canvas, held
     /// over it (unless Hover's touch takes fingers then), or just gone (lifted before `now_ms`, an
     /// input's time, or no longer held over it).
@@ -775,6 +917,15 @@ impl CanvasSession {
         let gone_ms = f64::from(PEN_GONE_S) * 1000.0;
         let lifted = now_ms.zip(t.pen_lifted_ms).is_some_and(|(now, lifted)| (0.0..gone_ms).contains(&(now - lifted)));
         t.pen_pointer.is_some() || (!t.settings.hover_touch && (hovering || left || lifted))
+    }
+
+    /// Whether the pen down holds a snapped shape (the stroke it drew, or a drag on its outline): a
+    /// finger landing then snaps it, as it would beside a finger's stroke, rather than being taken
+    /// for the hand.
+    fn pen_holds_shape(&self, t: &Touches) -> bool {
+        t.pen_pointer.is_some_and(|pen| pen == t.stroke_pointer)
+            && matches!(t.mode, Mode::Pen | Mode::ShapePin)
+            && self.shared.lock().shape.as_ref().is_some_and(|edit| edit.is_held())
     }
 
     /// What the touches down are doing is taken back (a hand resting on the screen, the pen come
@@ -862,12 +1013,12 @@ impl CanvasSession {
             return self.pen_hover_ends();
         }
         let rest = held.split_off(1);
-        let mut out = self.touch_down(id, kind, held.clone());
+        let mut out = self.take_down(id, kind, held.clone());
         if lifts {
             // a tap: a dot where it touched
-            out.extend(self.touch_up(id, if rest.is_empty() { held } else { rest }));
+            out.extend(self.take_up(id, if rest.is_empty() { held } else { rest }));
         } else if !rest.is_empty() {
-            out.extend(self.touch_move(id, rest));
+            out.extend(self.take_move(id, rest));
         }
         out
     }
@@ -938,12 +1089,12 @@ impl CanvasSession {
         drop(t);
         let rest = samples.split_off(from + 1);
         let pressed = samples.split_off(from);
-        let mut out = self.touch_down(id, kind, pressed.clone());
+        let mut out = self.take_down(id, kind, pressed.clone());
         if lifts {
             // a tap whose pressure came only as it lifted: a dot where it pressed
             out.extend(self.lifted(id, if rest.is_empty() { pressed } else { rest }, false));
         } else if !rest.is_empty() {
-            out.extend(self.touch_move(id, rest));
+            out.extend(self.take_move(id, rest));
         }
         out
     }
@@ -953,7 +1104,7 @@ impl CanvasSession {
 impl CanvasSession {
     /// The gesture settings the touches follow from now on.
     pub fn set_touch_settings(&self, settings: TouchSettings) {
-        self.touches().settings = settings;
+        self.tell_touches(false, move |s| s.touches().settings = settings);
     }
 
     /// The modify button tapped: whether the next touch picks a colour.
@@ -986,11 +1137,9 @@ impl CanvasSession {
 
     /// The selection tool open (each touch selects, as `how` says) or not.
     pub fn set_touch_selecting(&self, how: Option<SelectTouch>) {
-        let mut t = self.touches();
-        t.selecting = how;
-        if how.is_none() {
-            t.freehand.clear();
-        }
+        // (closing, it takes the canvas)
+        let closing = how.is_none() && self.touches().selecting.is_some();
+        self.tell_touches(closing, move |s| s.touch_selecting(how));
     }
 
     /// The colour selection being slid, shown at `threshold` from window point (`x`, `y`) where it
@@ -1032,6 +1181,12 @@ impl CanvasSession {
     pub fn close_selection_tool(&self, colour_fill: bool) -> bool {
         let open = self.touches().freehand.len() >= 3;
         self.close_freehand();
+        // the shapes' paths, and the feather's line, show only while the tool is open
+        {
+            let mut st = self.shared.lock();
+            st.selection_outlines.clear();
+            st.feather_edge = false;
+        }
         if !colour_fill || open {
             return open;
         }
@@ -1068,7 +1223,7 @@ impl CanvasSession {
 
     /// A transform open (each touch works its box) or not.
     pub fn set_touch_transforming(&self, transforming: Option<TransformTouch>) {
-        self.touches().transforming = transforming;
+        self.tell_touches(false, move |s| s.touches().transforming = transforming);
     }
 
     /// The guide editor open (or not): a touch drags the guide's handle it lands on, and a tap on
@@ -1077,14 +1232,16 @@ impl CanvasSession {
     /// window), and nothing else: nothing paints, and fingers tapped, held, scrubbed or swiped do
     /// nothing.
     pub fn set_touch_guide_editing(&self, editing: bool) {
-        let mut t = self.touches();
-        t.guide_editing = editing;
-        t.guide_grab = None;
+        self.tell_touches(false, move |s| {
+            let mut t = s.touches();
+            t.guide_editing = editing;
+            t.guide_grab = None;
+        });
     }
 
     /// Continue filling on (each touch on the canvas fills with `fill`) or off.
     pub fn set_touch_filling(&self, fill: Option<Fill>) {
-        self.touches().filling = fill;
+        self.tell_touches(false, move |s| s.touches().filling = fill);
     }
 
     /// Layer Opacity on for layer `id` (a drag across the canvas changes its opacity, each drag
@@ -1121,7 +1278,7 @@ impl CanvasSession {
     /// The single touch companion's Zoom or Move on (a lone press dragged on the canvas zooms or
     /// moves it), or off.
     pub fn set_touch_companion(&self, mode: Option<CompanionMode>) {
-        self.touches().companion = mode;
+        self.tell_touches(false, move |s| s.touches().companion = mode);
     }
 
     /// A panel is open over the canvas (or not): a touch landing on the canvas waits, until a tap
@@ -1130,7 +1287,7 @@ impl CanvasSession {
     /// still, it does what a hold does; more fingers landing move the canvas: both leave the
     /// panel up.
     pub fn set_touch_panel_open(&self, open: bool) {
-        self.touches().panel_open = open;
+        self.tell_touches(false, move |s| s.touches().panel_open = open);
     }
 
     /// Layer Opacity's layer's opacity as dragged, while it is on.
@@ -1145,16 +1302,24 @@ impl CanvasSession {
 
     /// When the touches next need [`CanvasSession::touch_tick`] (a hold, a repeat, an airbrush's
     /// next dab), if ever.
+    ///
+    /// Asked after every input, it never waits on the canvas: while something holds it, the
+    /// airbrush's next dab is as last seen, and input kept meanwhile (see [`mail`]) asks for a tick
+    /// a frame on, which takes it once the canvas is free.
     pub fn touch_deadline(&self) -> Option<f64> {
-        let due = {
-            let t = self.touches();
-            [t.hold_due, t.quickshape_due, t.rapid_due, t.liquify_due, t.pen_wait_due]
+        let seen = self.shared.try_lock().map(|st| st.airbrush.map(|(_, _, next)| next));
+        let (due, airbrush) = {
+            let mut t = self.touches();
+            if let Some(seen) = seen {
+                t.airbrush_next = seen;
+            }
+            let due = [t.hold_due, t.quickshape_due, t.rapid_due, t.liquify_due, t.pen_wait_due]
                 .into_iter()
                 .flatten()
-                .reduce(f64::min)
+                .reduce(f64::min);
+            (due, t.airbrush_next)
         };
-        let airbrush = self.shared.lock().airbrush.map(|(_, _, next)| next);
-        [due, airbrush].into_iter().flatten().reduce(f64::min)
+        [due, airbrush, self.kept_input_due()].into_iter().flatten().reduce(f64::min)
     }
 
     /// An airbrush's stroke whose pen holds still is handed the pen again, as it last was, now.
@@ -1184,65 +1349,8 @@ impl CanvasSession {
     /// ([`TouchCommand::PenHovers`]) until it presses, and its touch begins there. One not known to
     /// give a pressure does so for [`PEN_PRESSURE_WAIT_MS`]; none coming, it paints from where it
     /// touched, at full pressure.
-    pub fn touch_down(&self, id: u64, kind: PointerKind, mut samples: Vec<PenSample>) -> Vec<TouchCommand> {
-        let Some(first) = last_of(&samples).copied() else { return Vec::new() };
-        let mut t = self.touches();
-        if is_pen(kind) {
-            Self::pen_input(&mut t, &mut samples);
-            t.pen_unpressed = None;
-            t.pen_waiting.clear();
-            t.pen_wait_due = None;
-            let Some(from) = Self::pen_presses(&samples) else {
-                t.pen_unpressed = Some((id, kind));
-                // one not known to give a pressure waits a moment for one, keeping what it does
-                if !t.pen_pressure {
-                    t.pen_wait_due = samples.first().map(|s| s.time_ms + PEN_PRESSURE_WAIT_MS);
-                    t.pen_waiting = samples;
-                }
-                drop(t);
-                return self.pen_hovers_at((first.x, first.y));
-            };
-            samples.drain(..from);
-            t.pen_pointer = Some(id);
-            // a finger waiting for another is the hand's
-            if let Some((waiting, _, _)) = t.palm_wait.take() {
-                t.palms.push(waiting);
-            }
-        } else if kind == PointerKind::Finger
-            && !t.modify_held
-            && Self::pen_near(&t, Some(first.time_ms))
-            && (t.pen_pointer.is_some() || t.down.is_empty())
-        {
-            let waiting = t.palm_wait.take();
-            match waiting {
-                _ if t.pen_pointer.is_some() => t.palms.push(id),
-                None => t.palm_wait = Some((id, kind, samples)),
-                Some((other, other_kind, other_samples)) => {
-                    let landed = last_of(&other_samples).map_or(f64::MIN, |s| s.time_ms);
-                    if first.time_ms - landed <= TOGETHER_MS {
-                        drop(t);
-                        let mut out = self.touch_down_now(other, other_kind, other_samples);
-                        out.extend(self.touch_down_now(id, kind, samples));
-                        return out;
-                    }
-                    t.palms.extend([other, id]);
-                }
-            }
-            return Vec::new();
-        } else if let Some((other, other_kind, other_samples)) = t.palm_wait.take() {
-            // the pen gone meanwhile (its time run out): a finger left waiting still makes a
-            // gesture with one landing together with it, else it was the hand's
-            let landed = last_of(&other_samples).map_or(f64::MIN, |s| s.time_ms);
-            if kind == PointerKind::Finger && first.time_ms - landed <= TOGETHER_MS {
-                drop(t);
-                let mut out = self.touch_down_now(other, other_kind, other_samples);
-                out.extend(self.touch_down_now(id, kind, samples));
-                return out;
-            }
-            t.palms.push(other);
-        }
-        drop(t);
-        self.touch_down_now(id, kind, samples)
+    pub fn touch_down(&self, id: u64, kind: PointerKind, samples: Vec<PenSample>) -> Vec<TouchCommand> {
+        self.take_input(mail::Input::Down(id, kind, samples))
     }
 
     /// A pointer goes down on the canvas, taken as a touch.
@@ -1258,8 +1366,10 @@ impl CanvasSession {
         let at = (first.x, first.y);
         t.down.retain(|d| d.id != id);
         t.down.push(Down { id, at, from: at });
-        // a plugin locking the turn: the fingers landing now don't turn the canvas
-        t.turn_locked = hooks.as_ref().is_some_and(|hooks| hooks.gesture_lock(crate::hooks::GESTURE_TURN));
+        // a plugin locking the turn or the fit: the fingers landing now don't turn the canvas, or
+        // fit it with a quick pinch in
+        let locked = |part| hooks.as_ref().is_some_and(|hooks| hooks.gesture_lock(part));
+        (t.turn_locked, t.fit_locked) = (locked(crate::hooks::GESTURE_TURN), locked(crate::hooks::GESTURE_FIT));
         // the guide editor: a touch takes a handle, more fingers move the view
         if t.guide_editing {
             if t.down.len() == 1 {
@@ -1326,6 +1436,123 @@ impl CanvasSession {
     /// Pointers down move together, as one input event has them: the view goes by all of them at
     /// once, never by a spread that only some of them have got to.
     pub fn touch_moves(&self, moves: Vec<TouchMove>) -> Vec<TouchCommand> {
+        self.take_input(mail::Input::Moves(moves))
+    }
+
+    /// A pointer down moves (`samples` its input since the last).
+    pub fn touch_move(&self, id: u64, samples: Vec<PenSample>) -> Vec<TouchCommand> {
+        self.take_input(mail::Input::Move(id, samples))
+    }
+
+    /// A pointer lifts (`samples` its last input).
+    pub fn touch_up(&self, id: u64, samples: Vec<PenSample>) -> Vec<TouchCommand> {
+        self.take_input(mail::Input::Up(id, samples))
+    }
+
+    /// The platform took back one pointer (it was a hand resting on the screen): what it alone
+    /// was doing is taken back, and the touch it was part of is no tap.
+    pub fn touch_cancel_one(&self, id: u64) -> Vec<TouchCommand> {
+        self.take_input(mail::Input::CancelOne(id))
+    }
+
+    /// The platform called the touches off: what they were doing is taken back.
+    pub fn touch_cancel(&self) -> Vec<TouchCommand> {
+        self.take_input(mail::Input::Cancel)
+    }
+
+    /// Runs the waits (a hold, a repeat, an airbrush's next dab) that have run out by `now_ms`.
+    pub fn touch_tick(&self, now_ms: f64) -> Vec<TouchCommand> {
+        self.take_input(mail::Input::Tick(now_ms))
+    }
+}
+
+// what the entry points above take, in order (see `mail`)
+impl CanvasSession {
+    /// [`CanvasSession::set_touch_selecting`], as the touches take it.
+    fn touch_selecting(&self, how: Option<SelectTouch>) {
+        let mut t = self.touches();
+        let closing = t.selecting.is_some() && how.is_none();
+        t.selecting = how;
+        if how.is_none() {
+            t.freehand.clear();
+        }
+        drop(t);
+        // the tool closed: the shapes' paths go (a selection it opens with has none)
+        if closing {
+            let mut guard = self.shared.lock();
+            let st = &mut *guard;
+            if !st.selection_outlines.is_empty() {
+                st.selection_outlines.clear();
+                self.shared.frame(st);
+            }
+        }
+    }
+
+    /// [`CanvasSession::touch_down`], as the touches take it (see [`mail`]).
+    pub(crate) fn take_down(&self, id: u64, kind: PointerKind, mut samples: Vec<PenSample>) -> Vec<TouchCommand> {
+        let Some(first) = last_of(&samples).copied() else { return Vec::new() };
+        let mut t = self.touches();
+        if is_pen(kind) {
+            Self::pen_input(&mut t, &mut samples);
+            t.pen_unpressed = None;
+            t.pen_waiting.clear();
+            t.pen_wait_due = None;
+            let Some(from) = Self::pen_presses(&samples) else {
+                t.pen_unpressed = Some((id, kind));
+                // one not known to give a pressure waits a moment for one, keeping what it does
+                if !t.pen_pressure {
+                    t.pen_wait_due = samples.first().map(|s| s.time_ms + PEN_PRESSURE_WAIT_MS);
+                    t.pen_waiting = samples;
+                }
+                drop(t);
+                return self.pen_hovers_at((first.x, first.y));
+            };
+            samples.drain(..from);
+            t.pen_pointer = Some(id);
+            // a finger waiting for another is the hand's
+            if let Some((waiting, _, _)) = t.palm_wait.take() {
+                t.palms.push(waiting);
+            }
+        } else if kind == PointerKind::Finger
+            && !t.modify_held
+            && Self::pen_near(&t, Some(first.time_ms))
+            && (t.pen_pointer.is_some() || t.down.is_empty())
+            && !self.pen_holds_shape(&t)
+        {
+            let waiting = t.palm_wait.take();
+            match waiting {
+                _ if t.pen_pointer.is_some() => t.palms.push(id),
+                None => t.palm_wait = Some((id, kind, samples)),
+                Some((other, other_kind, other_samples)) => {
+                    let landed = last_of(&other_samples).map_or(f64::MIN, |s| s.time_ms);
+                    if first.time_ms - landed <= TOGETHER_MS {
+                        drop(t);
+                        let mut out = self.touch_down_now(other, other_kind, other_samples);
+                        out.extend(self.touch_down_now(id, kind, samples));
+                        return out;
+                    }
+                    t.palms.extend([other, id]);
+                }
+            }
+            return Vec::new();
+        } else if let Some((other, other_kind, other_samples)) = t.palm_wait.take() {
+            // the pen gone meanwhile (its time run out): a finger left waiting still makes a
+            // gesture with one landing together with it, else it was the hand's
+            let landed = last_of(&other_samples).map_or(f64::MIN, |s| s.time_ms);
+            if kind == PointerKind::Finger && first.time_ms - landed <= TOGETHER_MS {
+                drop(t);
+                let mut out = self.touch_down_now(other, other_kind, other_samples);
+                out.extend(self.touch_down_now(id, kind, samples));
+                return out;
+            }
+            t.palms.push(other);
+        }
+        drop(t);
+        self.touch_down_now(id, kind, samples)
+    }
+
+    /// [`CanvasSession::touch_moves`], as the touches take it (see [`mail`]).
+    pub(crate) fn take_moves(&self, moves: Vec<TouchMove>) -> Vec<TouchCommand> {
         let mut out = Vec::new();
         // the last that counts: a resting finger the pen put aside moves in the event too
         let last = {
@@ -1334,14 +1561,14 @@ impl CanvasSession {
         };
         for (i, step) in moves.into_iter().enumerate() {
             self.touches().more_to_come = i < last;
-            out.extend(self.touch_move(step.id, step.samples));
+            out.extend(self.take_move(step.id, step.samples));
         }
         self.touches().more_to_come = false;
         out
     }
 
-    /// A pointer down moves (`samples` its input since the last).
-    pub fn touch_move(&self, id: u64, mut samples: Vec<PenSample>) -> Vec<TouchCommand> {
+    /// [`CanvasSession::touch_move`], as the touches take it (see [`mail`]).
+    pub(crate) fn take_move(&self, id: u64, mut samples: Vec<PenSample>) -> Vec<TouchCommand> {
         let Some(last) = last_of(&samples).copied() else { return Vec::new() };
         let mut out = Vec::new();
         let mut t = self.touches();
@@ -1371,15 +1598,11 @@ impl CanvasSession {
         let slop = TAP_SLOP * t.scale;
         match t.mode {
             Mode::Pen | Mode::Finger if id == t.stroke_pointer => {
-                if t.mode == Mode::Finger && dist(at, t.down_at) > slop {
-                    t.hold_due = None;
-                }
-                // moving on restarts the wait for a hold
-                if dist(at, t.hold_at) > QUICKSHAPE_STILL * t.scale {
-                    t.hold_at = at;
-                    let snapped = self.shared.lock().shape.is_some();
-                    t.quickshape_due =
-                        (!snapped && t.settings.draw_and_hold).then_some(last.time_ms + t.settings.quickshape_ms);
+                // moving on restarts the waits for a hold and for draw and hold (none while a shape
+                // it snapped to is being held)
+                let shapes = t.settings.draw_and_hold;
+                if t.travelled(&samples, shapes) && self.shared.lock().shape.is_some() {
+                    t.quickshape_due = None;
                 }
                 drop(t);
                 self.clone_stroke_at(at, false);
@@ -1387,6 +1610,7 @@ impl CanvasSession {
                 out.push(TouchCommand::Cursor { x: at.0, y: at.1 });
             }
             Mode::Held if id == t.stroke_pointer => {
+                t.travelled(&samples, false);
                 if let Some(held) = t.held.as_mut() {
                     held.moves.extend(samples);
                 }
@@ -1448,9 +1672,7 @@ impl CanvasSession {
             }
             Mode::Turn if id == t.stroke_pointer => {
                 let last = std::mem::replace(&mut t.turn_last, at);
-                if dist(at, t.down_at) > TAP_SLOP * t.scale {
-                    t.hold_due = None;
-                }
+                t.travelled(&samples, false);
                 drop(t);
                 self.turn_model(at.0 - last.0, at.1 - last.1);
             }
@@ -1525,14 +1747,25 @@ impl CanvasSession {
                         t.liquify_held = 0.0;
                     }
                     let pen = t.liquify_pen;
+                    let rolled = pen && t.settings.liquify_roll;
+                    let turn = if rolled { barrel_turn(&mut t.liquify_roll, last.roll) } else { 0.0 };
                     let points = liquify_points(pen, &samples, t.liquify_ms);
                     t.liquify_ms = last.time_ms;
                     drop(t);
                     self.adjustment_liquify_stroke(points, false, pen);
+                    if turn != 0.0 {
+                        self.adjustment_liquify_rolled(at.0, at.1, turn);
+                    }
                     out.push(TouchCommand::AdjustChanged);
                     return out;
                 }
                 match open {
+                    // a filter layer's point or angle follows the drag, once past the slop
+                    Some(Adjustment::Plugin) if self.filter_layer_touched() => {
+                        if !self.touches().adjust_moved || !self.filter_layer_drag(from, at) {
+                            return out;
+                        }
+                    }
                     // a motion blur follows the drag: along it, longer the further it goes
                     Some(Adjustment::MotionBlur) => self.adjustment_motion(at.0 - from.0, at.1 - from.1),
                     // displacing, the drag moves the fringes
@@ -1558,6 +1791,11 @@ impl CanvasSession {
                 }
             }
             Mode::Pour if id == t.stroke_pointer => {
+                // slid past the slop it is one finger's: its fill is made, and the slide moves its
+                // threshold
+                if dist(at, t.down_at) > POUR_SLOP * t.scale {
+                    self.pour_now(&mut t, &mut out);
+                }
                 if let Some(threshold) = Self::pour_slide(&mut t, at, last.time_ms) {
                     out.push(TouchCommand::FillThreshold { threshold });
                 }
@@ -1574,8 +1812,9 @@ impl CanvasSession {
                 }
             }
             Mode::Idle => {
-                if dist(at, t.down_at) > slop {
-                    t.hold_due = None;
+                // (a hold is waited for with one finger down alone)
+                if t.hold_due.is_some() {
+                    t.travelled(&samples, false);
                 }
                 // the lone finger set to move the canvas moves it, from where it went down
                 if let Some(last) = t.pan_last.filter(|_| id == t.stroke_pointer && t.down.len() == 1)
@@ -1640,8 +1879,8 @@ impl CanvasSession {
         out
     }
 
-    /// A pointer lifts (`samples` its last input).
-    pub fn touch_up(&self, id: u64, mut samples: Vec<PenSample>) -> Vec<TouchCommand> {
+    /// [`CanvasSession::touch_up`], as the touches take it (see [`mail`]).
+    pub(crate) fn take_up(&self, id: u64, mut samples: Vec<PenSample>) -> Vec<TouchCommand> {
         let unpressed = self.touches().pen_unpressed.filter(|(unpressed, _)| *unpressed == id);
         if let Some((_, kind)) = unpressed {
             return self.unpressed_input(id, kind, samples, true);
@@ -1655,14 +1894,13 @@ impl CanvasSession {
         self.lifted(id, samples, false)
     }
 
-    /// The platform took back one pointer (it was a hand resting on the screen): what it alone
-    /// was doing is taken back, and the touch it was part of is no tap.
-    pub fn touch_cancel_one(&self, id: u64) -> Vec<TouchCommand> {
+    /// [`CanvasSession::touch_cancel_one`], as the touches take it (see [`mail`]).
+    pub(crate) fn take_cancel_one(&self, id: u64) -> Vec<TouchCommand> {
         self.lifted(id, Vec::new(), true)
     }
 
-    /// The platform called the touches off: what they were doing is taken back.
-    pub fn touch_cancel(&self) -> Vec<TouchCommand> {
+    /// [`CanvasSession::touch_cancel`], as the touches take it (see [`mail`]).
+    pub(crate) fn take_cancel(&self) -> Vec<TouchCommand> {
         let (ids, unpressed): (Vec<u64>, bool) = {
             let mut t = self.touches();
             t.palms.clear();
@@ -1681,8 +1919,8 @@ impl CanvasSession {
         out
     }
 
-    /// Runs the waits (a hold, a repeat, an airbrush's next dab) that have run out by `now_ms`.
-    pub fn touch_tick(&self, now_ms: f64) -> Vec<TouchCommand> {
+    /// [`CanvasSession::touch_tick`], as the touches take it (see [`mail`]).
+    pub(crate) fn take_tick(&self, now_ms: f64) -> Vec<TouchCommand> {
         self.airbrush_tick(now_ms);
         let mut out = Vec::new();
         // a pen not known to give a pressure, held still at none past its wait: one that gives none
@@ -1725,21 +1963,6 @@ impl CanvasSession {
             }
             if worked || going {
                 out.push(TouchCommand::AdjustChanged);
-            }
-        }
-        // a freehand selection held still snaps to a shape, which the lift then selects
-        if t.mode == Mode::Select
-            && t.quickshape_due.is_some_and(|due| due <= now_ms)
-            && t.selecting.is_some_and(|s| s.kind == SelectKind::Freehand)
-        {
-            t.quickshape_due = None;
-            if t.select_moved && t.settings.draw_and_hold {
-                let flat: Vec<f32> = t.freehand.iter().flat_map(|&(x, y)| [x, y]).collect();
-                if let Some(outline) = crate::quickshape::quickshape_outline(flat).filter(|o| o.len() >= 6) {
-                    t.freehand = outline.as_chunks::<2>().0.iter().map(|&[x, y]| (x, y)).collect();
-                    t.lasso_snapped = true;
-                    out.push(TouchCommand::FreehandChanged);
-                }
             }
         }
         if t.quickshape_due.is_some_and(|due| due <= now_ms) {
@@ -1835,6 +2058,7 @@ impl CanvasSession {
         t.stroke_pointer = t.down.first().map_or(0, |d| d.id);
         t.held = Some(Held { kind, first: samples, moves: Vec::new() });
         t.mode = Mode::Held;
+        t.travel_from(t.down_at);
         if !is_pen(kind) && t.settings.hold.is_some() {
             t.hold_due = Some(first.time_ms + t.settings.hold_ms);
         }
@@ -1854,7 +2078,7 @@ impl CanvasSession {
         self.first_down(&mut t, held.kind, first, &held.first, out);
         drop(t);
         if !held.moves.is_empty() {
-            out.extend(self.touch_move(id, held.moves));
+            out.extend(self.take_move(id, held.moves));
         }
     }
 
@@ -1971,7 +2195,7 @@ impl CanvasSession {
             // cloning, and the pen (or a mouse, a desktop's drawing tool) painting an adjustment
             // on, paint (no eyedropper); the clone source follows the brush
             t.mode = if is_pen(kind) { Mode::Pen } else { Mode::Finger };
-            t.hold_at = at;
+            t.travel_from(at);
             self.clone_stroke_at(at, true);
             self.stroke_begin(kind, samples.to_vec());
             return;
@@ -1990,6 +2214,7 @@ impl CanvasSession {
                 t.liquify_ms = now;
                 t.liquify_tick_ms = now;
                 t.liquify_pen = is_pen(kind);
+                t.liquify_roll = None;
                 t.liquify_rest = at;
                 t.liquify_rest_ms = now;
                 t.liquify_held = 0.0;
@@ -2012,8 +2237,6 @@ impl CanvasSession {
         if t.selecting.is_some() && !self.finger_turns_model(kind, t) {
             t.stroke_pointer = id;
             t.select_moved = false;
-            t.lasso_snapped = false;
-            t.hold_at = at;
             t.pour_last = (at.0, now);
             t.select_threshold = t.selecting.map_or(0.5, |s| s.threshold);
             t.mode = Mode::Select;
@@ -2028,18 +2251,25 @@ impl CanvasSession {
             out.push(TouchCommand::TransformTouched);
             return;
         }
-        // Continue filling: the touch fills where it lands; slid, it changes the threshold
+        // Continue filling: the touch fills where it lands (the app pours, see `PourAt`); slid, it
+        // changes the threshold
         if let Some(fill) = t.filling {
             t.stroke_pointer = id;
             t.pour_moved = false;
             t.pour_last = (at.0, now);
-            if self.current_is_text() {
-                out.push(TouchCommand::TextLayer);
-                t.mode = Mode::Idle;
-            } else {
-                let poured = self.pour_begin(at.0, at.1, fill.r, fill.g, fill.b, fill.threshold);
-                t.mode = if poured { Mode::Pour } else { Mode::Idle };
-            }
+            t.pour_waiting = None;
+            t.mode = match self.pour_target_at(at) {
+                PourTarget::Text => {
+                    out.push(TouchCommand::TextLayer);
+                    Mode::Idle
+                }
+                // filled once it is one finger's (see `pour_waiting`)
+                target @ (PourTarget::Layer | PourTarget::Plugin) => {
+                    t.pour_waiting = Some((at, fill, target));
+                    Mode::Pour
+                }
+                PourTarget::Nothing => Mode::Idle,
+            };
             return;
         }
         // on a shown model a finger turns it, unless set to paint; the pen paints. Held still, it
@@ -2049,6 +2279,7 @@ impl CanvasSession {
             t.stroke_pointer = id;
             t.turn_last = at;
             t.mode = Mode::Turn;
+            t.travel_from(at);
             if t.settings.hold.is_some() {
                 t.hold_due = Some(now + t.settings.hold_ms);
             }
@@ -2093,6 +2324,7 @@ impl CanvasSession {
                 t.pan_last = Some(at);
                 t.panned = false;
             }
+            t.travel_from(at);
             if t.settings.hold.is_some() {
                 t.hold_due = Some(now + t.settings.hold_ms);
             }
@@ -2120,10 +2352,8 @@ impl CanvasSession {
         if t.mode == Mode::Finger && t.settings.hold.is_some() {
             t.hold_due = Some(now + t.settings.hold_ms);
         }
-        t.hold_at = at;
-        if t.settings.draw_and_hold {
-            t.quickshape_due = Some(now + t.settings.quickshape_ms);
-        }
+        // draw and hold waits until the stroke has gone far enough
+        t.travel_from(at);
     }
 
     /// Whether a touch of `kind` on the screen turns a shown model.
@@ -2166,8 +2396,9 @@ impl CanvasSession {
         // a second finger takes back the fill the first one made, and a transform's drag (a move
         // of what the box holds is kept when the fingers go on to take it); it keeps the opacity
         // dragged so far
-        if t.mode == Mode::Pour {
-            self.pour_end(false, None);
+        // (one not yet made is left unmade)
+        if t.mode == Mode::Pour && t.pour_waiting.take().is_none() {
+            out.push(TouchCommand::PourEnd { keep: false });
         }
         if t.mode == Mode::Opacity {
             self.opacity_lifted(t);
@@ -2331,9 +2562,11 @@ impl CanvasSession {
                 let pinched = parted && self.end_box_pinch(&mut t, cancelled, &mut out);
                 Self::follow_fingers(&mut t);
                 // two fingers parting as they close fast fit a canvas pinched smaller than it
-                // fits, settling into place (a tap's fingers aren't a pinch)
+                // fits, settling into place (a tap's fingers aren't a pinch), unless a plugin keeps
+                // the fit
                 let tap = Self::fingers_tapped(&t, now);
-                if parted && !pinched && !cancelled && !tap && t.tap_pointers == 2 && t.gesture_pair.is_none() {
+                let fits = !t.fit_locked && t.tap_pointers == 2 && t.gesture_pair.is_none();
+                if parted && !pinched && !cancelled && !tap && fits {
                     let flicked = Self::pinch_speed(&t, now) < QUICK_PINCH_SPEED;
                     if flicked && self.pinched_smaller_than_fit() {
                         out.push(TouchCommand::Fit);
@@ -2359,6 +2592,37 @@ impl CanvasSession {
                     self.fingers_did_tap(&mut t, &mut out);
                 }
             }
+            // the pen (or finger) holding a snapped shape lifted while fingers still snap it: the
+            // shape is let go as it shows now, and the fingers left do nothing more until they lift
+            // (ended by their lift instead, the shape went where the last of them lifted)
+            if id == t.stroke_pointer
+                && matches!(t.mode, Mode::Pen | Mode::Finger | Mode::ShapePin)
+                && self.shared.lock().shape.is_some()
+            {
+                let mode = std::mem::replace(&mut t.mode, Mode::Idle);
+                t.hold_due = None;
+                t.quickshape_due = None;
+                out.push(TouchCommand::CursorGone);
+                if mode == Mode::ShapePin {
+                    drop(t);
+                    self.quickshape_unpin();
+                    out.push(TouchCommand::ShapeChanged);
+                    return out;
+                }
+                let before = t.tool_before.take();
+                self.end_stroke_tools(&mut t);
+                drop(t);
+                if cancelled {
+                    self.stroke_cancel();
+                } else {
+                    self.stroke_end(samples);
+                    out.push(TouchCommand::StrokeEnded);
+                }
+                if let Some(before) = before {
+                    self.put_tool(before);
+                }
+                return out;
+            }
             // the last finger other than the stroke's lifted from a held snapped shape
             let stroke = t.stroke_pointer;
             if matches!(t.mode, Mode::Pen | Mode::Finger | Mode::ShapePin)
@@ -2380,6 +2644,10 @@ impl CanvasSession {
         out.push(TouchCommand::CursorGone);
         match mode {
             Mode::Pen | Mode::Finger => {
+                // a stroke erasing or smudging in place of the tool (a touch or the pen set to
+                // erase or smudge) ends as one, the tool put back only after: it puts no colour
+                // into the history
+                let before = t.tool_before.take();
                 self.end_stroke_tools(&mut t);
                 drop(t);
                 if cancelled {
@@ -2388,6 +2656,9 @@ impl CanvasSession {
                     self.stroke_end(samples);
                     // a snapped shape the pen moved: its handles where it now is
                     out.push(TouchCommand::StrokeEnded);
+                }
+                if let Some(before) = before {
+                    self.put_tool(before);
                 }
             }
             Mode::Pick => {
@@ -2407,7 +2678,15 @@ impl CanvasSession {
                     let going = !cancelled && self.adjustment_liquify_lift();
                     self.touches().liquify_due = going.then_some(now + LIQUIFY_HELD_STEP_MS);
                 } else if !cancelled && !t.adjust_moved && now - t.tap_start <= TAP_MS {
-                    out.push(TouchCommand::AdjustMenu { x: at.0, y: at.1 });
+                    drop(t);
+                    // a filter layer's point goes where it is tapped, or its seed is drawn afresh
+                    if self.filter_layer_touched() {
+                        if self.filter_layer_tap(at) {
+                            out.push(TouchCommand::AdjustChanged);
+                        }
+                    } else {
+                        out.push(TouchCommand::AdjustMenu { x: at.0, y: at.1 });
+                    }
                 }
             }
             Mode::Select => {
@@ -2466,13 +2745,19 @@ impl CanvasSession {
             }
             Mode::Pour => {
                 let slid = last_of(&samples).and_then(|s| Self::pour_slide(&mut t, (s.x, s.y), s.time_ms));
-                drop(t);
-                if let Some(threshold) = slid.filter(|_| !cancelled) {
-                    self.pour_threshold(threshold);
-                    out.push(TouchCommand::FillThreshold { threshold });
+                // a tap fills as it ends; called off before it filled, nothing was made
+                let asked = if cancelled { t.pour_waiting.take().is_none() } else { true };
+                if !cancelled {
+                    self.pour_now(&mut t, &mut out);
                 }
-                self.pour_end(!cancelled, None);
-                out.push(TouchCommand::Filled);
+                drop(t);
+                if asked {
+                    if let Some(threshold) = slid.filter(|_| !cancelled) {
+                        out.push(TouchCommand::FillThreshold { threshold });
+                    }
+                    out.push(TouchCommand::PourEnd { keep: !cancelled });
+                    out.push(TouchCommand::Filled);
+                }
             }
             // a tap in the guide editor: on a handle, its menu (the turn handle has none); elsewhere a
             // perspective guide's new point, where it came down
@@ -2501,18 +2786,26 @@ impl CanvasSession {
             // a tap on a handle rather than a drag of it: a curve's anchor steps to its next state
             Mode::Shape(i) => {
                 let tapped = !t.shape_dragged && now - t.tap_start <= TAP_MS && !cancelled;
+                let dragged = t.shape_dragged;
                 drop(t);
                 if tapped && self.quickshape_cycle_anchor(i).is_some() {
                     out.push(TouchCommand::ShapeChanged);
+                }
+                if dragged {
+                    self.quickshape_drag_end();
                 }
             }
             // a tap, on its outline or elsewhere, ends the editing; a drag only turned or moved it
             Mode::ShapePin | Mode::ShapeMove => {
                 let tapped = !t.shape_dragged && now - t.tap_start <= TAP_MS;
+                let dragged = t.shape_dragged;
                 drop(t);
                 if mode == Mode::ShapePin {
                     self.quickshape_unpin();
                     out.push(TouchCommand::ShapeChanged);
+                }
+                if dragged {
+                    self.quickshape_drag_end();
                 }
                 if tapped {
                     self.end_shape(&mut out);
@@ -2587,7 +2880,7 @@ impl CanvasSession {
 
     /// A step of the selection tool's touch at `at` (`done` as it lifts): a rectangle or ellipse
     /// dragged out; a freehand path drawn (or tapped point by point, closed by a tap on its first
-    /// point; held still, it snaps to a shape); a colour picked where it went down, its threshold
+    /// point; held still, it stays as drawn); a colour picked where it went down, its threshold
     /// slid left and right, faster the faster it goes.
     fn select_step(&self, at: (f32, f32), ms: f64, done: bool, out: &mut Vec<TouchCommand>) {
         let mut t = self.touches();
@@ -2630,24 +2923,7 @@ impl CanvasSession {
                 }
             }
             SelectKind::Freehand => {
-                // snapped: the shape is kept as it is, and the lift selects it
-                if t.lasso_snapped {
-                    if done {
-                        t.lasso_snapped = false;
-                        drop(t);
-                        self.close_freehand();
-                        out.push(TouchCommand::FreehandChanged);
-                        out.push(TouchCommand::SelectionChanged);
-                    }
-                    return;
-                }
-                if done {
-                    t.quickshape_due = None;
-                } else if moved && dist(at, t.hold_at) > QUICKSHAPE_STILL * t.scale {
-                    // still for the QuickShape delay, it snaps
-                    t.hold_at = at;
-                    t.quickshape_due = t.settings.draw_and_hold.then_some(ms + t.settings.quickshape_ms);
-                }
+                // (a path held still stays as drawn: QuickShape is the painting tools' alone)
                 let scale = t.scale;
                 let last = t.freehand.last().copied();
                 drop(t);
@@ -2760,6 +3036,21 @@ impl CanvasSession {
             y: node.1,
             right: node.0 > middle + 1.0,
         })
+    }
+
+    /// What Continue filling's touch at window point `at` lands on (see [`PourTarget`]). Never
+    /// waiting on a pour that holds the canvas (the last touch's, still being made): it goes by
+    /// what the artwork was last seen to be then.
+    fn pour_target_at(&self, at: (f32, f32)) -> PourTarget {
+        if let Some(st) = self.shared.try_lock() {
+            self.shared.lands_on.note(&st);
+            return pour_target(&st, at.0, at.1);
+        }
+        // (a plugin's layer says whether it takes the fill as it is poured, here)
+        match self.shared.lands_on.target(at.0, at.1).filter(|t| *t != PourTarget::Plugin) {
+            Some(target) => target,
+            None => pour_target(&self.shared.lock(), at.0, at.1),
+        }
     }
 
     /// Whether the current layer is a text layer (it takes no paint until rasterized).
@@ -2889,7 +3180,12 @@ impl CanvasSession {
         t.pinch.drain(..old);
         t.last = (x, y, d, angle);
         let gone: f32 = t.down.iter().map(|d| dist(d.at, d.from)).sum();
-        t.view_moving |= gone >= VIEW_SLOP * t.scale;
+        if !t.view_moving && gone >= VIEW_SLOP * t.scale {
+            t.view_moving = true;
+            // once the canvas moves, turns or zooms, the fingers are no tap and no hold that
+            // repeats an undo or redo, however little each has gone: never both
+            t.tap_moved = f32::INFINITY;
+        }
         // from where they are when it starts, so it doesn't jump
         if t.view_moving {
             self.view_gesture(lx, ly, x - lx, y - ly, scale, turn);
@@ -2932,6 +3228,17 @@ impl CanvasSession {
         }
     }
 
+    /// Continue filling's touch's fill asked for now, if it is still waiting (see `pour_waiting`):
+    /// the app pours it (`PourAt`), or, on a plugin's layer, the touch pours it itself.
+    fn pour_now(&self, t: &mut Touches, out: &mut Vec<TouchCommand>) {
+        let Some((at, fill, target)) = t.pour_waiting.take() else { return };
+        if target == PourTarget::Plugin {
+            self.pour_begin(at.0, at.1, fill.r, fill.g, fill.b, fill.threshold);
+        } else {
+            out.push(TouchCommand::PourAt { x: at.0, y: at.1, fill });
+        }
+    }
+
     /// Continue filling's touch at `at`: slid past the slop, it moves the fill's threshold as a
     /// selection's follows a drag, only more gently. The threshold, when it moved.
     fn pour_slide(t: &mut Touches, at: (f32, f32), ms: f64) -> Option<f32> {
@@ -2968,6 +3275,39 @@ mod tests {
 
     fn session() -> std::sync::Arc<CanvasSession> {
         CanvasSession::new(64, 64)
+    }
+
+    #[test]
+    fn the_barrel_turns_the_short_way_round() {
+        use std::f32::consts::TAU;
+        let mut last = None;
+        // its first reading turns nothing: it may start anywhere
+        assert_eq!(barrel_turn(&mut last, 1.0), 0.0);
+        assert!((barrel_turn(&mut last, 1.5) - 0.5).abs() < 1e-5);
+        assert!((barrel_turn(&mut last, 1.2) + 0.3).abs() < 1e-5);
+        // past a full turn it is a small step on, not nearly all the way back
+        let step = 0.1 + TAU - 6.2;
+        last = Some(6.2);
+        assert!((barrel_turn(&mut last, 0.1) - step).abs() < 1e-5);
+        assert!((barrel_turn(&mut last, 6.2) + step).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_pen_with_no_barrel_to_read_turns_nothing() {
+        let mut last = None;
+        for _ in 0..4 {
+            assert_eq!(barrel_turn(&mut last, 0.0), 0.0);
+        }
+    }
+
+    #[test]
+    fn only_a_twirl_turns_with_the_barrel() {
+        use crate::adjust::{LiquifyBrush, LiquifyKind};
+        let s = session();
+        let brush = |kind| LiquifyBrush { kind, size: 0.5, pressure: 0.5, distortion: 0.0 };
+        assert!(s.liquify_rolled(10.0, 10.0, 0.3, brush(LiquifyKind::TwirlLeft)));
+        assert!(s.liquify_rolled(10.0, 10.0, -0.3, brush(LiquifyKind::TwirlRight)));
+        assert!(!s.liquify_rolled(10.0, 10.0, 0.3, brush(LiquifyKind::Push)));
     }
 
     /// What the touches cost a pen stroke's events, the router and the stroke's own work (no GPU):
@@ -3210,9 +3550,9 @@ mod tests {
     fn fingers_pinched_or_turned_a_little_are_still_a_tap() {
         let s = session();
         s.set_display_scale(1.0);
-        // each short of the tap's reach by itself, though they part by more: a tap, as each
-        // finger alone decides
-        for (dx, dy) in [(-8.0, 0.0), (0.0, 8.0), (10.0, 0.0)] {
+        // each short of the tap's reach by itself, and both short of moving the canvas: a tap,
+        // though they part
+        for (dx, dy) in [(-4.0, 0.0), (0.0, 4.0), (3.0, 3.0)] {
             s.touch_down(1, PointerKind::Finger, at(100.0, 100.0, 500.0));
             s.touch_down(2, PointerKind::Finger, at(200.0, 100.0, 510.0));
             s.touch_move(1, at(100.0 + dx, 100.0 + dy, 530.0));
@@ -3226,6 +3566,124 @@ mod tests {
             .map(|i| Finger { lands: 20.0 * f64::from(i), lifts: 200.0, drift: 9.0, towards: 2.1 * i as f32 })
             .collect();
         assert!(redid_once(&real_tap(&s, &fingers, 1.5, 8.0, true)));
+    }
+
+    /// Two fingers `spread` points apart about the window's middle: they land 10 ms apart, rest
+    /// `rest` ms, turn `degrees` over `ms`, moving every 8 ms (in one event, as Android gives
+    /// them, or each its own, as the desktop does), rest `hold` ms more and lift 10 ms apart, the
+    /// touches' waits running as they come due. What the touches asked for, and how far (degrees)
+    /// the canvas had turned (either way) as the first lifted.
+    fn turn_fingers(
+        s: &CanvasSession,
+        spread: f32,
+        degrees: f32,
+        timing: (f64, f64, f64),
+        batched: bool,
+    ) -> (Vec<TouchCommand>, f32) {
+        let (rest, ms, hold) = timing;
+        let scale = s.shared.lock().display_scale;
+        let rotation = || s.shared.lock().view.map_or(0.0, |v| v.rotation());
+        let finger = |id: u64, angle: f32, at_ms: f64| {
+            let (half, way) = (spread * scale / 2.0, if id == 1 { std::f32::consts::PI } else { 0.0 });
+            at(400.0 + half * (angle + way).cos(), 300.0 + half * (angle + way).sin(), at_ms)
+        };
+        let start = rotation();
+        let mut out = Vec::new();
+        let tick = |out: &mut Vec<TouchCommand>, now: f64| {
+            while let Some(due) = s.touch_deadline().filter(|due| *due <= now) {
+                out.extend(s.touch_tick(due));
+            }
+        };
+        out.extend(s.touch_down(1, PointerKind::Finger, finger(1, 0.3, 0.0)));
+        out.extend(s.touch_down(2, PointerKind::Finger, finger(2, 0.3, 10.0)));
+        let (from, end) = (10.0 + rest, 10.0 + rest + ms + hold);
+        // the last move where they lift
+        let mut times: Vec<f64> = (1..).map(|k| 10.0 + 8.0 * f64::from(k)).take_while(|now| *now < end).collect();
+        times.push(end);
+        for now in times {
+            tick(&mut out, now);
+            let part = ((now - from) / ms.max(1.0)).clamp(0.0, 1.0) as f32;
+            let angle = 0.3 + degrees.to_radians() * part;
+            let moves = vec![
+                TouchMove { id: 1, samples: finger(1, angle, now) },
+                TouchMove { id: 2, samples: finger(2, angle, now) },
+            ];
+            if batched {
+                out.extend(s.touch_moves(moves));
+            } else {
+                for m in moves {
+                    out.extend(s.touch_move(m.id, m.samples));
+                }
+            }
+        }
+        let turned = (rotation() - start).to_degrees().abs();
+        let angle = 0.3 + degrees.to_radians();
+        out.extend(s.touch_up(1, finger(1, angle, end)));
+        tick(&mut out, end + 10.0);
+        out.extend(s.touch_up(2, finger(2, angle, end + 10.0)));
+        (out, turned)
+    }
+
+    #[test]
+    fn two_fingers_that_turn_the_canvas_don_t_undo() {
+        // fingers 120 pt apart turned 10 degrees in 200 ms: each goes 10.5 pt, short of a tap's
+        // 15 by itself, but the canvas turns (about 5 of the 10 degrees, from where it began to)
+        for batched in [true, false] {
+            let s = shown(1.0);
+            let (out, turned) = turn_fingers(&s, 120.0, 10.0, (0.0, 200.0, 0.0), batched);
+            assert!(!out.contains(&TouchCommand::Undo), "{out:?}");
+            assert!(turned > 4.0 && turned < 10.0, "{turned}");
+            // turned slowly after a short rest, then held: no undo as it turns, nor any repeated
+            // from the hold (the hold's 650 ms came once the canvas had begun to turn, at about
+            // 460 ms)
+            let s = shown(1.0);
+            let (out, turned) = turn_fingers(&s, 120.0, 12.0, (300.0, 400.0, 1000.0), batched);
+            assert!(!out.contains(&TouchCommand::Undo), "{out:?}");
+            assert!(turned > 6.0, "{turned}");
+            // a real two-finger tap still undoes, once, and leaves the canvas as it was
+            let s = shown(1.0);
+            let (out, turned) = turn_fingers(&s, 120.0, 0.0, (0.0, 80.0, 0.0), batched);
+            assert_eq!(out.iter().filter(|c| **c == TouchCommand::Undo).count(), 1, "{out:?}");
+            assert_eq!(turned, 0.0);
+            // and held still, it repeats
+            let s = shown(1.0);
+            let (out, _) = turn_fingers(&s, 120.0, 0.0, (0.0, 80.0, 1000.0), batched);
+            assert!(out.iter().filter(|c| **c == TouchCommand::Undo).count() > 1, "{out:?}");
+        }
+    }
+
+    #[test]
+    fn fingers_never_both_turn_the_canvas_and_undo() {
+        // a sweep: screens of a point a pixel and two; how far apart; how far turned (degrees);
+        // how quickly (ms, all within a tap's time)
+        let mut cases = 0;
+        for scale in [1.0, 2.0] {
+            for batched in [true, false] {
+                for spread in [60.0f32, 100.0, 150.0, 250.0] {
+                    for degrees in [1.0f32, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 30.0] {
+                        for ms in [60.0, 120.0, 200.0, 280.0] {
+                            let s = shown(1.0);
+                            s.set_display_scale(scale);
+                            let (out, turned) = turn_fingers(&s, spread, degrees, (0.0, ms, 0.0), batched);
+                            let undid = out.contains(&TouchCommand::Undo);
+                            let case =
+                                format!("{spread} pt apart, {degrees} deg in {ms} ms at {scale}, batched {batched}");
+                            assert!(!(undid && turned != 0.0), "{case}: undid, turned {turned}");
+                            // each finger goes the chord of its arc; both together past the
+                            // canvas's slop turn it, short of it they tap
+                            let each = spread * (degrees.to_radians() / 2.0).sin();
+                            if 2.0 * each >= VIEW_SLOP + 0.5 {
+                                assert!(!undid && turned != 0.0, "{case}: each {each} pt, turned {turned}");
+                            } else if 2.0 * each < VIEW_SLOP - 0.5 {
+                                assert!(undid && turned == 0.0, "{case}: each {each} pt, turned {turned}");
+                            }
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 704);
     }
 
     #[test]
@@ -3283,6 +3741,32 @@ mod tests {
         s.touch_down(1, PointerKind::Finger, at(10.0, 10.0, 3000.0));
         s.touch_move(1, at(60.0, 10.0, 3020.0));
         assert!(s.touch_up(1, at(60.0, 10.0, 3040.0)).contains(&TouchCommand::StrokeEnded));
+    }
+
+    /// A stroke erasing or smudging in place of the brush (a touch set to erase or smudge) ends as
+    /// that stroke, the brush put back only after: it puts no colour into the colour history, as
+    /// the eraser and smudge tools don't (the brush came back first, so it added the brush's
+    /// colour), while the pen's paint strokes add theirs.
+    #[test]
+    fn a_stroke_erasing_in_place_of_the_brush_puts_no_colour_in_the_history() {
+        let s = session();
+        let history = crate::ColourHistory::new();
+        s.use_colour_history(history.clone());
+        s.set_tool(ToolKind::Paint);
+        s.set_color(1.0, 0.0, 0.0);
+        for does in [GestureAction::Erase, GestureAction::Smudge] {
+            s.set_touch_settings(TouchSettings { touch: Some(does), ..TouchSettings::default() });
+            s.touch_down(1, PointerKind::Finger, at(10.0, 10.0, 0.0));
+            s.touch_move(1, at(60.0, 10.0, 20.0));
+            assert!(s.touch_up(1, at(60.0, 10.0, 40.0)).contains(&TouchCommand::StrokeEnded), "{does:?}");
+            assert_eq!(history.colours(), Vec::<u32>::new(), "{does:?}");
+            assert_eq!(s.info().tool, ToolKind::Paint, "{does:?}: the brush back after");
+        }
+        // the pen painting with the brush: its colour goes in
+        s.touch_down(2, PointerKind::Stylus, at(10.0, 30.0, 100.0));
+        s.touch_move(2, at(60.0, 30.0, 120.0));
+        assert!(s.touch_up(2, at(60.0, 30.0, 140.0)).contains(&TouchCommand::StrokeEnded));
+        assert_eq!(history.colours(), vec![0xFF0000]);
     }
 
     #[test]
@@ -3743,6 +4227,91 @@ mod tests {
     }
 
     #[test]
+    fn a_pen_button_set_to_undo_in_pen_buttons_undoes_and_the_other_still_swaps_the_eraser() {
+        // one button swapping brush and eraser, the other undoing, as a pen with two buttons is
+        // often set up: press, let go, press, hovering and touching
+        let s = session();
+        s.set_tool(ToolKind::Paint);
+        s.set_touch_settings(TouchSettings {
+            pen_second_button_does: Some(crate::QuickAction::Undo),
+            ..TouchSettings::default()
+        });
+        for _ in 0..3 {
+            assert_eq!(s.touch_pen_button(true, 10.0, 10.0), vec![TouchCommand::Undo]);
+            assert!(!s.touch_pen_button_up(true));
+        }
+        assert_eq!(s.info().tool, ToolKind::Paint);
+        assert!(s.touch_pen_button(false, 10.0, 10.0).is_empty());
+        assert_eq!(s.info().tool, ToolKind::Erase);
+        assert_eq!(s.touch_pen_button(true, 10.0, 10.0), vec![TouchCommand::Undo]);
+        assert_eq!(s.info().tool, ToolKind::Erase);
+        // set in Pen buttons, the button does that whatever Gesture controls say: redo, no action,
+        // or another of the QuickMenu's actions for the app, where the pen is
+        s.set_touch_settings(TouchSettings {
+            pen_button: Some(GestureAction::Erase),
+            pen_button_does: Some(crate::QuickAction::Redo),
+            pen_second_button: Some(GestureAction::QuickMenu),
+            pen_second_button_does: Some(crate::QuickAction::None),
+            ..TouchSettings::default()
+        });
+        assert_eq!(s.touch_pen_button(false, 10.0, 10.0), vec![TouchCommand::Redo]);
+        assert!(!s.touch_pen_button_up(false), "not held to erase");
+        assert_eq!(s.info().tool, ToolKind::Erase);
+        assert!(s.touch_pen_button(true, 10.0, 10.0).is_empty());
+        s.set_touch_settings(TouchSettings {
+            pen_button_does: Some(crate::QuickAction::NewLayer),
+            ..TouchSettings::default()
+        });
+        assert_eq!(
+            s.touch_pen_button(false, 30.0, 40.0),
+            vec![TouchCommand::Run { action: crate::QuickAction::NewLayer, x: 30.0, y: 40.0 }]
+        );
+        // a pen that double-taps in place of a button: as the first
+        s.set_touch_settings(TouchSettings {
+            pen_button_does: Some(crate::QuickAction::Undo),
+            ..TouchSettings::default()
+        });
+        assert_eq!(s.touch_pen_double_tap(PenPreferred::SwitchEraser, 5.0, 5.0), vec![TouchCommand::Undo]);
+        assert_eq!(s.info().tool, ToolKind::Erase);
+    }
+
+    #[test]
+    fn a_pen_button_set_to_a_plugin_s_action_runs_it_where_the_pen_is_before_anything_else() {
+        let s = session();
+        s.set_tool(ToolKind::Paint);
+        let key = "org.example.palette.open".to_owned();
+        s.set_touch_settings(TouchSettings {
+            pen_button: Some(GestureAction::Erase),
+            pen_button_does: Some(crate::QuickAction::Undo),
+            pen_second_button_runs: Some(key.clone()),
+            ..TouchSettings::default()
+        });
+        assert_eq!(
+            s.touch_pen_button(true, 30.0, 40.0),
+            vec![TouchCommand::RunPlugin { key: key.clone(), x: 30.0, y: 40.0 }]
+        );
+        assert!(!s.touch_pen_button_up(true), "not held to erase");
+        assert_eq!(s.info().tool, ToolKind::Paint);
+        // the other button as Pen buttons set it
+        assert_eq!(s.touch_pen_button(false, 30.0, 40.0), vec![TouchCommand::Undo]);
+        // the first set to it, a pen's double-tap runs it too
+        s.set_touch_settings(TouchSettings {
+            pen_button_does: Some(crate::QuickAction::Undo),
+            pen_button_runs: Some(key.clone()),
+            ..TouchSettings::default()
+        });
+        assert_eq!(
+            s.touch_pen_button(false, 5.0, 6.0),
+            vec![TouchCommand::RunPlugin { key: key.clone(), x: 5.0, y: 6.0 }]
+        );
+        assert_eq!(
+            s.touch_pen_double_tap(PenPreferred::SwitchEraser, 7.0, 8.0),
+            vec![TouchCommand::RunPlugin { key, x: 7.0, y: 8.0 }]
+        );
+        assert_eq!(s.info().tool, ToolKind::Paint);
+    }
+
+    #[test]
     fn two_fingers_held_still_keep_undoing() {
         let s = session();
         s.touch_down(1, PointerKind::Finger, at(100.0, 100.0, 0.0));
@@ -3844,6 +4413,47 @@ mod tests {
         // closing a little faster than 2.5 a second fits, a little slower doesn't
         assert!(pinch(&shown(1.0), -2.8, 150.0, 0.0).contains(&TouchCommand::Fit));
         assert!(!pinch(&shown(1.0), -2.2, 150.0, 0.0).contains(&TouchCommand::Fit));
+    }
+
+    /// A list with a plugin on the gesture lock's hook that locks part `part` of the view.
+    fn locking(part: i32) -> std::sync::Arc<crate::hooks::Hooks> {
+        let code = format!(
+            r#"(module (func (export "procraft_gesture_lock") (param i32) (result i32)
+                (i32.eq (local.get 0) (i32.const {part}))))"#
+        );
+        let running = crate::plugin_run::Running::start(&wat::parse_str(code).unwrap(), &[]).unwrap();
+        let hooks = std::sync::Arc::new(crate::hooks::Hooks::default());
+        hooks.put_on("org.example.lock".to_owned(), running, &[crate::plugin_run::Hook::GestureLock]);
+        hooks
+    }
+
+    #[test]
+    fn a_quick_pinch_in_zooms_as_any_pinch_while_a_plugin_keeps_the_fit() {
+        let s = shown(1.0);
+        s.shared.lock().hooks = Some(locking(crate::hooks::GESTURE_FIT));
+        let fitted = zoom(&s);
+        let out = pinch(&s, -5.0, 120.0, 0.0);
+        assert!(!out.contains(&TouchCommand::Fit), "{out:?}");
+        assert!(zoom(&s) < fitted * 0.5, "zoomed out as the fingers went: {} from {fitted}", zoom(&s));
+        // from fitted, the small flick in that fits it leaves it as the fingers left it
+        let s = shown(1.0);
+        s.shared.lock().hooks = Some(locking(crate::hooks::GESTURE_FIT));
+        assert!(!pinch(&s, -6.9, 32.0, 0.0).contains(&TouchCommand::Fit));
+        // a plugin keeping the turn alone leaves the fit as it is, and one on no part neither
+        for part in [crate::hooks::GESTURE_TURN, 7] {
+            let s = shown(1.0);
+            s.shared.lock().hooks = Some(locking(part));
+            assert!(pinch(&s, -5.0, 120.0, 0.0).contains(&TouchCommand::Fit), "{part}");
+        }
+        // asked as the fingers land, so a gesture under way goes on as it started
+        let hooks = locking(crate::hooks::GESTURE_FIT);
+        let t = std::time::Instant::now();
+        for _ in 0..1000 {
+            assert!(hooks.gesture_lock(crate::hooks::GESTURE_FIT));
+        }
+        let asked = t.elapsed() / 1000;
+        println!("the fit's lock asked in {asked:?} as a finger lands");
+        assert!(asked < std::time::Duration::from_micros(200), "{asked:?}");
     }
 
     #[test]
@@ -4138,6 +4748,104 @@ mod tests {
         assert!(out.contains(&TouchCommand::Pick { x: 210.0, y: 200.0 }));
         let out = s.touch_up(1, at(210.0, 200.0, 500.0));
         assert!(out.contains(&TouchCommand::PickDone));
+    }
+
+    /// A point `r` window pixels from (200, 200) round a circle, `turns` of the way round, at `ms`.
+    fn round(r: f32, turns: f32, ms: f64) -> Vec<PenSample> {
+        let a = turns * std::f32::consts::TAU;
+        at(200.0 + r * a.cos(), 200.0 + r * a.sin(), ms)
+    }
+
+    /// The window pixels a point takes in `s` (as its touches take them).
+    fn per_point(s: &CanvasSession) -> f32 {
+        s.shared.lock().display_scale
+    }
+
+    /// A finger drawing small circles (2 points across, a turn every 200 ms, a sample every 8 ms)
+    /// never stays within a still touch's 3 points long enough to hold, however near it stays to
+    /// where it came down, and once it has gone 15 points all told it holds no more, kept still
+    /// after for a second. Before, a finger anywhere within 24 points of where it came down picked
+    /// a colour 400 ms after it came down, moving or not.
+    #[test]
+    fn a_finger_drawing_small_circles_picks_no_colour() {
+        let s = session();
+        let r = per_point(&s);
+        s.touch_down(1, PointerKind::Finger, round(r, 0.0, 0.0));
+        let mut out = Vec::new();
+        let mut ms = 0.0;
+        while ms < 1200.0 {
+            ms += 8.0;
+            out.extend(s.touch_move(1, round(r, (ms / 200.0) as f32, ms)));
+            out.extend(s.touch_tick(ms));
+        }
+        // held still for a second after
+        for k in 1..=10 {
+            out.extend(s.touch_tick(ms + f64::from(k) * 100.0));
+        }
+        let picked = out.iter().find(|c| matches!(c, TouchCommand::Pick { .. }));
+        assert!(picked.is_none(), "{picked:?}");
+        assert!(s.touches().hold_due.is_none());
+    }
+
+    /// A finger held all but still holds: one creeping under 3 points in the 400 ms picks a colour
+    /// then; one that went 3 points (and no more than 15 all told) waits 400 ms again from there.
+    #[test]
+    fn a_finger_s_hold_waits_again_each_time_it_goes_three_points() {
+        let s = session();
+        let pt = per_point(&s);
+        s.touch_down(1, PointerKind::Finger, at(200.0, 200.0, 0.0));
+        for k in 1..=4 {
+            s.touch_move(1, at(200.0 + 0.6 * pt * k as f32, 200.0, f64::from(k) * 90.0));
+        }
+        assert!(!s.touch_tick(399.0).iter().any(|c| matches!(c, TouchCommand::Pick { .. })));
+        assert!(s.touch_tick(400.0).iter().any(|c| matches!(c, TouchCommand::Pick { .. })));
+        s.touch_up(1, at(200.0 + 2.4 * pt, 200.0, 450.0));
+
+        s.touch_down(1, PointerKind::Finger, at(200.0, 200.0, 1000.0));
+        // 4 points across at 1300 ms, then still
+        s.touch_move(1, at(200.0 + 2.0 * pt, 200.0, 1200.0));
+        s.touch_move(1, at(200.0 + 4.0 * pt, 200.0, 1300.0));
+        assert!(!s.touch_tick(1400.0).iter().any(|c| matches!(c, TouchCommand::Pick { .. })));
+        assert!(!s.touch_tick(1699.0).iter().any(|c| matches!(c, TouchCommand::Pick { .. })));
+        assert!(s.touch_tick(1700.0).iter().any(|c| matches!(c, TouchCommand::Pick { .. })));
+    }
+
+    /// Draw and hold: a pen drawing small circles (2 points across) never keeps still for the
+    /// 650 ms, so its stroke never snaps to a shape; a dab under 15 points long held still doesn't
+    /// either; a line held still at its end does, 650 ms after it last went 3 points. Before, a
+    /// stroke kept within 6 points of where its wait began snapped 650 ms on, moving or not.
+    #[test]
+    fn draw_and_hold_waits_for_a_stroke_gone_far_and_kept_still() {
+        let s = session();
+        let due = |s: &CanvasSession| s.touches().quickshape_due;
+        let pt = per_point(&s);
+        s.touch_down(1, PointerKind::Stylus, round(pt, 0.0, 0.0));
+        let mut ms = 0.0;
+        while ms < 2000.0 {
+            ms += 8.0;
+            s.touch_move(1, round(pt, (ms / 200.0) as f32, ms));
+            // the wait always ahead: it starts again before it runs out
+            assert!(due(&s).is_none_or(|d| d > ms), "{ms} {:?}", due(&s));
+            assert!(!s.touch_tick(ms).contains(&TouchCommand::ShapeSnapped));
+        }
+        s.touch_up(1, round(pt, 10.0, ms + 8.0));
+
+        // a dab 10 points long, held: no wait
+        s.touch_down(1, PointerKind::Stylus, at(100.0, 100.0, 3000.0));
+        for k in 1..=10 {
+            s.touch_move(1, at(100.0 + pt * k as f32, 100.0, 3000.0 + f64::from(k) * 8.0));
+        }
+        assert_eq!(due(&s), None);
+        s.touch_up(1, at(100.0 + 10.0 * pt, 100.0, 4000.0));
+
+        // a line 100 points long in 400 ms, then still: the wait began again within its last 3
+        // points, so it ends 650 ms after the line did, give or take that
+        s.touch_down(1, PointerKind::Stylus, at(100.0, 100.0, 5000.0));
+        for k in 1..=50 {
+            s.touch_move(1, at(100.0 + 2.0 * pt * k as f32, 100.0, 5000.0 + f64::from(k) * 8.0));
+        }
+        let d = due(&s).unwrap_or_default();
+        assert!((5400.0 - 16.0..=5400.0).contains(&(d - 650.0)), "{d}");
     }
 
     #[test]
@@ -4637,6 +5345,80 @@ mod tests {
         assert!(!out.contains(&TouchCommand::Filled));
     }
 
+    /// Continue filling's commands among `out`: P a fill asked for, T its threshold slid, K kept,
+    /// X taken back, F let go of.
+    fn fills(out: &[TouchCommand]) -> String {
+        out.iter()
+            .filter_map(|c| match c {
+                TouchCommand::PourAt { .. } => Some('P'),
+                TouchCommand::FillThreshold { .. } => Some('T'),
+                TouchCommand::PourEnd { keep: true } => Some('K'),
+                TouchCommand::PourEnd { keep: false } => Some('X'),
+                TouchCommand::Filled => Some('F'),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// #411: with Continue filling on, every pinch's first finger filled the whole layer at once (on
+    /// a large canvas a read of the layer and a flood of it, holding the canvas a good part of a
+    /// second) and the second finger took it back, so each zoom began late. As the reference's
+    /// one-finger tap, a touch fills once it is one finger's: let go, or slid past the slop; a
+    /// second finger landing first leaves it unmade, and the pinch asks for no fill at all.
+    #[test]
+    fn continue_filling_fills_a_touch_once_it_is_one_finger_s_and_a_pinch_never() {
+        let s = session();
+        {
+            let mut st = s.shared.lock();
+            st.window_size = (64, 64);
+            st.view = Some(procraft_engine::view::View::fit((64, 64), (64, 64)));
+        }
+        s.set_touch_filling(Some(Fill { r: 1.0, g: 0.0, b: 0.0, threshold: 0.5 }));
+        // a tap: nothing as it lands, filled as it lifts and kept
+        assert_eq!(fills(&s.touch_down(1, PointerKind::Finger, at(30.0, 30.0, 0.0))), "");
+        assert_eq!(fills(&s.touch_up(1, at(31.0, 30.0, 80.0))), "PKF");
+        // held still a long while, then let go: filled as it lifts
+        assert_eq!(fills(&s.touch_down(1, PointerKind::Finger, at(30.0, 30.0, 1000.0))), "");
+        assert_eq!(fills(&s.touch_move(1, at(32.0, 30.0, 1500.0))), "", "within the slop");
+        assert_eq!(fills(&s.touch_up(1, at(32.0, 30.0, 2000.0))), "PKF");
+        // slid past the slop (15 points, 30 pixels here): filled there, the slide moving its
+        // threshold, kept as it lifts
+        assert_eq!(fills(&s.touch_down(1, PointerKind::Finger, at(20.0, 30.0, 3000.0))), "");
+        assert_eq!(fills(&s.touch_move(1, at(48.0, 30.0, 3016.0))), "");
+        assert_eq!(fills(&s.touch_move(1, at(60.0, 30.0, 3032.0))), "PT");
+        assert_eq!(fills(&s.touch_move(1, at(63.0, 30.0, 3048.0))), "T");
+        assert_eq!(fills(&s.touch_up(1, at(63.0, 30.0, 3064.0))), "KF");
+        // a pinch: the second finger lands before the first is one finger's, and nothing fills
+        // however the fingers go and lift
+        let mut pinch = String::new();
+        pinch += &fills(&s.touch_down(1, PointerKind::Finger, at(20.0, 30.0, 4000.0)));
+        pinch += &fills(&s.touch_down(2, PointerKind::Finger, at(44.0, 30.0, 4030.0)));
+        for k in 1..=8 {
+            let d = 3.0 * k as f32;
+            let ms = 4030.0 + 16.0 * f64::from(k);
+            pinch += &fills(&s.touch_move(1, at(20.0 - d, 30.0, ms)));
+            pinch += &fills(&s.touch_move(2, at(44.0 + d, 30.0, ms)));
+        }
+        pinch += &fills(&s.touch_up(2, at(68.0, 30.0, 4200.0)));
+        pinch += &fills(&s.touch_up(1, at(-4.0, 30.0, 4210.0)));
+        assert_eq!(pinch, "", "a pinch asks for no fill");
+        // the second finger after a slide filled: that fill taken back, as before
+        let mut late = fills(&s.touch_down(1, PointerKind::Finger, at(20.0, 30.0, 5000.0)));
+        late += &fills(&s.touch_move(1, at(60.0, 30.0, 5016.0)));
+        late += &fills(&s.touch_down(2, PointerKind::Finger, at(10.0, 10.0, 5100.0)));
+        late += &fills(&s.touch_up(2, at(10.0, 10.0, 5150.0)));
+        late += &fills(&s.touch_up(1, at(60.0, 30.0, 5160.0)));
+        assert_eq!(late, "PTX");
+        // called off before it filled: nothing made, nothing to end
+        assert_eq!(fills(&s.touch_down(1, PointerKind::Finger, at(30.0, 30.0, 6000.0))), "");
+        assert_eq!(fills(&s.touch_cancel()), "");
+        // off the artwork nothing ever fills
+        s.shared.lock().view = None;
+        let mut off = fills(&s.touch_down(1, PointerKind::Finger, at(30.0, 30.0, 7000.0)));
+        off += &fills(&s.touch_up(1, at(30.0, 30.0, 7050.0)));
+        assert_eq!(off, "");
+    }
+
     /// One finger of a tap on a real screen: when it lands and lifts (ms), and how far (points)
     /// it drifts from where it landed by the time it lifts, which way (radians).
     #[derive(Clone, Copy, Debug)]
@@ -4794,5 +5576,89 @@ mod tests {
         let s = session();
         s.set_touch_settings(TouchSettings { undo_taps: false, ..TouchSettings::default() });
         assert!(!real_tap(&s, &hands_three_finger_taps()[1], 1.0, 8.0, true).contains(&TouchCommand::Redo));
+    }
+
+    /// Three fingers tapped on an iPad, as its touches come: two pixels a point, every finger that
+    /// moved in one event 120 times a second, each with the two samples the system coalesced since
+    /// the last; the Pencil held over the glass (its hover as the iPad reports it) or not. Then
+    /// the same when the system takes the touches back as they land (as its own three-finger
+    /// editing gestures do where they aren't turned off): nothing is redone, nothing is left
+    /// down, and the next tap redoes.
+    #[test]
+    fn three_fingers_tapped_on_an_ipad_redo_once_and_a_tap_the_system_took_back_does_nothing() {
+        // (lands, lifts) ms, each finger 140 points from the last
+        let fingers = [(0.0, 120.0), (20.0, 130.0), (45.0, 140.0)];
+        let place = |i: usize, ms: f64| {
+            let wobble = (ms * 0.3 + i as f64).sin() as f32;
+            (2.0 * (300.0 + 140.0 * i as f32 + wobble), 2.0 * (400.0 + 20.0 * i as f32))
+        };
+        let samples = |i: usize, ms: f64, coalesced: bool| -> Vec<PenSample> {
+            let times = if coalesced { vec![ms - 1000.0 / 240.0, ms] } else { vec![ms] };
+            times
+                .into_iter()
+                .map(|t| {
+                    let (x, y) = place(i, t);
+                    PenSample { x, y, pressure: 1.0, tilt: 0.0, orientation: 0.0, time_ms: t, roll: 0.0 }
+                })
+                .collect()
+        };
+        let tap = |s: &CanvasSession, from: f64, taken_back: bool| {
+            let mut out = Vec::new();
+            let mut down = [false; 3];
+            let mut ms = from;
+            let end = from + 150.0;
+            while ms <= end {
+                while let Some(due) = s.touch_deadline().filter(|due| *due <= ms) {
+                    out.extend(s.touch_tick(due));
+                }
+                for (i, &(lands, lifts)) in fingers.iter().enumerate() {
+                    if !down[i] && ms >= from + lands && ms < from + lifts {
+                        down[i] = true;
+                        out.extend(s.touch_down(i as u64 + 1, PointerKind::Finger, samples(i, ms, false)));
+                    }
+                }
+                if taken_back && down.iter().all(|d| *d) {
+                    // the system's gesture took them: each called off
+                    for i in 0..3 {
+                        out.extend(s.touch_cancel_one(i as u64 + 1));
+                    }
+                    return out;
+                }
+                let moves: Vec<TouchMove> = (0..3)
+                    .filter(|&i| down[i] && ms < from + fingers[i].1)
+                    .map(|i| TouchMove { id: i as u64 + 1, samples: samples(i, ms, true) })
+                    .collect();
+                if !moves.is_empty() {
+                    out.extend(s.touch_moves(moves));
+                }
+                for (i, &(_, lifts)) in fingers.iter().enumerate() {
+                    if down[i] && ms + 1000.0 / 120.0 > from + lifts {
+                        down[i] = false;
+                        out.extend(s.touch_up(i as u64 + 1, samples(i, from + lifts, false)));
+                    }
+                }
+                ms += 1000.0 / 120.0;
+            }
+            out
+        };
+        for hovering in [false, true] {
+            let s = session();
+            s.set_display_scale(2.0);
+            if hovering {
+                s.touch_pen_hover(Some(PenHover { x: 900.0, y: 300.0, height: 0.4, time_ms: 0.0 }));
+            }
+            let out = tap(&s, 1000.0, false);
+            assert!(redid_once(&out), "hovering {hovering}: {out:?}");
+            // taken back as they land: no redo, no undo, nothing painted, nothing left down
+            let out = tap(&s, 2000.0, true);
+            assert!(
+                !out.iter().any(|c| matches!(c, TouchCommand::Redo | TouchCommand::Undo | TouchCommand::StrokeEnded)),
+                "hovering {hovering}, taken back: {out:?}"
+            );
+            assert!(s.touches().down.is_empty(), "hovering {hovering}: touches left down");
+            // and the next tap redoes
+            let out = tap(&s, 3000.0, false);
+            assert!(redid_once(&out), "hovering {hovering}, after: {out:?}");
+        }
     }
 }

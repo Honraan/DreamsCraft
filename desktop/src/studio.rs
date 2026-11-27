@@ -53,6 +53,22 @@ const DONE: u32 = 0xFF0190FF;
 const SETTINGS_WIDTH: f32 = 323.0;
 const PAD_HEIGHT: f32 = 510.0;
 const TABS_WIDTH: f32 = 81.0;
+/// A window wider than tall and wider than this (points) has the studio's pages, settings and pad
+/// side by side, as the reference lays it; else the pages are a rail beside the pad over the
+/// settings, as upright.
+const SIDE_BY_SIDE_PAST: f32 = 1024.0;
+
+/// Whether the studio in a window `width` × `height` (points) lays its pages, settings and pad side
+/// by side (see [`SIDE_BY_SIDE_PAST`]).
+fn side_by_side(width: f32, height: f32) -> bool {
+    width > height && width > SIDE_BY_SIDE_PAST
+}
+
+/// How tall the pad over the settings is in a window `height` tall (points), laid upright: as
+/// measured, but at most 45% of the window, so the settings under it always have room.
+fn upright_pad_height(height: f32) -> f32 {
+    PAD_HEIGHT.min(height * 0.45)
+}
 /// How far in from the track's ends a slider's knob stops.
 const KNOB_INSET: f32 = 5.0;
 /// The pad's colours to paint with (white the first time, as the pad is dark), and its own grey.
@@ -730,9 +746,11 @@ pub struct Studio {
     randomise_tapped: bool,
     /// The frame the pad menu opened in (the press that opened it doesn't close it).
     pad_menu_frame: u64,
-    /// The brush's sample stroke, and when it is drawn again.
+    /// The brush's sample stroke, when it is drawn again, and the one being drawn on a thread of its
+    /// own (a plugin's brush engine may take seconds over a brush's first).
     preview: Option<TextureHandle>,
     preview_due: Option<Instant>,
+    preview_drawing: Option<std::sync::mpsc::Receiver<Option<egui::ColorImage>>>,
     /// The source images, by kind; the Disclosure cards open.
     sources: HashMap<String, TextureHandle>,
     open_cards: HashSet<&'static str>,
@@ -1050,14 +1068,24 @@ impl Studio {
             return None;
         }
         self.plugin_rows = plugin_rows(&prefs.plugins);
-        if self.preview_due.is_some_and(|due| Instant::now() >= due) {
+        if let Some(drawing) = &self.preview_drawing {
+            match drawing.try_recv() {
+                Ok(image) => {
+                    self.preview = image.map(|i| ctx.load_texture("studio preview", i, egui::TextureOptions::LINEAR));
+                    self.preview_drawing = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(50)),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.preview_drawing = None,
+            }
+        }
+        if self.preview_due.is_some_and(|due| Instant::now() >= due) && self.preview_drawing.is_none() {
             self.preview_due = None;
-            self.preview = brush_preview(ctx, session);
+            self.preview_drawing = brush_preview(session);
         } else if let Some(due) = self.preview_due {
             ctx.request_repaint_after(due.saturating_duration_since(Instant::now()));
         }
         let screen = ctx.content_rect();
-        let wide = screen.width() > screen.height();
+        let wide = side_by_side(screen.width(), screen.height());
         self.wide = wide;
         // a sphere showing the brush's materials on their page, or on every page with the 3D
         // preview on
@@ -1107,7 +1135,7 @@ impl Studio {
                 let rail = Rect::from_min_max(screen.min, pos2(screen.left() + TABS_WIDTH, screen.bottom()));
                 let pad = Rect::from_min_max(
                     pos2(rail.right(), screen.top()),
-                    pos2(screen.right(), screen.top() + PAD_HEIGHT),
+                    pos2(screen.right(), screen.top() + upright_pad_height(screen.height())),
                 );
                 let line =
                     Rect::from_min_max(pos2(rail.right(), pad.bottom()), pos2(screen.right(), pad.bottom() + 1.0));
@@ -2032,12 +2060,20 @@ fn control_height(c: &Control, width: f32) -> f32 {
     }
 }
 
-/// The brush's sample stroke for the Preview page's card.
-fn brush_preview(ctx: &egui::Context, session: &CanvasSession) -> Option<TextureHandle> {
-    let b = session.current_brush();
-    let t = session.brush_preview(b.set, b.index, 1060, 324)?;
-    let image = egui::ColorImage::from_rgba_premultiplied([t.width as usize, t.height as usize], &t.rgba);
-    Some(ctx.load_texture("studio preview", image, egui::TextureOptions::LINEAR))
+/// The brush's sample stroke for the Preview page's card, drawn on a thread of its own: the
+/// interface never waits on it (a plugin's brush engine may take seconds over a brush's first).
+fn brush_preview(session: &Arc<CanvasSession>) -> Option<std::sync::mpsc::Receiver<Option<egui::ColorImage>>> {
+    let (done, drawing) = std::sync::mpsc::channel();
+    let session = Arc::clone(session);
+    let thread = std::thread::Builder::new().name("studio preview".into());
+    let started = thread.spawn(move || {
+        let b = session.current_brush();
+        let image = session
+            .brush_preview(b.set, b.index, 1060, 324)
+            .map(|t| egui::ColorImage::from_rgba_premultiplied([t.width as usize, t.height as usize], &t.rgba));
+        let _ = done.send(image);
+    });
+    started.ok().map(|_| drawing)
 }
 
 /// A blend mode's name, as the picker shows it (a file may give the grain a layer mode its list
@@ -2835,6 +2871,23 @@ mod tests {
             }
         }
         shapes.iter().find_map(|c| find(&c.shape, words))
+    }
+
+    #[test]
+    fn the_pad_goes_beside_the_settings_only_in_a_window_wider_than_tall_and_past_1024() {
+        for (w, h) in [(1133.0, 744.0), (1200.0, 700.0), (1280.0, 800.0), (1366.0, 1024.0), (1025.0, 768.0)] {
+            assert!(side_by_side(w, h), "{w} x {h}");
+        }
+        // the reference's cut: 1024 across on its side is laid as upright, as is a narrower window
+        // on its side, and any window taller than wide
+        for (w, h) in
+            [(1024.0, 768.0), (1000.0, 600.0), (900.0, 500.0), (744.0, 1133.0), (1200.0, 1300.0), (1100.0, 1100.0)]
+        {
+            assert!(!side_by_side(w, h), "{w} x {h}");
+        }
+        // upright, the pad is as measured, but at most 45% of a short window
+        assert!((upright_pad_height(1400.0) - 510.0).abs() < 1e-3);
+        assert!((upright_pad_height(700.0) - 315.0).abs() < 1e-3);
     }
 
     #[test]

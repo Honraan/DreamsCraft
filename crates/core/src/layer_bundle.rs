@@ -276,6 +276,24 @@ impl CanvasSession {
         };
         let before = st.doc.clone();
         let pairs = st.doc.insert_copies(&layers, landing)?;
+        if st.doc.timeline.is_some() {
+            let dropped_top: Vec<(LayerId, String)> = pairs
+                .iter()
+                .filter_map(|&(_, copy)| {
+                    let layer = st.doc.layer(copy)?;
+                    (layer.parent.is_none() && layer.kind != LayerKind::Mask && layer.filter.is_none())
+                        .then(|| (copy, layer.name.clone()))
+                })
+                .collect();
+            if let Some(tl) = st.doc.timeline.as_mut() {
+                let start = tl.playhead;
+                let dur = tl.duration_frames.saturating_sub(start).max(1);
+                for (copy, name) in dropped_top {
+                    let tid = tl.add_track(Some(&name), false);
+                    let _ = tl.add_layer_clip(tid, start, dur, copy, Some(&name));
+                }
+            }
+        }
         let parts: Vec<(LayerId, IRect, Vec<u8>)> = layers
             .iter()
             .zip(&pairs)
@@ -379,5 +397,39 @@ mod tests {
         assert_eq!(b.items(), 2);
         assert_eq!(b.layer_count(), 3);
         assert_eq!(b.name(), "Top");
+    }
+
+    #[test]
+    fn dreamscraft_v2_5_drop_layers_registers_timeline_track_and_skips_filter_layers() {
+        let dst = CanvasSession::new_custom(64, 64, 300.0, vec![1.0, 1.0, 1.0], true, "Dest".into());
+        assert!(dst.set_timeline_enabled(true));
+        dst.timeline_set_playhead(9);
+        let initial_tracks = dst.timeline_state().unwrap().tracks.len();
+
+        let mut paint_layer = layers(1).remove(0);
+        paint_layer.name = "Dragged Cel".into();
+        let paint_bundle = Arc::new(bundle(64, 64, vec![(paint_layer, None)]));
+        let dropped_id = dst.drop_layers(paint_bundle, LayerDrop::AboveCurrent).expect("drop paint layer");
+        let tl = dst.timeline_state().unwrap();
+        assert_eq!(tl.tracks.len(), initial_tracks + 1);
+        let added_track = tl.tracks.last().unwrap();
+        assert_eq!(added_track.name, "Dragged Cel");
+        assert_eq!(added_track.clips.len(), 1);
+        assert_eq!(added_track.clips[0].start_frame, 9);
+        assert_eq!(added_track.clips[0].primary_layer_id, dropped_id);
+
+        // Dropping a Filter Layer must NOT create a timeline track (stays a global unmanaged filter layer).
+        let mut filter_layer = layers(1).remove(0);
+        filter_layer.name = "Global Glow".into();
+        filter_layer.filter = Some(procraft_engine::document::LayerFilter {
+            filter: "glow".into(),
+            values: std::collections::BTreeMap::new(),
+            tables: std::collections::BTreeMap::new(),
+        });
+        let filter_bundle = Arc::new(bundle(64, 64, vec![(filter_layer, None)]));
+        let dropped_filter = dst.drop_layers(filter_bundle, LayerDrop::Top).expect("drop filter layer");
+        let tl_after = dst.timeline_state().unwrap();
+        assert_eq!(tl_after.tracks.len(), initial_tracks + 1);
+        assert!(dst.layers().iter().any(|l| l.id == dropped_filter));
     }
 }

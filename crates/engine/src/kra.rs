@@ -1351,6 +1351,8 @@ fn read_layer_node(
             private: false,
             assisted: false,
             plugin: None,
+            filter: None,
+            marks: std::collections::BTreeMap::new(),
         });
         return Ok(());
     }
@@ -1397,6 +1399,8 @@ fn read_layer_node(
                 private: false,
                 assisted: false,
                 plugin: None,
+                filter: None,
+                marks: std::collections::BTreeMap::new(),
             });
             if let Some(rgba) = frame_rgba {
                 pixels.push((lid, rgba));
@@ -1443,6 +1447,8 @@ fn read_layer_node(
         private: false,
         assisted: false,
         plugin: None,
+        filter: None,
+        marks: std::collections::BTreeMap::new(),
     });
     anim_tracks.push(ImportedAnimTrack {
         name,

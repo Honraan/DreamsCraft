@@ -2,9 +2,10 @@
 //! brushes with a sample stroke on the right. Tapping a set shows it, the shown one for its menu
 //! (rename, duplicate, share, delete); tapping a brush chooses it; sliding one left shows Share,
 //! Duplicate and Delete; holding one shows its menu (Rename, Duplicate, Share, Delete; in the Recent
-//! set Find, Pin or Unpin, Share, Clear), and moving on from there drags it to another place or
-//! set. The plus makes a brush or a set, or brings brushes in from a file. Two fingers pinched in
-//! on a library go to every library's card, and pinched out on a card open it.
+//! set Find, Pin or Unpin, Share, Clear), and moving straight on from there drags it to another
+//! place or set (the core says how long the hold is, and how soon the move must come). The plus
+//! makes a brush or a set, or brings brushes in from a file. Two fingers pinched in on a library go
+//! to every library's card, and pinched out on a card open it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,7 +15,10 @@ use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat, TextWrapping};
 use egui::{
     Align2, Color32, Pos2, Rect, ScrollArea, Sense, TextureHandle, TextureOptions, Ui, UiBuilder, Vec2, pos2, vec2,
 };
-use procraft_core::{BrushFileReading, BrushInfo, BrushSetInfo, CanvasSession, ReadBrushes, read_brushes_from};
+use procraft_core::{
+    BRUSH_MENU_HOLD, BrushDrop, BrushDropOver, BrushFileReading, BrushHoldMove, BrushInfo, BrushSetInfo, CanvasSession,
+    LibraryScroll, ReadBrushes, brush_hold_move, read_brushes_from,
+};
 
 use crate::alert::{Alert, Answer};
 use crate::icons;
@@ -51,6 +55,11 @@ const PREVIEW: (u32, u32) = (530, 162);
 const PREVIEWS_AT_A_TIME: usize = 4;
 /// How often the interface looks for sample strokes drawn while a thread is at them.
 const PREVIEW_LOOK: Duration = Duration::from_millis(16);
+/// How many sample strokes' pictures are kept on the GPU at most (each [`PREVIEW`] big, 343 KB:
+/// 22 MB in all): past it, those out of sight go, the longest unseen first (to come back drawn
+/// already, from the strokes the session keeps). Every brush's, as the library is browsed, came
+/// to 205 MB for the 598 it ships with.
+const PREVIEWS_KEPT: usize = 64;
 /// Menus stay below the top bar; the set's menu sits this far left of it.
 const MENU_TOP: f32 = 57.0;
 const SET_MENU_GAP: f32 = 6.0;
@@ -82,13 +91,18 @@ const PICKER_GLASS: menu::Glass = menu::Glass {
     corner: 26.0,
     shadow: false,
 };
-/// A press moved this far (points) has gone somewhere; held still this long, it shows the brush's
-/// menu (and moved on from there, drags the brush).
+/// A press moved this far (points) has gone somewhere; held still this long, a set lifts to be
+/// dragged (a brush's menu shows sooner: [`brush_hold`]).
 pub(crate) const SLOP: f32 = 8.0;
 pub(crate) const HOLD: Duration = Duration::from_millis(400);
-/// A dragged brush held this long over a set opens it, to be let go among its brushes (as the
-/// system's own drags do).
-const SPRING_LOAD: Duration = Duration::from_millis(500);
+
+/// How long a brush is held still before its menu shows (the core's, as measured).
+fn brush_hold() -> Duration {
+    Duration::try_from_secs_f64(BRUSH_MENU_HOLD).unwrap_or(HOLD)
+}
+/// A dragged brush held this long over another set opens it, to be let go among its brushes
+/// (measured on the original: 1.76 s).
+const SPRING_LOAD: Duration = Duration::from_millis(1800);
 /// A press slides its brush once this far sideways (points), going this many times further
 /// sideways than up or down: a hand scrolling swings in an arc, and a slide opens onto Delete, so
 /// anything less plainly sideways is left to the list.
@@ -101,10 +115,12 @@ const PINCH_TO_LIBRARIES: f32 = 0.66;
 const PINCH_TO_LIBRARY: f32 = 2.0;
 const PINCH_QUIET: Duration = Duration::from_millis(200);
 
-/// A brush's sample stroke, and whether it runs under the name (which then sits on a dark pill).
+/// A brush's sample stroke, whether it runs under the name (which then sits on a dark pill), and
+/// the frame it was last in sight in.
 struct Preview {
     texture: TextureHandle,
     shaded: bool,
+    seen: u64,
 }
 
 /// A sample stroke drawn on its thread: the brush's, its picture (none if it draws nothing), and
@@ -117,6 +133,34 @@ pub struct BrushFileIn {
     pub path: std::path::PathBuf,
     pub name: String,
     pub taken: bool,
+}
+
+/// What a plugin's brush engine said of a brush file it had: a title when something went wrong (to
+/// be told with an OK), and its text ("120 brushes imported.").
+pub type ImportNotice = (Option<String>, String);
+
+/// A batch of brush files read: their brushes (none if Cancel stopped it), and what plugins' brush
+/// engines said of them.
+type Imported = (Option<Vec<ReadBrushes>>, Vec<ImportNotice>);
+
+/// What reading a batch of brush files came to: whether any brushes came in, whether to say so, and
+/// what plugins' brush engines said of them.
+pub struct Added {
+    pub any: bool,
+    pub tell: bool,
+    pub notices: Vec<ImportNotice>,
+}
+
+/// A file's size as the import card shows it: "199 MB", "4.2 MB", "380 KB".
+pub fn file_size(bytes: u64) -> String {
+    let mb = bytes as f64 / f64::from(1 << 20);
+    if mb >= 10.0 {
+        format!("{mb:.0} MB")
+    } else if mb >= 1.0 {
+        format!("{mb:.1} MB")
+    } else {
+        format!("{} KB", (bytes as f64 / 1024.0).round().max(1.0))
+    }
 }
 
 /// What a press on a brush turned out to be.
@@ -147,21 +191,31 @@ fn dragged_together(held: (u32, u32), picked: &[(u32, u32)], selected: bool) -> 
     going
 }
 
-/// Where brushes `moving` (all of one set) dragged together go, let go at `at`: onto another set
-/// of `sets` (by place), to its top; onto one of `brushes` (by place) not among them, to its place;
-/// nowhere over their own set, over one of them, or over neither.
-fn drop_place(
-    moving: &[(u32, u32)],
+/// What brushes dragged in the library are over at `at`, for the core to say where they land
+/// ([`procraft_core::brush_drop_place`]): a set's row of `sets` (by place); else, in `list` (the
+/// shown set's place, how many brushes it holds and where its list shows; none for the Recent
+/// set), the brush of `brushes` (by place) nearest up or down, on its upper or lower half, or with
+/// none there the list itself; else nothing.
+fn drop_over(
     at: Pos2,
     sets: &[(usize, Rect)],
+    list: Option<(u32, u32, Rect)>,
     brushes: &[((u32, u32), Rect)],
-) -> Option<(u32, u32)> {
-    let own = moving.first()?.0;
-    if let Some(&(to, _)) = sets.iter().find(|(_, r)| r.contains(at)) {
-        let to = u32::try_from(to).ok()?;
-        return (to != own).then_some((to, 0));
+) -> Option<BrushDropOver> {
+    if let Some(&(set, _)) = sets.iter().find(|(_, r)| r.contains(at)) {
+        return Some(BrushDropOver::OnSet { set: u32::try_from(set).ok()? });
     }
-    brushes.iter().find(|(_, r)| r.contains(at)).map(|(k, _)| *k).filter(|k| !moving.contains(k))
+    let (shown, count, area) = list?;
+    if !area.contains(at) {
+        return None;
+    }
+    // how far up or down from a row (none on it)
+    let off = |r: &Rect| (r.top() - at.y).max(at.y - r.bottom()).max(0.0);
+    let nearest = brushes.iter().filter(|((set, _), _)| *set == shown).min_by(|a, b| off(&a.1).total_cmp(&off(&b.1)));
+    Some(match nearest {
+        Some(&((_, index), r)) => BrushDropOver::OnBrush { set: shown, index, lower: at.y > r.center().y },
+        None => BrushDropOver::InList { set: shown, count },
+    })
 }
 
 /// What a press on a brush that has moved `d` (points) from where it went down is, once it can be
@@ -178,8 +232,9 @@ fn way_moved(d: Vec2) -> Option<Way> {
 }
 
 /// A press on a brush, followed until let go: which (set and place), where and when it went down,
-/// what it became, how far the brush was slid, where on it the press took hold, how far the
-/// pointer has moved since the last frame, and how far the list was scrolled.
+/// what it became (and when its menu showed, held), how far the brush was slid, where on it the
+/// press took hold, how far the pointer has moved since the last frame, and how far the list was
+/// scrolled.
 #[derive(Clone, Copy)]
 struct Press {
     list: f32,
@@ -187,6 +242,7 @@ struct Press {
     origin: Pos2,
     since: Instant,
     way: Way,
+    menu_at: Option<Instant>,
     start: f32,
     grab: Vec2,
     last: Pos2,
@@ -241,6 +297,8 @@ pub struct Library {
     recent_menu: Menu,
     found: Option<(u32, u32)>,
     previews: HashMap<(u32, u32), Option<Preview>>,
+    /// The frames shown so far, by which the sample strokes are seen.
+    frames: u64,
     /// The brushes in sight without a sample stroke yet, and those being drawn on a thread of
     /// their own (the GPU takes a while over each: the list isn't held up for it).
     wanted: Vec<((u32, u32), String)>,
@@ -289,6 +347,8 @@ pub struct Library {
     swiped: Option<(u32, u32)>,
     /// The brushes of the shown set picked by sliding them right.
     picked: Vec<(u32, u32)>,
+    /// Words for the app to show over the canvas (Combine refused), taken by it.
+    pub notice: Option<String>,
     /// The brushes a dragged one takes with it (it among them, those picked in its set), in their
     /// order, and the dragged cell's size (its row may go as another set opens); the set it is
     /// over, and since when (held there a moment, it opens).
@@ -297,9 +357,20 @@ pub struct Library {
     spring: Option<(usize, Instant)>,
     /// How far the brushes list is scrolled.
     list_at: f32,
-    /// Where the sets and the shown set's brushes were last drawn, for a dragged brush to land.
+    /// Where the lists stood as the frame that last showed them ended (kept as the library closes,
+    /// see [`CanvasSession::library_closed`]), and where they start as it opens, once the lists
+    /// show: as they stood (some), or with the shown set and the brush in use scrolled into sight
+    /// (none).
+    lists_spot: Option<LibraryScroll>,
+    opening: Option<Option<LibraryScroll>>,
+    /// Where the sets and the shown set's brushes were last drawn, for a dragged brush to land; and
+    /// the shown set's list (its place, how many brushes it holds, where it shows), not the Recent
+    /// set's.
     set_rects: Vec<(usize, Rect)>,
     brush_rects: Vec<((u32, u32), Rect)>,
+    brush_list: Option<(u32, u32, Rect)>,
+    /// Where the search's results were last drawn (none while it isn't in use).
+    result_rects: Vec<((u32, u32), Rect)>,
     /// The brush shown highlighted last frame: the one in use, where it is listed.
     highlighted: Option<(u32, u32)>,
     /// The library changed: the app keeps it; its sample strokes are drawn again next frame (not
@@ -310,8 +381,8 @@ pub struct Library {
     pub studio: Option<Option<(u32, u32)>>,
     /// Brush files read on threads of their own (another app's big ones take a while): each
     /// batch's brushes come back (a file that held none left out; none at all if Cancel stopped
-    /// it), and whether to say that they came in.
-    importing: Vec<(std::sync::mpsc::Receiver<Option<Vec<ReadBrushes>>>, bool)>,
+    /// it) with what plugins' brush engines said of them, and whether to say that they came in.
+    importing: Vec<(std::sync::mpsc::Receiver<Imported>, bool)>,
     /// A brush file picked from a "+" menu, to be read (with the import card, which the app
     /// shows), and whether to say that its brushes came in.
     picked_file: Option<(std::path::PathBuf, String, bool)>,
@@ -321,12 +392,61 @@ pub struct Library {
     searching: bool,
     search_down: bool,
     lists_top: (bool, bool),
+    /// What the sample strokes are tinted with as a plugin colours them (each brush's, then the
+    /// brush in use's), as this frame began; none, as the interface draws them.
+    tints: [Option<Color32>; 2],
+    /// Whether it was shown this frame and the last (see [`Library::after_frame`]).
+    shown_now: bool,
+    shown_last: bool,
+}
+
+/// A colour (0xRRGGBB) to draw.
+pub(crate) fn opaque(rgb: u32) -> Color32 {
+    let [_, r, g, b] = rgb.to_be_bytes();
+    Color32::from_rgb(r, g, b)
 }
 
 impl Library {
+    /// The tint of a sample stroke on a row (`selected`: the brush in use's, on the accent), as a
+    /// plugin colours it, or as the interface draws it: white, black on the light interface's
+    /// rows.
+    pub(crate) fn tint(&self, selected: bool) -> Color32 {
+        let [each, in_use] = self.tints;
+        match if selected { in_use } else { each } {
+            Some(tint) => tint,
+            None if crate::look::light() && !selected => Color32::BLACK,
+            None => Color32::WHITE,
+        }
+    }
+
     /// The tool changed: the library shows its brush's set again.
     pub fn tool_changed(&mut self) {
         self.shown_set = None;
+    }
+
+    /// The library opens: on the current brush's set (or the Recent set, if that was shown), not
+    /// on one tapped last time that the brush didn't come from; its lists as they stood when it
+    /// closed on that set, else with the set and the brush in use scrolled into sight.
+    pub fn opens(&mut self, session: &CanvasSession) {
+        if !self.recent {
+            self.shown_set = None;
+        }
+        let shown = if self.recent { -1 } else { i32::try_from(session.current_brush().set).unwrap_or(i32::MAX) };
+        self.opening = Some(session.library_opens(shown));
+    }
+
+    /// A frame ends: the library shown last frame and not in this one has closed (hanging from its
+    /// button or floating alike), and the core lets go of the canvas its sample strokes are drawn
+    /// on. Its strokes stay, so it opens again at once.
+    pub fn after_frame(&mut self, session: &CanvasSession) {
+        let shown = std::mem::take(&mut self.shown_now);
+        if self.shown_last && !shown {
+            if let Some(spot) = self.lists_spot {
+                session.library_closed(spot);
+            }
+            session.let_go_of_previews();
+        }
+        self.shown_last = shown;
     }
 
     /// A menu or question of the library's is up: a press elsewhere only closes it.
@@ -357,25 +477,42 @@ impl Library {
             return;
         }
         let (done, importing) = std::sync::mpsc::channel();
-        // plugins' brush engines make theirs of the files there too
+        // plugins' brush engines make theirs of the files there too, with what an import may take;
+        // the card says so while they do, with the file's name and size, its pie how much of the
+        // file they have read
         let engines = session.brush_engines();
         let reading = BrushFileReading::new();
+        let on = Arc::new(std::sync::Mutex::new(String::new()));
+        let (shown, named) = (Arc::clone(&reading), Arc::clone(&on));
+        let progress = move || match shown.engine_size() {
+            0 => shown.progress(),
+            _ => shown.engine_progress(),
+        };
         let shown = Arc::clone(&reading);
-        let exporting = (!card.busy()).then(|| card.start_importing(move || shown.progress()));
+        let detail: crate::export_card::Detail = Box::new(move || {
+            let size = shown.engine_size();
+            let name = named.lock().map(|n| n.clone()).unwrap_or_default();
+            (size > 0).then(|| ("Importing brushes", format!("{name} · {}", file_size(size))))
+        });
+        let exporting = (!card.busy()).then(|| card.start_importing(progress, detail));
         std::thread::spawn(move || {
-            let read: Vec<ReadBrushes> = std::thread::scope(|scope| {
+            let (read, notices): (Vec<ReadBrushes>, Vec<ImportNotice>) = std::thread::scope(|scope| {
                 let (files, reading) = (&files, &reading);
                 let worker = scope.spawn(move || {
-                    let mut read = Vec::new();
+                    let (mut read, mut notices) = (Vec::new(), Vec::new());
                     for file in files {
+                        if let Ok(mut name) = on.lock() {
+                            name.clone_from(&file.name);
+                        }
                         if let Some(brushes) = read_brushes_from(&file.path, Some(file.name.clone()), reading) {
-                            read.push(engines.make(brushes));
+                            read.push(engines.make_following(brushes, reading));
+                            notices.extend(reading.notice().map(|text| (reading.notice_title(), text)));
                         }
                         if file.taken && !reading.cancelled() {
                             let _ = std::fs::remove_file(&file.path);
                         }
                     }
-                    read
+                    (read, notices)
                 });
                 // Cancel on the card stops the reading at its next brush
                 while !worker.is_finished() {
@@ -390,7 +527,8 @@ impl Library {
             if let Some(exporting) = &exporting {
                 exporting.ended(!cancelled && !read.is_empty());
             }
-            let _ = done.send((!cancelled).then_some(read));
+            let notices = if cancelled { vec![(None, procraft_core::IMPORT_CANCELLED.to_owned())] } else { notices };
+            let _ = done.send(((!cancelled).then_some(read), notices));
         });
         self.importing.push((importing, tell));
     }
@@ -405,7 +543,7 @@ impl Library {
     /// and whether to say so. Not while the library holds brushes or sets by their places (a
     /// menu, a question, a set being renamed, a brush pressed, the studio asked for or open:
     /// `studio_open`), which brushes added at the top would move; they wait for that to end.
-    pub fn added(&mut self, session: &CanvasSession, studio_open: bool) -> Vec<(bool, bool)> {
+    pub fn added(&mut self, session: &CanvasSession, studio_open: bool) -> Vec<Added> {
         let holding = self.modal()
             || self.renaming_set.is_some()
             || self.renaming_brush.is_some()
@@ -415,17 +553,23 @@ impl Library {
             return Vec::new();
         }
         let mut came = Vec::new();
+        let mut stopped = Vec::new();
         self.importing.retain(|(r, tell)| match r.try_recv() {
-            Ok(Some(read)) => {
-                came.push((read, *tell));
+            Ok((Some(read), notices)) => {
+                came.push((read, *tell, notices));
                 false
             }
-            // stopped with Cancel: nothing to add or say
-            Ok(None) => false,
+            // stopped with Cancel: nothing to add, only that
+            Ok((None, notices)) => {
+                stopped.push(Added { any: false, tell: false, notices });
+                false
+            }
             Err(std::sync::mpsc::TryRecvError::Empty) => true,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
         });
-        came.into_iter().map(|(read, tell)| (self.add_read(session, read), tell)).collect()
+        let added =
+            came.into_iter().map(|(read, tell, notices)| Added { any: self.add_read(session, read), tell, notices });
+        added.chain(stopped).collect()
     }
 
     /// Brushes read from files added one after another, each into the set the library shows (or
@@ -456,10 +600,31 @@ impl Library {
     /// they are kept with the rest).
     pub fn finish_importing(&mut self, session: &CanvasSession) {
         for (importing, _) in std::mem::take(&mut self.importing) {
-            if let Ok(Some(read)) = importing.recv() {
+            if let Ok((Some(read), _)) = importing.recv() {
                 self.add_read(session, read);
             }
         }
+    }
+
+    /// Where the brushes dragged by `p` land let go at `at` (none: nowhere; see [`drop_over`]).
+    fn drop_place(&self, p: Press, at: Pos2) -> Option<BrushDrop> {
+        let over = drop_over(at, &self.set_rects, self.brush_list, &self.brush_rects)?;
+        procraft_core::brush_drop_place(p.key.0, self.dragged_indices(p), over)
+    }
+
+    /// The places in their set of the brushes `p` drags (it, and those going with it).
+    fn dragged_indices(&self, p: Press) -> Vec<u32> {
+        if self.dragged_with.is_empty() {
+            vec![p.key.1]
+        } else {
+            self.dragged_with.iter().filter(|k| k.0 == p.key.0).map(|k| k.1).collect()
+        }
+    }
+
+    /// Whether the brushes dragged by `p` would be copied where the pointer is now (onto another
+    /// set, or among the brushes of another set it opened), as the green plus on them says.
+    fn drop_copies(&self, p: Press) -> bool {
+        self.drop_place(p, p.last).is_some_and(|d| d.copies)
     }
 
     /// The library changed: its sample strokes are drawn again (they go by place), and it is kept.
@@ -491,6 +656,7 @@ impl Library {
                     pos2(left, top),
                     vec2(LIBRARY_WIDTH, (screen.bottom() - BOTTOM_MARGIN - top).max(200.0)),
                 );
+                let rect = panel::hung_rect(ctx, rect, f32::INFINITY, BOTTOM_MARGIN);
                 (rect, arrow_x, panel::area(ctx, egui::Id::unique("brush library"), rect))
             }
             panel::Hang::Floating(window) => (
@@ -499,8 +665,14 @@ impl Library {
                 panel::floating_area(ctx, egui::Id::unique("floating brush library"), window),
             ),
         };
+        self.shown_now = true;
         // the cards' strokes forgotten last frame are drawn no more
         self.card_retired.clear();
+        // nor the sample strokes out of sight past those kept (before any is drawn this frame)
+        self.keep_previews_seen(PREVIEWS_KEPT);
+        self.frames += 1;
+        // tinted as the plugins say by the colour now, the strokes themselves drawn once
+        self.tints = [false, true].map(|chosen| session.brush_preview_colour(chosen).map(opaque));
         if std::mem::take(&mut self.stale) {
             self.previews.clear();
             self.drawing = None;
@@ -534,7 +706,8 @@ impl Library {
             .or(lifted.map(|p| p.last))
             .and_then(|at| self.set_rects.iter().find(|(_, r)| r.contains(at)).map(|(i, _)| *i))
             .filter(|i| lifted.is_none_or(|p| p.set != *i));
-        // a dragged brush held over another set a moment opens it
+        // a dragged brush held over another set a moment opens it, as a tap on it would: the
+        // brush last chosen in it (its first, if none) becomes the one in use
         match (dragging, over_set) {
             (Some(_), Some(i)) if i != shown || recent => match self.spring {
                 Some((j, since)) if j == i => {
@@ -542,6 +715,10 @@ impl Library {
                         self.spring = None;
                         self.shown_set = Some(i);
                         self.recent = false;
+                        if let Some(b) = session.brush_set_choice(i as u32) {
+                            session.select_brush(b.set, b.index);
+                            self.changed = true;
+                        }
                     } else {
                         ctx.request_repaint_after(SPRING_LOAD.saturating_sub(since.elapsed()));
                     }
@@ -555,10 +732,13 @@ impl Library {
         }
         let mut set_rects = Vec::new();
         let mut brush_rects = Vec::new();
+        let mut brush_list = None;
         let mut highlighted = None;
         let mut plus = Rect::NOTHING;
         let mut lists = Rect::NOTHING;
         let mut set_tapped = None;
+        // a brush tapped among the search's results
+        let mut found_tapped = None;
         let mut recent_row = None;
         let mut recent_tapped = false;
         let mut brush_tapped = None;
@@ -570,7 +750,8 @@ impl Library {
                 panel::Hang::Button(_) => {
                     ui.allocate_rect(rect, Sense::click());
                     panel::frame(ui, look, "library frame", rect, arrow_x, backdrops);
-                    self.undock = if self.floats { panel::undock_grabber(ui, panel::body(rect)) } else { None };
+                    let body = panel::body_in(ui.ctx(), rect);
+                    self.undock = if self.floats { panel::undock_grabber(ui, body) } else { None };
                 }
                 panel::Hang::Floating(window) => {
                     ui.allocate_rect(window, Sense::click());
@@ -578,7 +759,7 @@ impl Library {
                     self.chrome = panel::floating_chrome(ui, window);
                 }
             }
-            let body = panel::body(rect);
+            let body = panel::body_in(ui.ctx(), rect);
             // the library in use's name (typed over while it is renamed), or every library's
             let name = libraries.get(place).map_or("Brush library", |l| l.name.as_str());
             let renaming = !self.showing_libraries && self.renaming_library.as_ref().is_some_and(|r| r.0 == place);
@@ -645,20 +826,35 @@ impl Library {
             lists.min.y += down;
             if in_use {
                 if let Some(key) = self.search_results(ui, &library, (current.set, current.index), lists) {
-                    brush_tapped = Some((key, false));
+                    found_tapped = Some(key);
                 }
             } else {
+                self.result_rects.clear();
                 let sets = Rect::from_min_size(lists.min, vec2(SETS_WIDTH, lists.height()));
                 let brushes = Rect::from_min_max(pos2(lists.left() + SETS_WIDTH, lists.top()), lists.max);
+                if !recent && let (Ok(set), Some(held)) = (u32::try_from(shown), library.get(shown)) {
+                    brush_list = Some((set, u32::try_from(held.brushes.len()).unwrap_or(u32::MAX), brushes));
+                }
                 if SET_COLUMN.value() >> 24 != 0 {
                     ui.painter().rect_filled(sets, 0, argb(SET_COLUMN));
                 }
                 let corner = panel::POPOVER_CORNER;
                 panel::rounded(ui, look, "library brushes", brushes, [0.0, 0.0, corner, 0.0], argb(BRUSH_COLUMN));
 
+                // as it opens: the lists as they stood, or the shown set and the brush in use brought
+                // into sight as little as it takes
+                let (restore, reveal) = match self.opening.take() {
+                    Some(Some(spot)) => (Some(spot), false),
+                    Some(None) => (None, true),
+                    None => (None, false),
+                };
                 let sets_out = ui.scope_builder(UiBuilder::new().max_rect(sets), |ui| {
-                    ScrollArea::vertical()
-                        .id_salt("library sets")
+                    let list = ScrollArea::vertical();
+                    let list = match restore {
+                        Some(spot) => list.vertical_scroll_offset(spot.sets_offset),
+                        None => list,
+                    };
+                    list.id_salt("library sets")
                         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         // a lifted set is dragged, not the list
                         .scroll_source(if lifted.is_some() {
@@ -670,6 +866,9 @@ impl Library {
                             ui.add_space(12.0);
                             // the brushes last painted with, and those pinned there, above the sets
                             let (response, at) = self.recent_row(ui, look, recent);
+                            if reveal && recent {
+                                ui.scroll_to_rect(at, None);
+                            }
                             recent_row = Some(at);
                             recent_tapped = response.clicked();
                             ui.add_space(12.0);
@@ -686,6 +885,11 @@ impl Library {
                                     })
                                     .inner;
                                 set_rects.push((i, at));
+                                // a brush found (from a search, or the Recent set) shows its set, as
+                                // the library opening does
+                                if self.found.is_some_and(|f| f.0 as usize == i) || (reveal && !recent && i == shown) {
+                                    ui.scroll_to_rect(at, None);
+                                }
                                 if self.set_press.is_none()
                                     && self.press.is_none()
                                     && response.is_pointer_button_down_on()
@@ -719,9 +923,10 @@ impl Library {
                         } else {
                             egui::scroll_area::ScrollSource::ALL
                         });
-                    let list = match held_at {
-                        Some(at) => list.vertical_scroll_offset(at),
-                        None => list,
+                    let list = match (held_at, restore) {
+                        (Some(at), _) => list.vertical_scroll_offset(at),
+                        (None, Some(spot)) => list.vertical_scroll_offset(spot.brushes_offset),
+                        (None, None) => list,
                     };
                     list.show(ui, |ui| {
                         ui.add_space(9.75);
@@ -748,10 +953,13 @@ impl Library {
                                 highlighted = Some((b.set, b.index));
                             }
                             let (response, cell) = self.brush_row(ui, look, session, b, selected, pinned);
-                            // a brush found from the Recent set is scrolled to in its own
+                            // a brush found from the Recent set is scrolled to in its own; the brush in
+                            // use, as the library opens
                             if self.found == Some((b.set, b.index)) {
                                 self.found = None;
                                 ui.scroll_to_rect(cell, Some(egui::Align::Center));
+                            } else if reveal && selected {
+                                ui.scroll_to_rect(cell, None);
                             }
                             brush_rects.push(((b.set, b.index), cell));
                             if let Some(r) = response {
@@ -768,6 +976,13 @@ impl Library {
                     })
                 });
                 self.list_at = brushes_out.inner.state.clamped_offset().y;
+                self.lists_spot = Some(LibraryScroll {
+                    shown_set: if recent { -1 } else { i32::try_from(shown).unwrap_or(i32::MAX) },
+                    sets_first: 0,
+                    sets_offset: sets_out.inner.state.clamped_offset().y,
+                    brushes_first: 0,
+                    brushes_offset: self.list_at,
+                });
                 self.lists_top =
                     (sets_out.inner.state.clamped_offset().y <= 0.5, brushes_out.inner.state.clamped_offset().y <= 0.5);
             }
@@ -787,6 +1002,12 @@ impl Library {
                     painter.circle_filled(badge, 12.0, Color32::WHITE);
                     let count = self.dragged_with.len().to_string();
                     text(&painter, badge, Align2::CENTER_CENTER, &count, 13.0, Weight::SemiBold, argb(pc::ACCENT));
+                }
+                // over another set they would be copied into: a green plus on its corner
+                if self.drop_copies(p) {
+                    let lands = ui.painter_at(lists.expand(12.0));
+                    lands.circle_filled(at.right_top(), 12.0, argb(crate::held_layers::LANDS));
+                    text(&lands, at.right_top(), Align2::CENTER_CENTER, "+", 15.0, Weight::Medium, Color32::WHITE);
                 }
                 ctx.request_repaint();
             }
@@ -812,6 +1033,7 @@ impl Library {
         });
         self.set_rects = set_rects;
         self.brush_rects = brush_rects;
+        self.brush_list = brush_list;
         self.highlighted = highlighted;
         self.draw_previews(ctx, session);
         self.follow_press(ctx, session);
@@ -856,6 +1078,19 @@ impl Library {
                     self.studio = Some(None);
                 }
             }
+        }
+        // picked from the search, a brush ends it and shows in its own set, chosen there and
+        // scrolled to (as the original)
+        if let Some(key) = found_tapped {
+            self.query.clear();
+            self.searching = false;
+            self.search_down = false;
+            ctx.memory_mut(|m| m.stop_text_input());
+            self.recent = false;
+            self.shown_set = Some(key.0 as usize);
+            self.found = Some(key);
+            session.select_brush(key.0, key.1);
+            self.changed = true;
         }
         if let Some((key, name, chose)) = swipe_chose {
             self.swiped = None;
@@ -941,19 +1176,20 @@ impl Library {
         if word(ui, "Delete", delete, "delete picked") {
             self.ask_delete(Deleting::Picked);
         }
+        // two picked (the current brush counts): Combine, which a combined one among them refuses
         let current = session.current_brush();
         let pair = match self.picked[..] {
             [(set, index)] if set == current.set => Some(index),
             _ => None,
         };
-        let pair = pair
-            .filter(|i| !session.brush_is_dual(current.set, *i) && !session.brush_is_dual(current.set, current.index));
         if let Some(second) = pair {
             let combine = Rect::from_min_size(pos2(delete.left() - 4.0 - 80.0, top), vec2(80.0, 32.0));
-            if word(ui, "Combine", combine, "combine picked")
-                && session.combine_brushes(current.set, current.index, second)
-            {
-                self.library_changed();
+            if word(ui, "Combine", combine, "combine picked") {
+                if let Some(refusal) = session.combine_refusal(current.set, current.index, second) {
+                    self.notice = Some(refusal);
+                } else if session.combine_brushes(current.set, current.index, second) {
+                    self.library_changed();
+                }
             }
         }
     }
@@ -1245,8 +1481,10 @@ impl Library {
     }
 
     /// Follows the press on a brush: moved sideways it slides the brush (let go past a third of
-    /// the way, it stays open); moved up or down, the list scrolls; held still, the brush is dragged
-    /// and, let go, goes to the top of the set it is over, or to the place of the brush it is over.
+    /// the way, it stays open); moved up or down, the list scrolls; held still, its menu shows, and
+    /// moved straight on from there the brush is dragged and, let go, goes to the top of the set it
+    /// is over, or to the place of the brush it is over (moved on later, the list scrolls under the
+    /// menu, which stays).
     fn follow_press(&mut self, ctx: &egui::Context, session: &CanvasSession) {
         let Some(mut p) = self.press else { return };
         let (at, down) = ctx.input(|i| (i.pointer.interact_pos(), i.pointer.primary_down()));
@@ -1260,19 +1498,25 @@ impl Library {
                         p.way = way;
                     } else if d.length() > SLOP {
                         // going somewhere, not yet plain which way: it is no hold
-                    } else if p.since.elapsed() >= HOLD {
+                    } else if p.since.elapsed() >= brush_hold() {
                         // held still: its menu shows
                         p.way = Way::Held;
+                        p.menu_at = Some(Instant::now());
                         self.swiped = None;
                         self.open_brush_menu(session, p.key);
                     } else {
-                        ctx.request_repaint_after(HOLD.saturating_sub(p.since.elapsed()));
+                        ctx.request_repaint_after(brush_hold().saturating_sub(p.since.elapsed()));
                     }
                 }
-                // moved on from there, the menu goes and the brush is dragged (the Recent set's
-                // brushes stay where they are)
+                // moved straight on from there, the menu goes and the brush is dragged (the Recent
+                // set's brushes stay where they are); moved on later, the list has the press and
+                // scrolls, the menu staying
                 Way::Held => {
-                    if d.length() > SLOP && !self.recent {
+                    let since_menu = p.menu_at.map_or(0.0, |shown| shown.elapsed().as_secs_f64());
+                    let what = brush_hold_move(d.length(), SLOP, since_menu, !self.recent);
+                    if what == BrushHoldMove::Leaves {
+                        p.way = Way::Scroll;
+                    } else if what == BrushHoldMove::Drags {
                         p.way = Way::Drag;
                         self.brush_menu.close();
                         let current = session.current_brush();
@@ -1319,19 +1563,14 @@ impl Library {
                 }
             }
             Way::Drag => {
-                // onto another set: to its top; onto a brush of the set shown not among them: to
-                // its place (the first of them taking it, the rest after it)
-                let moving = std::mem::take(&mut self.dragged_with);
-                let moving = if moving.is_empty() { vec![p.key] } else { moving };
-                let place = drop_place(&moving, at, &self.set_rects, &self.brush_rects);
-                let moved = place.is_some_and(|(to, index)| match moving.as_slice() {
-                    [(set, from)] => session.move_brush(*set, *from, to, index),
-                    _ => {
-                        let indices = moving.iter().map(|&(_, i)| i).collect();
-                        session.move_brushes(p.key.0, indices, to, index)
-                    }
-                });
-                if moved {
+                // onto another set: copied to its top; onto a brush of the set shown not among
+                // them: above it or below it as the pointer is on its upper or lower half (the
+                // first of them there, the rest after it), copied there from another set, moved
+                // along their own; into a list away from its brushes, after the last
+                let over = drop_over(at, &self.set_rects, self.brush_list, &self.brush_rects);
+                let indices = self.dragged_indices(p);
+                self.dragged_with.clear();
+                if over.is_some_and(|over| session.drop_brushes_over(p.key.0, indices, over)) {
                     self.library_changed();
                 }
             }
@@ -1582,6 +1821,7 @@ impl Library {
                 origin,
                 since,
                 way: Way::Undecided,
+                menu_at: None,
                 start: slide,
                 grab: origin - cell.min,
                 last: origin,
@@ -1655,12 +1895,71 @@ impl Library {
         }
     }
 
-    /// Asks for a brush's sample stroke when it is in sight and not drawn yet.
+    /// Asks for a brush's sample stroke when it is in sight and not drawn yet (one drawn is seen).
     fn want_preview(&mut self, ui: &Ui, b: &BrushInfo, cell: Rect) {
         let key = (b.set, b.index);
-        if !self.previews.contains_key(&key) && ui.is_rect_visible(cell) {
-            self.wanted.push((key, b.name.clone()));
+        if !ui.is_rect_visible(cell) {
+            return;
         }
+        match self.previews.get_mut(&key) {
+            Some(Some(p)) => p.seen = self.frames,
+            Some(None) => {}
+            None => self.wanted.push((key, b.name.clone())),
+        }
+    }
+
+    /// Lets go of the sample strokes' pictures out of sight last frame past `most` kept, the
+    /// longest unseen first: one scrolled back into sight is asked for again (and comes from the
+    /// strokes the session keeps, drawn already).
+    fn keep_previews_seen(&mut self, most: usize) {
+        let held = self.previews.values().filter(|p| p.is_some()).count();
+        if held <= most {
+            return;
+        }
+        // (called before the frame's count goes up: those seen last frame were seen at it)
+        let last = self.frames;
+        let mut unseen: Vec<(u64, (u32, u32))> = self
+            .previews
+            .iter()
+            .filter_map(|(k, p)| p.as_ref().filter(|p| p.seen < last).map(|p| (p.seen, *k)))
+            .collect();
+        unseen.sort_unstable();
+        for (_, key) in unseen.into_iter().take(held - most) {
+            self.previews.remove(&key);
+        }
+    }
+
+    /// Lets go of every sample stroke's picture, the cards' too (the GPU short of memory): those in
+    /// sight are asked for again, and come from the strokes the session keeps. Between frames only,
+    /// as one may draw them.
+    pub fn let_go_of_previews(&mut self) {
+        self.previews.clear();
+        self.card_previews.clear();
+        self.card_retired.clear();
+    }
+
+    /// How many sample strokes' pictures are held.
+    #[cfg(test)]
+    fn previews_held(&self) -> usize {
+        self.previews.values().filter(|p| p.is_some()).count()
+    }
+
+    /// The sample strokes of `brushes` (their places and names) for a plugin's panel, as drawn so
+    /// far: those not drawn yet are drawn on the library's thread, a frame asked for as they come.
+    pub fn panel_strokes(
+        &mut self,
+        ctx: &egui::Context,
+        session: &Arc<CanvasSession>,
+        brushes: &[((u32, u32), String)],
+    ) -> crate::actions::Strokes {
+        for (key, name) in brushes {
+            if !self.previews.contains_key(key) && !self.wanted.iter().any(|(k, _)| k == key) {
+                self.wanted.push((*key, name.clone()));
+            }
+        }
+        self.draw_previews(ctx, session);
+        let drawn = |(key, _): &((u32, u32), String)| Some((*key, self.previews.get(key)?.as_ref()?.texture.id()));
+        brushes.iter().filter_map(drawn).collect()
     }
 
     /// Takes the sample strokes drawn so far, and has those wanted drawn on a thread of their own.
@@ -1671,7 +1970,7 @@ impl Library {
                     Ok((key, drawn)) => {
                         let preview = drawn.map(|(image, shaded)| {
                             let texture = ctx.load_texture(format!("brush {key:?}"), image, TextureOptions::LINEAR);
-                            Preview { texture, shaded }
+                            Preview { texture, shaded, seen: self.frames }
                         });
                         self.previews.insert(key, preview);
                     }
@@ -1784,6 +2083,7 @@ impl Library {
             return None;
         }
         let mut tapped = None;
+        self.result_rects.clear();
         ui.scope_builder(UiBuilder::new().max_rect(area), |ui| {
             ScrollArea::vertical()
                 .id_salt("library results")
@@ -1800,6 +2100,7 @@ impl Library {
                             );
                             let key = (b.set, b.index);
                             let selected = key == current;
+                            self.result_rects.push((key, tile));
                             self.want_preview(ui, b, tile);
                             let painter = ui.painter_at(tile);
                             painter.rect_filled(tile, 12, if selected { argb(pc::ACCENT) } else { argb(RESULT_FILL) });
@@ -1832,8 +2133,7 @@ impl Library {
         let k = (at.width() / pw).max(at.height() / ph);
         let shown = Rect::from_center_size(at.center(), vec2(pw * k, ph * k));
         let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-        let tint = if crate::look::light() && !selected { Color32::BLACK } else { Color32::WHITE };
-        painter.image(p.texture.id(), shown, uv, tint);
+        painter.image(p.texture.id(), shown, uv, self.tint(selected));
         p.shaded
     }
 }
@@ -2060,6 +2360,176 @@ mod tests {
         }
     }
 
+    /// The library shown in a window of a laptop's size with its sample strokes drawn on the GPU
+    /// (one device) and shown through egui-wgpu as the window shows them (another, whose memory is
+    /// the interface's alone), scrolled by a finger.
+    struct Shown {
+        ctx: egui::Context,
+        look: Look,
+        library: Library,
+        session: Arc<CanvasSession>,
+        showing: procraft_gpu::Gpu,
+        renderer: egui_wgpu::Renderer,
+        time: f64,
+    }
+
+    impl Shown {
+        /// The window's height (points), as a laptop's of 1080 pixels at 1.25 pixels a point.
+        const HEIGHT: f32 = 820.0;
+
+        fn frame(&mut self, events: Vec<Event>) {
+            self.time += 1.0 / 60.0;
+            let raw = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1500.0, Self::HEIGHT))),
+                time: Some(self.time),
+                events,
+                ..RawInput::default()
+            };
+            let Shown { ctx, look, library, session, .. } = self;
+            let mut output = ctx.clone().run_ui(raw, |ui| {
+                let button = Rect::from_min_size(pos2(600.0, 10.0), vec2(40.0, 40.0));
+                library.show(ui.ctx(), look, session, crate::panel::Hang::Button(button), &mut Vec::new());
+            });
+            let (device, queue) = (&self.showing.device, &self.showing.queue);
+            for (id, deltas) in &output.textures_delta.set {
+                for delta in deltas {
+                    self.renderer.update_texture(device, queue, *id, delta);
+                }
+            }
+            for id in &output.textures_delta.free {
+                self.renderer.free_texture(id);
+            }
+            output.textures_delta.clear();
+        }
+
+        /// Frames until every sample stroke in sight is drawn and shown, and the list is still.
+        fn settle(&mut self) {
+            let mut at = f32::NAN;
+            for _ in 0..20_000 {
+                self.frame(Vec::new());
+                let still = self.library.list_at == at;
+                at = self.library.list_at;
+                if still && self.library.drawing.is_none() && self.library.wanted.is_empty() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        /// A finger drags the brushes up the list by `by` points, slowly (no fling).
+        fn drag_up(&mut self, by: f32) {
+            let low = Self::HEIGHT - 200.0;
+            let Some(from) = self.library.brush_rects.iter().map(|(_, r)| r.center()).find(|c| c.y > low) else {
+                return;
+            };
+            let touch =
+                |phase, pos| Event::Touch { device_id: TouchDeviceId(1), id: TouchId(1), phase, pos, force: None };
+            let press = |pos, pressed| Event::PointerButton {
+                pos,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            self.frame(vec![touch(TouchPhase::Start, from), Event::PointerMoved(from), press(from, true)]);
+            let steps = (by / 8.0).ceil() as usize;
+            let mut at = from;
+            for _ in 0..steps {
+                at.y -= 8.0;
+                self.frame(vec![touch(TouchPhase::Move, at), Event::PointerMoved(at)]);
+            }
+            // held still a moment, so it isn't flicked on
+            for _ in 0..10 {
+                self.frame(vec![touch(TouchPhase::Move, at), Event::PointerMoved(at)]);
+            }
+            self.frame(vec![touch(TouchPhase::End, at), press(at, false)]);
+        }
+
+        /// What the interface's device holds, bytes.
+        fn held(&self) -> u64 {
+            self.showing.flush();
+            self.showing.device.generate_allocator_report().map_or(0, |r| r.total_allocated_bytes)
+        }
+    }
+
+    /// Every set of the library as it ships browsed, scrolled from its top to its end, each brush's
+    /// sample stroke drawn and shown in turn: the pictures held on the GPU stay within those kept
+    /// ([`PREVIEWS_KEPT`]), not every brush's (all 598 of them came to 205 MB, which a laptop's
+    /// integrated GPU runs out of beside a canvas). `PREVIEWS_MEASURED=1` says what was held after
+    /// each set.
+    #[test]
+    fn browsing_every_set_holds_few_sample_strokes_on_the_gpu() {
+        use procraft_gpu::{Gpu, wgpu};
+        let (Ok(drawing), Ok(showing)) = (Gpu::headless(), Gpu::headless()) else {
+            return eprintln!("skipped: no GPU");
+        };
+        let session = CanvasSession::new(64, 64);
+        session.use_gpu(drawing.clone());
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let renderer = egui_wgpu::Renderer::new(&showing.device, format, egui_wgpu::RendererOptions::default());
+        let (ctx, look, library) = (egui::Context::default(), Look::default(), Library::default());
+        let mut shown = Shown { ctx, look, library, session, showing, renderer, time: 0.0 };
+        // laid out first, its fonts' pictures made: what the strokes hold is counted from there
+        shown.frame(Vec::new());
+        shown.frame(Vec::new());
+        let before = shown.held();
+        let drawn = |gpu: &Gpu| {
+            gpu.flush();
+            gpu.device.generate_allocator_report().map_or(0, |r| r.total_allocated_bytes)
+        };
+        let drawing_before = drawn(&drawing);
+        let sets = shown.session.brush_library();
+        let measured = std::env::var_os("PREVIEWS_MEASURED").is_some();
+        let (mut most, mut seen) = (0, std::collections::HashSet::new());
+        for (i, set) in sets.iter().enumerate() {
+            shown.library.shown_set = Some(i);
+            shown.settle();
+            // scrolled down to the set's end, most of a window's height at a time
+            loop {
+                let at = shown.library.list_at;
+                seen.extend(shown.library.previews.iter().filter(|(_, p)| p.is_some()).map(|(k, _)| *k));
+                most = most.max(shown.library.previews_held());
+                shown.drag_up(Shown::HEIGHT - 300.0);
+                shown.settle();
+                if shown.library.list_at <= at + 1.0 {
+                    break;
+                }
+            }
+            seen.extend(shown.library.previews.iter().filter(|(_, p)| p.is_some()).map(|(k, _)| *k));
+            most = most.max(shown.library.previews_held());
+            if measured {
+                let mb = shown.held().saturating_sub(before) as f64 / f64::from(1 << 20);
+                let held = shown.library.previews_held();
+                println!("{:<20} {:3} brushes: {held:3} pictures held, {mb:5.1} MB", set.name, set.brushes.len());
+            }
+        }
+        let brushes: usize = sets.iter().map(|s| s.brushes.len()).sum();
+        let picture = u64::from(PREVIEW.0 * PREVIEW.1 * 4);
+        let bytes = shown.held().saturating_sub(before);
+        let drawing_bytes = drawn(&drawing).saturating_sub(drawing_before);
+        println!("the strokes' own device holds {:.1} MB more", drawing_bytes as f64 / f64::from(1 << 20));
+        println!(
+            "{} of {brushes} brushes' strokes shown in {} sets: at most {most} pictures held, {:.1} MB on the GPU after \
+             (every one's would be {:.1} MB)",
+            seen.len(),
+            sets.len(),
+            bytes as f64 / f64::from(1 << 20),
+            (seen.len() as u64 * picture) as f64 / f64::from(1 << 20)
+        );
+        // every brush's stroke shown on the way (the window shows each in turn)
+        assert!(seen.len() * 10 >= brushes * 9, "{} of {brushes} brushes' strokes shown", seen.len());
+        // those kept and those in sight at once, which is fewer
+        assert!(most <= PREVIEWS_KEPT + 16, "{most} pictures held");
+        // the pictures kept, half more for the device's alignment, and 16 MB for the meshes' buffers
+        // (34 MB on the PC it was written on; every brush's came to 205); where the device can't
+        // say, nothing to compare
+        let bound = PREVIEWS_KEPT as u64 * picture * 3 / 2 + (16 << 20);
+        assert!(bytes <= bound, "{bytes} bytes held on the GPU, past {bound}");
+        // and the strokes' own device, which draws them all on the one canvas kept for them, holds
+        // as much whatever the number drawn (102 MB there)
+        assert!(drawing_bytes <= 160 << 20, "{drawing_bytes} bytes held drawing the strokes");
+        assert_eq!(drawing.errors() + shown.showing.errors(), 0);
+    }
+
     #[test]
     fn the_brushes_keep_up_with_a_finger_and_carry_on_when_flicked() {
         let mut f = Finger::new();
@@ -2087,6 +2557,32 @@ mod tests {
             f.frame(Vec::new());
         }
         assert!(f.top() < lifted - 10.0, "stopped dead: {} to {}", lifted, f.top());
+    }
+
+    #[test]
+    fn the_sample_strokes_show_in_the_colour_a_plugin_gives_by_the_colour_painted_with() {
+        const ID: &str = "io.github.artcraftandroid.interface-look";
+        let dir = std::env::temp_dir().join(format!("procraft-library-tints-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let plugins = procraft_core::Plugins::with_bundled(dir.to_string_lossy().into_owned());
+        let mut f = Finger::new();
+        f.session.use_plugins(Arc::clone(&plugins));
+        f.session.set_color(1.0, 0.0, 0.0);
+        f.frame(Vec::new());
+        let red = Color32::from_rgb(255, 0, 0);
+        // as the interface draws them with the plugin off (it comes so)
+        assert_ne!(f.library.tint(false), red);
+        assert_eq!(f.library.tint(true), Color32::WHITE);
+        // on: each brush's in the colour painted with, the one in use's white on the accent
+        assert!(plugins.set_on(ID.to_owned(), true));
+        assert!(plugins.set_switch(format!("{ID}.coloured_previews"), true));
+        f.frame(Vec::new());
+        assert_eq!((f.library.tint(false), f.library.tint(true)), (red, Color32::WHITE));
+        // the colour changed, the next frame shows it, the strokes themselves not drawn again
+        f.session.set_color(0.0, 0.0, 1.0);
+        f.frame(Vec::new());
+        assert_eq!(f.library.tint(false), Color32::from_rgb(0, 0, 255));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2156,13 +2652,14 @@ mod tests {
             f.session.brush_library()[set as usize].brushes[index as usize].name.clone()
         };
         let held = name(&f, key);
-        // the brush two places further down, as it shows
+        // the brush two places further down, as it shows: on its lower half, just below it (in its
+        // place once the held one has left its own)
         let (target, onto) = f
             .library
             .brush_rects
             .iter()
             .find(|(k, r)| k.0 == key.0 && k.1 == key.1 + 2 && r.top() > cell.bottom())
-            .map(|(k, r)| (*k, r.center()))
+            .map(|(k, r)| (*k, r.center() + vec2(0.0, r.height() / 4.0)))
             .unwrap();
         // held still: the menu, and nothing moved
         f.down(from);
@@ -2180,6 +2677,155 @@ mod tests {
         assert_eq!(name(&f, target), held);
         assert_ne!(name(&f, key), held);
         assert!(!f.library.brush_menu.is_open());
+    }
+
+    /// A brush held past its menu showing and moved on only after the core's drag window isn't
+    /// lifted (as measured: presses of 0.7 s and 1 s moved on scrolled the list): the list has the
+    /// press and scrolls under the menu, which stays open; let go, nothing is chosen or moved.
+    #[test]
+    fn a_brush_held_and_moved_on_too_late_scrolls_the_list_under_its_menu() {
+        let mut f = Finger::new();
+        let names = |f: &Finger| -> Vec<Vec<String>> {
+            f.session.brush_library().iter().map(|s| s.brushes.iter().map(|b| b.name.clone()).collect()).collect()
+        };
+        let (before, chosen) = (names(&f), f.session.current_brush());
+        let from = f.on_a_brush();
+        f.down(from);
+        std::thread::sleep(brush_hold() + Duration::from_millis(50));
+        f.frame(Vec::new());
+        assert!(f.library.brush_menu.is_open());
+        let top = f.top();
+        std::thread::sleep(Duration::from_secs_f64(procraft_core::BRUSH_DRAG_WINDOW) + Duration::from_millis(100));
+        let mut at = from;
+        for _ in 0..10 {
+            at.y -= 8.0;
+            f.to(at);
+        }
+        assert!(f.library.press.is_some_and(|p| p.way == Way::Scroll), "not left to the list");
+        assert!(f.library.dragged_with.is_empty(), "lifted");
+        assert!(f.library.brush_menu.is_open(), "the menu went");
+        assert!(f.top() < top - 20.0, "the list stayed: {top} to {}", f.top());
+        f.up(at);
+        f.frame(Vec::new());
+        assert!(f.library.brush_menu.is_open());
+        assert_eq!(names(&f), before);
+        let now = f.session.current_brush();
+        assert_eq!((now.set, now.index), (chosen.set, chosen.index));
+    }
+
+    /// What a dragged brush is over: a set's row; in the shown set's list, the brush nearest up or
+    /// down and which half of it (a gap or the room below the last going to the nearest); an empty
+    /// list itself; nothing elsewhere or over the Recent set's list.
+    #[test]
+    fn a_dragged_brush_is_over_a_set_or_the_nearest_brush_s_upper_or_lower_half() {
+        let sets = [
+            (0, Rect::from_min_size(pos2(0.0, 0.0), vec2(150.0, 50.0))),
+            (3, Rect::from_min_size(pos2(0.0, 62.0), vec2(150.0, 50.0))),
+        ];
+        let area = Rect::from_min_max(pos2(170.0, 0.0), pos2(600.0, 500.0));
+        // set 2's brushes 0 to 2, 80 tall and 8 apart
+        let rows: Vec<((u32, u32), Rect)> = (0..3)
+            .map(|i| ((2, i), Rect::from_min_size(pos2(180.0, 10.0 + 88.0 * i as f32), vec2(400.0, 80.0))))
+            .collect();
+        let list = Some((2, 3, area));
+        let over = |x: f32, y: f32| drop_over(pos2(x, y), &sets, list, &rows);
+        let brush = |index, lower| Some(BrushDropOver::OnBrush { set: 2, index, lower });
+        assert_eq!(over(60.0, 80.0), Some(BrushDropOver::OnSet { set: 3 }));
+        assert_eq!(over(60.0, 56.0), None);
+        // brush 1 (98 to 178): its upper half, its lower half
+        assert_eq!(over(300.0, 120.0), brush(1, false));
+        assert_eq!(over(300.0, 160.0), brush(1, true));
+        // in the gap under brush 0, nearer it; above the first; far below the last
+        assert_eq!(over(300.0, 92.0), brush(0, true));
+        assert_eq!(over(300.0, 4.0), brush(0, false));
+        assert_eq!(over(300.0, 450.0), brush(2, true));
+        // an empty set's list: the list itself
+        assert_eq!(
+            drop_over(pos2(300.0, 200.0), &sets, Some((5, 0, area)), &[]),
+            Some(BrushDropOver::InList { set: 5, count: 0 })
+        );
+        // off the list, or the Recent set's list (none): nothing
+        assert_eq!(over(650.0, 120.0), None);
+        assert_eq!(drop_over(pos2(300.0, 120.0), &sets, None, &rows), None);
+    }
+
+    /// A brush let go on another of its set's goes just above it from its upper half and just below
+    /// it from its lower half, the rest of the set as it was.
+    #[test]
+    fn a_brush_let_go_on_another_s_upper_half_goes_above_it_and_on_its_lower_half_below() {
+        let names = |f: &Finger, set: u32| -> Vec<String> {
+            f.session.brush_library()[set as usize].brushes.iter().map(|b| b.name.clone()).collect()
+        };
+        for lower in [false, true] {
+            let mut f = Finger::new();
+            let from = f.on_a_brush();
+            let key = f.library.brush_rects.iter().find(|(_, r)| r.contains(from)).map(|(k, _)| *k).unwrap();
+            let before = names(&f, key.0);
+            // the brush just above it: on its upper half the held one goes before it; on its lower
+            // half it stays where it is
+            let (target, onto) = f
+                .library
+                .brush_rects
+                .iter()
+                .find(|(k, _)| k.0 == key.0 && k.1 + 1 == key.1)
+                .map(|(k, r)| (*k, r.center() + vec2(0.0, if lower { 1.0 } else { -1.0 } * r.height() / 4.0)))
+                .unwrap();
+            f.down(from);
+            std::thread::sleep(HOLD + Duration::from_millis(50));
+            f.frame(Vec::new());
+            for i in 1..=6 {
+                f.to(from + (onto - from) * (i as f32 / 6.0));
+            }
+            // along its own set: no green plus
+            assert!(!f.library.drop_copies(f.library.press.unwrap()));
+            f.up(onto);
+            f.frame(Vec::new());
+            let mut after = before.clone();
+            if !lower {
+                after.swap(target.1 as usize, key.1 as usize);
+            }
+            assert_eq!(names(&f, key.0), after, "lower half {lower}");
+        }
+    }
+
+    /// A brush held over a new, empty set opens it, and let go in its list it is copied in.
+    #[test]
+    fn a_brush_held_over_an_empty_set_until_it_opens_is_copied_in_let_go_in_its_list() {
+        let mut f = Finger::new();
+        assert_eq!(f.session.new_brush_set(), 0);
+        f.library.library_changed();
+        f.frame(Vec::new());
+        f.frame(Vec::new());
+        let names = |f: &Finger, set: usize| -> Vec<String> {
+            f.session.brush_library()[set].brushes.iter().map(|b| b.name.clone()).collect()
+        };
+        let from = f.on_a_brush();
+        let key = f.library.brush_rects.iter().find(|(_, r)| r.contains(from)).map(|(k, _)| *k).unwrap();
+        assert_ne!(key.0, 0);
+        let theirs = names(&f, key.0 as usize);
+        let over = f.library.set_rects.iter().find(|(s, _)| *s == 0).map(|(_, r)| r.center()).unwrap();
+        f.down(from);
+        std::thread::sleep(HOLD + Duration::from_millis(50));
+        f.frame(Vec::new());
+        for i in 1..=6 {
+            f.to(from + (over - from) * (i as f32 / 6.0));
+        }
+        std::thread::sleep(SPRING_LOAD + Duration::from_millis(50));
+        f.frame(Vec::new());
+        f.frame(Vec::new());
+        assert_eq!(f.library.shown_set, Some(0));
+        assert!(f.library.brush_rects.is_empty());
+        // into its list, away from the sets
+        let (_, _, area) = f.library.brush_list.unwrap();
+        let inside = area.center();
+        for i in 1..=4 {
+            f.to(over + (inside - over) * (i as f32 / 4.0));
+        }
+        assert!(f.library.drop_copies(f.library.press.unwrap()));
+        f.up(inside);
+        f.frame(Vec::new());
+        assert_eq!(names(&f, 0), [theirs[key.1 as usize].clone()]);
+        assert_eq!(names(&f, key.0 as usize), theirs);
     }
 
     /// Brushes picked go with the one held and dragged; held over a set that isn't shown, the set
@@ -2212,6 +2858,9 @@ mod tests {
             f.to(from + (over - from) * (i as f32 / 6.0));
         }
         assert_eq!(f.library.dragged_with, vec![key, other]);
+        // over another set they would be copied there, as the green plus on them says
+        let press = f.library.press.unwrap();
+        assert!(f.library.drop_copies(press));
         // held there a moment: it opens, its brushes shown
         std::thread::sleep(SPRING_LOAD + Duration::from_millis(50));
         f.frame(Vec::new());
@@ -2228,7 +2877,8 @@ mod tests {
         let now = names(&f, to);
         assert_eq!(now.len(), theirs.len() + 2);
         assert_eq!(now[1..3], [before[key.1 as usize].clone(), before[other.1 as usize].clone()]);
-        assert_eq!(names(&f, key.0 as usize).len(), before.len() - 2);
+        // copied there: their own set keeps them
+        assert_eq!(names(&f, key.0 as usize), before);
     }
 
     #[test]
@@ -2376,30 +3026,187 @@ mod tests {
         assert_eq!(f.library.highlighted, Some((0, 3)));
     }
 
-    /// A set never chosen in, opened, leaves the brush as it is and shows none highlighted; a tap
-    /// on one of its brushes makes it the brush.
-    #[test]
-    fn a_set_with_no_brush_chosen_shows_none_highlighted_and_a_tap_takes_one() {
-        let mut f = Finger::new();
-        let start = f.session.current_brush();
-        let set = f
-            .library
+    /// A set on screen other than set `but`, with brushes, that nothing was chosen in: its choice
+    /// is its first brush.
+    fn never_chosen(f: &Finger, but: u32) -> usize {
+        f.library
             .set_rects
             .iter()
+            .filter(|(_, r)| (0.0..650.0).contains(&r.center().y))
             .map(|(s, _)| *s)
-            .find(|&s| s as u32 != start.set && f.session.brush_set_choice(s as u32).is_none())
-            .expect("a set never chosen in");
+            .find(|&s| {
+                s as u32 != but
+                    && f.session.brush_library()[s].brushes.len() > 1
+                    && f.session.brush_set_choice(s as u32).map(|b| b.index) == Some(0)
+            })
+            .expect("a set never chosen in")
+    }
+
+    /// A set never chosen in, opened, takes its first brush as the one in use, lit (the original
+    /// keeps one brush per set, the first until one is chosen); a tap on another of its brushes
+    /// makes that the brush.
+    #[test]
+    fn a_set_never_chosen_in_opened_takes_its_first_brush_and_a_tap_takes_another() {
+        let mut f = Finger::new();
+        let start = f.session.current_brush();
+        let set = never_chosen(&f, start.set);
         let row = f.library.set_rects.iter().find(|(s, _)| *s == set).map(|(_, r)| r.center()).unwrap();
         f.down(row);
         f.up(row);
         f.frame(Vec::new());
-        assert_eq!((f.session.current_brush().set, f.session.current_brush().index), (start.set, start.index));
-        assert_eq!(f.library.highlighted, None);
+        assert_eq!((f.session.current_brush().set, f.session.current_brush().index), (set as u32, 0));
+        assert_eq!(f.library.highlighted, Some((set as u32, 0)));
         let cell = f.library.brush_rects.iter().find(|(k, _)| k.1 == 1).map(|(_, r)| r.center()).unwrap();
         f.down(cell);
         f.up(cell);
         f.frame(Vec::new());
         assert_eq!((f.session.current_brush().set, f.session.current_brush().index), (set as u32, 1));
+        assert!(f.library.studio.is_none());
+    }
+
+    /// The library opens on the current brush's set: a set with no brushes, looked at last time
+    /// (the brush staying in another), isn't the one it opens on again.
+    #[test]
+    fn the_library_opens_on_the_current_brush_s_set() {
+        let mut f = Finger::new();
+        let empty = f.session.new_brush_set() as usize;
+        f.library.library_changed();
+        f.frame(Vec::new());
+        f.frame(Vec::new());
+        let start = f.session.current_brush();
+        assert_ne!(start.set as usize, empty);
+        let row = f.library.set_rects.iter().find(|(s, _)| *s == empty).map(|(_, r)| r.center()).unwrap();
+        f.down(row);
+        f.up(row);
+        f.frame(Vec::new());
+        assert_eq!(f.library.shown_set, Some(empty));
+        assert!(f.library.brush_rects.is_empty());
+        assert_eq!((f.session.current_brush().set, f.session.current_brush().index), (start.set, start.index));
+        // shut, and opened again
+        f.library.opens(&f.session);
+        f.frame(Vec::new());
+        assert!(f.library.brush_rects.iter().all(|(k, _)| k.0 == start.set));
+        assert_eq!(f.library.highlighted, Some((start.set, start.index)));
+    }
+
+    /// The library opens with the brush in use in sight, as little scrolled as it takes (one in
+    /// sight already leaves its list where it is); closed and opened again on the same set, its
+    /// lists stand as they did when it closed.
+    #[test]
+    fn the_library_opens_with_the_brush_in_use_in_sight() {
+        let mut f = Finger::new();
+        let settle = |f: &mut Finger| {
+            for _ in 0..40 {
+                f.frame(Vec::new());
+            }
+        };
+        // a brush in sight already: nothing scrolls
+        let first = f.session.brush_library()[0].brushes[0].clone();
+        assert!(f.session.select_brush(first.set, first.index));
+        f.library.opens(&f.session);
+        settle(&mut f);
+        assert_eq!(f.library.list_at, 0.0);
+        // the longest set's last brush: brought into sight
+        let library = f.session.brush_library();
+        let longest = library.iter().max_by_key(|s| s.brushes.len()).unwrap();
+        let last = longest.brushes.last().unwrap().clone();
+        assert!(longest.brushes.len() > 12, "{} brushes", longest.brushes.len());
+        assert!(f.session.select_brush(last.set, last.index));
+        f.library.opens(&f.session);
+        settle(&mut f);
+        let (_, _, area) = f.library.brush_list.unwrap();
+        let lit = f.library.brush_rects.iter().find(|(k, _)| *k == (last.set, last.index)).map(|(_, r)| *r).unwrap();
+        assert!(area.expand(0.5).contains_rect(lit), "{lit:?} not in {area:?}");
+        let scrolled = f.library.list_at;
+        assert!(scrolled > 0.0);
+        // closed (a frame without it), and opened again on the same set: as it stood
+        f.library.after_frame(&f.session);
+        f.library.after_frame(&f.session);
+        let kept = f.session.library_opens(i32::try_from(last.set).unwrap()).map(|s| s.brushes_offset);
+        assert_eq!(kept, Some(scrolled));
+        f.library.opens(&f.session);
+        f.frame(Vec::new());
+        assert_eq!(f.library.list_at, scrolled);
+    }
+
+    /// A brush dragged and held over another set opens it as a tap on it would (the original's
+    /// set rows take a resting drag as their tap): the brush last chosen there becomes the one in
+    /// use, lit; let go away from the library, nothing lands and that stays the brush.
+    #[test]
+    fn a_set_a_dragged_brush_opens_brings_back_its_brush_as_a_tap_does() {
+        let mut f = Finger::new();
+        let start = f.session.current_brush();
+        let from = f.on_a_brush();
+        let key = f.library.brush_rects.iter().find(|(_, r)| r.contains(from)).map(|(k, _)| *k).unwrap();
+        // a set other than this one, on screen, its brush 2 chosen there before
+        let (to, over) = f
+            .library
+            .set_rects
+            .iter()
+            .find(|(s, r)| *s != key.0 as usize && (0.0..650.0).contains(&r.center().y))
+            .map(|(s, r)| (*s, r.center()))
+            .unwrap();
+        assert!(f.session.select_brush(to as u32, 2));
+        assert!(f.session.select_brush(start.set, start.index));
+        f.library.tool_changed();
+        f.frame(Vec::new());
+        let sizes: Vec<usize> = f.session.brush_library().iter().map(|s| s.brushes.len()).collect();
+        f.down(from);
+        std::thread::sleep(HOLD + Duration::from_millis(50));
+        f.frame(Vec::new());
+        for i in 1..=6 {
+            f.to(from + (over - from) * (i as f32 / 6.0));
+        }
+        // not yet open: the brush as it was
+        assert_eq!((f.session.current_brush().set, f.session.current_brush().index), (start.set, start.index));
+        std::thread::sleep(SPRING_LOAD + Duration::from_millis(50));
+        f.frame(Vec::new());
+        f.frame(Vec::new());
+        assert_eq!(f.library.shown_set, Some(to));
+        assert_eq!((f.session.current_brush().set, f.session.current_brush().index), (to as u32, 2));
+        assert_eq!(f.library.highlighted, Some((to as u32, 2)));
+        // carried off the library and let go: nothing lands anywhere
+        let away = pos2(40.0, 650.0);
+        for i in 1..=4 {
+            f.to(over + (away - over) * (i as f32 / 4.0));
+        }
+        f.up(away);
+        f.frame(Vec::new());
+        assert_eq!(f.session.brush_library().iter().map(|s| s.brushes.len()).collect::<Vec<_>>(), sizes);
+        assert_eq!((f.session.current_brush().set, f.session.current_brush().index), (to as u32, 2));
+    }
+
+    /// A brush picked from the search ends it and shows in its own set, chosen there and lit (as
+    /// the original), wherever the library stood.
+    #[test]
+    fn a_brush_picked_from_the_search_shows_in_its_own_set() {
+        let mut f = Finger::new();
+        let start = f.session.current_brush();
+        let library = f.session.brush_library();
+        let named = |name: &str| library.iter().flat_map(|s| &s.brushes).filter(|o| o.name == name).count();
+        // a brush of another set, not its first, with a name no other brush holds
+        let picked = library
+            .iter()
+            .flat_map(|s| &s.brushes)
+            .find(|b| b.set != start.set && b.index > 0 && named(&b.name) == 1)
+            .cloned()
+            .expect("a brush of its own name");
+        f.library.query = picked.name.clone();
+        f.frame(Vec::new());
+        f.frame(Vec::new());
+        // the results in place of the lists: the one found, first
+        assert!(f.library.brush_rects.is_empty());
+        let (key, at) = f.library.result_rects.first().map(|(k, r)| (*k, r.center())).expect("a result");
+        assert_eq!(key, (picked.set, picked.index));
+        f.down(at);
+        f.up(at);
+        f.frame(Vec::new());
+        f.frame(Vec::new());
+        assert!(f.library.query.is_empty() && !f.library.searching);
+        assert_eq!((f.session.current_brush().set, f.session.current_brush().index), (picked.set, picked.index));
+        assert_eq!(f.library.shown_set, Some(picked.set as usize));
+        assert_eq!(f.library.highlighted, Some((picked.set, picked.index)));
+        assert!(f.library.brush_rects.iter().all(|(k, _)| k.0 == picked.set));
         assert!(f.library.studio.is_none());
     }
 

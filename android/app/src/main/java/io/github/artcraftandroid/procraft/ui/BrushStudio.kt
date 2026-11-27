@@ -50,19 +50,20 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.PointerType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
-import android.content.res.Configuration
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.artcraftandroid.procraft.canvas.CanvasViewModel
 import io.github.artcraftandroid.procraft.canvas.PadSurfaceView
+import io.github.artcraftandroid.procraft.core.ListSliderTouch
 import io.github.artcraftandroid.procraft.core.SourceKind
 import io.github.artcraftandroid.procraft.core.curveSamples
+import io.github.artcraftandroid.procraft.core.listSliderTouch
 import io.github.artcraftandroid.procraft.core.sliderExtras
 import kotlin.math.pow
 import kotlin.math.roundToInt
@@ -122,6 +123,27 @@ private val StudioDone get() = Pc.tinted(Color(0xFF0190FF))
 /** Where the settings start below the drawing pad (points from the top). */
 private val PadHeight = 510.dp
 private val TabsWidth = 81.dp
+
+/** The landscape studio's pages card (with its margin), its settings and the line after them. */
+internal val PagesAndSettings = 330.dp + SettingsWidth + 1.dp
+
+/**
+ * The least the pad beside them needs: its buttons as measured, each in from its edge, with
+ * Cancel and Done's gap between them and the Drawing Pad button: 21 in, the Drawing Pad button
+ * (145), the gap (13), Cancel (73), the gap, Done (44), 20 in.
+ */
+internal val PadLeast = 21.dp + 145.dp + 13.dp + 73.dp + 13.dp + 44.dp + 20.dp
+
+/**
+ * Whether the studio in a window [width] × [height] lays its pages, settings and pad side by side:
+ * where the window is wider than tall (its own shape, not the screen's turn) and the pad beside
+ * them still has room for its buttons (on a phone held sideways it had about 80 across, and Done
+ * was squeezed to nothing); else the pages as a rail beside the pad over the settings, as upright.
+ */
+internal fun studioSideBySide(width: Dp, height: Dp) = width > height && width >= PagesAndSettings + PadLeast
+
+/** The studio is laid side by side (see [studioSideBySide]): its settings take that layout's shapes. */
+internal val LocalStudioSideBySide = androidx.compose.runtime.staticCompositionLocalOf { false }
 
 /**
  * How a slider reads; [SIZE] reads the size the control sets (the brush's most size × place^2.2) as a
@@ -651,39 +673,43 @@ fun BrushStudio(vm: CanvasViewModel) {
 
 @Composable
 private fun Studio(vm: CanvasViewModel) {
-    val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
     BoxWithConstraints(
         Modifier.fillMaxSize().background(StudioBack).pointerInput(Unit) { awaitEachGesture { awaitFirstDown().consume() } },
     ) {
-        if (landscape) {
-            // the pages listed by name on a card, the settings beside them, the pad on the right
-            Row(Modifier.fillMaxSize()) {
-                StudioPagesCard(vm)
-                StudioSettings(vm, Modifier.width(SettingsWidth).fillMaxHeight())
-                Box(Modifier.width(1.dp).fillMaxHeight().background(StudioLine))
-                StudioPad(vm, Modifier.fillMaxSize())
-            }
-        } else {
-            // a short screen (a split window, or a tablet held upright) gives the pad at most 45%
-            // of its height, so the settings under it always have room to show and scroll
-            val pad = if (maxHeight * 0.45f < PadHeight) maxHeight * 0.45f else PadHeight
-            Row(Modifier.fillMaxSize()) {
-                StudioRail(vm)
-                Column(Modifier.fillMaxSize()) {
-                    StudioPad(vm, Modifier.fillMaxWidth().height(pad))
-                    Box(Modifier.fillMaxWidth().height(1.dp).background(StudioLine))
-                    StudioSettings(vm, Modifier.fillMaxSize())
+        val sideBySide = studioSideBySide(maxWidth, maxHeight)
+        androidx.compose.runtime.CompositionLocalProvider(LocalStudioSideBySide provides sideBySide) {
+            if (sideBySide) {
+                // the pages listed by name on a card, the settings beside them, the pad on the right
+                Row(Modifier.fillMaxSize()) {
+                    StudioPagesCard(vm)
+                    StudioSettings(vm, Modifier.width(SettingsWidth).fillMaxHeight())
+                    Box(Modifier.width(1.dp).fillMaxHeight().background(StudioLine))
+                    StudioPad(vm, Modifier.fillMaxSize())
+                }
+            } else {
+                // a short screen (a split window, or a tablet held upright) gives the pad at most 45%
+                // of its height, so the settings under it always have room to show and scroll
+                val pad = if (maxHeight * 0.45f < PadHeight) maxHeight * 0.45f else PadHeight
+                Row(Modifier.fillMaxSize()) {
+                    StudioRail(vm)
+                    Column(Modifier.fillMaxSize()) {
+                        StudioPad(vm, Modifier.fillMaxWidth().height(pad))
+                        Box(Modifier.fillMaxWidth().height(1.dp).background(StudioLine))
+                        StudioSettings(vm, Modifier.fillMaxSize())
+                    }
                 }
             }
+            // over the studio, shaped as it is laid
+            SourceEditor(vm)
         }
     }
-    SourceEditor(vm)
 }
 
 /** Portrait: the pages as icons down the left. */
 @Composable
 private fun StudioRail(vm: CanvasViewModel) {
-    Column(Modifier.width(TabsWidth).fillMaxHeight().background(StudioTabs).padding(top = 46.dp)) {
+    // scrolling where the window is too short for all of them (a phone held sideways)
+    Column(Modifier.width(TabsWidth).fillMaxHeight().background(StudioTabs).verticalScroll(rememberScrollState()).padding(top = 46.dp)) {
         STUDIO_TABS.forEachIndexed { i, tab ->
             val on = vm.studioTab == i
             Box(
@@ -881,7 +907,7 @@ private fun StudioControlView(vm: CanvasViewModel, c: StudioControl) {
         )
         StudioControl.TiltAngle -> TiltAngle(vm.studio("tilt_angle")) { vm.setStudio("tilt_angle", it) }
         StudioControl.Roundness -> RoundnessGraph(vm.studio("roundness"), vm.studio("shape_angle"), onRoundness = { vm.setStudio("roundness", it) }, onAngle = { vm.setStudio("shape_angle", it) })
-        is StudioControl.Source -> if (LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE) SourceBox(vm, c) else Row(
+        is StudioControl.Source -> if (LocalStudioSideBySide.current) SourceBox(vm, c) else Row(
             Modifier.fillMaxWidth().height(60.dp).clip(RoundedCornerShape(12.dp)).background(StudioCard)
                 .tap { vm.sourceEditing = c.kind }.padding(start = 16.dp, end = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -900,7 +926,7 @@ private fun StudioControlView(vm: CanvasViewModel, c: StudioControl) {
         // the brush's stroke filling the card's height, its name over it on a patch of the card's own colour
         StudioControl.PreviewCard -> Box(
             Modifier.fillMaxWidth()
-                .aspectRatio(if (LocalConfiguration.current.orientation == Configuration.ORIENTATION_PORTRAIT) 623f / 200f else 278.5f / 91.5f)
+                .aspectRatio(if (LocalStudioSideBySide.current) 278.5f / 91.5f else 623f / 200f)
                 .clip(RoundedCornerShape(12.dp))
                 .background(PreviewCardFill).border(1.dp, PreviewCardEdge, RoundedCornerShape(12.dp)),
         ) {
@@ -1250,15 +1276,29 @@ internal fun StudioSlider(
                 if (!enabled) return@pointerInput
                 awaitEachGesture {
                     val down = awaitFirstDown()
-                    down.consume()
+                    val span = if (both) 2f else 1f
+                    val travel = (size.width - 2 * KNOB_INSET.toPx()).coerceAtLeast(1f)
+                    // landing on the knob it is the slider's at once; elsewhere the first ten points
+                    // either way decide, so a finger scrolling the list over a slider leaves it be
+                    val t = (if (both) (current + 1f) / 2f else current).coerceIn(0f, 1f)
+                    val knob = Offset(KNOB_INSET.toPx() + travel * t, size.height / 2f)
+                    val pen = down.type == PointerType.Stylus || down.type == PointerType.Eraser
+                    val fromKnob = (down.position - knob).getDistance().toDp().value
+                    var owner = listSliderTouch(fromKnob, pen, 0f, 0f)
+                    if (owner == ListSliderTouch.SLIDER) down.consume()
                     var last = down.position.x
                     var v = current
                     while (true) {
                         val ev = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
                         if (!ev.pressed) break
+                        if (owner == ListSliderTouch.UNDECIDED) {
+                            val moved = ev.position - down.position
+                            owner = listSliderTouch(fromKnob, pen, moved.x.toDp().value, moved.y.toDp().value)
+                        }
+                        // the list's: it scrolls, the slider as it was
+                        if (owner == ListSliderTouch.LIST) break
+                        if (owner == ListSliderTouch.UNDECIDED) continue
                         // relative: the knob follows the drag, as far as it travels
-                        val span = if (both) 2f else 1f
-                        val travel = (size.width - 2 * KNOB_INSET.toPx()).coerceAtLeast(1f)
                         v = (v + (ev.position.x - last) / travel * span).coerceIn(if (both) -1f else 0f, 1f)
                         last = ev.position.x
                         change(v)

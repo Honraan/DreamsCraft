@@ -376,7 +376,7 @@ impl GuideEditor {
     fn toolbar(&mut self, ctx: &egui::Context, look: &mut Look, session: &CanvasSession, g: &GuideInfo, screen: Rect) {
         let wide = screen.width() > screen.height();
         let (w, h) = if wide { (screen.width() - 16.0, 137.0) } else { (652.0, 199.0) };
-        let rect = panel_rect(screen, w, h);
+        let rect = panel_rect(ctx, screen, w, h);
         let mut options_button = Rect::NOTHING;
         let set_look =
             |opacity: f32, thickness: f32, size: f32| _ = session.set_guide_look(opacity, thickness, size, g.hue);

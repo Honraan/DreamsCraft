@@ -58,6 +58,7 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -84,6 +85,8 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
@@ -361,7 +364,7 @@ internal fun distortCornersToDeformPoints(corners: List<Pair<Float, Float>>): Li
 internal enum class MultiFingerTapAction { NONE, UNDO, REDO }
 
 /**
- * Recognizes Procreate-style **2-finger tap = Undo** and **3-finger tap = Redo** gestures while
+ * Recognizes DreamsCraft-style **2-finger tap = Undo** and **3-finger tap = Redo** gestures while
  * rejecting pinches, drags (`maxTravelPx > 24f`), or long presses (`durationMs > 320L`).
  */
 internal fun classifyMultiFingerTap(
@@ -806,14 +809,19 @@ fun BoxScope.DreamsWorkspaceOverlay(
     }
 
     // 3. Stage and multitrack timeline with the center action bar
+    val dockCover = remember { Any() }
+    val dockCorner = LocalClearance.current.corner
+    DisposableEffect(dockCover) { onDispose { vm.covers(dockCover, null) } }
     Column(
         modifier = Modifier
             .align(Alignment.BottomCenter)
             .fillMaxWidth()
             .height(timelineHeightDp + CenterBarHeight)
             .background(DreamsSurface)
-            // Consume all touches so no accidental strokes reach the Stage underneath
-            .pointerInput(Unit) { detectTapGestures { } },
+            // Consume all touches so no accidental strokes reach the Stage underneath,
+            // and register bounds so hovering pens hide the brush cursor over the dock.
+            .keepsItsTouches()
+            .onGloballyPositioned { vm.covers(dockCover, it.boundsInRoot().translate(-dockCorner)) },
     ) {
         CenterActionBar(
             vm = vm,
@@ -920,6 +928,9 @@ private fun BoxScope.DreamsFlipbookDock(
     val activeCelIndex = activeClip?.activeCelIndex?.toInt() ?: -1
     val activeCel = cels.getOrNull(activeCelIndex)
 
+    val flipbookCover = remember { Any() }
+    val flipbookCorner = LocalClearance.current.corner
+    DisposableEffect(flipbookCover) { onDispose { vm.covers(flipbookCover, null) } }
     Column(
         modifier = Modifier
             .align(Alignment.BottomCenter)
@@ -930,7 +941,8 @@ private fun BoxScope.DreamsFlipbookDock(
             .clip(RoundedCornerShape(22.dp))
             .background(DreamsCardFill.copy(alpha = 0.96f))
             .border(1.dp, DreamsGlassEdge, RoundedCornerShape(22.dp))
-            .pointerInput(Unit) { detectTapGestures { } },
+            .keepsItsTouches()
+            .onGloballyPositioned { vm.covers(flipbookCover, it.boundsInRoot().translate(-flipbookCorner)) },
     ) {
         // Optional inline Onion Skin quick drawer right inside Flipbook
         if (onionDrawerOpen) {
@@ -1747,7 +1759,7 @@ private fun MultiTrackDopesheet(
     Column(
         modifier = modifier
             .background(DreamsTrackBg)
-            // Procreate-style 2-finger tap = Undo, 3-finger tap = Redo right over the Timeline
+            // DreamsCraft-style 2-finger tap = Undo, 3-finger tap = Redo right over the Timeline
             .multiFingerUndoRedo(
                 onUndo = { vm.undo() },
                 onRedo = { vm.redo() },
@@ -3322,7 +3334,7 @@ private fun BoxScope.StageKeyTransformOverlay(
             .width(stageWidth)
             .height(stageHeight)
             .clipToBounds()
-            // Procreate-style 2-finger tap = Undo, 3-finger tap = Redo right over Perform & Stage Gizmo
+            // DreamsCraft-style 2-finger tap = Undo, 3-finger tap = Redo right over Perform & Stage Gizmo
             .multiFingerUndoRedo(
                 onUndo = { vm.undo() },
                 onRedo = { vm.redo() },

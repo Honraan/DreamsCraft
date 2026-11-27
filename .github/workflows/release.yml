@@ -6,7 +6,7 @@
 #   - Desktop Windows (x64):         dreamscraft-<version>-windows-x64.msi / -portable.zip
 #   - Checksums:                     SHA256SUMS.txt
 #
-# Triggered automatically when pushing a version tag (e.g. `v1.0.0`) or manually via Actions > Release > Run workflow.
+# Triggered automatically when pushing a version tag (e.g. `v2.5.0`) or manually via Actions > Release > Run workflow.
 name: Release
 
 on:

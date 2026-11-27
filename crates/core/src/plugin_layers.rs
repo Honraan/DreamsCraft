@@ -147,6 +147,13 @@ pub(crate) mod field {
     /// triangle, equilateral triangle, quadrilateral, rectangle, square), then its nodes, x and y as
     /// 32-bit floats (canvas pixels, before its transform).
     pub(crate) const SHAPE: u16 = 26;
+    /// Its pressure as plugins gave it, if they did: u8 1 if it was given though the pointer reports
+    /// none (a finger's), then two 32-bit floats, how far it grew from nothing at the start and fell
+    /// to nothing at the end (canvas pixels, before its transform).
+    pub(crate) const PRESSURE: u16 = 27;
+    /// 32-bit float: how far the pen's pressure reached (see
+    /// [`procraft_engine::stroke::InputSettings::pressure_scale`]); none, 1.
+    pub(crate) const PRESSURE_SCALE: u16 = 28;
     /// The first id of a plugin's own fields.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const OWN: u16 = 0x8000;
@@ -332,6 +339,9 @@ pub(crate) struct Item {
     pub(crate) region: Option<Arc<Region>>,
     /// The shape it was snapped to, if it was: its kind and nodes.
     pub(crate) shape: Option<Arc<(u8, Vec<Vec2>)>>,
+    /// Its pressure as plugins gave it: given though its pointer reports none, and how far it grew
+    /// from nothing and fell to nothing (canvas pixels; see [`StrokeBuilder::pressing`]).
+    pub(crate) pressing: (bool, [f32; 2]),
 }
 
 /// A region an item fills: its outlines (canvas pixels, before the item's transform), filled
@@ -491,6 +501,9 @@ impl Item {
             input.extend_from_slice(&p.y.to_le_bytes());
         }
         r.field(field::INPUT, &input);
+        if i.pressure_scale != 1.0 {
+            r.floats(field::PRESSURE_SCALE, &[i.pressure_scale]);
+        }
         if let Some(symmetry) = self.symmetry {
             r.field(field::SYMMETRY, &symmetry.bytes());
         }
@@ -513,6 +526,14 @@ impl Item {
                 bytes.extend_from_slice(&p.y.to_le_bytes());
             }
             r.field(field::SHAPE, &bytes);
+        }
+        if self.pressing != (false, [0.0; 2]) {
+            let (given, [start, end]) = self.pressing;
+            let mut bytes = vec![u8::from(given)];
+            for v in [start, end] {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            r.field(field::PRESSURE, &bytes);
         }
         let batches: Vec<u8> = self.batches.iter().flat_map(|b| b.to_le_bytes()).collect();
         r.field(field::BATCHES, &batches);
@@ -551,6 +572,7 @@ impl Item {
             clip: None,
             region: None,
             shape: None,
+            pressing: (false, [0.0; 2]),
         };
         let mut brush = None;
         for (id, bytes) in fields(record) {
@@ -592,6 +614,14 @@ impl Item {
                         Arc::new((*kind, nodes.filter(|p| p.is_finite()).take(MOST_SAMPLES).collect()))
                     });
                 }
+                field::PRESSURE => {
+                    let span = |v: f32| if v.is_finite() { v.clamp(0.0, 1e6) } else { 0.0 };
+                    if let (Some(&given), Some([start, end])) =
+                        (bytes.first(), floats::<2>(bytes.get(1..).unwrap_or_default()))
+                    {
+                        item.pressing = (given == 1, [span(start), span(end)]);
+                    }
+                }
                 field::SIZES => item.sizes = floats_of(bytes).take(4).filter(|v| v.is_finite() && *v >= 0.0).collect(),
                 field::BRUSH_NAME => item.brush_name = String::from_utf8_lossy(bytes).chars().take(256).collect(),
                 field::SEED => item.seed = u32_of(bytes).unwrap_or(0),
@@ -614,7 +644,15 @@ impl Item {
                         .map(|z| z.clamp(1e-4, 1e4));
                 }
                 field::ALPHA_LOCK => item.alpha_lock = bytes.first().is_some_and(|b| *b != 0),
-                field::INPUT => item.input = input_of(bytes).unwrap_or_default(),
+                field::INPUT => {
+                    // (its pressure's reach kept, whichever field came first)
+                    let scale = item.input.pressure_scale;
+                    item.input = InputSettings { pressure_scale: scale, ..input_of(bytes).unwrap_or_default() };
+                }
+                field::PRESSURE_SCALE => {
+                    item.input.pressure_scale =
+                        floats::<1>(bytes).filter(|[v]| v.is_finite()).map_or(1.0, |[v]| v.clamp(1.0, 16.0));
+                }
                 field::SYMMETRY => item.symmetry = Symmetry::read(bytes),
                 field::STARTED => {
                     item.started = bytes
@@ -921,6 +959,7 @@ fn input_of(bytes: &[u8]) -> Option<InputSettings> {
         speed_distance: speed_distance.clamp(0.25, 1.0),
         tip_attached,
         tilt_known: true,
+        pressure_scale: 1.0,
     })
 }
 
@@ -1162,6 +1201,10 @@ impl State {
             clip: self.selection.as_ref().and_then(Clip::of).map(Arc::new),
             region: None,
             shape: None,
+            pressing: {
+                let per_point = self.canvas_per_point();
+                (self.pressing.given, self.pressing.tapers.map(|t| t * per_point))
+            },
         };
         let laid = self.laid_current(layer);
         let mut recording = Recording { layer, kind, item, started: None, laid };
@@ -1201,7 +1244,7 @@ impl State {
                 crate::close_stroke(canvas, builder, second, &guide);
                 self.flush();
                 // laid where it is laid now, after the rest
-                let ended = self.canvas.as_ref().and_then(procraft_gpu::Canvas::last_stroke);
+                let ended = self.canvas.as_deref().and_then(procraft_gpu::Canvas::last_stroke);
                 if let (Some(mut items), Some((bounds, in_place))) = (laid_before.clone(), ended) {
                     let key = Item::read(&record, &[]).and_then(|i| item_keys(&[i]).first().copied()).unwrap_or(0);
                     Arc::make_mut(&mut items).push(LaidItem { key, bounds, in_place });
@@ -1237,7 +1280,7 @@ impl State {
             }
         };
         self.flush();
-        let made = self.canvas.as_ref().filter(|c| c.steps_made() > steps).and_then(procraft_gpu::Canvas::undo_step);
+        let made = self.canvas.as_deref().filter(|c| c.steps_made() > steps).and_then(procraft_gpu::Canvas::undo_step);
         let after = Some(Arc::new(after));
         self.doc.set_plugin_data(layer, after.clone());
         if let Some(made) = made {
@@ -1503,6 +1546,10 @@ impl State {
                 .with_input(item.input.clone())
                 .on_view_turned(item.rotation)
                 .seen_at(item.seen_at);
+            // its pressure as plugins gave it, its tapers moved with it
+            let (given, tapers) = item.pressing;
+            let builder = if given { builder.with_given_pressure() } else { builder };
+            let builder = builder.with_pressure_tapers(tapers[0] * t.scale_factor(), tapers[1] * t.scale_factor());
             let builder = match item.whole_pixels {
                 Some(zoom) => builder.read_in_whole_pixels(zoom),
                 None => builder,
@@ -1536,7 +1583,16 @@ impl State {
         let (Some(canvas), Some(gpu)) = (self.canvas.as_mut(), self.gpu.as_ref()) else { return (IRect::EMPTY, false) };
         let engine = hooks.and_then(|hooks| {
             let look = (item.alpha_lock, false);
-            crate::plugin_brushes::engine_stroke(&hooks, &brush, item.tool.stroke_tool(), starting, look, canvas, gpu)
+            crate::plugin_brushes::engine_stroke(
+                &hooks,
+                &brush,
+                item.tool.stroke_tool(),
+                starting,
+                look,
+                canvas,
+                gpu,
+                false,
+            )
         });
         let (style, second) = match engine {
             Some(o) => {
@@ -1590,7 +1646,7 @@ impl State {
         let t = item.transform.unwrap_or(Affine::IDENTITY);
         let to = self.lay_to.map_or(t, |to| t.then(to));
         let (width, height) = (self.doc.width(), self.doc.height());
-        let measuring = self.canvas.as_ref().is_some_and(procraft_gpu::Canvas::measuring);
+        let measuring = self.canvas.as_deref().is_some_and(procraft_gpu::Canvas::measuring);
         let Some((rect, coverage)) = region.coverage(to, width, height) else { return (IRect::EMPTY, false) };
         if !measuring && let Some(canvas) = self.canvas.as_mut() {
             let [r, g, b] = item.colour.map(|c| c.clamp(0.0, 1.0));
@@ -1630,9 +1686,9 @@ impl State {
         self.flush();
         let laid_before = self.laid_items(layer);
         self.laid.remove(&layer);
-        let steps = self.canvas.as_ref().map_or(0, procraft_gpu::Canvas::steps_made);
+        let steps = self.canvas.as_deref().map_or(0, procraft_gpu::Canvas::steps_made);
         self.lay_items_again(layer, &read_drawn(&list), "Redraw layer");
-        let made = self.canvas.as_ref().filter(|c| c.steps_made() > steps).and_then(procraft_gpu::Canvas::undo_step);
+        let made = self.canvas.as_deref().filter(|c| c.steps_made() > steps).and_then(procraft_gpu::Canvas::undo_step);
         if let Some(made) = made {
             let laid = laid_before.zip(self.laid_items(layer));
             self.note_layer_step(made, layer, data.clone(), data, laid);
@@ -1891,12 +1947,12 @@ impl State {
             Ok(Some((running.layer_save(MOST_DATA)?, running.layer_draw(MOST_DRAWN)?)))
         });
         let Some(Some((after, list))) = answer else { return false };
-        let steps = self.canvas.as_ref().map_or(0, procraft_gpu::Canvas::steps_made);
+        let steps = self.canvas.as_deref().map_or(0, procraft_gpu::Canvas::steps_made);
         self.flush();
         let laid_before = self.laid_items(layer);
         let items = read_drawn(&list);
         self.lay_items_again(layer, &items, name);
-        let made = self.canvas.as_ref().filter(|c| c.steps_made() > steps).and_then(procraft_gpu::Canvas::undo_step);
+        let made = self.canvas.as_deref().filter(|c| c.steps_made() > steps).and_then(procraft_gpu::Canvas::undo_step);
         let after = Arc::new(after);
         // what it draws of its data now, known without asking again
         let generation = self.hooks.as_ref().map_or(0, |hooks| hooks.generation());
@@ -2254,7 +2310,7 @@ impl CanvasSession {
         let reason = |why: &str| crate::MobileError::File { reason: why.to_owned() };
         let bytes = self.plugin_export_bytes(&key).ok_or_else(|| reason("the plugin couldn't make it"))?;
         crate::project::write_atomically(std::path::Path::new(&path), |p| {
-            std::fs::write(p, &bytes).map_err(|e| reason(&format!("writing the file: {e}")))
+            crate::storage::write(p, &bytes).map_err(|e| reason(&format!("writing the file: {e}")))
         })
     }
 
@@ -2475,6 +2531,8 @@ mod tests {
                 stabilization: 0.2,
                 pressure_curve: Curve::new(&[Vec2::new(0.0, 0.0), Vec2::new(0.5, 0.7), Vec2::new(1.0, 1.0)]),
                 tip_attached: false,
+                // drawn with an iPad's Pencil
+                pressure_scale: 25.0 / 6.0,
                 ..InputSettings::default()
             },
             symmetry: Some(Symmetry {
@@ -2490,6 +2548,7 @@ mod tests {
             clip: Some(Arc::new(Clip { x: 3, y: 4, width: 3, height: 2, coverage: vec![0, 0, 255, 255, 255, 9] })),
             region: None,
             shape: Some(Arc::new((4, vec![Vec2::new(1.0, 2.0), Vec2::new(3.0, 4.0)]))),
+            pressing: (true, [12.0, 30.5]),
         }
     }
 

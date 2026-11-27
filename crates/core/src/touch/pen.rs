@@ -1,7 +1,8 @@
 //! The pen's own gestures beside its touches, the same for every app: held over the canvas, its
 //! double-tap (or side button) and its squeeze.
 //!
-//! Hovering, the brush's outline shows where the pen would paint ([`CanvasSession::pen_hover_cursor`]):
+//! Hovering, the brush's outline shows where the pen would paint, at the size it would paint with
+//! the pressure the brush estimates for a pen held there ([`CanvasSession::pen_hover_cursor`]):
 //! it fades in once the pen has hovered a moment, back out while it races across, and out as it
 //! rises to the top of the height it is sensed at. Hover's touch works while it is there.
 //!
@@ -98,6 +99,21 @@ pub struct HoverCursor {
     pub x: f32,
     pub y: f32,
     pub alpha: f32,
+    /// The share of the brush's size the outline shows: what its pressure dynamics make of the
+    /// pressure it estimates while hovering.
+    pub scale: f32,
+}
+
+/// A pen button set to a QuickMenu action in Pen buttons, pressed at `at`: undo and redo as
+/// themselves, No Action nothing, the rest for the app to do.
+fn pen_runs(quick: crate::QuickAction, at: (f32, f32), out: &mut Vec<TouchCommand>) {
+    use crate::QuickAction as Q;
+    match quick {
+        Q::None => {}
+        Q::Undo => out.push(TouchCommand::Undo),
+        Q::Redo => out.push(TouchCommand::Redo),
+        action => out.push(TouchCommand::Run { action, x: at.0, y: at.1 }),
+    }
 }
 
 /// The pen's hover and squeeze, kept with the touches.
@@ -183,25 +199,46 @@ impl CanvasSession {
             }
             (t.pen.hover?, t.pen.settled)
         };
-        if self.shared.lock().adjust.open().is_some() {
-            return None;
-        }
+        let scale = {
+            let st = self.shared.lock();
+            if st.adjust.open().is_some() {
+                return None;
+            }
+            let brush = st.brush(st.tool);
+            brush.pressure_factors(brush.setting("hover_pressure")).0
+        };
         let shown = ((settled - HOVER_SHOWS_S) / HOVER_FADES_IN_S).clamp(0.0, 1.0);
         let low = if h.height > 0.0 { ((1.0 - h.height) * HOVER_HEIGHT_FADE).clamp(0.0, 1.0) } else { 1.0 };
-        Some(HoverCursor { x: h.x, y: h.y, alpha: shown * low })
+        Some(HoverCursor { x: h.x, y: h.y, alpha: shown * low, scale })
     }
 
-    /// The pen's button pressed (its `second`), hovering or touching at (`x`, `y`): what Gesture
-    /// controls set it to do. Set to nothing, the first switches between the current tool and the
-    /// eraser, and back, as a pen's double-tap does by default; the second does nothing. Set to
-    /// erase, the eraser is borrowed until the button is let go
-    /// ([`CanvasSession::touch_pen_button_up`]).
+    /// The pen's button pressed (its `second`), hovering or touching at (`x`, `y`): the QuickMenu
+    /// action Pen buttons set it to, else what Gesture controls set it to do. Set to nothing in
+    /// either, the first switches between the current tool and the eraser, and back, as a pen's
+    /// double-tap does by default; the second does nothing. Set to erase in Gesture controls, the
+    /// eraser is borrowed until the button is let go ([`CanvasSession::touch_pen_button_up`]).
     pub fn touch_pen_button(&self, second: bool, x: f32, y: f32) -> Vec<TouchCommand> {
-        let action = {
+        let (action, does, runs) = {
             let t = self.touches();
-            if second { t.settings.pen_second_button } else { t.settings.pen_button }
+            if second {
+                (
+                    t.settings.pen_second_button,
+                    t.settings.pen_second_button_does,
+                    t.settings.pen_second_button_runs.clone(),
+                )
+            } else {
+                (t.settings.pen_button, t.settings.pen_button_does, t.settings.pen_button_runs.clone())
+            }
         };
         let mut out = Vec::new();
+        if let Some(key) = runs {
+            out.push(TouchCommand::RunPlugin { key, x, y });
+            return out;
+        }
+        if let Some(quick) = does {
+            pen_runs(quick, (x, y), &mut out);
+            return out;
+        }
         if action == Some(GestureAction::Erase) {
             self.hold_eraser(second);
             return out;
@@ -236,8 +273,21 @@ impl CanvasSession {
         if preferred == PenPreferred::Ignore || !(x.is_finite() && y.is_finite()) {
             return out;
         }
+        // as the first button: set in Pen buttons, it does that
+        let (action, does, runs) = {
+            let t = self.touches();
+            (t.settings.pen_button, t.settings.pen_button_does, t.settings.pen_button_runs.clone())
+        };
+        if let Some(key) = runs {
+            out.push(TouchCommand::RunPlugin { key, x, y });
+            return out;
+        }
+        if let Some(quick) = does {
+            pen_runs(quick, (x, y), &mut out);
+            return out;
+        }
         // a double-tap can't be held: set to erase while held, it does what the platform asks
-        let action = self.touches().settings.pen_button.filter(|&a| a != GestureAction::Erase);
+        let action = action.filter(|&a| a != GestureAction::Erase);
         self.pen_does(action, preferred, (x, y), &mut out);
         out
     }
@@ -601,6 +651,24 @@ mod tests {
         assert_eq!(s.info().tool, ToolKind::Smudge);
         s.touch_pen_double_tap(PenPreferred::SwitchPrevious, 0.0, 0.0);
         assert_eq!(s.info().tool, ToolKind::Paint);
+    }
+
+    #[test]
+    fn the_hover_outline_is_the_brush_at_its_estimated_pressure() {
+        let s = session();
+        s.touch_pen_hover(over(20.0, 20.0, 0.2, 0.0));
+        let scale_at = |pressure: f32| {
+            let mut st = s.shared.lock();
+            let tool = st.tool;
+            st.brush_mut(tool).expect("the tool has a brush").set_settings([("hover_pressure", pressure)]);
+            drop(st);
+            s.pen_hover_cursor().map(|c| c.scale)
+        };
+        // pressed fully it paints at its size; held lighter, as much smaller as its dynamics say
+        assert_eq!(scale_at(1.0), Some(1.0));
+        let light = scale_at(0.2).expect("hovering");
+        let lighter = scale_at(0.0).expect("hovering");
+        assert!(lighter <= light && light < 1.0, "{lighter} {light}");
     }
 
     #[test]
