@@ -671,14 +671,14 @@ impl State {
         };
         if covers {
             if let Some(before) = self.pending_draw_doc.take() {
-                canvas.attach_next_step_doc(Some(before));
+                canvas.attach_next_step_doc(Some(*before));
             }
             canvas.name_next_step(STEP);
             canvas.end_stroke();
         } else {
             canvas.cancel_stroke();
             if let Some(before) = self.pending_draw_doc.take() {
-                self.doc = before;
+                self.doc = *before;
                 canvas.invalidate();
             }
         }

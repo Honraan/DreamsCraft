@@ -958,7 +958,7 @@ impl CanvasSession {
             let (mut canvas, mut doc) = match kept {
                 Some(kept) => kept,
                 None => {
-                    let mut doc = Document::new(cw, ch);
+                    let mut doc = Box::new(Document::new(cw, ch));
                     doc.background_visible = false;
                     let mut canvas = Box::new(Canvas::new(&gpu, &doc).ok()?);
                     // drawn beside the window's frames: its work goes to the GPU a short piece at

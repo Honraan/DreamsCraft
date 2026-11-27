@@ -1740,7 +1740,7 @@ impl CanvasSession {
         st.finish_stroke();
         st.settle();
         let before = st.doc.clone();
-        st.pending_doc = Some(before);
+        st.pending_doc = Some(Box::new(before));
         st.pending_name = Some("perform motion".to_owned());
     }
 
@@ -1756,7 +1756,7 @@ impl CanvasSession {
         let st = &mut *guard;
         st.finish_stroke();
         if st.pending_doc.is_none() {
-            st.pending_doc = Some(st.doc.clone());
+            st.pending_doc = Some(Box::new(st.doc.clone()));
             st.pending_name = Some("perform motion".to_owned());
         }
         let tl = st.doc.ensure_timeline();
@@ -1783,7 +1783,7 @@ impl CanvasSession {
         let st = &mut *guard;
         st.finish_stroke();
         if st.pending_doc.is_none() {
-            st.pending_doc = Some(st.doc.clone());
+            st.pending_doc = Some(Box::new(st.doc.clone()));
             st.pending_name = Some("perform motion".to_owned());
         }
         let tl = st.doc.ensure_timeline();
@@ -1813,7 +1813,7 @@ impl CanvasSession {
         let st = &mut *guard;
         st.finish_stroke();
         if st.pending_doc.is_none() {
-            st.pending_doc = Some(st.doc.clone());
+            st.pending_doc = Some(Box::new(st.doc.clone()));
             st.pending_name = Some("perform warp".to_owned());
         }
         let tl = st.doc.ensure_timeline();
@@ -1839,7 +1839,7 @@ impl CanvasSession {
         let st = &mut *guard;
         st.finish_stroke();
         if st.pending_doc.is_none() {
-            st.pending_doc = Some(st.doc.clone());
+            st.pending_doc = Some(Box::new(st.doc.clone()));
             st.pending_name = Some("perform warp".to_owned());
         }
         let tl = st.doc.ensure_timeline();
@@ -1868,7 +1868,7 @@ impl CanvasSession {
         let st = &mut *guard;
         st.finish_stroke();
         if st.pending_doc.is_none() {
-            st.pending_doc = Some(st.doc.clone());
+            st.pending_doc = Some(Box::new(st.doc.clone()));
             st.pending_name = Some("perform camera".to_owned());
         }
         let tl = st.doc.ensure_timeline();
@@ -1889,7 +1889,7 @@ impl CanvasSession {
         let st = &mut *guard;
         st.finish_stroke();
         if st.pending_doc.is_none() {
-            st.pending_doc = Some(st.doc.clone());
+            st.pending_doc = Some(Box::new(st.doc.clone()));
             st.pending_name = Some("perform camera".to_owned());
         }
         let tl = st.doc.ensure_timeline();
@@ -1914,7 +1914,7 @@ impl CanvasSession {
         let Some(before) = st.pending_doc.take() else {
             return false;
         };
-        st.doc = before;
+        st.doc = *before;
         sync_current_layer_to_playhead(&mut st.doc);
         if let Some(canvas) = st.canvas.as_mut() {
             canvas.invalidate();
@@ -1949,7 +1949,7 @@ impl CanvasSession {
         let st = &mut *guard;
         st.finish_stroke();
         // Consume the pre-Perform snapshot directly (avoiding a separate intermediate settle step!)
-        let before = st.pending_doc.take().unwrap_or_else(|| st.doc.clone());
+        let before = st.pending_doc.take().map_or_else(|| st.doc.clone(), |b| *b);
         st.pending_name = None;
 
         // Start from the clean pre-Perform clip keyframes so raw preview frames don't linger
@@ -2008,7 +2008,7 @@ impl CanvasSession {
         let mut guard = self.shared.lock();
         let st = &mut *guard;
         st.finish_stroke();
-        let before = st.pending_doc.take().unwrap_or_else(|| st.doc.clone());
+        let before = st.pending_doc.take().map_or_else(|| st.doc.clone(), |b| *b);
         st.pending_name = None;
 
         let orig_cam_kfs = before.timeline.as_ref().map(|t| t.camera.transform.clone());
@@ -2425,7 +2425,7 @@ impl CanvasSession {
         let mut guard = self.shared.lock();
         let st = &mut *guard;
         st.finish_stroke();
-        let before = st.pending_doc.take().unwrap_or_else(|| st.doc.clone());
+        let before = st.pending_doc.take().map_or_else(|| st.doc.clone(), |b| *b);
         st.pending_name = None;
 
         let cid = ClipId(clip_id);
@@ -2976,7 +2976,7 @@ impl CanvasSession {
         let st = &mut *guard;
         st.finish_stroke();
         if st.pending_doc.is_none() {
-            st.pending_doc = Some(st.doc.clone());
+            st.pending_doc = Some(Box::new(st.doc.clone()));
             st.pending_name = Some("perform opacity".to_owned());
         }
         let tl = st.doc.ensure_timeline();
@@ -3023,7 +3023,7 @@ impl CanvasSession {
         let mut guard = self.shared.lock();
         let st = &mut *guard;
         st.finish_stroke();
-        let before = st.pending_doc.take().unwrap_or_else(|| st.doc.clone());
+        let before = st.pending_doc.take().map_or_else(|| st.doc.clone(), |b| *b);
         st.pending_name = None;
 
         let cid = ClipId(clip_id);
@@ -3061,7 +3061,7 @@ impl CanvasSession {
         let st = &mut *guard;
         st.finish_stroke();
         if st.pending_doc.is_none() {
-            st.pending_doc = Some(st.doc.clone());
+            st.pending_doc = Some(Box::new(st.doc.clone()));
             st.pending_name = Some("perform filter".to_owned());
         }
         let tl = st.doc.ensure_timeline();
@@ -3108,7 +3108,7 @@ impl CanvasSession {
         let mut guard = self.shared.lock();
         let st = &mut *guard;
         st.finish_stroke();
-        let before = st.pending_doc.take().unwrap_or_else(|| st.doc.clone());
+        let before = st.pending_doc.take().map_or_else(|| st.doc.clone(), |b| *b);
         st.pending_name = None;
 
         let cid = ClipId(clip_id);

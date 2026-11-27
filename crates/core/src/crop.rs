@@ -185,7 +185,7 @@ impl CanvasSession {
             old_canvas.forget_redo();
             // (kept only for the next stroke, as big as a layer four times over)
             old_canvas.let_go_of_carried();
-            st.crop_undo = Some((old_canvas, old_doc));
+            st.crop_undo = Some((old_canvas, Box::new(old_doc)));
         }
         st.crop_redo = None;
         st.selection = None;
@@ -332,17 +332,17 @@ impl CanvasSession {
             }
             let Some((canvas, doc)) = st.crop_undo.take() else { return false };
             let cropped = st.canvas.replace(canvas);
-            let cropped_doc = std::mem::replace(&mut st.doc, doc);
+            let cropped_doc = std::mem::replace(&mut st.doc, *doc);
             let steps = st.canvas.as_deref().map_or(0, Canvas::steps_made);
-            st.crop_redo = cropped.map(|c| (c, cropped_doc, steps));
+            st.crop_redo = cropped.map(|c| (c, Box::new(cropped_doc), steps));
         } else {
             if !st.crop_redo_ready() {
                 return false;
             }
             let Some((canvas, doc, _)) = st.crop_redo.take() else { return false };
             let before = st.canvas.replace(canvas);
-            let before_doc = std::mem::replace(&mut st.doc, doc);
-            st.crop_undo = before.map(|c| (c, before_doc));
+            let before_doc = std::mem::replace(&mut st.doc, *doc);
+            st.crop_undo = before.map(|c| (c, Box::new(before_doc)));
         }
         st.selection = None;
         st.view = Some(st.fitted_view());

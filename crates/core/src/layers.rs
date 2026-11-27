@@ -1601,7 +1601,7 @@ impl CanvasSession {
             return false;
         }
         if let Some(before) = before {
-            st.pending_doc = Some(before);
+            st.pending_doc = Some(Box::new(before));
         }
         st.pending_name = Some(name.to_owned());
         if let Some(canvas) = st.canvas.as_mut() {

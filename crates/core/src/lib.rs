@@ -672,8 +672,8 @@ pub(crate) struct State {
     pub(crate) sound_hover: Option<(procraft_engine::geom::Vec2, std::time::Instant)>,
     /// Crops kept for undo: the canvas and document from before; and one undone, for redo, with
     /// the steps the canvas then put back had made (redo only while that hasn't changed).
-    crop_undo: Option<(Box<Canvas>, Document)>,
-    crop_redo: Option<(Box<Canvas>, Document, u64)>,
+    crop_undo: Option<(Box<Canvas>, Box<Document>)>,
+    crop_redo: Option<(Box<Canvas>, Box<Document>, u64)>,
     /// The text layer being edited, the document as the edit began, and the width changes made
     /// inside it.
     text_edit: Option<text::TextEdit>,
@@ -736,7 +736,7 @@ pub(crate) struct State {
     /// Strokes started, to seed each one's randomness.
     strokes: u32,
     /// The small canvas brush previews are drawn on.
-    preview: Option<(Box<Canvas>, Document)>,
+    preview: Option<(Box<Canvas>, Box<Document>)>,
     /// The library's brushes' shape and grain pictures as its sample strokes draw them: each
     /// brush's own (as the library holds it) beside the twin the strokes drew instead, until the
     /// library closes (see `brushes::preview_twins`).
@@ -872,12 +872,12 @@ pub(crate) struct State {
     /// The light interface: a light surround and grid.
     light: bool,
     /// The document before a continuous change (a slider drag) began.
-    pending_doc: Option<Document>,
+    pending_doc: Option<Box<Document>>,
     /// What undo calls that change.
     pending_name: Option<String>,
     /// The document snapshot before an auto-created timeline cel/clip was inserted at `stroke_begin`,
     /// attached to the stroke's undo step so 1 undo reverses both the paint and the auto-frame.
-    pub(crate) pending_draw_doc: Option<Document>,
+    pub(crate) pending_draw_doc: Option<Box<Document>>,
     /// The artwork's title.
     pub(crate) name: String,
     /// What the artwork keeps about itself: when it was made, strokes, time spent, its author.
@@ -1163,7 +1163,7 @@ impl State {
         }
         if let (Some(open), Some(canvas)) = (self.stroke.take(), self.canvas.as_mut()) {
             if let Some(before) = self.pending_draw_doc.take() {
-                canvas.attach_next_step_doc(Some(before));
+                canvas.attach_next_step_doc(Some(*before));
             }
             close_stroke(canvas, *open, self.second.take().map(|b| *b), &self.doc.stroke_guide());
             self.bake_painted_on();
@@ -1177,12 +1177,12 @@ impl State {
         self.end_adjustment(true);
         let name = self.pending_name.take();
         if let (Some(before), Some(canvas)) = (self.pending_doc.take(), self.canvas.as_mut())
-            && before != self.doc
+            && *before != self.doc
         {
             if let Some(name) = name {
                 canvas.name_next_step(&name);
             }
-            canvas.record_document(before);
+            canvas.record_document(*before);
         }
     }
 
@@ -2916,7 +2916,7 @@ impl CanvasSession {
                     }
                     st.doc.set_current(paint_layer);
                     if mutated {
-                        st.pending_draw_doc = Some(before);
+                        st.pending_draw_doc = Some(Box::new(before));
                         st.revision += 1;
                         if let Some(c) = st.canvas.as_mut() {
                             c.invalidate();
@@ -2937,7 +2937,7 @@ impl CanvasSession {
             })
         {
             if let Some(before) = st.pending_draw_doc.take() {
-                st.doc = before;
+                st.doc = *before;
             }
             return;
         }
@@ -3077,7 +3077,7 @@ impl CanvasSession {
         }
         let Some(canvas) = st.canvas.as_mut() else {
             if let Some(before) = st.pending_draw_doc.take() {
-                st.doc = before;
+                st.doc = *before;
             }
             return;
         };
@@ -3311,14 +3311,14 @@ impl CanvasSession {
                 // on a plugin's layer, handed to the plugin
                 Some(mut recording) => {
                     if let Some(before) = st.pending_draw_doc.take() {
-                        canvas.attach_next_step_doc(Some(before));
+                        canvas.attach_next_step_doc(Some(*before));
                     }
                     recording.lift(&canvas_samples);
                     st.end_recorded(recording, builder, second);
                 }
                 None => {
                     if let Some(before) = st.pending_draw_doc.take() {
-                        canvas.attach_next_step_doc(Some(before));
+                        canvas.attach_next_step_doc(Some(*before));
                     }
                     close_stroke(canvas, builder, second, &st.doc.stroke_guide());
                 }
@@ -3365,7 +3365,7 @@ impl CanvasSession {
         st.recording = None;
         st.filling = None;
         if let Some(before) = st.pending_draw_doc.take() {
-            st.doc = before;
+            st.doc = *before;
             if let Some(canvas) = st.canvas.as_mut() {
                 canvas.invalidate();
             }
